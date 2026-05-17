@@ -59,7 +59,13 @@ Avalonia 桌面应用（MVVM）：
 
 ## [当前状态]
 
-### 最近一次成功运行的功能
+### 最近一次成功运行的功能（2026-05-17 更新）
+- Tag 编辑窗口自动推荐：全量展示（移除数量上限）、显示使用次数 "name (count)"、ToggleSwitch 控制是否显示数量、点击添加时仅取 tag 名不含计数
+- Tag 搜索栏交互优化：输入搜索 → 点击图片/空白 → 自动失焦关闭联想框 → 再次聚焦搜索框 → 联想框重开（co-tag 模式复用已加载建议，前缀模式重建）；Enter 搜索后自动失焦
+- 缩略图加载优先可见区域：首屏 item 优先加载（`EstimateVisibleItemCount`），其余后台排队，SemaphoreSlim(4) 不变
+- 深色模式输入框文字可见性：所有 TextBox 背景改用 `DynamicResource InputBgBrush`（浅色 #FFF / 深色 #1A1A24）
+- 修复前缀模式点击 tag 建议崩溃（`SelectTagSuggestion` 绕开 backing field 避免 mid-click 清空 ObservableCollection 导致 Avalonia NPE）
+- 修复返回搜索前按钮页表恢复（`BackFromSearch` / `ClearFilter`：直接调用 `ShowPageAsync` + 先清 page cache 再注入恢复页，消除搜索结果残留）
 - 右键在线搜图自动上传（SauceNAO / IQDB / ascii2d / trace.moe 通过 HTTP POST 直接上传图片，结果自动在浏览器打开；Google / Yandex / soutubot 打开首页手动上传）
 - 文件夹实时监控（FileSystemWatcher：外部新增/删除文件自动 sync + 哈希补算）
 - 大文件夹导入哈希补算修复（sync → hash 串行，消除时序竞争导致新文件漏算哈希）
@@ -74,7 +80,8 @@ Avalonia 桌面应用（MVVM）：
 - 数据迁移（旧 JSON → SQLite）
 - 文件夹重定位（外部路径变更后更新 DB）
 
-### 最近的 Git 提交（2026-05-14 ~ 2026-05-16）
+### 最近的 Git 提交
+- 2026-05-17：Tag 编辑优化、搜索框交互改进、缩略图可见区域优先加载、深色模式修复、前缀点击/返回搜索 bug 修复
 - `be379fd` — Revert "路径修改前备份"
 - `1ffa895` — 路径修改前备份
 - `296f308` — 添加项目文件
@@ -86,6 +93,7 @@ Avalonia 桌面应用（MVVM）：
 - `App.SetValue(ItemWidthProperty, ...)` 在 `SmartWaterfallPanel` 中有静态方法调用但未使用 `SetValue`（代码审查项）
 - 文件夹搜索/过滤功能仅有 UI 绑定 `FolderSearchText`，未实现实际过滤逻辑
 - `StopSearch` 命令当前为空实现
+- `SmartWaterfallPanel` 无 UI 虚拟化，200 个元素全量 measure/arrange；`ImageViewItem.NotifyAll()` 每次 8 次 PropertyChanged 通知
 
 ## [环境依赖]
 

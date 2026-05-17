@@ -5,17 +5,24 @@ using ImageManager.Core.Models;
 
 namespace ImageManager.App.ViewModels;
 
+public class TagDisplayItem
+{
+    public string Name { get; init; } = string.Empty;
+    public int Count { get; init; }
+    public string Display { get; set; } = string.Empty;
+}
+
 public partial class TagEditViewModel : ViewModelBase
 {
     private readonly List<TagCount> _allTagCounts;
     private readonly IList<string> _favoriteTagsBacking;
-    private readonly int _maxSuggestionCount;
 
     [ObservableProperty] private string _tagInputText = string.Empty;
     [ObservableProperty] private string _newFavoriteText = string.Empty;
     [ObservableProperty] private string _errorMessage = string.Empty;
+    [ObservableProperty] private bool _showTagCount = true;
 
-    public ObservableCollection<TagCount> AutoTagSuggestions { get; } = new();
+    public ObservableCollection<TagDisplayItem> AutoTagSuggestions { get; } = new();
     public ObservableCollection<string> CurrentTags { get; } = new();
     public ObservableCollection<string> FavoriteTagSuggestions { get; } = new();
 
@@ -23,15 +30,16 @@ public partial class TagEditViewModel : ViewModelBase
 
     private static readonly HashSet<string> ReservedTagNames = new(StringComparer.OrdinalIgnoreCase) { "a", "o", "e" };
 
+    private string _lastAutoSuggestKeyword = string.Empty;
+
     public TagEditViewModel(
         string currentTagsText,
         List<TagCount> allTagCounts,
         IList<string> favoriteTags,
-        int maxSuggestionCount)
+        int maxSuggestionCount) // kept for API compat, unused — we now show all
     {
         _allTagCounts = allTagCounts;
         _favoriteTagsBacking = favoriteTags;
-        _maxSuggestionCount = maxSuggestionCount > 0 ? maxSuggestionCount : 30;
 
         if (!string.IsNullOrWhiteSpace(currentTagsText))
         {
@@ -77,10 +85,10 @@ public partial class TagEditViewModel : ViewModelBase
     }
 
     [RelayCommand]
-    private void AddSuggestedTag(TagCount tag)
+    private void AddSuggestedTag(string name)
     {
-        if (!CurrentTags.Any(t => string.Equals(t, tag.Name, StringComparison.OrdinalIgnoreCase)))
-            CurrentTags.Add(tag.Name);
+        if (!CurrentTags.Any(t => string.Equals(t, name, StringComparison.OrdinalIgnoreCase)))
+            CurrentTags.Add(name);
     }
 
     [RelayCommand]
@@ -127,9 +135,15 @@ public partial class TagEditViewModel : ViewModelBase
         RebuildFavoriteSuggestions(string.Empty);
     }
 
+    partial void OnShowTagCountChanged(bool value)
+    {
+        RebuildAutoSuggestions(_lastAutoSuggestKeyword);
+    }
+
     partial void OnTagInputTextChanged(string value)
     {
         var keyword = value.Trim();
+        _lastAutoSuggestKeyword = keyword;
         RebuildAutoSuggestions(keyword);
         RebuildFavoriteSuggestions(keyword);
     }
@@ -156,9 +170,12 @@ public partial class TagEditViewModel : ViewModelBase
                 .ThenBy(t => t.Name, StringComparer.OrdinalIgnoreCase);
         }
 
-        foreach (var t in query.Take(_maxSuggestionCount))
-            AutoTagSuggestions.Add(t);
+        foreach (var t in query)
+            AutoTagSuggestions.Add(new TagDisplayItem { Name = t.Name, Count = t.Count, Display = FormatTagDisplay(t.Name, t.Count) });
     }
+
+    private string FormatTagDisplay(string name, int count)
+        => ShowTagCount ? $"{name} ({count})" : name;
 
     private void RebuildFavoriteSuggestions(string keyword)
     {

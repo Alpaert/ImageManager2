@@ -17,7 +17,6 @@ public static class OnlineSearchHelper
     {
         ["saucenao"] = ("https://saucenao.com/search.php", "file"),
         ["iqdb"] = ("https://iqdb.org/", "file"),
-        ["ascii2d"] = ("https://ascii2d.net/search/file", "file"),
         ["tracemoe"] = ("https://api.trace.moe/search", "image"),
     };
 

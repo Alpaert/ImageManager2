@@ -880,29 +880,51 @@ public partial class MainWindowViewModel : ViewModelBase
             if (!_pageCache.TryGetValue(pageIndex, out pageItems!)) return;
         }
 
-        foreach (var item in pageItems)
+        var unloaded = pageItems.Where(i => !i.IsLoaded).ToList();
+        if (unloaded.Count == 0) return;
+
+        int visibleCount = EstimateVisibleItemCount();
+        var priorityItems = unloaded.Take(visibleCount).ToList();
+        var bgItems = unloaded.Skip(visibleCount).ToList();
+
+        foreach (var item in priorityItems)
+            await LoadSingleThumbnailAsync(item);
+
+        foreach (var item in bgItems)
+            await LoadSingleThumbnailAsync(item);
+    }
+
+    private async Task LoadSingleThumbnailAsync(ImageViewItem item)
+    {
+        await _thumbnailLoadSemaphore.WaitAsync();
+        try
         {
-            if (item.IsLoaded) continue;
-
-            await _thumbnailLoadSemaphore.WaitAsync();
-            try
+            var data = await _thumbCache.GetOrCreateThumbnailAsync(item.FilePath, _thumbnailDecodeWidth);
+            if (data != null)
             {
-                var data = await _thumbCache.GetOrCreateThumbnailAsync(item.FilePath, _thumbnailDecodeWidth);
-                if (data != null)
-                {
-                    item.ThumbnailData = data;
-                    var (w, h) = ThumbnailGenerator.GetDimensions(item.FilePath);
-                    item.Width = w;
-                    item.Height = h;
-                    item.IsLoaded = true;
-                }
+                item.ThumbnailData = data;
+                var (w, h) = ThumbnailGenerator.GetDimensions(item.FilePath);
+                item.Width = w;
+                item.Height = h;
+                item.IsLoaded = true;
             }
-            catch { }
-            finally { _thumbnailLoadSemaphore.Release(); }
-
-            item.IsLoading = false;
-            item.NotifyAll();
         }
+        catch { }
+        finally { _thumbnailLoadSemaphore.Release(); }
+
+        item.IsLoading = false;
+        item.NotifyAll();
+    }
+
+    private int EstimateVisibleItemCount()
+    {
+        double itemW = ThumbnailBaseWidth;
+        double itemH = WaterfallMode == "None"
+            ? ThumbnailBaseWidth / Math.Max(0.01, AppSettings.ThumbnailAspectRatio)
+            : ThumbnailBaseWidth * 0.75;
+        int perRow = Math.Max(1, (int)(900 / itemW));
+        int rows = Math.Max(2, (int)(400 / itemH) + 1);
+        return Math.Max(12, Math.Min(PageSize, perRow * rows));
     }
 
     private void PreloadAdjacentPages()
@@ -1198,8 +1220,10 @@ partial void OnCornerRadiusDipChanged(double value)
             return;
         }
 
-        // Prefix mode: replace text and search
-        TagSearchText = tag.Name;
+        // Prefix mode: use backing field to skip OnTagSearchTextChanged,
+        // which would Clear() the suggestions collection mid-click → Avalonia NPE
+        _tagSearchText = tag.Name;
+        OnPropertyChanged(nameof(TagSearchText));
         IsTagSearchPopupOpen = false;
         await SearchByTag();
     }
@@ -1248,6 +1272,18 @@ partial void OnCornerRadiusDipChanged(double value)
             TagSearchSuggestions.Add(t);
 
         IsTagSearchPopupOpen = TagSearchSuggestions.Count > 0;
+    }
+
+    public void OnTagSearchGotFocus()
+    {
+        if (_coTagMode)
+        {
+            IsTagSearchPopupOpen = TagSearchSuggestions.Count > 0;
+        }
+        else if (!string.IsNullOrWhiteSpace(TagSearchText))
+        {
+            UpdateTagSuggestions(TagSearchText);
+        }
     }
 
     private async Task RefreshCoTagSuggestionsAsync()
@@ -1558,9 +1594,13 @@ partial void OnCornerRadiusDipChanged(double value)
 
             if (_preSearchPageItems is { Count: > 0 })
             {
-                CurrentPage = _preSearchPageIndex;
-                Images = new ObservableCollection<ImageViewItem>(_preSearchPageItems);
+                lock (_pageCacheLock)
+                {
+                    _pageCache.Clear();
+                    _pageCache[_preSearchPageIndex] = _preSearchPageItems;
+                }
                 _preSearchPageItems = null;
+                await ShowPageAsync(_preSearchPageIndex);
                 StatusText = $"总文件数: {_allFiles.Count}";
                 ScrollRestoreRequested?.Invoke();
             }
@@ -1640,9 +1680,13 @@ partial void OnCornerRadiusDipChanged(double value)
 
         if (_preSearchPageItems is { Count: > 0 })
         {
-            CurrentPage = _preSearchPageIndex;
-            Images = new ObservableCollection<ImageViewItem>(_preSearchPageItems);
+            lock (_pageCacheLock)
+            {
+                _pageCache.Clear();
+                _pageCache[_preSearchPageIndex] = _preSearchPageItems;
+            }
             _preSearchPageItems = null;
+            _ = ShowPageAsync(_preSearchPageIndex);
             StatusText = $"总文件数: {_allFiles.Count}";
             ScrollRestoreRequested?.Invoke();
         }

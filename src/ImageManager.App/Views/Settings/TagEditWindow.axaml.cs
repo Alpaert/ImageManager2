@@ -2,7 +2,6 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using ImageManager.App.ViewModels;
-using ImageManager.Core.Models;
 
 namespace ImageManager.App.Views.Settings;
 
@@ -74,8 +73,8 @@ public partial class TagEditWindow : Window
 
     private void AutoTag_Click(object? sender, RoutedEventArgs e)
     {
-        if (sender is Button btn && btn.Tag is TagCount tag)
-            Vm.AddSuggestedTagCommand.Execute(tag);
+        if (sender is Button btn && btn.Tag is string name)
+            Vm.AddSuggestedTagCommand.Execute(name);
     }
 
     private void DeleteCurrentTag_Click(object? sender, RoutedEventArgs e)

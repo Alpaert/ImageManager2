@@ -513,6 +513,10 @@ public partial class MainWindow : Window
             source = source.Parent as Avalonia.Controls.Control;
         }
 
+        // Dismiss tag search popup when clicking on blank area
+        Vm.IsTagSearchPopupOpen = false;
+        RootGrid.Focus();
+
         var point = e.GetCurrentPoint(ImagePanelHost);
         if (!point.Properties.IsLeftButtonPressed) return;
 
@@ -584,6 +588,10 @@ public partial class MainWindow : Window
     {
         if (sender is not Avalonia.Controls.Border border) return;
         if (border.DataContext is not ImageViewItem item) return;
+
+        // Dismiss tag search popup when clicking on an image
+        Vm.IsTagSearchPopupOpen = false;
+        RootGrid.Focus();
 
         // Store for potential drag-drop initiation
         _dragPressArgs = e;
@@ -1093,10 +1101,11 @@ public partial class MainWindow : Window
         if (sender is Button btn && btn.Tag is Core.Models.TagCount tag)
         {
             Vm.PreSearchScrollOffset = ThumbnailScrollViewer.Offset.Y;
+            var wasCoTagMode = Vm.IsSuggestionCoTagMode;
             await Vm.SelectTagSuggestionCommand.ExecuteAsync(tag);
 
-            // Update border color (not Button.Background, to avoid pseudo-class override)
-            if (Vm.IsSuggestionCoTagMode && btn.Content is Border border)
+            // Update border color only for co-tag cycling; prefix-mode click already removed this button
+            if (wasCoTagMode && btn.Content is Border border)
             {
                 var state = Vm.GetCoTagState(tag.Name);
                 border.Background = state switch
@@ -1114,12 +1123,18 @@ public partial class MainWindow : Window
         }
     }
 
+    private void TxtTagSearch_GotFocus(object? sender, RoutedEventArgs e)
+    {
+        Vm.OnTagSearchGotFocus();
+    }
+
     private async void TxtTagSearch_KeyDown(object? sender, KeyEventArgs e)
     {
         if (e.Key == Key.Enter)
         {
             Vm.PreSearchScrollOffset = ThumbnailScrollViewer.Offset.Y;
             await Vm.SearchByTagCommand.ExecuteAsync(null);
+            RootGrid.Focus();
             e.Handled = true;
         }
     }
@@ -1294,6 +1309,7 @@ public partial class MainWindow : Window
                 Vm.AppSettings.DiskCacheDirectory = memVm.CachePath;
                 var cache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
                 cache.CacheDirectory = memVm.CachePath;
+                OnlineSearchHelper.SetTempDir(Path.Combine(memVm.CachePath, "search_temp"));
                 _ = cache.ClearAsync();
                 _ = Vm.SaveSettingsAsync();
             });

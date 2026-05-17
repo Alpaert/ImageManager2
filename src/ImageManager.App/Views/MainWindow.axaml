@@ -35,7 +35,7 @@
 			<Setter Property="Foreground" Value="{Binding $parent[Button].Foreground}" />
 		</Style>
 	</Window.Styles>
-    <Grid x:Name="RootGrid" ColumnDefinitions="230,*" RowDefinitions="Auto,Auto,Auto,Auto,*">
+    <Grid x:Name="RootGrid" Focusable="True" ColumnDefinitions="230,*" RowDefinitions="Auto,Auto,Auto,Auto,*">
 
         <!-- Left Sidebar -->
         <Border Grid.Column="0" Grid.RowSpan="5"
@@ -55,7 +55,7 @@
                                 Click="BtnRemoveFolder_Click"/>
                     </StackPanel>
                     <TextBox PlaceholderText="搜索文件夹..."
-                             Margin="0,0,0,8" Background="White"
+                             Margin="0,0,0,8" Background="{DynamicResource InputBgBrush}"
                              Text="{Binding FolderSearchText}"/>
                 </StackPanel>
 
@@ -124,7 +124,7 @@
                     FontSize="12" Padding="8,4" Click="BtnSelectFolder_Click"/>
             <Button Content="保存数据" Margin="0,0,5,0"
                     FontSize="12" Padding="8,4" Click="BtnSaveData_Click"/>
-            <Button Content="全局检测重复并移动" Margin="0,0,5,0"
+            <Button Content="全局检测重复并移动（未实现暂时）" Margin="0,0,5,0"
                     FontSize="12" Padding="8,4" Click="BtnDetectDuplicates_Click"/>
             <Button Content="清除所有筛选" Margin="0,0,5,0"
                     FontSize="12" Padding="8,4"
@@ -150,8 +150,9 @@
                         BorderThickness="1.5" CornerRadius="4">
                     <TextBox x:Name="TxtTagSearch" Text="{Binding TagSearchText}"
                              Width="200" PlaceholderText="输入 Tag 名称..."
-                             Background="White" BorderThickness="0"
-                             KeyDown="TxtTagSearch_KeyDown"/>
+                             Background="{DynamicResource InputBgBrush}" BorderThickness="0"
+                             KeyDown="TxtTagSearch_KeyDown"
+                             GotFocus="TxtTagSearch_GotFocus"/>
                 </Border>
                 <Popup IsOpen="{Binding IsTagSearchPopupOpen}"
                        Placement="Bottom">
@@ -207,7 +208,7 @@
                            VerticalAlignment="Center"
                            Foreground="#818CF8" FontSize="12"/>
             </Border>
-			<CheckBox x:Name="ChkLocalSearch" Content="局部匹配"
+			<CheckBox x:Name="ChkLocalSearch" Content="局部匹配（暂未实现）"
 					  Foreground="{DynamicResource AccentBrush}"
 					  Margin="10,0,0,0" VerticalAlignment="Center"/>
             <Button Content="停止搜索" Margin="10,0,0,0"
