@@ -365,3 +365,6 @@ FodyWeavers.xsd
 *.rar
 *.zip
 *.7z
+
+# Claude Code 本地配置
+.claude/
