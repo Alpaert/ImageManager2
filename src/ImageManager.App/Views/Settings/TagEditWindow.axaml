@@ -1,0 +1,127 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ImageManager.App.ViewModels"
+        xmlns:models="using:ImageManager.Core.Models"
+        x:Class="ImageManager.App.Views.Settings.TagEditWindow"
+        x:DataType="vm:TagEditViewModel"
+        Title="编辑 Tag"
+        Width="700" Height="480">
+
+    <Grid x:Name="RootGrid" Focusable="True"
+          ColumnDefinitions="*,220,220" RowDefinitions="Auto,*,Auto" Margin="12"
+          Background="Transparent" PointerPressed="RootGrid_PointerPressed">
+
+        <!-- Top Input -->
+        <StackPanel Grid.Row="0" Grid.ColumnSpan="3" Spacing="6" Margin="0,0,0,10">
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <TextBox Text="{Binding TagInputText}" Width="200"
+                         PlaceholderText="输入 Tag 名称..."
+                         Background="White"
+                         KeyDown="TxtTagInput_KeyDown"/>
+                <Button Content="添加" Width="70"
+                        Command="{Binding AddTagCommand}"/>
+                <TextBlock Text="输入后回车或点添加" Foreground="{DynamicResource MutedFgBrush}"
+                           FontSize="11" VerticalAlignment="Center"/>
+            </StackPanel>
+            <!-- Reserved name error -->
+            <TextBlock Text="{Binding ErrorMessage}"
+                       Foreground="#EF4444" FontSize="12"
+                       IsVisible="{Binding ErrorMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+        </StackPanel>
+
+        <!-- Left: Auto Suggestions -->
+        <Border Grid.Row="1" Grid.Column="0" Padding="8" Margin="0,0,8,0"
+                BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+            <DockPanel>
+                <TextBlock DockPanel.Dock="Top" Text="自动推荐 Tag"
+                           FontWeight="SemiBold" FontSize="13" Margin="0,0,0,8"/>
+                <ScrollViewer>
+                    <ItemsControl ItemsSource="{Binding AutoTagSuggestions}">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="models:TagCount">
+                                <Button Content="{Binding Name}" Margin="2"
+                                        Padding="6,3" FontSize="12"
+                                        Click="AutoTag_Click" Tag="{Binding}"/>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </DockPanel>
+        </Border>
+
+        <!-- Center: Current Tags -->
+        <Border Grid.Row="1" Grid.Column="1" Padding="8" Margin="0,0,8,0"
+                BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+            <DockPanel>
+                <TextBlock DockPanel.Dock="Top" Text="当前图片 Tag"
+                           FontWeight="SemiBold" FontSize="13" Margin="0,0,0,8"/>
+                <ScrollViewer>
+                    <ItemsControl ItemsSource="{Binding CurrentTags}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="x:String">
+                                <Border Margin="2" Padding="6,3"
+                                        BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="4">
+                                    <Grid ColumnDefinitions="*,Auto">
+                                        <TextBlock Text="{Binding}" VerticalAlignment="Center" FontSize="13"/>
+                                        <Button Grid.Column="1" Content="×"
+                                                Width="24" Height="24" FontSize="14" Padding="0"
+                                                Click="DeleteCurrentTag_Click" Tag="{Binding}"/>
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </DockPanel>
+        </Border>
+
+        <!-- Right: Favorite Tags -->
+        <Border Grid.Row="1" Grid.Column="2" Padding="8"
+                BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+            <DockPanel>
+                <TextBlock DockPanel.Dock="Top" Text="我的常用 Tag"
+                           FontWeight="SemiBold" FontSize="13" Margin="0,0,0,8"/>
+                <StackPanel DockPanel.Dock="Bottom" Margin="0,8,0,0" Spacing="6">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <TextBox Text="{Binding NewFavoriteText}" Width="120"
+                                 PlaceholderText="新 Tag..."
+                                 Background="White"
+                                 KeyDown="TxtFavoriteInput_KeyDown"/>
+                        <Button Content="+" Width="36" FontSize="16" Padding="0"
+                                Command="{Binding AddFavoriteCommand}"/>
+                    </StackPanel>
+                </StackPanel>
+                <ScrollViewer>
+                    <ItemsControl ItemsSource="{Binding FavoriteTagSuggestions}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="x:String">
+                                <Border Margin="2" Padding="6,3"
+                                        BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="4">
+                                    <Grid ColumnDefinitions="*,Auto">
+                                        <Button Grid.Column="0" Content="{Binding}"
+                                                FontSize="12" Padding="6,3"
+                                                Click="FavoriteTag_Click" Tag="{Binding}"/>
+                                        <Button Grid.Column="1" Content="×"
+                                                Width="24" Height="24" FontSize="14" Padding="0"
+                                                Click="DeleteFavorite_Click" Tag="{Binding}"/>
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </DockPanel>
+        </Border>
+
+        <!-- Bottom Buttons -->
+        <StackPanel Grid.Row="2" Grid.ColumnSpan="3" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Spacing="10" Margin="0,14,0,0">
+            <Button Content="取消" Width="80" Click="BtnCancel_Click"/>
+            <Button Content="确定" Width="80" Click="BtnOk_Click"/>
+        </StackPanel>
+
+    </Grid>
+</Window>

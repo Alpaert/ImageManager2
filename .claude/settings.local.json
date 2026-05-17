@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl *)",
+      "Bash(dotnet build *)",
+      "Bash(start *)",
+      "Bash(powershell -Command \"Stop-Process -Name ImageManager.App -Force -ErrorAction SilentlyContinue\")",
+      "WebSearch",
+      "Bash(taskkill /PID 381160 /F)",
+      "Bash(powershell -Command \"Stop-Process -Id 660908 -Force\")",
+      "Bash(powershell -Command \"Get-Process ImageManager.App -ErrorAction SilentlyContinue | Stop-Process -Force\")",
+      "Bash(powershell *)",
+      "Bash(./ImageManager.App.exe)",
+      "Bash(dotnet run *)",
+      "Bash(grep -v \"^src$\")",
+      "Skill(diagnose)",
+      "Bash(grep -rn \"SQLITE_MAX_VARIABLE\\\\|MaxVariable\\\\|sqlite3_limit\" /dev/null)",
+      "Bash(dotnet --version)",
+      "Bash(sed -i '47s/await Vm.SaveSettingsAsync\\(\\);/_ = Vm.SaveSettingsAsync\\(\\);/' \"src/ImageManager.App/Views/MainWindow.axaml.cs\")",
+      "Bash(sed -i '417s/await Vm.SaveSettingsAsync\\(\\);/_ = Vm.SaveSettingsAsync\\(\\);/' \"src/ImageManager.App/Views/MainWindow.axaml.cs\")",
+      "Bash(sed -i '446s/await Vm.SaveSettingsAsync\\(\\);/_ = Vm.SaveSettingsAsync\\(\\);/' \"src/ImageManager.App/Views/MainWindow.axaml.cs\")",
+      "Bash(sed -i '744s/await Vm.SaveSettingsAsync\\(\\);/_ = Vm.SaveSettingsAsync\\(\\);/' \"src/ImageManager.App/Views/MainWindow.axaml.cs\")",
+      "Bash(dotnet clean *)",
+      "Bash(taskkill /PID 472824 /F)",
+      "Bash(taskkill /F /IM ImageManager.App.exe)",
+      "Bash(grep -rn \"namespace.*Clip\\\\|class.*Clip\\\\|SetData\\\\|SetTextAsync\\\\|SetFile\" src/ImageManager.App/obj/Debug/net8.0/Avalonia*.dll)",
+      "Bash(find src *)"
+    ]
+  }
+}

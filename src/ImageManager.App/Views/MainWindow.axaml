@@ -1,0 +1,363 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ImageManager.App.ViewModels"
+        xmlns:models="using:ImageManager.Core.Models"
+        xmlns:controls="using:ImageManager.App.Controls"
+        xmlns:conv="using:ImageManager.App.Converters"
+        x:Class="ImageManager.App.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Title="图片管理工具"
+        Width="1200" Height="700"
+        Closing="Window_Closing">
+
+	<Window.Resources>
+		<conv:ByteArrayToBitmapConverter x:Key="BytesToBitmap"/>
+		<conv:HexToBrushConverter x:Key="HexToBrush"/>
+	</Window.Resources>
+	<Window.Styles>
+		<Style Selector="MenuItem">
+			<Setter Property="Foreground" Value="{DynamicResource AppFgBrush}" />
+		</Style>
+		<Style Selector="MenuItem MenuItem">
+			<Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+		</Style>
+		<Style Selector="MenuItem:pointerover /template/ ContentPresenter#PART_HeaderPresenter">
+			<Setter Property="TextBlock.Foreground" Value="{Binding $parent[MenuItem].Foreground}" />
+		</Style>
+		<Style Selector="MenuItem:pointerover /template/ Border#PART_LayoutRoot">
+			<Setter Property="Background" Value="{DynamicResource HoverBgBrush}" />
+		</Style>
+		<Style Selector="Button:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+			<Setter Property="Foreground" Value="{Binding $parent[Button].Foreground}" />
+			<Setter Property="Background" Value="{DynamicResource CtrlHoverBgBrush}" />
+		</Style>
+		<Style Selector="Button:disabled /template/ ContentPresenter#PART_ContentPresenter">
+			<Setter Property="Foreground" Value="{Binding $parent[Button].Foreground}" />
+		</Style>
+	</Window.Styles>
+    <Grid x:Name="RootGrid" ColumnDefinitions="230,*" RowDefinitions="Auto,Auto,Auto,Auto,*">
+
+        <!-- Left Sidebar -->
+        <Border Grid.Column="0" Grid.RowSpan="5"
+                BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="0,0,1,0"
+                Padding="8" Background="{DynamicResource SidebarBgBrush}">
+            <DockPanel>
+                <StackPanel DockPanel.Dock="Top" Margin="0,0,0,8">
+                    <TextBlock Text="图片文件夹"
+                               FontWeight="SemiBold" FontSize="14"
+                               Foreground="{DynamicResource SecondaryFgBrush}" Margin="0,0,0,8"/>
+                    <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+                        <Button Content="添加文件夹" Width="90" Margin="0,0,5,0"
+                                FontSize="12" Padding="6,4"
+                                Click="BtnAddFolder_Click"/>
+                        <Button Content="移除选中" Width="90"
+                                FontSize="12" Padding="6,4"
+                                Click="BtnRemoveFolder_Click"/>
+                    </StackPanel>
+                    <TextBox PlaceholderText="搜索文件夹..."
+                             Margin="0,0,0,8" Background="White"
+                             Text="{Binding FolderSearchText}"/>
+                </StackPanel>
+
+                <ListBox x:Name="LstFolders"
+                         ItemsSource="{Binding FolderList}"
+                         SelectionChanged="LstFolders_SelectionChanged"
+                         DragDrop.AllowDrop="True"
+                         DragDrop.DragOver="LstFolders_DragOver"
+                         DragDrop.Drop="LstFolders_Drop"
+                         PointerPressed="LstFolders_PointerPressed">
+                    <ListBox.ContextMenu>
+                        <ContextMenu>
+                            <MenuItem Header="重命名显示名称" Click="MenuRenameFolder_Click"/>
+                            <MenuItem Header="清除显示名称" Click="MenuClearFolderAlias_Click"/>
+                        </ContextMenu>
+                    </ListBox.ContextMenu>
+                    <ListBox.ItemTemplate>
+                        <DataTemplate x:DataType="models:FolderInfo">
+                            <StackPanel Margin="2">
+                                <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" FontSize="13"
+                                           TextTrimming="CharacterEllipsis"/>
+                                <TextBlock Text="{Binding Path}" FontSize="11" Foreground="{DynamicResource MutedFgBrush}"
+                                           TextTrimming="CharacterEllipsis"/>
+                            </StackPanel>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </DockPanel>
+        </Border>
+
+        <!-- Top Menu -->
+        <DockPanel Grid.Row="0" Grid.Column="1" Background="{DynamicResource SidebarBgBrush}">
+            <Menu DockPanel.Dock="Left" Background="Transparent">
+                <MenuItem Header="设置" Height="28" Padding="12,4">
+                    <MenuItem Header="设置主界面大小" Click="MenuSetMainSize_Click"/>
+                    <MenuItem Header="设置预览窗口大小" Click="MenuSetPreviewSize_Click"/>
+
+                    <MenuItem Header="外观设置" Click="MenuAppearanceSettings_Click"/>
+                    <MenuItem Header="壁纸设置" Click="MenuWallpaperSettings_Click"/>
+                    <MenuItem Header="缩略图选项" Click="MenuThumbnailSettings_Click"/>
+                    <MenuItem Header="内存与缓存设置" Click="MenuMemorySettings_Click"/>
+
+                    <MenuItem Header="快捷键设置" Click="MenuShortcutSettings_Click"/>
+                </MenuItem>
+            </Menu>
+            <Menu HorizontalAlignment="Right" Background="Transparent">
+                <MenuItem Header="排序 ▾" Height="28" Padding="12,4">
+                    <MenuItem Header="按文件名 ↑" Click="SortFileNameAsc_Click"/>
+                    <MenuItem Header="按文件名 ↓" Click="SortFileNameDesc_Click"/>
+
+                    <MenuItem Header="按修改时间 ↑" Click="SortModifiedAsc_Click"/>
+                    <MenuItem Header="按修改时间 ↓" Click="SortModifiedDesc_Click"/>
+
+                    <MenuItem Header="按文件大小 ↑" Click="SortFileSizeAsc_Click"/>
+                    <MenuItem Header="按文件大小 ↓" Click="SortFileSizeDesc_Click"/>
+
+                    <MenuItem Header="按分辨率 ↑" Click="SortResolutionAsc_Click"/>
+                    <MenuItem Header="按分辨率 ↓" Click="SortResolutionDesc_Click"/>
+                </MenuItem>
+            </Menu>
+        </DockPanel>
+
+        <!-- Toolbar Row 1: Actions -->
+        <StackPanel Orientation="Horizontal" Margin="5,5,5,2" Grid.Row="1" Grid.Column="1">
+            <Button Content="选择图片文件夹" Margin="0,0,5,0"
+                    FontSize="12" Padding="8,4" Click="BtnSelectFolder_Click"/>
+            <Button Content="保存数据" Margin="0,0,5,0"
+                    FontSize="12" Padding="8,4" Click="BtnSaveData_Click"/>
+            <Button Content="全局检测重复并移动" Margin="0,0,5,0"
+                    FontSize="12" Padding="8,4" Click="BtnDetectDuplicates_Click"/>
+            <Button Content="清除所有筛选" Margin="0,0,5,0"
+                    FontSize="12" Padding="8,4"
+                    Command="{Binding ClearFilterCommand}"/>
+            <Button Content="返回搜索前" Margin="0,0,5,0"
+                    FontSize="12" Padding="8,4"
+                    IsEnabled="{Binding IsShowingSearchResult}"
+                    Command="{Binding BackFromSearchCommand}"/>
+            <TextBlock Text="{Binding StatusText}"
+                       Margin="10,0,0,0" Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
+                       VerticalAlignment="Center"/>
+            <TextBlock Text="{Binding BackgroundStatusText}"
+                       Margin="16,0,0,0" Foreground="{DynamicResource AccentBrush}" FontSize="12"
+                       VerticalAlignment="Center"/>
+        </StackPanel>
+
+        <!-- Toolbar Row 2: Filters -->
+        <StackPanel Orientation="Horizontal" Margin="5,0,5,2" Grid.Row="2" Grid.Column="1">
+            <TextBlock Text="Tag 搜索:" VerticalAlignment="Center" Margin="0,0,5,0"
+                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+            <StackPanel>
+                <Border BorderBrush="{Binding SearchBoxBorderColor}"
+                        BorderThickness="1.5" CornerRadius="4">
+                    <TextBox x:Name="TxtTagSearch" Text="{Binding TagSearchText}"
+                             Width="200" PlaceholderText="输入 Tag 名称..."
+                             Background="White" BorderThickness="0"
+                             KeyDown="TxtTagSearch_KeyDown"/>
+                </Border>
+                <Popup IsOpen="{Binding IsTagSearchPopupOpen}"
+                       Placement="Bottom">
+                    <Border Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource CtrlBorderBrush}"
+                            BorderThickness="1" CornerRadius="8" Padding="6"
+                            MaxWidth="300">
+                        <ScrollViewer MaxHeight="160">
+                            <ItemsControl ItemsSource="{Binding TagSearchSuggestions}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate x:DataType="models:TagCount">
+                                        <Button Margin="2" Padding="0" FontSize="12"
+                                                Click="TagSuggestion_Click" Tag="{Binding}">
+                                            <Border Padding="6,3" CornerRadius="3">
+                                                <TextBlock Text="{Binding Name}"/>
+                                            </Border>
+                                        </Button>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </ScrollViewer>
+                    </Border>
+                </Popup>
+            </StackPanel>
+            <Button Content="按 Tag 搜索" Margin="0,0,8,0"
+                    FontSize="12" Padding="8,4"
+                    Command="{Binding SearchByTagCommand}"/>
+
+            <TextBlock Text="方向筛选:" VerticalAlignment="Center" Margin="10,0,5,0"
+                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+            <Button Content="全部" Margin="0,0,3,0" FontSize="12" Padding="8,4"
+                    Command="{Binding FilterAllCommand}"/>
+            <Button Content="横图" Margin="0,0,3,0" FontSize="12" Padding="8,4"
+                    Command="{Binding FilterLandscapeCommand}"/>
+            <Button Content="竖图" Margin="0,0,3,0" FontSize="12" Padding="8,4"
+                    Command="{Binding FilterPortraitCommand}"/>
+
+            <TextBlock Text="{Binding LoadedInfoText}"
+                       Margin="16,0,0,0" Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
+                       VerticalAlignment="Center"/>
+
+            <!-- Drag-to-search similar zone -->
+            <Border x:Name="DragSearchZone" Margin="16,0,0,0"
+                    Padding="10,5" BorderThickness="1"
+                    BorderBrush="{DynamicResource AccentBrush}" CornerRadius="6"
+                    Background="#206366F1" Cursor="Hand"
+                    DragDrop.AllowDrop="True"
+                    DragDrop.DragOver="DragSearchZone_DragOver"
+                    DragDrop.Drop="DragSearchZone_Drop">
+                <TextBlock Text="拖拽图片到此查相似"
+                           VerticalAlignment="Center"
+                           Foreground="#818CF8" FontSize="12"/>
+            </Border>
+			<CheckBox x:Name="ChkLocalSearch" Content="局部匹配"
+					  Foreground="{DynamicResource AccentBrush}"
+					  Margin="10,0,0,0" VerticalAlignment="Center"/>
+            <Button Content="停止搜索" Margin="10,0,0,0"
+                    FontSize="12" Padding="8,4"
+                    Click="BtnStopSearch_Click"/>
+        </StackPanel>
+
+        <!-- Toolbar Row 3: Paging + Zoom -->
+        <Border Grid.Row="3" Grid.Column="1"
+                Margin="5,2,5,5" Padding="6,5"
+                BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="6">
+            <Grid ColumnDefinitions="*,Auto">
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                    <Button Content="上一页" Margin="0,0,5,0" FontSize="12" Padding="8,4"
+                            Command="{Binding PrevPageCommand}"/>
+                    <TextBlock Text="页:" VerticalAlignment="Center" Margin="0,0,5,0"
+                               Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                    <ComboBox Width="80" ItemsSource="{Binding PageNumbers}"
+                              SelectedIndex="{Binding CurrentPage}"/>
+                    <TextBlock Text="/" VerticalAlignment="Center" Margin="5,0,5,0"
+                               Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                    <TextBlock Text="{Binding TotalPages}" Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"
+                               VerticalAlignment="Center"/>
+                    <Button Content="下一页" Margin="10,0,0,0" FontSize="12" Padding="8,4"
+                            Command="{Binding NextPageCommand}"/>
+                </StackPanel>
+
+                <StackPanel Orientation="Horizontal" Grid.Column="1"
+                            HorizontalAlignment="Right" VerticalAlignment="Center" Margin="10,0,5,0">
+                    <TextBlock Text="缩略图缩放:" VerticalAlignment="Center" Margin="0,0,8,0"
+                               Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                    <Slider Minimum="1" Maximum="10" Value="{Binding ZoomTick}"
+                            Width="160"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- Image Grid Area -->
+        <ScrollViewer x:Name="ThumbnailScrollViewer" Grid.Row="4" Grid.Column="1">
+            <Grid x:Name="ImagePanelHost"
+                  Background="Transparent"
+                  PointerPressed="ImagePanelHost_PointerPressed"
+                  PointerMoved="ImagePanelHost_PointerMoved"
+                  PointerReleased="ImagePanelHost_PointerReleased">
+                <ItemsControl x:Name="ItemsImages" ItemsSource="{Binding Images}">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <controls:SmartWaterfallPanel
+                            Mode="{Binding $parent[Window].DataContext.WaterfallMode}"
+                            ColumnWidth="{Binding $parent[Window].DataContext.ThumbnailBaseWidth}"/>
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="vm:ImageViewItem">
+						<!-- 此处margin数值是缩略框之间间距 -->
+                        <Border Margin="5" Padding="0"
+                                BorderThickness="{Binding $parent[Window].DataContext.ThumbnailBorderThickness}"
+                                CornerRadius="{Binding $parent[Window].DataContext.ThumbnailCornerRadius}"
+                                BorderBrush="{Binding $parent[Window].DataContext.ThumbnailBorderColor, Converter={StaticResource HexToBrush}}"
+                                Background="{Binding $parent[Window].DataContext.ThumbnailBackgroundColor, Converter={StaticResource HexToBrush}}"
+                                Opacity="{Binding $parent[Window].DataContext.ThumbnailOpacity}"
+                                PointerPressed="Thumbnail_PointerPressed"
+                                PointerMoved="Thumbnail_PointerMoved"
+                                DoubleTapped="Thumbnail_DoubleTapped">
+                            <Border.ContextMenu>
+                                <ContextMenu>
+                                    <MenuItem Header="编辑 Tag" Click="MenuEditTag_Click"/>
+                                    <MenuItem Header="复制图片到剪贴板" Click="MenuCopyImage_Click"/>
+                                    <MenuItem Header="查找相似图片（本文件夹）" Click="MenuFindSimilar_Click"/>
+                                    <Separator/>
+                                    <MenuItem Header="在线搜图">
+										<MenuItem Header="不要来回切换ip地址，容易被搜图网站ban"/>
+										<MenuItem Header="搜图网站比较慢，打开网页可能时间较久"/>
+										<MenuItem Header="Multi（大杂烩搜图）" Click="MenuSearchOnline_Click" Tag="iqdb"/>
+										<MenuItem Header="SauceNAO（P站推特）" Click="MenuSearchOnline_Click" Tag="saucenao"/>
+										<MenuItem Header="ascii2d（p站推特）" Click="MenuSearchOnline_Click" Tag="ascii2d"/>
+                                        <MenuItem Header="Trace（动画搜图）" Click="MenuSearchOnline_Click" Tag="tracemoe"/>
+                                        <MenuItem Header="Yande" Click="MenuSearchOnline_Click" Tag="yandex"/>
+                                        <MenuItem Header="Google" Click="MenuSearchOnline_Click" Tag="google"/>
+                                        <MenuItem Header="Soutubot（本子）" Click="MenuSearchOnline_Click" Tag="soutubot"/>
+                                    </MenuItem>
+                                    <MenuItem Header="在资源管理器中打开" Click="MenuOpenInExplorer_Click"/>
+                                    <Separator/>
+                                    <MenuItem Header="删除该图片文件" Click="MenuDeleteFile_Click"/>
+                                    <Separator/>
+                                    <MenuItem Header="复制到其他文件夹..." Click="MenuCopyFileToFolder_Click"/>
+                                    <MenuItem Header="移动到其他文件夹..." Click="MenuMoveFileToFolder_Click"/>
+                                    <Separator/>
+                                    <MenuItem Header="刷新当前文件夹" Click="MenuRefreshFolder_Click"/>
+                                </ContextMenu>
+                            </Border.ContextMenu>
+                            <Grid>
+                                <!-- Content layer -->
+                                <Border Margin="{Binding $parent[Window].DataContext.ThumbnailPadding}"
+                                        CornerRadius="{Binding $parent[Window].DataContext.ThumbnailInnerCornerRadius}"
+                                        ClipToBounds="True">
+                                    <Grid MinHeight="80">
+                                        <!-- Placeholder color background while loading -->
+                                        <Border Background="{Binding PlaceholderColor, Converter={StaticResource HexToBrush}}"
+                                                IsVisible="{Binding IsNotLoaded}"
+                                                CornerRadius="2"/>
+                                        <!-- Main image — fills entire thumbnail box -->
+                                        <Image Width="{Binding $self.(controls:SmartWaterfallPanel.ItemWidth)}"
+                                               Height="{Binding $parent[Window].DataContext.GridThumbnailHeight}"
+                                               Source="{Binding ThumbnailData, Converter={StaticResource BytesToBitmap}}"
+                                               Stretch="{Binding $parent[Window].DataContext.ThumbnailImageStretch}"/>
+                                        <!-- Text overlay floating at bottom — does NOT affect image dimensions -->
+                                        <Border VerticalAlignment="Bottom"
+                                                Background="#AA000000" Padding="4,2"
+                                                IsVisible="{Binding $parent[Window].DataContext.ShowAnyThumbnailText}">
+                                            <StackPanel>
+                                            <TextBlock Text="{Binding FileName}"
+                                                       IsVisible="{Binding $parent[Window].DataContext.ShowFileName}"
+                                                       FontSize="11" TextTrimming="CharacterEllipsis"
+                                                       Foreground="White" HorizontalAlignment="Center"
+                                                       MaxWidth="{Binding $parent[Window].DataContext.ThumbnailBaseWidth}"/>
+                                            <TextBlock Text="{Binding StatusText}"
+                                                       IsVisible="{Binding $parent[Window].DataContext.ShowTags}"
+                                                       FontSize="10" Foreground="#CCCCCC"
+                                                       HorizontalAlignment="Center"/>
+                                            <TextBlock Text="{Binding OrientationText}"
+                                                       IsVisible="{Binding $parent[Window].DataContext.ShowOrientation}"
+                                                       FontSize="10" Foreground="#CCCCCC"
+                                                       HorizontalAlignment="Center"/>
+                                            </StackPanel>
+                                        </Border>
+                                    </Grid>
+                                </Border>
+                                <!-- Selection highlight overlay -->
+                                <Border BorderBrush="#FF3D7FFF" BorderThickness="4"
+                                        CornerRadius="{Binding $parent[Window].DataContext.ThumbnailSelectionCornerRadius}"
+                                        IsVisible="{Binding IsSelected}"
+                                        IsHitTestVisible="False"/>
+                            </Grid>
+                        </Border>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
+                <!-- Selection rectangle overlay -->
+                <Rectangle x:Name="SelectionRectangle"
+                           Stroke="#FF3D7FFF" StrokeThickness="1"
+                           Fill="#403D7FFF"
+                           IsVisible="False"
+                           IsHitTestVisible="False"
+                           HorizontalAlignment="Left"
+                           VerticalAlignment="Top"/>
+            </Grid>
+        </ScrollViewer>
+
+    </Grid>
+</Window>

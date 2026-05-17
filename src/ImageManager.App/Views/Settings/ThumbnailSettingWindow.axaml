@@ -1,0 +1,109 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ImageManager.App.ViewModels"
+        x:Class="ImageManager.App.Views.Settings.ThumbnailSettingWindow"
+        x:DataType="vm:ThumbnailSettingViewModel"
+        Title="缩略图选项"
+        Width="480" Height="460"
+        CanResize="False">
+
+    <Grid RowDefinitions="*,Auto" Margin="16">
+        <ScrollViewer Grid.Row="0">
+            <StackPanel Spacing="12">
+
+                <!-- 缩略图显示 -->
+                <Border Padding="12" Background="{DynamicResource SurfaceBrush}"
+                        BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="缩略图显示" FontWeight="SemiBold" FontSize="14"/>
+                        <CheckBox Content="显示文件名" IsChecked="{Binding ShowFileName}"/>
+                        <CheckBox Content="显示 Tag" IsChecked="{Binding ShowTags}"/>
+                        <CheckBox Content="显示横图/竖图" IsChecked="{Binding ShowOrientation}"/>
+
+                        <Border Height="1" Background="{DynamicResource CtrlBorderBrush}" Margin="0,4"/>
+
+                        <TextBlock Text="缩略框外观" FontWeight="SemiBold" FontSize="13"/>
+                        <CheckBox Content="保留图片与边框间距"
+                                  IsChecked="{Binding KeepPadding}"/>
+                        <CheckBox Content="为缩略框添加圆角"
+                                  IsChecked="{Binding EnableCornerRadius}"/>
+                        <StackPanel Orientation="Horizontal" Spacing="8"
+                                    IsVisible="{Binding EnableCornerRadius}">
+                            <TextBlock Text="圆角大小:" VerticalAlignment="Center"
+                                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                            <TextBox Text="{Binding CornerRadiusText}" Width="60"/>
+                            <TextBlock Text="px"
+                                       Foreground="{DynamicResource MutedFgBrush}" FontSize="12"
+                                       VerticalAlignment="Center"/>
+                        </StackPanel>
+
+                        <Border Height="1" Background="{DynamicResource CtrlBorderBrush}" Margin="0,4"/>
+
+                        <TextBlock Text="颜色与样式" FontWeight="SemiBold" FontSize="13"/>
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <TextBlock Text="边框颜色:" VerticalAlignment="Center"
+                                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                            <TextBox Text="{Binding BorderColor}" Width="120"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <TextBlock Text="背景颜色:" VerticalAlignment="Center"
+                                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                            <TextBox Text="{Binding BackgroundColor}" Width="120"/>
+                        </StackPanel>
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <TextBlock Text="不透明度:" VerticalAlignment="Center"
+                                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                            <TextBox Text="{Binding OpacityText}" Width="80"/>
+                            <TextBlock Text="(0~1)"
+                                       Foreground="{DynamicResource MutedFgBrush}" FontSize="12"
+                                       VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <!-- 缩略框宽高比 -->
+                <Border Padding="12" Background="{DynamicResource SurfaceBrush}"
+                        BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="缩略框宽高比" FontWeight="SemiBold" FontSize="14"/>
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <TextBlock Text="比例 (宽:高):" VerticalAlignment="Center"
+                                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                            <TextBox Text="{Binding AspectRatioText}" Width="100"/>
+                            <TextBlock Text="例: 1.6:1 或 1:1"
+                                       Foreground="{DynamicResource MutedFgBrush}" FontSize="12"
+                                       VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <!-- 排版模式 -->
+                <Border Padding="12" Background="{DynamicResource SurfaceBrush}"
+                        BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="排版模式" FontWeight="SemiBold" FontSize="14"/>
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <TextBlock Text="模式:" VerticalAlignment="Center"
+                                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                            <ComboBox SelectedIndex="{Binding WaterfallModeIndex}" Width="140">
+                                <ComboBoxItem>常规网格</ComboBoxItem>
+                                <ComboBoxItem>竖版瀑布流</ComboBoxItem>
+                                <ComboBoxItem>横版瀑布流</ComboBoxItem>
+                            </ComboBox>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+            </StackPanel>
+        </ScrollViewer>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Spacing="10" Margin="0,16,0,0">
+            <Button Content="取消" Width="80"
+                    Click="BtnCancel_Click"/>
+            <Button Content="确定" Width="80"
+                    Command="{Binding SaveCommand}"
+                    Click="BtnOk_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

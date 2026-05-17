@@ -1,0 +1,105 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ImageManager.App.ViewModels"
+        x:Class="ImageManager.App.Views.Settings.ShortcutSettingWindow"
+        x:DataType="vm:ShortcutSettingViewModel"
+        Title="快捷键设置"
+        Width="620" Height="520"
+        CanResize="False">
+
+    <Grid RowDefinitions="*,Auto" Margin="16">
+        <ScrollViewer Grid.Row="0">
+            <StackPanel Spacing="12">
+
+                <TextBlock Text="点击快捷键栏位后按下组合键即可录制新快捷键"
+                           Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12" Margin="0,0,0,4"/>
+
+                <ItemsControl ItemsSource="{Binding Shortcuts}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="vm:ShortcutItem">
+                            <Border Padding="10,8" Margin="0,2"
+                                    BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="6"
+                                    >
+                                <Grid ColumnDefinitions="24,140,*,140,Auto">
+                                    <!-- Modified dot -->
+                                    <Ellipse Grid.Column="0" Width="8" Height="8"
+                                             Fill="{DynamicResource AccentBrush}"
+                                             IsVisible="{Binding IsModified}"
+                                             VerticalAlignment="Center" Margin="4,0,8,0"/>
+
+                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                        <TextBlock Text="{Binding DisplayName}"
+                                                   FontSize="13"/>
+                                        <TextBlock Text="{Binding Category}"
+                                                   Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
+                                    </StackPanel>
+
+                                    <!-- Default hint -->
+                                    <TextBlock Grid.Column="2"
+                                               Text="{Binding DefaultGesture}"
+                                               Foreground="{DynamicResource MutedFgBrush}" FontSize="12"
+                                               VerticalAlignment="Center"
+                                               HorizontalAlignment="Right"
+                                               Margin="0,0,12,0"/>
+
+                                    <!-- Key gesture box: normal state -->
+                                    <Border Grid.Column="3"
+                                            Width="140" Height="36"
+                                            CornerRadius="4"
+                                            BorderBrush="{DynamicResource CtrlBorderBrush}"
+                                            BorderThickness="1.5"
+                                            Cursor="Hand"
+                                            IsVisible="{Binding IsNotRecording}"
+                                            PointerPressed="GestureBox_PointerPressed"
+                                            Tag="{Binding}">
+                                        <TextBlock Text="{Binding KeyGesture}"
+                                                   HorizontalAlignment="Center"
+                                                   VerticalAlignment="Center"
+                                                   FontSize="13"
+                                                   FontWeight="SemiBold"
+                                                   Foreground="{DynamicResource AppFgBrush}"/>
+                                    </Border>
+
+                                    <!-- Key gesture box: recording state -->
+                                    <Border Grid.Column="3"
+                                            Width="140" Height="36"
+                                            CornerRadius="4"
+                                            BorderBrush="{DynamicResource AccentBrush}"
+                                            BorderThickness="2"
+                                            Cursor="Hand"
+                                            IsVisible="{Binding IsRecording}"
+                                            PointerPressed="GestureBox_PointerPressed"
+                                            Tag="{Binding}">
+                                        <TextBlock Text="按下组合键..."
+                                                   HorizontalAlignment="Center"
+                                                   VerticalAlignment="Center"
+                                                   FontSize="12"
+                                                   Foreground="#818CF8"/>
+                                    </Border>
+
+                                    <!-- Reset button -->
+                                    <Button Grid.Column="4" Content="重置" Width="50"
+                                            FontSize="11" Padding="6,3" Margin="6,0,0,0"
+                                            Command="{Binding $parent[Window].DataContext.ResetShortcutCommand}"
+                                            CommandParameter="{Binding}"/>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+
+            </StackPanel>
+        </ScrollViewer>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Spacing="10" Margin="0,16,0,0">
+            <Button Content="全部重置" Width="90"
+                    Command="{Binding ResetAllCommand}"/>
+            <Button Content="取消" Width="80"
+                    Click="BtnCancel_Click"/>
+            <Button Content="确定" Width="80"
+                    Command="{Binding SaveCommand}"
+                    Click="BtnOk_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

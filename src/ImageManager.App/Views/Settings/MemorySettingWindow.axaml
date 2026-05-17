@@ -1,0 +1,57 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ImageManager.App.ViewModels"
+        x:Class="ImageManager.App.Views.Settings.MemorySettingWindow"
+        x:DataType="vm:MemorySettingViewModel"
+        Title="内存与缓存设置"
+        Width="500" Height="350"
+        CanResize="False">
+
+    <Grid RowDefinitions="*,Auto" Margin="16">
+        <StackPanel Grid.Row="0" Spacing="14">
+            <Border Padding="14" BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="内存缓存上限" FontWeight="SemiBold" FontSize="14"/>
+
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <TextBlock Text="最大占用 (MB):" VerticalAlignment="Center"
+                                   Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                        <TextBox Text="{Binding MaxCacheMB}" Width="100"/>
+                    </StackPanel>
+
+                    <TextBlock Text="{Binding CurrentUsageHint}"
+                               Foreground="{DynamicResource MutedFgBrush}" FontSize="12"
+                               TextWrapping="Wrap"/>
+                </StackPanel>
+            </Border>
+
+            <Border Padding="14" BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="磁盘缓存位置" FontWeight="SemiBold" FontSize="14"/>
+
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <TextBox Text="{Binding CachePath}" Width="350"/>
+                        <Button Content="浏览..." Width="70" FontSize="12"
+                                Click="BtnBrowseCachePath_Click"/>
+                    </StackPanel>
+
+                    <TextBlock Text="{Binding DiskUsageHint}"
+                               Foreground="{DynamicResource MutedFgBrush}" FontSize="12"
+                               TextWrapping="Wrap"/>
+                    <TextBlock Foreground="{DynamicResource MutedFgBrush}" FontSize="11">
+                        <Run Text="不同缩放档位的缓存以 w(宽度) 子目录存放 .jpg 文件。"/>
+                    </TextBlock>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Spacing="10" Margin="0,16,0,0">
+            <Button Content="取消" Width="80"
+                    Click="BtnCancel_Click"/>
+            <Button Content="确定" Width="80"
+                    Command="{Binding SaveCommand}"
+                    Click="BtnOk_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

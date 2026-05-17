@@ -1,0 +1,58 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ImageManager.App.ViewModels"
+        x:Class="ImageManager.App.Views.Settings.AppearanceSettingWindow"
+        x:DataType="vm:AppearanceSettingViewModel"
+        Title="外观设置"
+        Width="380" Height="200"
+        CanResize="False">
+	<Window.Styles>
+		<!-- 1. 让【所有菜单项】的默认文字颜色，绑定到你的动态资源 AppFgBrush -->
+		<Style Selector="MenuItem">
+			<Setter Property="Foreground" Value="{DynamicResource AppFgBrush}" />
+		</Style>
+
+		<!-- 2. 可选：如果你希望下拉的【子菜单】背景色也能跟着模式切换（深色/浅色背景） -->
+		<Style Selector="MenuItem MenuItem">
+			<Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+			<!-- 这里如果你想让子菜单文字颜色稍微暗一点，也可以换成 SecondaryFgBrush -->
+			<!-- <Setter Property="Foreground" Value="{DynamicResource SecondaryFgBrush}" /> -->
+		</Style>
+
+		<!-- 3. 解决鼠标悬浮时变黑的问题：让悬浮时的文字颜色跟随控件本身的颜色 -->
+		<Style Selector="MenuItem:pointerover /template/ ContentPresenter#PART_HeaderPresenter">
+			<Setter Property="TextBlock.Foreground" Value="{Binding $parent[MenuItem].Foreground}" />
+		</Style>
+
+		<!-- 4. 解决鼠标悬浮时背景变色的问题（绑定到你的 HoverBgBrush） -->
+		<Style Selector="MenuItem:pointerover /template/ Border#PART_LayoutRoot">
+			<Setter Property="Background" Value="{DynamicResource HoverBgBrush}" />
+		</Style>
+
+		<!-- ================= 之前的 Button 样式保留 ================= -->
+		<Style Selector="Button:pointerover /template/ ContentPresenter#PART_ContentPresenter">
+			<Setter Property="Foreground" Value="{Binding $parent[Button].Foreground}" />
+			<!-- 按钮悬浮背景也可以顺便绑上你的动态资源 -->
+			<Setter Property="Background" Value="{DynamicResource CtrlHoverBgBrush}" />
+		</Style>
+	</Window.Styles>
+    <Grid RowDefinitions="*,Auto" Margin="16">
+        <Border Grid.Row="0" Padding="16"
+                BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+            <StackPanel Spacing="10">
+                <TextBlock Text="主题模式" FontWeight="SemiBold" FontSize="14"/>
+                <ComboBox SelectedIndex="{Binding ThemeIndex}" Width="160">
+                    <ComboBoxItem>深色模式</ComboBoxItem>
+                    <ComboBoxItem>浅色模式</ComboBoxItem>
+                </ComboBox>
+            </StackPanel>
+        </Border>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Spacing="10" Margin="0,16,0,0">
+            <Button Content="取消" Width="80" Click="BtnCancel_Click"/>
+            <Button Content="确定" Width="80"
+                    Command="{Binding SaveCommand}" Click="BtnOk_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

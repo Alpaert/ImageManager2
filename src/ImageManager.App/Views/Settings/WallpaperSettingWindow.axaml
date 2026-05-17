@@ -1,0 +1,77 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ImageManager.App.ViewModels"
+        xmlns:conv="using:ImageManager.App.Converters"
+        x:Class="ImageManager.App.Views.Settings.WallpaperSettingWindow"
+        x:DataType="vm:WallpaperSettingViewModel"
+        Title="壁纸设置"
+        Width="550" Height="460"
+        CanResize="False">
+
+    <Window.Resources>
+        <conv:ByteArrayToBitmapConverter x:Key="BytesToBitmap"/>
+    </Window.Resources>
+
+    <Grid RowDefinitions="*,Auto" Margin="16">
+        <StackPanel Grid.Row="0" Spacing="12">
+            <!-- File picker -->
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Content="浏览..." Width="70" Click="BtnBrowse_Click"/>
+                <Button Content="清除壁纸" Width="80"
+                        Command="{Binding ClearWallpaperCommand}"/>
+                <TextBox Text="{Binding WallpaperPath}" Width="300"
+                         IsReadOnly="True"/>
+            </StackPanel>
+
+            <!-- Preview -->
+            <Border Height="180" BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1"
+                    CornerRadius="8">
+                <Image Source="{Binding PreviewData, Converter={StaticResource BytesToBitmap}}"
+                       Stretch="Uniform"/>
+            </Border>
+
+            <!-- Stretch mode -->
+            <StackPanel Orientation="Horizontal" Spacing="10">
+                <TextBlock Text="拉伸:" Width="60" VerticalAlignment="Center"
+                           Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                <ComboBox SelectedIndex="{Binding StretchIndex}" Width="180">
+                    <ComboBoxItem>适应</ComboBoxItem>
+                    <ComboBoxItem>填充（保持比例）</ComboBoxItem>
+                    <ComboBoxItem>拉伸填充</ComboBoxItem>
+                    <ComboBoxItem>原始大小</ComboBoxItem>
+                </ComboBox>
+            </StackPanel>
+
+            <!-- Alignment -->
+            <StackPanel Orientation="Horizontal" Spacing="10">
+                <TextBlock Text="对齐:" Width="60" VerticalAlignment="Center"
+                           Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                <ComboBox SelectedIndex="{Binding AlignmentIndex}" Width="160">
+                    <ComboBoxItem>居中</ComboBoxItem>
+                    <ComboBoxItem>左上</ComboBoxItem>
+                    <ComboBoxItem>右上</ComboBoxItem>
+                    <ComboBoxItem>左下</ComboBoxItem>
+                    <ComboBoxItem>右下</ComboBoxItem>
+                </ComboBox>
+            </StackPanel>
+
+            <!-- Opacity slider -->
+            <StackPanel Spacing="6">
+                <TextBlock Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13">
+                    <Run Text="不透明度: "/>
+                    <Run Text="{Binding OpacityText}"/>
+                </TextBlock>
+                <Slider Minimum="0.05" Maximum="1" Value="{Binding Opacity}"
+                        IsSnapToTickEnabled="True" TickFrequency="0.05"
+                        Width="400"/>
+            </StackPanel>
+        </StackPanel>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Spacing="10" Margin="0,16,0,0">
+            <Button Content="取消" Width="80" Click="BtnCancel_Click"/>
+            <Button Content="应用" Width="80"
+                    Command="{Binding SaveCommand}" Click="BtnOk_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

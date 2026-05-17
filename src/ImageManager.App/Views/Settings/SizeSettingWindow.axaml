@@ -1,0 +1,42 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ImageManager.App.ViewModels"
+        x:Class="ImageManager.App.Views.Settings.SizeSettingWindow"
+        x:DataType="vm:SizeSettingViewModel"
+        Title="{Binding Title}"
+        Width="{Binding WindowWidth}"
+        Height="{Binding WindowHeight}"
+        SizeToContent="Manual"
+        CanResize="True">
+
+    <Design.DataContext>
+        <vm:SizeSettingViewModel/>
+    </Design.DataContext>
+
+    <Grid RowDefinitions="*,Auto" Margin="12">
+        <Border Grid.Row="0"
+                BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1"
+                CornerRadius="8" Margin="0,0,0,12">
+            <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Spacing="10">
+                <TextBlock Text="拖拽窗口边缘调整大小"
+                           FontSize="14" Foreground="{DynamicResource SecondaryFgBrush}"
+                           HorizontalAlignment="Center"/>
+                <TextBlock HorizontalAlignment="Center" Foreground="{DynamicResource MutedFgBrush}" FontSize="12">
+                    <Run Text="当前: "/>
+                    <Run Text="{Binding WindowWidth, StringFormat={}{0:F0}}"/>
+                    <Run Text=" x "/>
+                    <Run Text="{Binding WindowHeight, StringFormat={}{0:F0}}"/>
+                </TextBlock>
+            </StackPanel>
+        </Border>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Spacing="10">
+            <Button Content="取消" Width="80"
+                    Click="BtnCancel_Click"/>
+            <Button Content="保存" Width="80"
+                    Command="{Binding SaveCommand}"
+                    Click="BtnSave_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>
