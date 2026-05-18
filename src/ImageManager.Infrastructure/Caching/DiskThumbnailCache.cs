@@ -91,6 +91,29 @@ public class DiskThumbnailCache
         catch { }
     }
 
+    public void DeleteAllWidths(string filePath)
+    {
+        try
+        {
+            var hashName = GetCacheFileName(filePath);
+            if (!Directory.Exists(_cacheRoot)) return;
+            foreach (var dir in Directory.EnumerateDirectories(_cacheRoot, "w*"))
+            {
+                var cachePath = Path.Combine(dir, hashName);
+                if (File.Exists(cachePath))
+                    File.Delete(cachePath);
+            }
+        }
+        catch { }
+    }
+
+    private string GetCacheFileName(string filePath)
+    {
+        using var md5 = System.Security.Cryptography.MD5.Create();
+        var hashBytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(filePath.ToLowerInvariant()));
+        return Convert.ToHexString(hashBytes).ToLowerInvariant() + ".jpg";
+    }
+
     public long EstimateDiskUsage()
     {
         try

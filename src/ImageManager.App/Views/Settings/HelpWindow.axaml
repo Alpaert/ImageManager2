@@ -1,0 +1,56 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="ImageManager.App.Views.Settings.HelpWindow"
+        Title="搜索帮助" Width="480" Height="380"
+        CanResize="False">
+
+    <Grid RowDefinitions="*,Auto" Margin="16">
+        <ScrollViewer Grid.Row="0">
+            <TextBlock FontSize="13" TextWrapping="Wrap">
+                <TextBlock.Inlines>
+                    <Run FontWeight="SemiBold" FontSize="15" Text="Tag 搜索规则"/>
+                    <LineBreak/>
+                    <LineBreak/>
+                    <Run FontWeight="SemiBold" Text="基本搜索"/>
+                    <LineBreak/>
+                    <Run Text="  tag          单一标签（包含该标签的图片）"/>
+                    <LineBreak/>
+                    <Run Text="  tag1 o tag2  或（包含任一标签）"/>
+                    <LineBreak/>
+                    <Run Text="  tag1 a tag2  且（同时包含所有标签，搜索框绿色边框）"/>
+                    <LineBreak/>
+                    <Run Text="  tag1 e tag2  逐项且（基础组 AND 每个额外标签，蓝色边框）"/>
+                    <LineBreak/>
+                    <Run Text="  tag1 - tag2  排除（左侧包含，右侧排除，排除项以 o 分隔，红色边框）"/>
+                    <LineBreak/>
+                    <LineBreak/>
+                    <Run FontWeight="SemiBold" Text="特殊搜索"/>
+                    <LineBreak/>
+                    <Run Text="  -every        筛选未标记任何标签的图片"/>
+                    <LineBreak/>
+                    <LineBreak/>
+                    <Run FontWeight="SemiBold" Text="共现标签模式"/>
+                    <LineBreak/>
+                    <Run Text="  搜索后联想框显示与结果共现的其他标签。"/>
+                    <LineBreak/>
+                    <Run Text="  点击联想标签循环切换状态："/>
+                    <LineBreak/>
+                    <Run Text="    未选 → 且(绿色) → 逐项且(蓝色) → 排除(红色) → 移除"/>
+                    <LineBreak/>
+                    <LineBreak/>
+                    <Run FontWeight="SemiBold" Text="快捷键"/>
+                    <LineBreak/>
+                    <Run Text="  Enter     执行搜索（搜索后自动失焦）"/>
+                    <LineBreak/>
+                    <Run Text="  点击图片  关闭联想框并失焦搜索框"/>
+                    <LineBreak/>
+                    <Run Text="  点击搜索框 重新打开联想框"/>
+                </TextBlock.Inlines>
+            </TextBlock>
+        </ScrollViewer>
+
+        <Button Grid.Row="1" Content="确定" Width="80"
+                HorizontalAlignment="Right" Margin="0,14,0,0"
+                Click="BtnOk_Click"/>
+    </Grid>
+</Window>

@@ -49,12 +49,9 @@ public partial class ImageViewItem : ObservableObject
 
     public void NotifyAll()
     {
-        OnPropertyChanged(nameof(IsSelected));
-        OnPropertyChanged(nameof(IsLoading));
-        OnPropertyChanged(nameof(IsLoaded));
+        // [ObservableProperty] fields fire their own PropertyChanged automatically.
+        // Only manually notify computed properties that lack a source-generated setter.
         OnPropertyChanged(nameof(IsNotLoaded));
-        OnPropertyChanged(nameof(Width));
-        OnPropertyChanged(nameof(Height));
         OnPropertyChanged(nameof(IsLandscape));
         OnPropertyChanged(nameof(OrientationText));
         OnPropertyChanged(nameof(TagSummary));

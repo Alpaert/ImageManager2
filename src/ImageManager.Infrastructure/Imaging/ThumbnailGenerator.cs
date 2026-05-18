@@ -133,6 +133,98 @@ public static class ThumbnailGenerator
     }
 
     /// <summary>
+    /// Decode file at low resolution (max side ≤ maxSize), encode to JPEG.
+    /// Returns small byte[] suitable for hash computation — avoids loading full image into memory.
+    /// </summary>
+    public static byte[]? DecodeForHashInput(string filePath, int maxSize = 256)
+    {
+        try
+        {
+            using var stream = File.OpenRead(filePath);
+            using var codec = SKCodec.Create(stream);
+            if (codec == null) return null;
+
+            int origW = codec.Info.Width;
+            int origH = codec.Info.Height;
+
+            int targetW = maxSize;
+            int targetH = Math.Max(1, (int)(origH * ((float)maxSize / origW)));
+            if (targetH > maxSize)
+            {
+                targetH = maxSize;
+                targetW = Math.Max(1, (int)(origW * ((float)maxSize / origH)));
+            }
+
+            SKBitmap? final = null;
+            try
+            {
+                if (targetW >= origW)
+                {
+                    final = SKBitmap.Decode(filePath);
+                    if (final == null) return null;
+                    if (origW > targetW * 2 || origH > targetH * 2)
+                    {
+                        var r = final.Resize(new SKSizeI(targetW, targetH),
+                            new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
+                        if (r == null) return null;
+                        final.Dispose();
+                        final = r;
+                    }
+                }
+                else
+                {
+                    // Same two-step decode as Generate(): native scale → resize
+                    float desiredScale = (float)targetW / origW;
+                    float jpegScale;
+                    if (desiredScale <= 0.125f) jpegScale = 0.125f;
+                    else if (desiredScale <= 0.25f) jpegScale = 0.25f;
+                    else if (desiredScale <= 0.5f) jpegScale = 0.5f;
+                    else jpegScale = 1f;
+
+                    int decodeW, decodeH;
+                    if (jpegScale >= 1f) { decodeW = origW; decodeH = origH; }
+                    else
+                    {
+                        var ds = codec.GetScaledDimensions(jpegScale);
+                        decodeW = ds.Width;
+                        decodeH = ds.Height;
+                    }
+
+                    var ci = codec.Info;
+                    var outColorType = ci.ColorType != SKColorType.Unknown ? ci.ColorType : SKColorType.Rgba8888;
+                    var outAlphaType = ci.AlphaType != SKAlphaType.Unknown ? ci.AlphaType : SKAlphaType.Premul;
+                    var decodeInfo = new SKImageInfo(decodeW, decodeH, outColorType, outAlphaType);
+
+                    final = new SKBitmap(decodeInfo);
+                    if (codec.GetPixels(decodeInfo, final.GetPixels()) != SKCodecResult.Success)
+                        return null;
+
+                    if (decodeW != targetW || decodeH != targetH)
+                    {
+                        var r = final.Resize(new SKSizeI(targetW, targetH),
+                            new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None));
+                        if (r == null) return null;
+                        final.Dispose();
+                        final = r;
+                    }
+                }
+
+                using var skImage = SKImage.FromBitmap(final);
+                using var jpeg = skImage.Encode(SKEncodedImageFormat.Jpeg, 85);
+                return jpeg?.ToArray();
+            }
+            finally
+            {
+                final?.Dispose();
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Decode image to SkiaSharp bitmap at reduced size for analysis
     /// </summary>
     public static SKBitmap? DecodeForAnalysis(string filePath, int maxSize)

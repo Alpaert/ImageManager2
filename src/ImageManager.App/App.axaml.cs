@@ -3,6 +3,7 @@ using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Media;
 using Avalonia.Styling;
 using Avalonia.Markup.Xaml;
+using ImageManager.App.Services;
 using ImageManager.App.ViewModels;
 using ImageManager.App.Views;
 using ImageManager.Core.Services;
@@ -43,7 +44,9 @@ public partial class App : Application
         services.AddSingleton<ThumbnailCacheService>();
         services.AddSingleton<IThumbnailCacheService>(sp => sp.GetRequiredService<ThumbnailCacheService>());
 
-        services.AddTransient<MainWindowViewModel>();
+        services.AddSingleton<PageManager>();
+        services.AddSingleton<TagSearchController>();
+        services.AddSingleton<MainWindowViewModel>();
 
         return services.BuildServiceProvider();
     }

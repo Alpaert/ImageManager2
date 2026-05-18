@@ -99,6 +99,7 @@
                     <MenuItem Header="内存与缓存设置" Click="MenuMemorySettings_Click"/>
 
                     <MenuItem Header="快捷键设置" Click="MenuShortcutSettings_Click"/>
+                    <MenuItem Header="帮助" Click="MenuHelp_Click"/>
                 </MenuItem>
             </Menu>
             <Menu HorizontalAlignment="Right" Background="Transparent">
@@ -285,6 +286,8 @@
 										<MenuItem Header="搜图网站比较慢，打开网页可能时间较久"/>
 										<MenuItem Header="Multi（大杂烩搜图）" Click="MenuSearchOnline_Click" Tag="iqdb"/>
 										<MenuItem Header="SauceNAO（P站推特）" Click="MenuSearchOnline_Click" Tag="saucenao"/>
+										<MenuItem Header="yande.re（第三方图库）" Click="MenuSearchOnline_Click" Tag="yandere"/>
+										<MenuItem Header="百度搜图" Click="MenuSearchOnline_Click" Tag="baidu"/>
 										<MenuItem Header="ascii2d（p站推特）" Click="MenuSearchOnline_Click" Tag="ascii2d"/>
                                         <MenuItem Header="Trace（动画搜图）" Click="MenuSearchOnline_Click" Tag="tracemoe"/>
                                         <MenuItem Header="Yande" Click="MenuSearchOnline_Click" Tag="yandex"/>

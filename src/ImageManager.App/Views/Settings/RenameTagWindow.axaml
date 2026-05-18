@@ -1,0 +1,18 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="ImageManager.App.Views.Settings.RenameTagWindow"
+        Title="重命名 Tag" Width="320" Height="140"
+        CanResize="False">
+
+    <Grid RowDefinitions="Auto,*,Auto" Margin="16">
+        <TextBlock x:Name="TxtPrompt" Grid.Row="0" FontSize="13" Margin="0,0,0,8"/>
+        <TextBox x:Name="TxtNewName" Grid.Row="1"
+                 PlaceholderText="输入新名称..."
+                 Background="{DynamicResource InputBgBrush}"/>
+        <StackPanel Grid.Row="2" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Spacing="10" Margin="0,10,0,0">
+            <Button Content="取消" Width="70" Click="BtnCancel_Click"/>
+            <Button Content="确定" Width="70" Click="BtnOk_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

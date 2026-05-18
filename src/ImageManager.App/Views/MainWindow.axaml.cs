@@ -75,6 +75,7 @@ public partial class MainWindow : Window
     {
         var deletedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         int successCount = 0;
+        var thumbCache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
 
         foreach (var item in items)
         {
@@ -84,6 +85,7 @@ public partial class MainWindow : Window
                 File.Delete(item.FilePath);
                 var repo = App.Services.GetRequiredService<Core.Services.IImageMetaRepository>();
                 await repo.DeleteByPathAsync(item.FilePath);
+                thumbCache.DeleteFromDiskCache(item.FilePath);
                 deletedPaths.Add(item.FilePath);
                 successCount++;
             }
@@ -756,7 +758,9 @@ public partial class MainWindow : Window
             string.Join(", ", item.Tags),
             allTags,
             Vm.AppSettings.FavoriteTags,
-            Vm.AppSettings.MaxTagSuggestionCount);
+            Vm.AppSettings.MaxTagSuggestionCount,
+            onRenameTag: (oldName, newName) => Vm.RenameTagAsync(oldName, newName),
+            onMergeTags: (oldName, newName) => Vm.MergeTagsAsync(oldName, newName));
 
         var win = new Settings.TagEditWindow { DataContext = tagVm };
         win.WindowStartupLocation = WindowStartupLocation.Manual;
@@ -1329,6 +1333,12 @@ public partial class MainWindow : Window
             });
 
         var win = new Settings.ShortcutSettingWindow { DataContext = vm };
+        await win.ShowDialog(this);
+    }
+
+    private async void MenuHelp_Click(object? sender, RoutedEventArgs e)
+    {
+        var win = new Settings.HelpWindow();
         await win.ShowDialog(this);
     }
 

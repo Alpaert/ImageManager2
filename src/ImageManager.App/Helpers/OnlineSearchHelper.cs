@@ -29,6 +29,8 @@ public static class OnlineSearchHelper
         ["ascii2d"] = "https://ascii2d.net/",
         ["iqdb"] = "https://www.iqdb.org/",
         ["soutubot"] = "https://soutubot.moe/",
+        ["yandere"] = "https://yande.re/post/similar",
+        ["baidu"] = "https://image.baidu.com/",
     };
 
     private static string _tempDir = Path.Combine(Path.GetTempPath(), "ImageManagerSearch");

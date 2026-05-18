@@ -5,6 +5,7 @@ using Avalonia;
 using Avalonia.Media;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using ImageManager.App.Services;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Caching;
@@ -111,7 +112,6 @@ public partial class MainWindowViewModel : ViewModelBase
 
     // ==================== Paging ====================
     private List<string> _allFiles = new();
-    private const int PageSize = 200;
     [ObservableProperty] private int _currentPage;
     [ObservableProperty] private int _totalPages;
     [ObservableProperty] private ObservableCollection<int> _pageNumbers = new();
@@ -121,23 +121,21 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         get
         {
-            var baseList = IsShowingSearchResult && _searchResultFiles.Count > 0
-                ? _searchResultFiles : _allFiles;
+            var searchFiles = _tagSearch.SearchResultFiles;
+            var baseList = IsShowingSearchResult && searchFiles.Count > 0
+                ? searchFiles : _allFiles;
             if (OrientationFilter == OrientationFilter.All)
                 return baseList;
             return _orientationFilteredFiles;
         }
     }
 
-    private List<string> _searchResultFiles = new();
     private List<string> _orientationFilteredFiles = new();
-    private int _preSearchPageIndex;
 
     public double PreSearchScrollOffset { get; set; }
     public event Action? ScrollRestoreRequested;
 
     // ==================== Thumbnail Zoom ====================
-    private static readonly double[] ZoomLevels = { 160, 183, 213, 256, 284, 320, 366, 427, 512, 640 };
     [ObservableProperty] private double _thumbnailBaseWidth = 160.0;
     [ObservableProperty] private double _zoomTick = 1;
 
@@ -148,10 +146,6 @@ public partial class MainWindowViewModel : ViewModelBase
             : double.NaN;
 
     public bool ShowAnyThumbnailText => ShowFileName || ShowTags || ShowOrientation;
-    private int _currentZoomLevel = 0;                     // index into ZoomLevels
-    private int _thumbnailDecodeWidth = 200;
-    private CancellationTokenSource? _zoomDebounceCts;
-    private readonly SemaphoreSlim _thumbnailLoadSemaphore = new(4);
 
     // ==================== Filters ====================
     [ObservableProperty] private string _tagSearchText = string.Empty;
@@ -166,44 +160,19 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private string _loadedInfoText = string.Empty;
     [ObservableProperty] private bool _isShowingSearchResult;
 
-    // ==================== Tag Suggestion Co-occurring Mode ====================
-    /// <summary>When true, suggestions show co-occurring tags instead of prefix matches</summary>
-    private bool _coTagMode;
-    /// <summary>Cycling state per tag name: 0=none, 1=AND(green), 2=AND-each(blue), 3=NOT(red)</summary>
-    private readonly Dictionary<string, int> _coTagStates = new(StringComparer.OrdinalIgnoreCase);
-    private string _lastSearchText = string.Empty;
+    public bool IsSuggestionCoTagMode => _tagSearch.IsSuggestionCoTagMode;
 
-    public bool IsSuggestionCoTagMode => _coTagMode;
+    public int GetCoTagState(string tagName) => _tagSearch.GetCoTagState(tagName);
 
-    public int GetCoTagState(string tagName)
-    {
-        _coTagStates.TryGetValue(tagName, out int state);
-        return state;
-    }
+    public string SearchBoxBorderColor => _tagSearch.SearchBoxBorderColor(TagSearchText);
 
-    /// <summary>Search box border color reflecting current search condition</summary>
-    public string SearchBoxBorderColor
-    {
-        get
-        {
-            var t = TagSearchText ?? "";
-            if (t.Contains(" - ", StringComparison.OrdinalIgnoreCase))
-                return "#E8A0A0"; // soft red: NOT
-            if (t.Contains(" e ", StringComparison.OrdinalIgnoreCase))
-                return "#8CB8E8"; // soft blue: AND-each
-            if (t.Contains(" a ", StringComparison.OrdinalIgnoreCase))
-                return "#86D9B0"; // soft green: AND-all
-            return "#4A5568"; // default dark gray
-        }
-    }
+    // ==================== Page Manager ====================
+    private readonly PageManager _pageManager;
+    private readonly TagSearchController _tagSearch;
 
-    // ==================== Page Cache ====================
-    private readonly Dictionary<int, List<ImageViewItem>> _pageCache = new();
-    private readonly object _pageCacheLock = new();
-    private const int MaxCachedPages = 3;
+    // ==================== Cache ====================
     private readonly ConcurrentDictionary<string, string> _phashCache = new(StringComparer.OrdinalIgnoreCase);
 
-    private List<TagCount> _allTagCounts = new();
     private Dictionary<string, List<string>> _tagCacheByPath = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, ImageMeta> _metaCache = new(StringComparer.OrdinalIgnoreCase);
     [ObservableProperty] private ImageSortOrder _currentSortOrder = ImageSortOrder.FileNameAsc;
@@ -211,7 +180,6 @@ public partial class MainWindowViewModel : ViewModelBase
     private CancellationTokenSource? _precomputeCts;
     private FileSystemWatcher? _folderWatcher;
     private CancellationTokenSource? _folderWatchDebounceCts;
-    private int _activePageIndex;
 
     public MainWindowViewModel(
         ISettingsRepository settingsRepo,
@@ -220,7 +188,9 @@ public partial class MainWindowViewModel : ViewModelBase
         ITagRepository tagRepo,
         ISimilarImageService similarService,
         IDuplicateService duplicateService,
-        ThumbnailCacheService thumbCache)
+        ThumbnailCacheService thumbCache,
+        PageManager pageManager,
+        TagSearchController tagSearch)
     {
         _settingsRepo = settingsRepo;
         _folderRepo = folderRepo;
@@ -229,15 +199,66 @@ public partial class MainWindowViewModel : ViewModelBase
         _similarService = similarService;
         _duplicateService = duplicateService;
         _thumbCache = thumbCache;
+        _pageManager = pageManager;
+        _tagSearch = tagSearch;
+
+        _pageManager.PageChanged += args =>
+        {
+            Images = new ObservableCollection<ImageViewItem>(args.Items);
+            _isNavigating = true;
+            CurrentPage = args.PageIndex;
+            _isNavigating = false;
+            LoadedInfoText = args.LoadedInfoText;
+        };
+
+        _tagSearch.SearchCompleted += result =>
+        {
+            if (!result.HasResults)
+            {
+                CurrentTagFilter = string.Empty;
+                return;
+            }
+
+            IsShowingSearchResult = true;
+            if (result.TotalPages == 0)
+            {
+                Images = new ObservableCollection<ImageViewItem>();
+                TotalPages = 0;
+                PageNumbers = new ObservableCollection<int>();
+            }
+            else
+            {
+                TotalPages = result.TotalPages;
+                PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, result.TotalPages));
+                _pageManager.InvalidateCache();
+                _ = ShowPageAsync(0);
+            }
+            StatusText = result.StatusText;
+        };
+
+        _tagSearch.SuggestionsChanged += (suggestions, isOpen) =>
+        {
+            TagSearchSuggestions = new ObservableCollection<TagCount>(suggestions);
+            IsTagSearchPopupOpen = isOpen;
+        };
+
+        _tagSearch.CoTagCycled += _ =>
+        {
+            OnPropertyChanged(nameof(SearchBoxBorderColor));
+        };
+
+        _tagSearch.CoTagModeExited += () =>
+        {
+            OnPropertyChanged(nameof(SearchBoxBorderColor));
+        };
     }
 
     public async Task InitializeAsync()
     {
         AppSettings = await _settingsRepo.LoadAsync();
 
-        _thumbnailDecodeWidth = ComputeDecodeWidth();
+        _pageManager.InitializeDecodeWidth(0);
         _thumbCache.CacheDirectory = AppSettings.DiskCacheDirectory;
-        _thumbCache.DecodeWidth = _thumbnailDecodeWidth;
 
         var folders = await _folderRepo.GetAllAsync();
         FolderList = new ObservableCollection<FolderInfo>(folders);
@@ -277,6 +298,19 @@ public partial class MainWindowViewModel : ViewModelBase
     private async Task RemoveFolderAsync()
     {
         if (SelectedFolder == null) return;
+
+        // Clean up disk thumbnail cache for all images in this folder
+        if (SelectedFolder.Id > 0)
+        {
+            try
+            {
+                var metas = await _metaRepo.GetByFolderIdAsync(SelectedFolder.Id);
+                foreach (var meta in metas)
+                    _thumbCache.DeleteFromDiskCache(meta.FilePath);
+            }
+            catch { }
+        }
+
         await _folderRepo.RemoveAsync(SelectedFolder.Path);
         FolderList.Remove(SelectedFolder);
         await SaveSettingsAsync();
@@ -358,7 +392,7 @@ public partial class MainWindowViewModel : ViewModelBase
         IsShowingSearchResult = false;
         Images.Clear();
         _allFiles.Clear();
-        lock (_pageCacheLock) { _pageCache.Clear(); }
+        _pageManager.InvalidateCache();
         _phashCache.Clear();
         BackgroundStatusText = "";
         CurrentPage = 0;
@@ -389,7 +423,7 @@ public partial class MainWindowViewModel : ViewModelBase
                     return;
                 }
 
-                TotalPages = (_allFiles.Count + PageSize - 1) / PageSize;
+                TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
                 PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
                 StatusText = $"总文件数: {_allFiles.Count}";
 
@@ -409,7 +443,14 @@ public partial class MainWindowViewModel : ViewModelBase
                 _precomputeCts?.Cancel();
                 _precomputeCts?.Dispose();
                 _precomputeCts = new CancellationTokenSource();
-                _ = PrecomputeHashesAsync(_precomputeCts.Token, folderId.Value);
+                // Delay hash precomputation to avoid competing with initial thumbnail loading
+                var captureCt = _precomputeCts.Token;
+                _ = Task.Run(async () =>
+                {
+                    try { await Task.Delay(3000, captureCt); }
+                    catch { return; }
+                    await PrecomputeHashesAsync(captureCt, folderId.Value);
+                });
                 return;
             }
         }
@@ -442,7 +483,7 @@ public partial class MainWindowViewModel : ViewModelBase
             folderId = folderInfo?.Id;
         }
 
-        TotalPages = (_allFiles.Count + PageSize - 1) / PageSize;
+        TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
 
         _ = Task.Run(async () =>
@@ -465,7 +506,13 @@ public partial class MainWindowViewModel : ViewModelBase
         _precomputeCts?.Cancel();
         _precomputeCts?.Dispose();
         _precomputeCts = new CancellationTokenSource();
-        _ = PrecomputeHashesAsync(_precomputeCts.Token, folderId);
+        var captureCt2 = _precomputeCts.Token;
+        _ = Task.Run(async () =>
+        {
+            try { await Task.Delay(3000, captureCt2); }
+            catch { return; }
+            await PrecomputeHashesAsync(captureCt2, folderId);
+        });
 
         var lastPage2 = await _folderRepo.GetLastPageIndexAsync(folder);
         int startPage2 = lastPage2.HasValue && lastPage2.Value < TotalPages ? lastPage2.Value : 0;
@@ -486,7 +533,13 @@ public partial class MainWindowViewModel : ViewModelBase
         _precomputeCts?.Cancel();
         _precomputeCts?.Dispose();
         _precomputeCts = new CancellationTokenSource();
-        _ = PrecomputeHashesAsync(_precomputeCts.Token, fi.Id);
+        var captureCt3 = _precomputeCts.Token;
+        _ = Task.Run(async () =>
+        {
+            try { await Task.Delay(3000, captureCt3); }
+            catch { return; }
+            await PrecomputeHashesAsync(captureCt3, fi.Id);
+        });
     }
 
     private void StartWatchingCurrentFolder()
@@ -610,9 +663,9 @@ public partial class MainWindowViewModel : ViewModelBase
                     {
                         int oldCount = _allFiles.Count;
                         _allFiles = diskFiles.ToList();
-                        TotalPages = (_allFiles.Count + PageSize - 1) / PageSize;
+                        TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
                         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-                        lock (_pageCacheLock) { _pageCache.Clear(); }
+                        _pageManager.InvalidateCache();
                         _phashCache.Clear();
                         int targetPage = CurrentPage;
                         if (targetPage >= TotalPages) targetPage = Math.Max(0, TotalPages - 1);
@@ -671,7 +724,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 FullMode = BoundedChannelFullMode.Wait
             });
 
-        int ioConcurrency = Math.Min(8, Math.Max(4, Environment.ProcessorCount / 2));
+        int ioConcurrency = 2;
         var ioSlots = new SemaphoreSlim(ioConcurrency);
 
         var produceTasks = needsHashing.Select(async path =>
@@ -683,20 +736,11 @@ public partial class MainWindowViewModel : ViewModelBase
                 try
                 {
                     var fi = new FileInfo(path);
-                    byte[] data = new byte[fi.Length];
-                    using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read,
-                               FileShare.Read, 4096, FileOptions.Asynchronous | FileOptions.SequentialScan))
-                    {
-                        int offset = 0;
-                        while (offset < data.Length)
-                        {
-                            int n = await fs.ReadAsync(data.AsMemory(offset), ct);
-                            if (n == 0) break;
-                            offset += n;
-                        }
-                    }
+                    // Decode at 256px max for hash input — avoids loading full image into memory
+                    var hashInput = await Task.Run(() => ThumbnailGenerator.DecodeForHashInput(path, 256), ct);
+                    if (hashInput == null) return;
                     await channel.Writer.WriteAsync(
-                        (path, data, fi.Length, fi.LastWriteTimeUtc.Ticks), ct);
+                        (path, hashInput, fi.Length, fi.LastWriteTimeUtc.Ticks), ct);
                 }
                 finally { ioSlots.Release(); }
             }
@@ -735,7 +779,7 @@ public partial class MainWindowViewModel : ViewModelBase
                             };
                             try
                             {
-                                var (w, h) = ThumbnailGenerator.GetDimensions(item.Data);
+                                var (w, h) = ThumbnailGenerator.GetDimensions(item.Path);
                                 meta.Width = w; meta.Height = h;
                             }
                             catch { }
@@ -817,160 +861,8 @@ public partial class MainWindowViewModel : ViewModelBase
         _isNavigating = true;
         CurrentPage = pageIndex;
         _isNavigating = false;
-
-        // Track which page is currently visible (for background loaders to check)
-        _activePageIndex = pageIndex;
-
-        List<ImageViewItem> pageItems;
-        bool needsLoad;
-        lock (_pageCacheLock)
-        {
-            if (!_pageCache.TryGetValue(pageIndex, out pageItems!))
-            {
-                pageItems = CreatePlaceholderItems(pageIndex);
-                _pageCache[pageIndex] = pageItems;
-            }
-            needsLoad = !pageItems.TrueForAll(i => i.IsLoaded);
-        }
-
-        // Fire-and-forget loading — never cancels; semaphore(4) throttles naturally
-        if (needsLoad)
-            _ = LoadPageThumbnailsAsync(pageIndex);
-
-        // Single collection swap — avoids 200 individual CollectionChanged events
-        Images = new ObservableCollection<ImageViewItem>(pageItems);
-        _pageItemsCopy = pageItems;
-        LoadedInfoText = $"当前页: {pageIndex + 1}/{TotalPages}  每页 {PageSize} 张";
-
-        // Defer non-critical work. Skip DB save when showing search results.
-        if (!IsShowingSearchResult && !string.IsNullOrEmpty(CurrentFolder))
-            _ = Task.Run(() => _folderRepo.SetLastPageIndexAsync(CurrentFolder, pageIndex));
-        PreloadAdjacentPages();
-        _ = Task.Run(TrimPageCache);
-    }
-
-    private List<ImageViewItem> CreatePlaceholderItems(int pageIndex)
-    {
-        var files = ActiveFileList;
-        int start = pageIndex * PageSize;
-        int count = Math.Min(PageSize, files.Count - start);
-        var list = new List<ImageViewItem>();
-
-        for (int i = 0; i < count; i++)
-        {
-            var file = files[start + i];
-            var tags = GetTagsForFile(file);
-            list.Add(new ImageViewItem
-            {
-                FilePath = file,
-                FileName = Path.GetFileName(file),
-                Tags = tags,
-                IsLoading = true
-            });
-        }
-
-        return list;
-    }
-
-    private async Task LoadPageThumbnailsAsync(int pageIndex)
-    {
-        List<ImageViewItem> pageItems;
-        lock (_pageCacheLock)
-        {
-            if (!_pageCache.TryGetValue(pageIndex, out pageItems!)) return;
-        }
-
-        var unloaded = pageItems.Where(i => !i.IsLoaded).ToList();
-        if (unloaded.Count == 0) return;
-
-        int visibleCount = EstimateVisibleItemCount();
-        var priorityItems = unloaded.Take(visibleCount).ToList();
-        var bgItems = unloaded.Skip(visibleCount).ToList();
-
-        foreach (var item in priorityItems)
-            await LoadSingleThumbnailAsync(item);
-
-        foreach (var item in bgItems)
-            await LoadSingleThumbnailAsync(item);
-    }
-
-    private async Task LoadSingleThumbnailAsync(ImageViewItem item)
-    {
-        await _thumbnailLoadSemaphore.WaitAsync();
-        try
-        {
-            var data = await _thumbCache.GetOrCreateThumbnailAsync(item.FilePath, _thumbnailDecodeWidth);
-            if (data != null)
-            {
-                item.ThumbnailData = data;
-                var (w, h) = ThumbnailGenerator.GetDimensions(item.FilePath);
-                item.Width = w;
-                item.Height = h;
-                item.IsLoaded = true;
-            }
-        }
-        catch { }
-        finally { _thumbnailLoadSemaphore.Release(); }
-
-        item.IsLoading = false;
-        item.NotifyAll();
-    }
-
-    private int EstimateVisibleItemCount()
-    {
-        double itemW = ThumbnailBaseWidth;
-        double itemH = WaterfallMode == "None"
-            ? ThumbnailBaseWidth / Math.Max(0.01, AppSettings.ThumbnailAspectRatio)
-            : ThumbnailBaseWidth * 0.75;
-        int perRow = Math.Max(1, (int)(900 / itemW));
-        int rows = Math.Max(2, (int)(400 / itemH) + 1);
-        return Math.Max(12, Math.Min(PageSize, perRow * rows));
-    }
-
-    private void PreloadAdjacentPages()
-    {
-        int currentPage = CurrentPage;
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(300);
-
-            int? preloadPrev = null, preloadNext = null;
-            lock (_pageCacheLock)
-            {
-                if (currentPage - 1 >= 0 && !_pageCache.ContainsKey(currentPage - 1))
-                {
-                    _pageCache[currentPage - 1] = CreatePlaceholderItems(currentPage - 1);
-                    preloadPrev = currentPage - 1;
-                }
-                if (currentPage + 1 < TotalPages && !_pageCache.ContainsKey(currentPage + 1))
-                {
-                    _pageCache[currentPage + 1] = CreatePlaceholderItems(currentPage + 1);
-                    preloadNext = currentPage + 1;
-                }
-            }
-            if (preloadPrev.HasValue)
-                _ = LoadPageThumbnailsAsync(preloadPrev.Value);
-            if (preloadNext.HasValue)
-                _ = LoadPageThumbnailsAsync(preloadNext.Value);
-        });
-    }
-
-    private void TrimPageCache()
-    {
-        lock (_pageCacheLock)
-        {
-            if (_pageCache.Count <= MaxCachedPages) return;
-
-            var mustKeep = new HashSet<int> { CurrentPage };
-            if (CurrentPage - 1 >= 0) mustKeep.Add(CurrentPage - 1);
-            if (CurrentPage + 1 < TotalPages) mustKeep.Add(CurrentPage + 1);
-
-            foreach (var key in _pageCache.Keys.ToList())
-            {
-                if (mustKeep.Contains(key)) continue;
-                _pageCache.Remove(key);
-            }
-        }
+        await _pageManager.ShowPageAsync(pageIndex, TotalPages,
+            ActiveFileList, GetTagsForFile, IsShowingSearchResult, CurrentFolder);
     }
 
     // ==================== Thumbnail Zoom ====================
@@ -1006,58 +898,9 @@ partial void OnCornerRadiusDipChanged(double value)
     partial void OnZoomTickChanged(double value)
     {
         SaveZoomForMode(WaterfallMode);
-        double t = Math.Clamp(value, 1.0, 10.0);
-
-        // Interpolate ThumbnailBaseWidth between discrete levels
-        int idx = (int)t - 1;
-        if (idx < 0) idx = 0;
-        if (idx >= ZoomLevels.Length - 1) idx = ZoomLevels.Length - 2;
-
-        double frac = t - (idx + 1);
-        if (frac < 0) frac = 0;
-        if (frac > 1) frac = 1;
-
-        ThumbnailBaseWidth = ZoomLevels[idx] + (ZoomLevels[idx + 1] - ZoomLevels[idx]) * frac;
-
-        // Only regenerate thumbnails when crossing a discrete level threshold
-        int newLevel = (int)Math.Round(t - 1);
-        if (newLevel < 0) newLevel = 0;
-        if (newLevel >= ZoomLevels.Length) newLevel = ZoomLevels.Length - 1;
-
-        if (newLevel != _currentZoomLevel)
-        {
-            _currentZoomLevel = newLevel;
-            int newDecodeWidth = ComputeDecodeWidth();
-            if (newDecodeWidth != _thumbnailDecodeWidth)
-            {
-                _thumbnailDecodeWidth = newDecodeWidth;
-
-                // Debounce: only rebuild when user pauses dragging (300ms of no zoom change)
-                _zoomDebounceCts?.Cancel();
-                _zoomDebounceCts = new CancellationTokenSource();
-                var token = _zoomDebounceCts.Token;
-                _ = Task.Run(async () =>
-                {
-                    try { await Task.Delay(300, token); }
-                    catch { return; }
-                    if (token.IsCancellationRequested) return;
-                    var dispatcher = Avalonia.Threading.Dispatcher.UIThread;
-                    await dispatcher.InvokeAsync(async () =>
-                    {
-                        _thumbCache.DecodeWidth = _thumbnailDecodeWidth;
-                        await _thumbCache.ClearAsync();
-                        lock (_pageCacheLock) { _pageCache.Clear(); }
-                        await ShowPageAsync(CurrentPage);
-                    });
-                }, token);
-            }
-        }
-    }
-
-    private int ComputeDecodeWidth()
-    {
-        int w = (int)(ZoomLevels[_currentZoomLevel] * 2.5);
-        return Math.Clamp(w, 300, 1600);
+        var (baseWidth, _) = _pageManager.OnZoomTickChanged(value, CurrentPage, TotalPages,
+            ActiveFileList, GetTagsForFile);
+        ThumbnailBaseWidth = baseWidth;
     }
 
     // ==================== Tag Search ====================
@@ -1074,135 +917,13 @@ partial void OnCornerRadiusDipChanged(double value)
 
         CurrentTagFilter = raw;
 
-        // Parse " - " first: left side = include, right side = exclude
-        List<string> excludeTags = new();
-        string includePart;
-        if (raw.Contains(" - ", StringComparison.OrdinalIgnoreCase))
-        {
-            var parts = raw.Split(new[] { " - " }, 2, StringSplitOptions.None);
-            includePart = parts[0].Trim();
-            excludeTags = parts[1].Split(new[] { " o " }, StringSplitOptions.None)
-                               .Select(t => t.Trim()).Where(t => t.Length > 0).ToList();
-        }
-        else
-        {
-            includePart = raw;
-        }
-
-        // Parse " e " = AND-each (base part + each-tags), " a " = AND-all, " o " = OR
-        List<string> tags;
-        bool isAnd = false;
-        bool isAndEach = false;
-        bool baseIsAnd = true; // base part of AND-each: AND (a) or OR (o)?
-        List<string> eachTags = new();
-        if (includePart.Contains(" e ", StringComparison.OrdinalIgnoreCase))
-        {
-            var parts = includePart.Split(new[] { " e " }, StringSplitOptions.None)
-                                   .Select(t => t.Trim()).Where(t => t.Length > 0).ToList();
-            // First part is the base — recursively parse for a/o
-            var basePart = parts[0];
-            eachTags = parts.Skip(1).ToList();
-            isAndEach = true;
-
-            if (basePart.Contains(" a ", StringComparison.OrdinalIgnoreCase))
-            {
-                tags = basePart.Split(new[] { " a " }, StringSplitOptions.None)
-                               .Select(t => t.Trim()).Where(t => t.Length > 0).ToList();
-                baseIsAnd = true;
-            }
-            else if (basePart.Contains(" o ", StringComparison.OrdinalIgnoreCase))
-            {
-                tags = basePart.Split(new[] { " o " }, StringSplitOptions.None)
-                               .Select(t => t.Trim()).Where(t => t.Length > 0).ToList();
-                baseIsAnd = false;
-            }
-            else
-            {
-                tags = new List<string> { basePart };
-            }
-        }
-        else if (includePart.Contains(" a ", StringComparison.OrdinalIgnoreCase))
-        {
-            tags = includePart.Split(new[] { " a " }, StringSplitOptions.None)
-                      .Select(t => t.Trim()).Where(t => t.Length > 0).ToList();
-            isAnd = true;
-        }
-        else if (includePart.Contains(" o ", StringComparison.OrdinalIgnoreCase))
-        {
-            tags = includePart.Split(new[] { " o " }, StringSplitOptions.None)
-                      .Select(t => t.Trim()).Where(t => t.Length > 0).ToList();
-        }
-        else
-        {
-            tags = new List<string> { includePart };
-        }
-
-        if (tags.Count == 0)
-        {
-            CurrentTagFilter = string.Empty;
-            return;
-        }
-
-        var opName = isAndEach ? "AND-each" : isAnd ? "且" : "或";
-        var excludeDesc = excludeTags.Count > 0
-            ? $"（排除: {string.Join(" 或 ", excludeTags)}）" : "";
-        var allTags = isAndEach ? tags.Concat(eachTags).ToList() : tags;
-        StatusText = $"正在搜索 Tag（{opName}）: {string.Join(" + ", allTags)}{excludeDesc}...";
-
-        // Save current page state before replacing with search results
         if (!IsShowingSearchResult)
-        {
-            _preSearchPageItems = Images.ToList();
-            _preSearchPageIndex = CurrentPage;
-        }
+            _pageManager.SavePreSearchState(Images, CurrentPage);
 
         try
         {
-            List<string> taggedPaths;
-            if (isAndEach)
-            {
-                taggedPaths = await _metaRepo.GetFilePathsByTagAndEachAsync(tags, baseIsAnd, eachTags,
-                    excludeTags.Count > 0 ? excludeTags : null);
-            }
-            else if (excludeTags.Count > 0)
-            {
-                taggedPaths = await _metaRepo.GetFilePathsByTagsExcludingAsync(tags, isAnd, excludeTags);
-            }
-            else if (tags.Count == 1)
-            {
-                taggedPaths = await _metaRepo.GetFilePathsByTagAsync(tags[0]);
-            }
-            else
-            {
-                taggedPaths = await _metaRepo.GetFilePathsByTagsAsync(tags, isAnd);
-            }
-
-            // Intersect with current folder files
-            var fileSet = new HashSet<string>(_allFiles, StringComparer.OrdinalIgnoreCase);
-            _searchResultFiles = taggedPaths.Where(p => fileSet.Contains(p)).ToList();
-
-            if (_searchResultFiles.Count == 0)
-            {
-                Images = new ObservableCollection<ImageViewItem>();
-                IsShowingSearchResult = true;
-                TotalPages = 0;
-                PageNumbers = new ObservableCollection<int>();
-                StatusText = $"未找到匹配的图片";
-                return;
-            }
-
-            // Setup paging for search results
-            IsShowingSearchResult = true;
-            TotalPages = (_searchResultFiles.Count + PageSize - 1) / PageSize;
-            PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-            lock (_pageCacheLock) { _pageCache.Clear(); }
-            await ShowPageAsync(0);
-            StatusText = $"Tag（{opName}）: 找到 {_searchResultFiles.Count} 张图片";
-
-            // Enter co-occurring tag mode: show other tags shared by search results
-            _coTagMode = true;
-            _lastSearchText = raw;
-            _ = RefreshCoTagSuggestionsAsync();
+            await _tagSearch.SearchByTagAsync(raw, _allFiles, IsShowingSearchResult,
+                list => { foreach (var t in list) TagSearchSuggestions.Add(t); });
         }
         catch (Exception ex)
         {
@@ -1213,160 +934,52 @@ partial void OnCornerRadiusDipChanged(double value)
     [RelayCommand]
     private async Task SelectTagSuggestion(TagCount tag)
     {
-        // In co-occurring mode: cycle through states (AND → AND-each → NOT → remove)
-        if (_coTagMode && !string.IsNullOrEmpty(_lastSearchText))
-        {
-            await CycleCoTagAsync(tag.Name);
-            return;
-        }
-
-        // Prefix mode: use backing field to skip OnTagSearchTextChanged,
-        // which would Clear() the suggestions collection mid-click → Avalonia NPE
-        _tagSearchText = tag.Name;
-        OnPropertyChanged(nameof(TagSearchText));
-        IsTagSearchPopupOpen = false;
-        await SearchByTag();
+        _tagSearch.SelectSuggestion(tag,
+            name =>
+            {
+                _tagSearchText = name;
+                OnPropertyChanged(nameof(TagSearchText));
+            },
+            open => IsTagSearchPopupOpen = open,
+            () => SearchByTagCommand.ExecuteAsync(null));
     }
 
     partial void OnTagSearchTextChanged(string value)
     {
-        // In co-occurring mode: only react to manual edits, don't touch suggestions
-        if (_coTagMode)
-        {
-            if (value != _lastSearchText)
-            {
-                _coTagMode = false;
-                _coTagStates.Clear();
-                OnPropertyChanged(nameof(SearchBoxBorderColor));
-                UpdateTagSuggestions(value);
-            }
-            // If value == _lastSearchText (code-internal change), keep popup open
-            return;
-        }
-        UpdateTagSuggestions(value);
+        _tagSearch.OnTextChanged(value, TagSearchText,
+            () => OnPropertyChanged(nameof(SearchBoxBorderColor)),
+            keyword => UpdateTagSuggestions(keyword));
     }
 
     private void UpdateTagSuggestions(string keyword)
     {
         TagSearchSuggestions.Clear();
-        if (_coTagMode)
-        {
-            // Show co-occurring tags from previous refresh (handled async)
-            return;
-        }
-
-        if (string.IsNullOrWhiteSpace(keyword) || _allTagCounts.Count == 0)
-        {
-            IsTagSearchPopupOpen = false;
-            return;
-        }
-
-        // Prefix match mode
-        var results = _allTagCounts
-            .Where(t => t.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(t => t.Name.StartsWith(keyword, StringComparison.OrdinalIgnoreCase))
-            .ThenByDescending(t => t.Count)
-            .Take(50);
-
-        foreach (var t in results)
-            TagSearchSuggestions.Add(t);
-
-        IsTagSearchPopupOpen = TagSearchSuggestions.Count > 0;
+        _tagSearch.UpdateSuggestions(keyword,
+            t => TagSearchSuggestions.Add(t),
+            open => IsTagSearchPopupOpen = open);
     }
 
     public void OnTagSearchGotFocus()
     {
-        if (_coTagMode)
-        {
-            IsTagSearchPopupOpen = TagSearchSuggestions.Count > 0;
-        }
-        else if (!string.IsNullOrWhiteSpace(TagSearchText))
-        {
-            UpdateTagSuggestions(TagSearchText);
-        }
-    }
-
-    private async Task RefreshCoTagSuggestionsAsync()
-    {
-        try
-        {
-            // Get all tag names currently in the search text (to exclude from suggestions)
-            var usedTags = ParseTagNamesFromSearchText(TagSearchText);
-            var coTags = await _metaRepo.GetCoOccurringTagsAsync(_searchResultFiles, usedTags);
-            TagSearchSuggestions = new ObservableCollection<TagCount>(coTags.Take(50));
-            IsTagSearchPopupOpen = TagSearchSuggestions.Count > 0;
-        }
-        catch
-        {
-            IsTagSearchPopupOpen = false;
-        }
-    }
-
-    private static List<string> ParseTagNamesFromSearchText(string text)
-    {
-        return text.Split(new[] { " a ", " o ", " e ", " - " }, StringSplitOptions.None)
-                   .Select(t => t.Trim())
-                   .Where(t => t.Length > 0)
-                   .Distinct(StringComparer.OrdinalIgnoreCase)
-                   .ToList();
-    }
-
-    private async Task CycleCoTagAsync(string tagName)
-    {
-        // Get current state (0=none, 1=AND-green, 2=AND-each-blue, 3=NOT-red)
-        _coTagStates.TryGetValue(tagName, out int state);
-        state = (state + 1) % 4;
-        _coTagStates[tagName] = state;
-
-        // Rebuild search text from base + all active co-tags
-        var baseTag = _lastSearchText;
-        // Strip any previously appended operators
-        var cleaned = new List<string>();
-        foreach (var t in ParseTagNamesFromSearchText(_lastSearchText))
-        {
-            if (!_coTagStates.ContainsKey(t))
-                cleaned.Add(t);
-        }
-
-        var andTags = new List<string>();
-        var eachTags = new List<string>();
-        var notTags = new List<string>();
-        foreach (var kv in _coTagStates)
-        {
-            if (kv.Value == 0) continue;
-            if (kv.Value == 1) andTags.Add(kv.Key);
-            else if (kv.Value == 2) eachTags.Add(kv.Key);
-            else if (kv.Value == 3) notTags.Add(kv.Key);
-        }
-
-        // Build expression: base [a andTags] [e eachTags] [- notTags]
-        var sb = new System.Text.StringBuilder();
-        sb.Append(string.Join(" a ", cleaned));
-        foreach (var t in andTags)
-            sb.Append($" a {t}");
-        foreach (var t in eachTags)
-            sb.Append($" e {t}");
-        if (notTags.Count > 0)
-            sb.Append(" - " + string.Join(" o ", notTags));
-
-        var newText = sb.ToString();
-        _lastSearchText = newText;
-        TagSearchText = newText;
-        OnPropertyChanged(nameof(SearchBoxBorderColor));
-        // Keep popup open so user can continue adjusting conditions
+        _tagSearch.OnGotFocus(TagSearchText,
+            open => IsTagSearchPopupOpen = open,
+            () => TagSearchSuggestions.ToList());
     }
 
     /// <summary>Remove deleted files incrementally, keeping existing thumbnails intact</summary>
     public void RemoveFilesFromView(HashSet<string> deletedPaths)
     {
+        // Invalidate page cache so stale entries (containing deleted files) are never served
+        _pageManager.InvalidateCache();
+
         // Remove from master lists
         _allFiles.RemoveAll(p => deletedPaths.Contains(p));
-        if (_searchResultFiles.Count > 0)
-            _searchResultFiles.RemoveAll(p => deletedPaths.Contains(p));
+        if (_tagSearch.SearchResultFiles.Count > 0)
+            _tagSearch.SearchResultFiles.RemoveAll(p => deletedPaths.Contains(p));
 
         // Recalculate paging
         var files = ActiveFileList;
-        TotalPages = files.Count == 0 ? 0 : (files.Count + PageSize - 1) / PageSize;
+        TotalPages = files.Count == 0 ? 0 : (files.Count + PageManager.PageSize - 1) / PageManager.PageSize;
         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
 
         // Clamp current page
@@ -1376,8 +989,7 @@ partial void OnCornerRadiusDipChanged(double value)
         if (TotalPages == 0)
         {
             Images = new ObservableCollection<ImageViewItem>();
-            _pageItemsCopy = null;
-            lock (_pageCacheLock) { _pageCache.Clear(); }
+            _pageManager.InvalidateCache();
             return;
         }
 
@@ -1386,10 +998,10 @@ partial void OnCornerRadiusDipChanged(double value)
         currentImages.RemoveAll(i => deletedPaths.Contains(i.FilePath));
 
         // Fill gaps from ActiveFileList page range
-        int pageStart = CurrentPage * PageSize;
+        int pageStart = CurrentPage * PageManager.PageSize;
         var existingPaths = new HashSet<string>(currentImages.Select(i => i.FilePath), StringComparer.OrdinalIgnoreCase);
         var newItems = new List<ImageViewItem>();
-        for (int i = 0; i < PageSize && currentImages.Count + newItems.Count < PageSize; i++)
+        for (int i = 0; i < PageManager.PageSize && currentImages.Count + newItems.Count < PageManager.PageSize; i++)
         {
             int idx = pageStart + i;
             if (idx >= files.Count) break;
@@ -1406,41 +1018,10 @@ partial void OnCornerRadiusDipChanged(double value)
 
         currentImages.AddRange(newItems);
         Images = new ObservableCollection<ImageViewItem>(currentImages);
-        _pageItemsCopy = currentImages;
-
-        // Update page cache for current page
-        lock (_pageCacheLock) { _pageCache[CurrentPage] = currentImages; }
-
-        // Load thumbnails only for new gap-fill items
         if (newItems.Count > 0)
-        {
-            _ = Task.Run(async () =>
-            {
-                foreach (var item in newItems)
-                {
-                    await _thumbnailLoadSemaphore.WaitAsync();
-                    try
-                    {
-                        var data = await _thumbCache.GetOrCreateThumbnailAsync(item.FilePath, _thumbnailDecodeWidth);
-                        if (data != null)
-                        {
-                            item.ThumbnailData = data;
-                            var (w, h) = ThumbnailGenerator.GetDimensions(item.FilePath);
-                            item.Width = w; item.Height = h;
-                            item.IsLoaded = true;
-                        }
-                    }
-                    catch { }
-                    finally { _thumbnailLoadSemaphore.Release(); }
-                    item.IsLoading = false;
-                    item.NotifyAll();
-                }
-            });
-        }
+            _pageManager.LoadThumbnailsForItems(newItems);
     }
 
-    private List<ImageViewItem>? _pageItemsCopy;
-    private List<ImageViewItem>? _preSearchPageItems; // Saved before search, restored on back
 
     // ==================== Orientation Filter ====================
 
@@ -1450,8 +1031,8 @@ partial void OnCornerRadiusDipChanged(double value)
 
     private async Task RebuildFromOrientationFilterAsync()
     {
-        var source = IsShowingSearchResult && _searchResultFiles.Count > 0
-            ? _searchResultFiles : _allFiles;
+        var source = IsShowingSearchResult && _tagSearch.SearchResultFiles.Count > 0
+            ? _tagSearch.SearchResultFiles : _allFiles;
 
         if (OrientationFilter == OrientationFilter.All)
         {
@@ -1477,9 +1058,9 @@ partial void OnCornerRadiusDipChanged(double value)
         }
 
         var files = ActiveFileList;
-        TotalPages = files.Count == 0 ? 0 : (files.Count + PageSize - 1) / PageSize;
+        TotalPages = files.Count == 0 ? 0 : (files.Count + PageManager.PageSize - 1) / PageManager.PageSize;
         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-        lock (_pageCacheLock) { _pageCache.Clear(); }
+        _pageManager.InvalidateCache();
 
         if (files.Count == 0)
         {
@@ -1524,13 +1105,13 @@ partial void OnCornerRadiusDipChanged(double value)
         };
 
         await Task.Run(() => files.Sort(comparison));
-        _searchResultFiles.Sort(comparison);
+        _tagSearch.SearchResultFiles.Sort(comparison);
         _orientationFilteredFiles.Clear();
 
         var active = ActiveFileList;
-        TotalPages = active.Count == 0 ? 0 : (active.Count + PageSize - 1) / PageSize;
+        TotalPages = active.Count == 0 ? 0 : (active.Count + PageManager.PageSize - 1) / PageManager.PageSize;
         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-        lock (_pageCacheLock) { _pageCache.Clear(); }
+        _pageManager.InvalidateCache();
         await ShowPageAsync(0);
 
         var labels = new Dictionary<ImageSortOrder, string>
@@ -1587,20 +1168,14 @@ partial void OnCornerRadiusDipChanged(double value)
         {
             // Restore normal page view
             IsShowingSearchResult = false;
-            _searchResultFiles.Clear();
+            _tagSearch.SearchResultFiles.Clear();
 
-            TotalPages = (_allFiles.Count + PageSize - 1) / PageSize;
+            TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
             PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
 
-            if (_preSearchPageItems is { Count: > 0 })
+            if (_pageManager.TryRestorePreSearchState(out _, out var pageIndex))
             {
-                lock (_pageCacheLock)
-                {
-                    _pageCache.Clear();
-                    _pageCache[_preSearchPageIndex] = _preSearchPageItems;
-                }
-                _preSearchPageItems = null;
-                await ShowPageAsync(_preSearchPageIndex);
+                await ShowPageAsync(pageIndex);
                 StatusText = $"总文件数: {_allFiles.Count}";
                 ScrollRestoreRequested?.Invoke();
             }
@@ -1611,7 +1186,7 @@ partial void OnCornerRadiusDipChanged(double value)
         }
         else
         {
-            TotalPages = (_allFiles.Count + PageSize - 1) / PageSize;
+            TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
             PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
             await ShowPageAsync(0);
         }
@@ -1627,19 +1202,16 @@ partial void OnCornerRadiusDipChanged(double value)
         _searchCts = new CancellationTokenSource();
 
         if (!IsShowingSearchResult)
-        {
-            _preSearchPageItems = Images.ToList();
-            _preSearchPageIndex = CurrentPage;
-        }
+            _pageManager.SavePreSearchState(Images, CurrentPage);
 
         try
         {
             var results = await _similarService.FindSimilarAsync(
                 filePath, _allFiles, 5, _searchCts.Token);
 
-            _searchResultFiles = results.ToList();
+            _tagSearch.SearchResultFiles = results.ToList();
 
-            if (_searchResultFiles.Count == 0)
+            if (_tagSearch.SearchResultFiles.Count == 0)
             {
                 Images = new ObservableCollection<ImageViewItem>();
                 IsShowingSearchResult = true;
@@ -1650,11 +1222,11 @@ partial void OnCornerRadiusDipChanged(double value)
             }
 
             IsShowingSearchResult = true;
-            TotalPages = (_searchResultFiles.Count + PageSize - 1) / PageSize;
+            TotalPages = (_tagSearch.SearchResultFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
             PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-            lock (_pageCacheLock) { _pageCache.Clear(); }
+            _pageManager.InvalidateCache();
             await ShowPageAsync(0);
-            StatusText = $"找到 {_searchResultFiles.Count} 张相似图片";
+            StatusText = $"找到 {_tagSearch.SearchResultFiles.Count} 张相似图片";
         }
         catch (OperationCanceledException)
         {
@@ -1672,21 +1244,15 @@ partial void OnCornerRadiusDipChanged(double value)
     {
         if (!IsShowingSearchResult) return;
         IsShowingSearchResult = false;
-        _searchResultFiles.Clear();
+        _tagSearch.SearchResultFiles.Clear();
 
         // Recalculate paging for normal folder view
-        TotalPages = (_allFiles.Count + PageSize - 1) / PageSize;
+        TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
 
-        if (_preSearchPageItems is { Count: > 0 })
+        if (_pageManager.TryRestorePreSearchState(out _, out var pageIndex))
         {
-            lock (_pageCacheLock)
-            {
-                _pageCache.Clear();
-                _pageCache[_preSearchPageIndex] = _preSearchPageItems;
-            }
-            _preSearchPageItems = null;
-            _ = ShowPageAsync(_preSearchPageIndex);
+            _ = ShowPageAsync(pageIndex);
             StatusText = $"总文件数: {_allFiles.Count}";
             ScrollRestoreRequested?.Invoke();
         }
@@ -1712,12 +1278,76 @@ partial void OnCornerRadiusDipChanged(double value)
 
     // ==================== Tag Management ====================
 
-    public async Task RefreshTagCountsAsync()
+    public async Task<RenameResult> RenameTagAsync(string oldName, string newName)
     {
-        _allTagCounts = await _tagRepo.GetAllTagCountsAsync();
+        var result = await _tagRepo.RenameTagAsync(oldName, newName);
+        if (result == RenameResult.Conflict) return RenameResult.Conflict;
+
+        // Update in-memory tag caches for all images
+        foreach (var tags in _tagCacheByPath.Values)
+        {
+            for (int i = 0; i < tags.Count; i++)
+                if (string.Equals(tags[i], oldName, StringComparison.OrdinalIgnoreCase))
+                    tags[i] = newName;
+        }
+
+        // Update currently displayed images
+        foreach (var img in Images)
+        {
+            for (int i = 0; i < img.Tags.Count; i++)
+                if (string.Equals(img.Tags[i], oldName, StringComparison.OrdinalIgnoreCase))
+                    img.Tags[i] = newName;
+            img.NotifyAll();
+        }
+
+        await RefreshTagCountsAsync();
+        return RenameResult.Success;
     }
 
-    public List<TagCount> GetAllTagCounts() => _allTagCounts;
+    public async Task MergeTagsAsync(string oldName, string newName)
+    {
+        await _tagRepo.MergeTagsAsync(oldName, newName);
+
+        // Update in-memory tag caches
+        foreach (var tags in _tagCacheByPath.Values)
+        {
+            for (int i = tags.Count - 1; i >= 0; i--)
+            {
+                if (string.Equals(tags[i], oldName, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!tags.Contains(newName, StringComparer.OrdinalIgnoreCase))
+                        tags[i] = newName;
+                    else
+                        tags.RemoveAt(i);
+                }
+            }
+        }
+
+        // Update currently displayed images
+        foreach (var img in Images)
+        {
+            for (int i = img.Tags.Count - 1; i >= 0; i--)
+            {
+                if (string.Equals(img.Tags[i], oldName, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!img.Tags.Contains(newName, StringComparer.OrdinalIgnoreCase))
+                        img.Tags[i] = newName;
+                    else
+                        img.Tags.RemoveAt(i);
+                }
+            }
+            img.NotifyAll();
+        }
+
+        await RefreshTagCountsAsync();
+    }
+
+    public async Task RefreshTagCountsAsync()
+    {
+        _tagSearch.AllTagCounts = await _tagRepo.GetAllTagCountsAsync();
+    }
+
+    public List<TagCount> GetAllTagCounts() => _tagSearch.AllTagCounts;
 
     public async Task SetImageTagsAsync(string filePath, List<string> tags)
     {

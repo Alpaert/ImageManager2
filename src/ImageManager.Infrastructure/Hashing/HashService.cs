@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Imaging;
 using SkiaSharp;
 
 namespace ImageManager.Infrastructure.Hashing;
@@ -77,8 +78,9 @@ public class HashService : IHashService
     {
         try
         {
-            var data = File.ReadAllBytes(filePath);
-            return ComputeCombinedPerceptualHashFromBytes(data);
+            var hashInput = ThumbnailGenerator.DecodeForHashInput(filePath, 256);
+            if (hashInput == null) return string.Empty;
+            return ComputeCombinedPerceptualHashFromBytes(hashInput);
         }
         catch
         {

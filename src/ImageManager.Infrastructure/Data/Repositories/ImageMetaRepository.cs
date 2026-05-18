@@ -391,6 +391,18 @@ public class ImageMetaRepository : IImageMetaRepository
         return results.ToList();
     }
 
+    public async Task<List<string>> GetFilePathsWithNoTagsAsync()
+    {
+        using var conn = _db.CreateConnection();
+        var sql = @"
+            SELECT im.FilePath
+            FROM ImageMeta im
+            WHERE im.Id NOT IN (SELECT DISTINCT ImageMetaId FROM ImageTag)
+            ORDER BY im.FilePath";
+        var result = await conn.QueryAsync<string>(sql);
+        return result.AsList();
+    }
+
     public async Task<List<TagCount>> GetCoOccurringTagsAsync(List<string> filePaths, List<string>? excludeNames = null)
     {
         if (filePaths.Count == 0) return new List<TagCount>();

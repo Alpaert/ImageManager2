@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using ImageManager.Core.Models;
+using ImageManager.Core.Services;
 
 namespace ImageManager.App.ViewModels;
 
@@ -16,6 +17,8 @@ public partial class TagEditViewModel : ViewModelBase
 {
     private readonly List<TagCount> _allTagCounts;
     private readonly IList<string> _favoriteTagsBacking;
+    private readonly Func<string, string, Task<RenameResult>>? _onRenameTag;
+    private readonly Func<string, string, Task>? _onMergeTags;
 
     [ObservableProperty] private string _tagInputText = string.Empty;
     [ObservableProperty] private string _newFavoriteText = string.Empty;
@@ -36,10 +39,14 @@ public partial class TagEditViewModel : ViewModelBase
         string currentTagsText,
         List<TagCount> allTagCounts,
         IList<string> favoriteTags,
-        int maxSuggestionCount) // kept for API compat, unused — we now show all
+        int maxSuggestionCount,
+        Func<string, string, Task<RenameResult>>? onRenameTag = null,
+        Func<string, string, Task>? onMergeTags = null)
     {
         _allTagCounts = allTagCounts;
         _favoriteTagsBacking = favoriteTags;
+        _onRenameTag = onRenameTag;
+        _onMergeTags = onMergeTags;
 
         if (!string.IsNullOrWhiteSpace(currentTagsText))
         {
@@ -82,6 +89,38 @@ public partial class TagEditViewModel : ViewModelBase
         TagInputText = string.Empty;
         RebuildAutoSuggestions(string.Empty);
         RebuildFavoriteSuggestions(string.Empty);
+    }
+
+    public async Task<RenameResult> HandleRenameAsync(string oldName, string newName)
+    {
+        if (_onRenameTag == null) return RenameResult.Cancelled;
+        var result = await _onRenameTag(oldName, newName);
+        if (result == RenameResult.Success)
+        {
+            ReplaceInCurrentTags(oldName, newName);
+            RebuildAutoSuggestions(_lastAutoSuggestKeyword);
+        }
+        return result;
+    }
+
+    public async Task HandleMergeAsync(string oldName, string newName)
+    {
+        if (_onMergeTags == null) return;
+        await _onMergeTags(oldName, newName);
+        ReplaceInCurrentTags(oldName, newName);
+        RebuildAutoSuggestions(_lastAutoSuggestKeyword);
+    }
+
+    private void ReplaceInCurrentTags(string oldName, string newName)
+    {
+        for (int i = CurrentTags.Count - 1; i >= 0; i--)
+        {
+            if (!string.Equals(CurrentTags[i], oldName, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!CurrentTags.Contains(newName, StringComparer.OrdinalIgnoreCase))
+                CurrentTags[i] = newName;
+            else
+                CurrentTags.RemoveAt(i);
+        }
     }
 
     [RelayCommand]

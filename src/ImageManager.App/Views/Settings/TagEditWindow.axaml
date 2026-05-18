@@ -49,7 +49,14 @@
                             <DataTemplate x:DataType="vm:TagDisplayItem">
                                 <Button Content="{Binding Display}" Margin="2"
                                         Padding="6,3" FontSize="12"
-                                        Click="AutoTag_Click" Tag="{Binding Name}"/>
+                                        Click="AutoTag_Click" Tag="{Binding Name}">
+                                    <Button.ContextMenu>
+                                        <ContextMenu>
+                                            <MenuItem Header="重命名" Click="AutoTag_Rename_Click"
+                                                      Tag="{Binding Name}"/>
+                                        </ContextMenu>
+                                    </Button.ContextMenu>
+                                </Button>
                             </DataTemplate>
                         </ItemsControl.ItemTemplate>
                     </ItemsControl>

@@ -16,6 +16,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
     private readonly ConcurrentDictionary<string, CacheEntry> _cache = new(StringComparer.OrdinalIgnoreCase);
     private readonly DiskThumbnailCache _diskCache;
     private long _totalBytes;
+    private const long MaxMemoryBytes = 50 * 1024 * 1024; // 50 MB
 
     public long EstimatedMemoryBytes => Interlocked.Read(ref _totalBytes);
     public string CacheDirectory { get; set; }
@@ -111,7 +112,12 @@ public class ThumbnailCacheService : IThumbnailCacheService
 
         _cache[filePath] = entry;
         Interlocked.Add(ref _totalBytes, data.Length);
+
+        if (Interlocked.Read(ref _totalBytes) > MaxMemoryBytes)
+            Trim(MaxMemoryBytes, filePath);
     }
+
+    public void DeleteFromDiskCache(string filePath) => _diskCache.DeleteAllWidths(filePath);
 
     public long EstimateDiskUsage() => _diskCache.EstimateDiskUsage();
 }
