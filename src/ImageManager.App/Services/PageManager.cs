@@ -90,6 +90,13 @@ public class PageManager
             _ = LoadSingleThumbnailAsync(item);
     }
 
+    public async Task LoadThumbnailsForItemsAsync(List<ImageViewItem> items)
+    {
+        var toLoad = items.Where(i => !i.IsLoaded).ToList();
+        foreach (var item in toLoad)
+            await LoadSingleThumbnailAsync(item);
+    }
+
     public int EstimateVisibleItemCount(PageUiState state)
     {
         double itemW = state.ThumbnailBaseWidth;
@@ -172,6 +179,16 @@ public class PageManager
     public void InvalidateCache()
     {
         lock (_pageCacheLock) { _pageCache.Clear(); }
+    }
+
+    public void RemoveFromCache(int pageIndex)
+    {
+        lock (_pageCacheLock) { _pageCache.Remove(pageIndex); }
+    }
+
+    public void SetPageCache(int pageIndex, List<ImageViewItem> items)
+    {
+        lock (_pageCacheLock) { _pageCache[pageIndex] = items; }
     }
 
     public void SavePreSearchState(IReadOnlyList<ImageViewItem> currentItems, int pageIndex)

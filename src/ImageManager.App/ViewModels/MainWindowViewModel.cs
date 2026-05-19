@@ -258,6 +258,13 @@ public partial class MainWindowViewModel : ViewModelBase
         AppSettings = await _settingsRepo.LoadAsync();
 
         _pageManager.InitializeDecodeWidth(0);
+
+        // Sync: if DB was recovered fresh, settings default may not match actual cache dir
+        if (string.IsNullOrWhiteSpace(AppSettings.DiskCacheDirectory)
+            || AppSettings.DiskCacheDirectory == @"C:\ImageManagerCache")
+        {
+            AppSettings.DiskCacheDirectory = App.CacheDirectoryPath;
+        }
         _thumbCache.CacheDirectory = AppSettings.DiskCacheDirectory;
 
         var folders = await _folderRepo.GetAllAsync();
@@ -571,6 +578,18 @@ public partial class MainWindowViewModel : ViewModelBase
             _folderWatcher.Dispose();
             _folderWatcher = null;
         }
+    }
+
+    public void SuppressDeletedEvent()
+    {
+        if (_folderWatcher != null)
+            _folderWatcher.Deleted -= OnFolderFileDeleted;
+    }
+
+    public void RestoreDeletedEvent()
+    {
+        if (_folderWatcher != null)
+            _folderWatcher.Deleted += OnFolderFileDeleted;
     }
 
     private void OnFolderFileCreated(object sender, FileSystemEventArgs e)
@@ -967,10 +986,10 @@ partial void OnCornerRadiusDipChanged(double value)
     }
 
     /// <summary>Remove deleted files incrementally, keeping existing thumbnails intact</summary>
-    public void RemoveFilesFromView(HashSet<string> deletedPaths)
+    public async Task RemoveFilesFromViewAsync(HashSet<string> deletedPaths)
     {
-        // Invalidate page cache so stale entries (containing deleted files) are never served
-        _pageManager.InvalidateCache();
+        // Guard against OnCurrentPageChanged firing ShowPageAsync during paging updates
+        _isNavigating = true;
 
         // Remove from master lists
         _allFiles.RemoveAll(p => deletedPaths.Contains(p));
@@ -993,33 +1012,73 @@ partial void OnCornerRadiusDipChanged(double value)
             return;
         }
 
-        // Surgical removal: remove deleted items from current Images, keep rest
-        var currentImages = Images.ToList();
-        currentImages.RemoveAll(i => deletedPaths.Contains(i.FilePath));
+        // Find deleted positions in Images (sorted ascending)
+        var removedIndices = new List<int>();
+        for (int i = 0; i < Images.Count; i++)
+        {
+            if (deletedPaths.Contains(Images[i].FilePath))
+                removedIndices.Add(i);
+        }
 
-        // Fill gaps from ActiveFileList page range
+        // Build gap-fill file paths from ActiveFileList that aren't already in Images
         int pageStart = CurrentPage * PageManager.PageSize;
-        var existingPaths = new HashSet<string>(currentImages.Select(i => i.FilePath), StringComparer.OrdinalIgnoreCase);
-        var newItems = new List<ImageViewItem>();
-        for (int i = 0; i < PageManager.PageSize && currentImages.Count + newItems.Count < PageManager.PageSize; i++)
+        var existingPaths = new HashSet<string>(Images.Select(i => i.FilePath), StringComparer.OrdinalIgnoreCase);
+        var gapPaths = new List<string>();
+        for (int i = 0; i < PageManager.PageSize && gapPaths.Count < removedIndices.Count; i++)
         {
             int idx = pageStart + i;
             if (idx >= files.Count) break;
             var path = files[idx];
             if (existingPaths.Contains(path)) continue;
-            newItems.Add(new ImageViewItem
-            {
-                FilePath = path,
-                FileName = Path.GetFileName(path),
-                Tags = GetTagsForFile(path),
-                IsLoading = true
-            });
+            gapPaths.Add(path);
+            existingPaths.Add(path);
         }
 
-        currentImages.AddRange(newItems);
-        Images = new ObservableCollection<ImageViewItem>(currentImages);
-        if (newItems.Count > 0)
-            _pageManager.LoadThumbnailsForItems(newItems);
+        // Reuse existing ImageViewItem objects — mutate in-place to avoid CollectionChanged
+        int reuseCount = Math.Min(removedIndices.Count, gapPaths.Count);
+        var reloadItems = new List<ImageViewItem>();
+        for (int i = 0; i < reuseCount; i++)
+        {
+            var item = Images[removedIndices[i]];
+            item.FilePath = gapPaths[i];
+            item.FileName = System.IO.Path.GetFileName(gapPaths[i]);
+            item.Tags = GetTagsForFile(gapPaths[i]);
+            item.IsLoading = true;
+            item.IsLoaded = false;
+            item.ThumbnailData = null;
+            item.Width = 1;
+            item.Height = 1;
+            reloadItems.Add(item);
+        }
+
+        // If more deleted than gap-fill, remove extras
+        for (int i = removedIndices.Count - 1; i >= reuseCount; i--)
+            Images.RemoveAt(removedIndices[i]);
+
+        // If more gap-fill than deleted, add new items at the end
+        for (int i = reuseCount; i < gapPaths.Count; i++)
+        {
+            var path = gapPaths[i];
+            var item = new ImageViewItem
+            {
+                FilePath = path,
+                FileName = System.IO.Path.GetFileName(path),
+                Tags = GetTagsForFile(path),
+                IsLoading = true
+            };
+            Images.Add(item);
+            reloadItems.Add(item);
+        }
+
+        // Load thumbnails for gap-fill items
+        if (reloadItems.Count > 0)
+            await _pageManager.LoadThumbnailsForItemsAsync(reloadItems);
+
+        // Clear all cached pages except current (stale after deletion), then store current
+        _pageManager.InvalidateCache();
+        _pageManager.SetPageCache(CurrentPage, Images.ToList());
+
+        _isNavigating = false;
     }
 
 
@@ -1280,74 +1339,89 @@ partial void OnCornerRadiusDipChanged(double value)
 
     public async Task<RenameResult> RenameTagAsync(string oldName, string newName)
     {
-        var result = await _tagRepo.RenameTagAsync(oldName, newName);
-        if (result == RenameResult.Conflict) return RenameResult.Conflict;
-
-        // Update in-memory tag caches for all images
-        foreach (var tags in _tagCacheByPath.Values)
+        return await Task.Run(async () =>
         {
-            for (int i = 0; i < tags.Count; i++)
-                if (string.Equals(tags[i], oldName, StringComparison.OrdinalIgnoreCase))
-                    tags[i] = newName;
-        }
+            var result = await _tagRepo.RenameTagAsync(oldName, newName);
+            if (result == RenameResult.Conflict) return RenameResult.Conflict;
 
-        // Update currently displayed images
-        foreach (var img in Images)
-        {
-            for (int i = 0; i < img.Tags.Count; i++)
-                if (string.Equals(img.Tags[i], oldName, StringComparison.OrdinalIgnoreCase))
-                    img.Tags[i] = newName;
-            img.NotifyAll();
-        }
+            foreach (var tags in _tagCacheByPath.Values)
+            {
+                for (int i = 0; i < tags.Count; i++)
+                    if (string.Equals(tags[i], oldName, StringComparison.OrdinalIgnoreCase))
+                        tags[i] = newName;
+            }
 
-        await RefreshTagCountsAsync();
-        return RenameResult.Success;
+            _tagSearch.AllTagCounts = await _tagRepo.GetAllTagCountsAsync();
+            return RenameResult.Success;
+        });
     }
 
     public async Task MergeTagsAsync(string oldName, string newName)
     {
-        await _tagRepo.MergeTagsAsync(oldName, newName);
-
-        // Update in-memory tag caches
-        foreach (var tags in _tagCacheByPath.Values)
+        await Task.Run(async () =>
         {
-            for (int i = tags.Count - 1; i >= 0; i--)
+            await _tagRepo.MergeTagsAsync(oldName, newName);
+
+            foreach (var tags in _tagCacheByPath.Values)
             {
-                if (string.Equals(tags[i], oldName, StringComparison.OrdinalIgnoreCase))
+                for (int i = tags.Count - 1; i >= 0; i--)
                 {
-                    if (!tags.Contains(newName, StringComparer.OrdinalIgnoreCase))
-                        tags[i] = newName;
-                    else
-                        tags.RemoveAt(i);
+                    if (string.Equals(tags[i], oldName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!tags.Contains(newName, StringComparer.OrdinalIgnoreCase))
+                            tags[i] = newName;
+                        else
+                            tags.RemoveAt(i);
+                    }
                 }
             }
-        }
 
-        // Update currently displayed images
+            _tagSearch.AllTagCounts = await _tagRepo.GetAllTagCountsAsync();
+        });
+    }
+
+    public async Task RefreshTagCountsAsync()
+    {
+        _tagSearch.AllTagCounts = await Task.Run(() => _tagRepo.GetAllTagCountsAsync());
+    }
+
+    public List<TagCount> GetAllTagCounts() => _tagSearch.AllTagCounts;
+
+    public async Task DeleteTagFromAllImagesAsync(string tagName)
+    {
+        await _tagRepo.DeleteTagAsync(tagName);
+
+        // Clear from in-memory caches
+        foreach (var kv in _tagCacheByPath)
+            kv.Value.RemoveAll(t => string.Equals(t, tagName, StringComparison.OrdinalIgnoreCase));
+
+        // Update displayed images
         foreach (var img in Images)
         {
-            for (int i = img.Tags.Count - 1; i >= 0; i--)
-            {
-                if (string.Equals(img.Tags[i], oldName, StringComparison.OrdinalIgnoreCase))
-                {
-                    if (!img.Tags.Contains(newName, StringComparer.OrdinalIgnoreCase))
-                        img.Tags[i] = newName;
-                    else
-                        img.Tags.RemoveAt(i);
-                }
-            }
+            img.Tags.RemoveAll(t => string.Equals(t, tagName, StringComparison.OrdinalIgnoreCase));
             img.NotifyAll();
         }
 
         await RefreshTagCountsAsync();
     }
 
-    public async Task RefreshTagCountsAsync()
+    public async Task RefreshImageTagsAsync(string filePath)
     {
-        _tagSearch.AllTagCounts = await _tagRepo.GetAllTagCountsAsync();
-    }
+        var meta = await _metaRepo.GetByPathAsync(filePath);
+        if (meta == null) return;
 
-    public List<TagCount> GetAllTagCounts() => _tagSearch.AllTagCounts;
+        var tags = meta.Tags.Select(t => t.Name).ToList();
+        _tagCacheByPath[filePath] = tags;
+
+        // Update the displayed ImageViewItem if present
+        var imgItem = Images.FirstOrDefault(i =>
+            string.Equals(i.FilePath, filePath, StringComparison.OrdinalIgnoreCase));
+        if (imgItem != null)
+        {
+            imgItem.Tags = tags;
+            imgItem.NotifyAll();
+        }
+    }
 
     public async Task SetImageTagsAsync(string filePath, List<string> tags)
     {

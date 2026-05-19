@@ -9,6 +9,7 @@ using Avalonia.VisualTree;
 using System.Runtime.InteropServices;
 using ImageManager.App.Helpers;
 using ImageManager.App.ViewModels;
+using ImageManager.Infrastructure.Data;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace ImageManager.App.Views;
@@ -77,6 +78,7 @@ public partial class MainWindow : Window
         int successCount = 0;
         var thumbCache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
 
+        Vm.SuppressDeletedEvent();
         foreach (var item in items)
         {
             if (string.IsNullOrEmpty(item.FilePath) || !File.Exists(item.FilePath)) continue;
@@ -91,9 +93,10 @@ public partial class MainWindow : Window
             }
             catch { }
         }
+        Vm.RestoreDeletedEvent();
 
         if (deletedPaths.Count > 0)
-            Vm.RemoveFilesFromView(deletedPaths);
+            await Vm.RemoveFilesFromViewAsync(deletedPaths);
 
         Vm.StatusText = $"已删除 {successCount} 个文件";
     }
@@ -809,6 +812,44 @@ public partial class MainWindow : Window
         return result;
     }
 
+    private async void MenuAutoTagSingle_Click(object? sender, RoutedEventArgs e)
+    {
+        var item = GetCtxItem(sender);
+        if (item == null) return;
+
+        var controller = App.Services.GetRequiredService<Services.AutoTagController>();
+
+        if (!controller.IsModelLoaded)
+        {
+            Vm.StatusText = "正在加载打标模型...";
+            try { await controller.LoadModelAsync(); }
+            catch (Exception ex) { Vm.StatusText = $"模型加载失败: {ex.Message}"; return; }
+        }
+
+        var settings = Vm.AppSettings;
+        controller.Configure(settings.OnnxConfidenceThreshold, 20, settings.DeepSeekApiKey);
+
+        Vm.StatusText = $"正在推理: {System.IO.Path.GetFileName(item.FilePath)}...";
+        var items = await controller.RunSingleImageAsync(item.FilePath);
+
+        if (items.Count == 0)
+        {
+            Vm.StatusText = "推理完成，未识别到标签";
+            return;
+        }
+
+        Vm.StatusText = $"推理完成，{items.Count} 个标签";
+        var reviewVm = new ViewModels.AutoTagReviewViewModel(controller, items,
+            isSingleImageMode: true, singleImagePath: item.FilePath);
+        var win = new Settings.AutoTagReviewWindow { DataContext = reviewVm };
+        win.Title = $"自动打标 — {System.IO.Path.GetFileName(item.FilePath)}";
+
+        await win.ShowDialog(this);
+        // Refresh displayed tags for this image
+        await Vm.RefreshImageTagsAsync(item.FilePath);
+        Vm.StatusText = "单图打标完成";
+    }
+
     private async void MenuCopyImage_Click(object? sender, RoutedEventArgs e)
     {
         var item = GetCtxItem(sender);
@@ -1200,6 +1241,152 @@ public partial class MainWindow : Window
         await Vm.UpdateFolderAliasAsync(folder.Path, null);
     }
 
+    private async void MenuComputeAutoTags_Click(object? sender, RoutedEventArgs e)
+    {
+        var folder = GetContextMenuFolder(sender);
+        if (folder == null) return;
+
+        var controller = App.Services.GetRequiredService<Services.AutoTagController>();
+
+        // Load model first
+        if (!controller.IsModelLoaded)
+        {
+            Vm.StatusText = "正在加载打标模型...";
+            try
+            {
+                await controller.LoadModelAsync();
+            }
+            catch (Exception ex)
+            {
+                Vm.StatusText = $"模型加载失败: {ex.Message}";
+                return;
+            }
+        }
+        Vm.StatusText = $"模型就绪 路径:{controller.ModelPath}";
+
+        // Use currently displayed file list (doesn't rely on FolderId being set in DB)
+        var filePaths = Vm.ActiveFileList;
+        if (filePaths.Count == 0)
+        {
+            Vm.StatusText = "文件夹无图片";
+            return;
+        }
+
+        // Determine action
+        Vm.StatusText = "正在检查文件夹状态...";
+        var action = await controller.DetermineActionAsync(folder);
+
+        if (!action.CanProceed)
+        {
+            Vm.StatusText = action.Message;
+            return;
+        }
+
+        // Configure with current settings
+        var settings = Vm.AppSettings;
+        controller.Configure(settings.OnnxConfidenceThreshold, 20, settings.DeepSeekApiKey);
+
+        // Confirm with user (Resume: 是=继续审核, 否=重新打标)
+        var confirmResult = await ShowConfirmDialogAsync(action.Message);
+
+        var effectiveAction = action.Action;
+        if (action.Action == "Resume")
+        {
+            if (confirmResult)
+                effectiveAction = "Resume";
+            else
+                effectiveAction = "Retry";
+        }
+        else if (!confirmResult)
+        {
+            Vm.StatusText = "已取消";
+            return;
+        }
+
+        // Hook progress to status bar
+        controller.ProgressChanged += progress =>
+        {
+            Console.WriteLine($"[AutoTag] {progress.Phase}: {progress.StatusText}");
+            Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                Vm.StatusText = $"[{progress.Phase}] {progress.StatusText}");
+        };
+
+        // Run pipeline in background
+        Vm.StatusText = "正在推理图片标签...";
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await controller.RunPipelineAsync(folder, filePaths, effectiveAction);
+
+                // Open review window on UI thread
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
+                {
+                    var reviewData = await controller.GetReviewDataAsync();
+                    var reviewVm = new ViewModels.AutoTagReviewViewModel(controller, reviewData);
+                    var reviewWindow = new Settings.AutoTagReviewWindow { DataContext = reviewVm };
+
+                    reviewWindow.Closed += async (_, _) =>
+                    {
+                        await reviewVm.MarkDoneAsync();
+                        Vm.StatusText = "自动打标审核完成";
+                    };
+
+                    await reviewWindow.ShowDialog(this);
+                });
+            }
+            catch (Exception ex)
+            {
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                    Vm.StatusText = $"打标失败: {ex.Message}");
+            }
+        });
+    }
+
+    private async Task ShowInfoDialogAsync(string message)
+    {
+        var dialog = new Window
+        {
+            Title = "诊断信息",
+            Width = 500, Height = 200,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner
+        };
+        var panel = new StackPanel { Margin = new Avalonia.Thickness(16) };
+        panel.Children.Add(new TextBlock { Text = message, TextWrapping = Avalonia.Media.TextWrapping.Wrap });
+        var btn = new Button { Content = "确定", Width = 80, HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Center, Margin = new Avalonia.Thickness(0, 12, 0, 0) };
+        btn.Click += (_, _) => dialog.Close();
+        panel.Children.Add(btn);
+        dialog.Content = panel;
+        await dialog.ShowDialog(this);
+    }
+
+    private async Task<bool> ShowConfirmDialogAsync(string message)
+    {
+        var tcs = new TaskCompletionSource<bool>();
+        var dialog = new Window
+        {
+            Title = "确认",
+            Width = 400, Height = 200,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner
+        };
+
+        var panel = new StackPanel { Margin = new Avalonia.Thickness(16) };
+        panel.Children.Add(new TextBlock { Text = message, TextWrapping = Avalonia.Media.TextWrapping.Wrap });
+        var btnPanel = new StackPanel { Orientation = Avalonia.Layout.Orientation.Horizontal,
+            HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Center, Margin = new Avalonia.Thickness(0, 12, 0, 0) };
+        var yesBtn = new Button { Content = "是", Width = 80, Margin = new Avalonia.Thickness(4) };
+        var noBtn = new Button { Content = "否", Width = 80, Margin = new Avalonia.Thickness(4) };
+        yesBtn.Click += (_, _) => { tcs.TrySetResult(true); dialog.Close(); };
+        noBtn.Click += (_, _) => { tcs.TrySetResult(false); dialog.Close(); };
+        btnPanel.Children.Add(yesBtn);
+        btnPanel.Children.Add(noBtn);
+        panel.Children.Add(btnPanel);
+        dialog.Content = panel;
+
+        await dialog.ShowDialog(this);
+        return tcs.Task.Result;
+    }
+
     private async Task<string?> ShowFolderAliasDialogAsync(string currentText)
     {
         var tcs = new TaskCompletionSource<string?>();
@@ -1305,17 +1492,31 @@ public partial class MainWindow : Window
         memVm = new MemorySettingViewModel(
             Vm.AppSettings.ThumbnailCacheMaxMB,
             Vm.AppSettings.DiskCacheDirectory,
+            Vm.AppSettings.DeepSeekApiKey,
+            Vm.AppSettings.OnnxConfidenceThreshold,
             () => App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>().EstimatedMemoryBytes,
             path => new Infrastructure.Caching.DiskThumbnailCache(path).EstimateDiskUsage(),
             pathChanged =>
             {
                 Vm.AppSettings.ThumbnailCacheMaxMB = memVm!.MaxCacheMB;
-                Vm.AppSettings.DiskCacheDirectory = memVm.CachePath;
+                var oldPath = Vm.AppSettings.DiskCacheDirectory;
+                var newPath = memVm.CachePath;
+                Vm.AppSettings.DiskCacheDirectory = newPath;
+                Vm.AppSettings.DeepSeekApiKey = memVm.DeepSeekApiKey;
+                Vm.AppSettings.OnnxConfidenceThreshold = memVm.OnnxConfidenceThreshold;
                 var cache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
-                cache.CacheDirectory = memVm.CachePath;
-                OnlineSearchHelper.SetTempDir(Path.Combine(memVm.CachePath, "search_temp"));
-                _ = cache.ClearAsync();
+                cache.SwitchCacheDirectory(newPath);
+                OnlineSearchHelper.SetTempDir(Path.Combine(newPath, "search_temp"));
                 _ = Vm.SaveSettingsAsync();
+
+                // Update boot config with previous path for startup DB migration
+                var bootDir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "ImageManager");
+                Directory.CreateDirectory(bootDir);
+                var configPath = Path.Combine(bootDir, "config.json");
+                File.WriteAllText(configPath,
+                    $"CacheDirectory={newPath}\nPreviousCacheDirectory={oldPath}");
             });
 
         var win = new Settings.MemorySettingWindow { DataContext = memVm };
@@ -1334,6 +1535,20 @@ public partial class MainWindow : Window
 
         var win = new Settings.ShortcutSettingWindow { DataContext = vm };
         await win.ShowDialog(this);
+    }
+
+    private async void MenuTagManage_Click(object? sender, RoutedEventArgs e)
+    {
+        var allTags = Vm.GetAllTagCounts();
+        var tagVm = new ViewModels.TagManageViewModel(
+            allTags,
+            onRename: (oldName, newName) => Vm.RenameTagAsync(oldName, newName),
+            onMerge: (oldName, newName) => Vm.MergeTagsAsync(oldName, newName),
+            onDelete: async (tagName) => await Vm.DeleteTagFromAllImagesAsync(tagName));
+
+        var win = new Settings.TagManageWindow { DataContext = tagVm };
+        await win.ShowDialog(this);
+        Avalonia.Threading.Dispatcher.UIThread.RunJobs();
     }
 
     private async void MenuHelp_Click(object? sender, RoutedEventArgs e)
