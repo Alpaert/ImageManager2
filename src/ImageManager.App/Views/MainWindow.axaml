@@ -70,6 +70,8 @@
                         <ContextMenu>
                             <MenuItem Header="重命名显示名称" Click="MenuRenameFolder_Click"/>
                             <MenuItem Header="清除显示名称" Click="MenuClearFolderAlias_Click"/>
+                            <Separator/>
+                            <MenuItem Header="计算此文件夹的图片标签" Click="MenuComputeAutoTags_Click"/>
                         </ContextMenu>
                     </ListBox.ContextMenu>
                     <ListBox.ItemTemplate>
@@ -98,9 +100,11 @@
                     <MenuItem Header="缩略图选项" Click="MenuThumbnailSettings_Click"/>
                     <MenuItem Header="内存与缓存设置" Click="MenuMemorySettings_Click"/>
 
+                    <MenuItem Header="标签管理" Click="MenuTagManage_Click"/>
                     <MenuItem Header="快捷键设置" Click="MenuShortcutSettings_Click"/>
                     <MenuItem Header="帮助" Click="MenuHelp_Click"/>
                 </MenuItem>
+                <MenuItem Header="AI推荐" Height="28" Padding="12,4" Click="MenuAiRecommend_Click"/>
             </Menu>
             <Menu HorizontalAlignment="Right" Background="Transparent">
                 <MenuItem Header="排序 ▾" Height="28" Padding="12,4">
@@ -160,8 +164,12 @@
                     <Border Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource CtrlBorderBrush}"
                             BorderThickness="1" CornerRadius="8" Padding="6"
                             MaxWidth="300">
-                        <ScrollViewer MaxHeight="160">
-                            <ItemsControl ItemsSource="{Binding TagSearchSuggestions}">
+                        <StackPanel>
+                            <TextBox PlaceholderText="过滤共有 Tag..." Text="{Binding CoTagFilterText}"
+                                     IsVisible="{Binding IsSuggestionCoTagMode}"
+                                     Margin="0,0,0,4" FontSize="12" />
+                            <ScrollViewer MaxHeight="400">
+                                <ItemsControl ItemsSource="{Binding TagSearchSuggestions}">
                                 <ItemsControl.ItemsPanel>
                                     <ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate>
                                 </ItemsControl.ItemsPanel>
@@ -177,6 +185,7 @@
                                 </ItemsControl.ItemTemplate>
                             </ItemsControl>
                         </ScrollViewer>
+                        </StackPanel>
                     </Border>
                 </Popup>
             </StackPanel>
@@ -278,6 +287,7 @@
                             <Border.ContextMenu>
                                 <ContextMenu>
                                     <MenuItem Header="编辑 Tag" Click="MenuEditTag_Click"/>
+                                    <MenuItem Header="自动打标" Click="MenuAutoTagSingle_Click"/>
                                     <MenuItem Header="复制图片到剪贴板" Click="MenuCopyImage_Click"/>
                                     <MenuItem Header="查找相似图片（本文件夹）" Click="MenuFindSimilar_Click"/>
                                     <Separator/>

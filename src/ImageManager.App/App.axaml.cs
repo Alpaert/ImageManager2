@@ -12,6 +12,7 @@ using ImageManager.Infrastructure.Data;
 using ImageManager.Infrastructure.Data.Repositories;
 using ImageManager.Infrastructure.Hashing;
 using ImageManager.Infrastructure.Services;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace ImageManager.App;
@@ -19,21 +20,115 @@ namespace ImageManager.App;
 public partial class App : Application
 {
     public static ServiceProvider Services { get; private set; } = null!;
+    public static string CacheDirectoryPath { get; private set; } = @"C:\ImageManagerCache";
 
     private static ServiceProvider ConfigureServices()
     {
         var services = new ServiceCollection();
 
-        var dbDir = System.IO.Path.Combine(
+        // Boot config: always at %LocalAppData%\ImageManager\config.json
+        var bootDir = System.IO.Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "ImageManager");
-        System.IO.Directory.CreateDirectory(dbDir);
+        System.IO.Directory.CreateDirectory(bootDir);
+        var configPath = System.IO.Path.Combine(bootDir, "config.json");
 
-        var dbPath = System.IO.Path.Combine(dbDir, "data.db");
-        services.AddSingleton(new AppDbContext(dbPath));
+        string cacheDir = @"C:\ImageManagerCache";
+        string prevCacheDir = "";
+        if (System.IO.File.Exists(configPath))
+        {
+            try
+            {
+                var lines = System.IO.File.ReadAllLines(configPath);
+                foreach (var line in lines)
+                {
+                    var idx = line.IndexOf('=');
+                    if (idx < 0) continue;
+                    var key = line[..idx].Trim();
+                    var val = line[(idx + 1)..].Trim();
+                    if (key.Equals("CacheDirectory", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(val))
+                        cacheDir = val;
+                    else if (key.Equals("PreviousCacheDirectory", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(val))
+                        prevCacheDir = val;
+                }
+            }
+            catch { }
+        }
+        else
+        {
+            System.IO.File.WriteAllText(configPath, $"CacheDirectory={cacheDir}");
+        }
+
+        CacheDirectoryPath = cacheDir;
+
+        var dbPath = System.IO.Path.Combine(cacheDir, "data.db");
+        System.IO.Directory.CreateDirectory(cacheDir);
+
+        // Migrate DB from previous cache dir (if user switched dirs) or old boot dir
+        if (!System.IO.File.Exists(dbPath))
+        {
+            string[] candidateDirs = [
+                prevCacheDir,
+                System.IO.Path.Combine(bootDir), // %LocalAppData%\ImageManager (legacy)
+            ];
+            foreach (var srcDir in candidateDirs)
+            {
+                if (string.IsNullOrWhiteSpace(srcDir)) continue;
+                var srcDb = System.IO.Path.Combine(srcDir, "data.db");
+                if (!System.IO.File.Exists(srcDb)) continue;
+                try
+                {
+                    System.IO.File.Copy(srcDb, dbPath);
+                    foreach (var suffix in new[] { "-wal", "-shm" })
+                    {
+                        if (System.IO.File.Exists(srcDb + suffix))
+                        {
+                            try { System.IO.File.Copy(srcDb + suffix, dbPath + suffix); } catch { }
+                        }
+                    }
+                    break;
+                }
+                catch { }
+            }
+        }
+
+        // Open DB with recovery: if corrupt, delete files and start fresh
+        AppDbContext? dbContext = null;
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            try
+            {
+                dbContext = new AppDbContext(dbPath);
+                break;
+            }
+            catch
+            {
+                SqliteConnection.ClearAllPools();
+                // Wipe everything related to this DB and let SQLite create fresh
+                foreach (var path in new[] { dbPath, dbPath + "-wal", dbPath + "-shm", dbPath + ".bak" })
+                {
+                    for (int retry = 0; retry < 3; retry++)
+                    {
+                        try
+                        {
+                            if (System.IO.File.Exists(path))
+                                System.IO.File.Delete(path);
+                            break;
+                        }
+                        catch { System.Threading.Thread.Sleep(50); }
+                    }
+                }
+            }
+        }
+
+        if (dbContext == null)
+            throw new InvalidOperationException("Unable to open or create database at " + dbPath);
+
+        services.AddSingleton(dbContext);
 
         services.AddSingleton<IImageMetaRepository, ImageMetaRepository>();
         services.AddSingleton<ITagRepository, TagRepository>();
+        services.AddSingleton<ITagMappingRepository, TagMappingRepository>();
         services.AddSingleton<IFolderRepository, FolderRepository>();
         services.AddSingleton<ISettingsRepository, SettingsRepository>();
 
@@ -43,6 +138,16 @@ public partial class App : Application
 
         services.AddSingleton<ThumbnailCacheService>();
         services.AddSingleton<IThumbnailCacheService>(sp => sp.GetRequiredService<ThumbnailCacheService>());
+
+        services.AddSingleton<OnnxTagService>();
+        services.AddSingleton<IAutoTagService>(sp => sp.GetRequiredService<OnnxTagService>());
+        services.AddSingleton<DeepSeekTranslationService>();
+        services.AddSingleton<ITranslationService>(sp => sp.GetRequiredService<DeepSeekTranslationService>());
+        services.AddSingleton<IAutoTagStateRepository, AutoTagStateRepository>();
+        services.AddSingleton<AutoTagPipelineService>();
+        services.AddSingleton<AutoTagController>();
+        services.AddSingleton<DeepSeekRecommendService>();
+        services.AddSingleton<IAiRecommendService>(sp => sp.GetRequiredService<DeepSeekRecommendService>());
 
         services.AddSingleton<PageManager>();
         services.AddSingleton<TagSearchController>();

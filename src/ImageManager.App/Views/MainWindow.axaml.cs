@@ -502,6 +502,17 @@ public partial class MainWindow : Window
         await win.ShowDialog(this);
     }
 
+    private void MenuAiRecommend_Click(object? sender, RoutedEventArgs e)
+    {
+        var recommendService = App.Services.GetRequiredService<Infrastructure.Services.DeepSeekRecommendService>();
+        recommendService.SetApiKey(Vm.AppSettings.DeepSeekApiKey);
+
+        var tagMappingRepo = App.Services.GetRequiredService<Core.Services.ITagMappingRepository>();
+        var vm = new AiRecommendViewModel(recommendService, tagMappingRepo);
+        var win = new Settings.AiRecommendWindow { DataContext = vm };
+        win.Show(this);
+    }
+
     // ==================== Box Selection ====================
 
     private bool _isDraggingSelection;
@@ -805,7 +816,6 @@ public partial class MainWindow : Window
             await Vm.SetImageTagsAsync(item.FilePath, newTags);
             item.Tags = newTags;
             item.NotifyAll();
-            await Vm.RefreshTagCountsAsync();
             await Vm.SaveSettingsAsync();
         }
 
