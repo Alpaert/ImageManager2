@@ -74,24 +74,26 @@ public class TagRepository : ITagRepository
     public async Task MergeTagsAsync(string oldName, string newName)
     {
         using var conn = _db.CreateConnection();
+        using var txn = conn.BeginTransaction();
         var oldId = await conn.ExecuteScalarAsync<long?>(
-            "SELECT Id FROM Tag WHERE Name = @Name", new { Name = oldName.Trim() });
+            "SELECT Id FROM Tag WHERE Name = @Name", new { Name = oldName.Trim() }, txn);
         var newId = await conn.ExecuteScalarAsync<long?>(
-            "SELECT Id FROM Tag WHERE Name = @Name", new { Name = newName.Trim() });
+            "SELECT Id FROM Tag WHERE Name = @Name", new { Name = newName.Trim() }, txn);
         if (oldId == null || newId == null) return;
 
         await conn.ExecuteAsync(
             "UPDATE OR IGNORE ImageTag SET TagId = @NewId WHERE TagId = @OldId",
-            new { OldId = oldId, NewId = newId });
+            new { OldId = oldId, NewId = newId }, txn);
         await conn.ExecuteAsync(
             "DELETE FROM ImageTag WHERE TagId = @OldId",
-            new { OldId = oldId });
+            new { OldId = oldId }, txn);
         await conn.ExecuteAsync(
             "DELETE FROM Tag WHERE Id = @OldId",
-            new { OldId = oldId });
+            new { OldId = oldId }, txn);
         await conn.ExecuteAsync(
             "DELETE FROM FavoriteTag WHERE Name = @OldName",
-            new { OldName = oldName.Trim() });
+            new { OldName = oldName.Trim() }, txn);
+        txn.Commit();
     }
 
     public async Task<List<string>> GetFavoritesAsync()
@@ -100,6 +102,22 @@ public class TagRepository : ITagRepository
         var results = await conn.QueryAsync<string>(
             "SELECT Name FROM FavoriteTag ORDER BY Name");
         return results.ToList();
+    }
+
+    public async Task DeleteTagAsync(string tagName)
+    {
+        using var conn = _db.CreateConnection();
+        using var txn = conn.BeginTransaction();
+        var tagId = await conn.ExecuteScalarAsync<long?>(
+            "SELECT Id FROM Tag WHERE Name = @Name COLLATE NOCASE",
+            new { Name = tagName.Trim() }, txn);
+        if (tagId == null) return;
+
+        await conn.ExecuteAsync(
+            "DELETE FROM ImageTag WHERE TagId = @Id", new { Id = tagId.Value }, txn);
+        await conn.ExecuteAsync(
+            "DELETE FROM Tag WHERE Id = @Id", new { Id = tagId.Value }, txn);
+        txn.Commit();
     }
 
     public async Task<List<string>> SearchTagsAsync(string keyword, int limit = 50)

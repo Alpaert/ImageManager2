@@ -20,6 +20,7 @@ public class TagSearchController
     private bool _coTagMode;
     private readonly Dictionary<string, int> _coTagStates = new(StringComparer.OrdinalIgnoreCase);
     private string _lastSearchText = string.Empty;
+    private List<TagCount> _fullCoTags = new();
 
     public bool IsSuggestionCoTagMode => _coTagMode;
     public List<string> SearchResultFiles { get; set; } = new();
@@ -55,11 +56,18 @@ public class TagSearchController
             return;
         }
 
+        var activeToken = ExtractActiveToken(keyword);
+        if (string.IsNullOrWhiteSpace(activeToken))
+        {
+            setPopupOpen(false);
+            return;
+        }
+
         var results = AllTagCounts
-            .Where(t => t.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(t => t.Name.StartsWith(keyword, StringComparison.OrdinalIgnoreCase))
+            .Where(t => t.Name.Contains(activeToken, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(t => t.Name.StartsWith(activeToken, StringComparison.OrdinalIgnoreCase))
             .ThenByDescending(t => t.Count)
-            .Take(50)
+            .Take(300)
             .ToList();
 
         foreach (var t in results)
@@ -256,7 +264,7 @@ public class TagSearchController
         _ = RefreshCoTagSuggestionsAsync(setSuggestions);
     }
 
-    public void SelectSuggestion(TagCount tag, Action<string> setTagSearchText, Action<bool> setPopupOpen,
+    public void SelectSuggestion(TagCount tag, string currentText, Action<string> setTagSearchText, Action<bool> setPopupOpen,
         Func<Task> triggerSearch)
     {
         if (_coTagMode && !string.IsNullOrEmpty(_lastSearchText))
@@ -265,8 +273,8 @@ public class TagSearchController
             return;
         }
 
-        // Prefix mode: set text directly, skip OnTagSearchTextChanged
-        setTagSearchText(tag.Name);
+        // Prefix mode: replace only the active token, not the whole text
+        setTagSearchText(ReplaceActiveToken(currentText, tag.Name));
         setPopupOpen(false);
         _ = triggerSearch();
     }
@@ -327,12 +335,73 @@ public class TagSearchController
         {
             var usedTags = ParseTagNames(_lastSearchText);
             var coTags = await _metaRepo.GetCoOccurringTagsAsync(SearchResultFiles, usedTags);
-            SuggestionsChanged?.Invoke(new List<TagCount>(coTags.Take(50)), true);
+            _fullCoTags = coTags.Take(300).ToList();
+            SuggestionsChanged?.Invoke(new List<TagCount>(_fullCoTags), true);
         }
         catch
         {
             SuggestionsChanged?.Invoke(new List<TagCount>(), false);
         }
+    }
+
+    public async Task SearchCoTagsAsync(string keyword)
+    {
+        if (string.IsNullOrWhiteSpace(keyword))
+        {
+            SuggestionsChanged?.Invoke(new List<TagCount>(_fullCoTags), true);
+            return;
+        }
+
+        try
+        {
+            var usedTags = ParseTagNames(_lastSearchText);
+            var results = await _metaRepo.GetCoOccurringTagsAsync(SearchResultFiles, usedTags, keyword);
+            SuggestionsChanged?.Invoke(results, true);
+        }
+        catch
+        {
+            SuggestionsChanged?.Invoke(new List<TagCount>(), false);
+        }
+    }
+
+    internal static string ExtractActiveToken(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return string.Empty;
+
+        var segments = text.Split(new[] { " a ", " o ", " e ", " - " }, StringSplitOptions.None);
+        var lastSegment = segments.LastOrDefault()?.Trim() ?? string.Empty;
+
+        var parts = lastSegment.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        return parts.LastOrDefault() ?? string.Empty;
+    }
+
+    internal static string ReplaceActiveToken(string text, string tagName)
+    {
+        var operators = new[] { " a ", " o ", " e ", " - " };
+
+        int lastSepIdx = -1;
+        int lastSepLen = 0;
+        foreach (var op in operators)
+        {
+            var pos = text.LastIndexOf(op, StringComparison.OrdinalIgnoreCase);
+            if (pos > lastSepIdx)
+            {
+                lastSepIdx = pos;
+                lastSepLen = op.Length;
+            }
+        }
+
+        int startIdx = lastSepIdx >= 0 ? lastSepIdx + lastSepLen : 0;
+
+        if (startIdx < text.Length)
+        {
+            var afterSep = text[startIdx..];
+            var lastSpaceIdx = afterSep.LastIndexOf(' ');
+            if (lastSpaceIdx >= 0)
+                startIdx += lastSpaceIdx + 1;
+        }
+
+        return text[..startIdx] + tagName;
     }
 
     internal static List<string> ParseTagNames(string text)

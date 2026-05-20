@@ -4,7 +4,7 @@
         x:Class="ImageManager.App.Views.Settings.MemorySettingWindow"
         x:DataType="vm:MemorySettingViewModel"
         Title="内存与缓存设置"
-        Width="500" Height="350"
+        Width="500" Height="580"
         CanResize="False">
 
     <Grid RowDefinitions="*,Auto" Margin="16">
@@ -41,6 +41,32 @@
                     <TextBlock Foreground="{DynamicResource MutedFgBrush}" FontSize="11">
                         <Run Text="不同缩放档位的缓存以 w(宽度) 子目录存放 .jpg 文件。"/>
                     </TextBlock>
+                </StackPanel>
+            </Border>
+
+            <Border Padding="14" BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="AI 打标设置" FontWeight="SemiBold" FontSize="14"/>
+
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="DeepSeek API Key:"
+                                   Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"/>
+                        <TextBox Text="{Binding DeepSeekApiKey}" Width="400"
+                                 PasswordChar="*"/>
+                        <TextBlock Text="用于批量翻译英文标签为中文，不填写则跳过翻译步骤"
+                                   Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
+                    </StackPanel>
+
+                    <StackPanel Spacing="4">
+                        <TextBlock Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
+                                   Text="{Binding OnnxConfidenceThreshold, StringFormat='{}阈值: {0:0.00}'}"/>
+                        <Slider Minimum="0.1" Maximum="0.9"
+                                Value="{Binding OnnxConfidenceThreshold}"
+                                TickFrequency="0.05" IsSnapToTickEnabled="True"
+                                Width="400"/>
+                        <TextBlock Text="低于阈值的标签会被过滤，默认 0.35"
+                                   Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
+                    </StackPanel>
                 </StackPanel>
             </Border>
         </StackPanel>

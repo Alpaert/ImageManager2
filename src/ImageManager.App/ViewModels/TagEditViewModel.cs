@@ -24,16 +24,34 @@ public partial class TagEditViewModel : ViewModelBase
     [ObservableProperty] private string _newFavoriteText = string.Empty;
     [ObservableProperty] private string _errorMessage = string.Empty;
     [ObservableProperty] private bool _showTagCount = true;
+    [ObservableProperty] private string _currentTagsFilterText = string.Empty;
 
     public ObservableCollection<TagDisplayItem> AutoTagSuggestions { get; } = new();
     public ObservableCollection<string> CurrentTags { get; } = new();
+    public ObservableCollection<string> FilteredCurrentTags { get; } = new();
     public ObservableCollection<string> FavoriteTagSuggestions { get; } = new();
 
     public string ResultText => string.Join(", ", CurrentTags);
 
+    partial void OnCurrentTagsFilterTextChanged(string value) => RefreshFilteredTags();
+
+    private void RefreshFilteredTags()
+    {
+        var keyword = CurrentTagsFilterText ?? string.Empty;
+        FilteredCurrentTags.Clear();
+        foreach (var tag in CurrentTags)
+        {
+            if (string.IsNullOrWhiteSpace(keyword) ||
+                tag.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                FilteredCurrentTags.Add(tag);
+        }
+    }
+
     private static readonly HashSet<string> ReservedTagNames = new(StringComparer.OrdinalIgnoreCase) { "a", "o", "e" };
 
     private string _lastAutoSuggestKeyword = string.Empty;
+    private int _autoSuggestVersion;
+    private CancellationTokenSource? _autoSuggestCts;
 
     public TagEditViewModel(
         string currentTagsText,
@@ -62,6 +80,7 @@ public partial class TagEditViewModel : ViewModelBase
 
         RebuildAutoSuggestions(string.Empty);
         RebuildFavoriteSuggestions(string.Empty);
+        RefreshFilteredTags();
     }
 
     private bool IsReservedName(string name)
@@ -89,6 +108,7 @@ public partial class TagEditViewModel : ViewModelBase
         TagInputText = string.Empty;
         RebuildAutoSuggestions(string.Empty);
         RebuildFavoriteSuggestions(string.Empty);
+        RefreshFilteredTags();
     }
 
     public async Task<RenameResult> HandleRenameAsync(string oldName, string newName)
@@ -99,6 +119,7 @@ public partial class TagEditViewModel : ViewModelBase
         {
             ReplaceInCurrentTags(oldName, newName);
             RebuildAutoSuggestions(_lastAutoSuggestKeyword);
+            RefreshFilteredTags();
         }
         return result;
     }
@@ -109,6 +130,7 @@ public partial class TagEditViewModel : ViewModelBase
         await _onMergeTags(oldName, newName);
         ReplaceInCurrentTags(oldName, newName);
         RebuildAutoSuggestions(_lastAutoSuggestKeyword);
+        RefreshFilteredTags();
     }
 
     private void ReplaceInCurrentTags(string oldName, string newName)
@@ -127,14 +149,20 @@ public partial class TagEditViewModel : ViewModelBase
     private void AddSuggestedTag(string name)
     {
         if (!CurrentTags.Any(t => string.Equals(t, name, StringComparison.OrdinalIgnoreCase)))
+        {
             CurrentTags.Add(name);
+            RefreshFilteredTags();
+        }
     }
 
     [RelayCommand]
     private void AddFavoriteTag(string name)
     {
         if (!CurrentTags.Any(t => string.Equals(t, name, StringComparison.OrdinalIgnoreCase)))
+        {
             CurrentTags.Add(name);
+            RefreshFilteredTags();
+        }
     }
 
     [RelayCommand]
@@ -145,6 +173,7 @@ public partial class TagEditViewModel : ViewModelBase
             if (string.Equals(CurrentTags[i], name, StringComparison.OrdinalIgnoreCase))
                 CurrentTags.RemoveAt(i);
         }
+        RefreshFilteredTags();
     }
 
     [RelayCommand]
@@ -183,34 +212,68 @@ public partial class TagEditViewModel : ViewModelBase
     {
         var keyword = value.Trim();
         _lastAutoSuggestKeyword = keyword;
-        RebuildAutoSuggestions(keyword);
         RebuildFavoriteSuggestions(keyword);
+        ScheduleAutoSuggestRebuild(keyword);
+    }
+
+    private void ScheduleAutoSuggestRebuild(string keyword)
+    {
+        _autoSuggestCts?.Cancel();
+        _autoSuggestCts = new CancellationTokenSource();
+        var token = _autoSuggestCts.Token;
+        var captured = keyword;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(200, token);
+                if (!token.IsCancellationRequested)
+                    Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() => RebuildAutoSuggestions(captured));
+            }
+            catch (OperationCanceledException) { }
+        });
     }
 
     private void RebuildAutoSuggestions(string keyword)
     {
-        AutoTagSuggestions.Clear();
-        if (_allTagCounts.Count == 0) return;
+        int version = Interlocked.Increment(ref _autoSuggestVersion);
+        var source = _allTagCounts.ToList();
+        bool showCount = ShowTagCount;
+        var captured = keyword;
 
-        IEnumerable<TagCount> query = _allTagCounts;
-
-        if (!string.IsNullOrWhiteSpace(keyword))
+        _ = Task.Run(() =>
         {
-            query = query
-                .Where(t => t.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(t => t.Name.StartsWith(keyword, StringComparison.OrdinalIgnoreCase))
-                .ThenByDescending(t => t.Count)
-                .ThenBy(t => t.Name, StringComparer.OrdinalIgnoreCase);
-        }
-        else
-        {
-            query = query
-                .OrderByDescending(t => t.Count)
-                .ThenBy(t => t.Name, StringComparer.OrdinalIgnoreCase);
-        }
+            if (source.Count == 0) return;
 
-        foreach (var t in query)
-            AutoTagSuggestions.Add(new TagDisplayItem { Name = t.Name, Count = t.Count, Display = FormatTagDisplay(t.Name, t.Count) });
+            IEnumerable<TagCount> query = source;
+
+            if (!string.IsNullOrWhiteSpace(captured))
+            {
+                query = query
+                    .Where(t => t.Name.Contains(captured, StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(t => t.Name.StartsWith(captured, StringComparison.OrdinalIgnoreCase))
+                    .ThenByDescending(t => t.Count)
+                    .ThenBy(t => t.Name, StringComparer.OrdinalIgnoreCase);
+            }
+            else
+            {
+                query = query
+                    .OrderByDescending(t => t.Count)
+                    .ThenBy(t => t.Name, StringComparer.OrdinalIgnoreCase);
+            }
+
+            var results = query
+                .Select(t => new TagDisplayItem { Name = t.Name, Count = t.Count, Display = showCount ? $"{t.Name} ({t.Count})" : t.Name })
+                .ToList();
+
+            Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                if (version != _autoSuggestVersion) return;
+                AutoTagSuggestions.Clear();
+                foreach (var item in results)
+                    AutoTagSuggestions.Add(item);
+            });
+        });
     }
 
     private string FormatTagDisplay(string name, int count)

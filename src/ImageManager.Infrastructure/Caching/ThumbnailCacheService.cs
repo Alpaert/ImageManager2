@@ -19,14 +19,48 @@ public class ThumbnailCacheService : IThumbnailCacheService
     private const long MaxMemoryBytes = 50 * 1024 * 1024; // 50 MB
 
     public long EstimatedMemoryBytes => Interlocked.Read(ref _totalBytes);
-    public string CacheDirectory { get; set; }
+    private string _cacheDirectory = @"C:\ImageManagerCache";
+    public string CacheDirectory
+    {
+        get => _cacheDirectory;
+        set
+        {
+            _cacheDirectory = value;
+            _diskCache.CacheDirectory = value;
+        }
+    }
     public int DecodeWidth { get; set; } = 200;
 
     public ThumbnailCacheService(string cacheRoot = @"C:\ImageManagerCache", int decodeWidth = 200)
     {
-        CacheDirectory = cacheRoot;
         DecodeWidth = decodeWidth;
         _diskCache = new DiskThumbnailCache(cacheRoot, decodeWidth);
+        _cacheDirectory = cacheRoot;
+    }
+
+    public void SwitchCacheDirectory(string newPath)
+    {
+        var oldPath = _cacheDirectory;
+        if (string.Equals(oldPath.TrimEnd('\\', '/'), newPath.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase))
+            return;
+
+        CacheDirectory = newPath;
+
+        // Async-clean old thumbnail cache directory (best-effort)
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                if (Directory.Exists(oldPath))
+                {
+                    foreach (var dir in Directory.EnumerateDirectories(oldPath, "w*"))
+                    {
+                        try { Directory.Delete(dir, true); } catch { }
+                    }
+                }
+            }
+            catch { }
+        });
     }
 
     public async Task<byte[]?> GetOrCreateThumbnailAsync(string filePath, int decodeWidth)

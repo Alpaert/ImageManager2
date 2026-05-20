@@ -19,14 +19,20 @@ public interface IImageMetaRepository
 
     // Tag associations
     Task SetTagsAsync(long imageId, List<string> tags);
+    Task AddAutoTagsAsync(long imageId, List<string> tagNames);
+    Task ReplaceAutoTagAsync(long imageId, string englishTagName, long chineseTagId);
+    Task DeleteAutoTagFromImageAsync(long imageId, string tagName);
     Task<List<TagCount>> GetTagCountsAsync();
     Task<List<string>> GetFilePathsByTagAsync(string tagName);
     Task<List<string>> GetFilePathsByTagsAsync(List<string> tagNames, bool requireAll);
     Task<List<string>> GetFilePathsByTagsExcludingAsync(List<string> includeTags, bool requireAll, List<string> excludeTags);
     Task<List<string>> GetFilePathsByTagAndEachAsync(List<string> baseTags, bool requireAllBase, List<string> eachTags, List<string>? excludeTags = null);
     Task<List<string>> GetFilePathsWithNoTagsAsync();
-    Task<List<TagCount>> GetCoOccurringTagsAsync(List<string> filePaths, List<string>? excludeNames = null);
+    Task<List<TagCount>> GetCoOccurringTagsAsync(List<string> filePaths, List<string>? excludeNames = null, string? nameFilter = null);
 
     /// <summary>Batch-load perceptual hashes for a specific set of file paths (lightweight, no tags)</summary>
     Task<Dictionary<string, string>> GetPerceptualHashesByPathsAsync(List<string> filePaths);
+
+    /// <summary>Batch-load Width/Height for a set of file paths. Only returns entries with non-zero dimensions.</summary>
+    Task<Dictionary<string, (int Width, int Height)>> GetDimensionsByPathsAsync(List<string> filePaths);
 }

@@ -1,0 +1,44 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ImageManager.App.ViewModels"
+        xmlns:conv="using:ImageManager.App.Converters"
+        x:Class="ImageManager.App.Views.Settings.TagImageViewerWindow"
+        x:DataType="vm:TagImageViewerViewModel"
+        Title="{Binding Title}"
+        Width="600" Height="500">
+
+    <Window.Resources>
+        <conv:ByteArrayToBitmapConverter x:Key="BytesToBitmap"/>
+    </Window.Resources>
+
+    <Grid RowDefinitions="*,Auto">
+        <Grid Grid.Row="0" Background="Transparent">
+            <Image Source="{Binding ImageData, Converter={StaticResource BytesToBitmap}}"
+                   Stretch="Uniform" VerticalAlignment="Center" HorizontalAlignment="Center"/>
+
+            <!-- Left arrow -->
+            <Border VerticalAlignment="Center" HorizontalAlignment="Left"
+                    Background="#33000000" CornerRadius="4" Margin="8"
+                    Cursor="Hand" IsVisible="{Binding HasPrev}"
+                    PointerPressed="ArrowLeft_Click">
+                <TextBlock Text="◀" FontSize="28" Foreground="#CCFFFFFF" Margin="4,12"/>
+            </Border>
+
+            <!-- Right arrow -->
+            <Border VerticalAlignment="Center" HorizontalAlignment="Right"
+                    Background="#33000000" CornerRadius="4" Margin="8"
+                    Cursor="Hand" IsVisible="{Binding HasNext}"
+                    PointerPressed="ArrowRight_Click">
+                <TextBlock Text="▶" FontSize="28" Foreground="#CCFFFFFF" Margin="4,12"/>
+            </Border>
+        </Grid>
+
+        <Border Grid.Row="1" Padding="8,6"
+                Background="{DynamicResource SurfaceBrush}"
+                BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="0,1,0,0">
+            <TextBlock Text="{Binding InfoText}"
+                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
+                       TextTrimming="CharacterEllipsis"/>
+        </Border>
+    </Grid>
+</Window>

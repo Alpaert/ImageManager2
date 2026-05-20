@@ -13,5 +13,6 @@ public interface ITagRepository
     Task<List<string>> GetFavoritesAsync();
     Task<RenameResult> RenameTagAsync(string oldName, string newName);
     Task MergeTagsAsync(string oldName, string newName);
+    Task DeleteTagAsync(string tagName);
     Task<List<string>> SearchTagsAsync(string keyword, int limit = 50);
 }

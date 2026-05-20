@@ -63,7 +63,10 @@ Avalonia 桌面应用（MVVM）：
 
 ## [当前状态]
 
-### 最近一次成功运行的功能（2026-05-18 更新）
+### 最近一次成功运行的功能（2026-05-20 更新）
+- **共现 tag 建议优化**：上限 50→300 防止低频 tag 被截断；popup `MaxHeight` 160→400 容纳更多 tag；新增 popup 内过滤输入框 — 输入关键词时通过 `GetCoOccurringTagsAsync(nameFilter)` 直接 DB `LIKE %keyword%` 查询全部共现 tag，不受 300 条缓存限制；过滤框清空后恢复缓存列表，仅在共现 tag 模式下可见。`TagSearchController` 新增 `SearchCoTagsAsync` 方法，VM 端 `OnCoTagFilterTextChanged` 直接调用。
+- **操作符后前缀联想**：用户输入空格/操作符（`a`/`o`/`e`/`-`）后继续打字时，`UpdateSuggestions` 通过 `ExtractActiveToken` 提取当前正在输入的 tag 片段（按操作符分割取末段、按空格分割取末部），仅对该片段做前缀匹配，而非对全文匹配。点击联想项时通过 `ReplaceActiveToken` 仅替换当前 token，保留前方已输入的 tag 和操作符。
+- **修复 TagEditWindow 关闭时主窗口卡死**：AutoTagSuggestions ItemsControl 大量 Button 子元素（~3870）在窗口销毁时逐一 detach 造成 UI 线程长时间阻塞。修复：`CloseWindow()` 关闭前先清空 `AutoTagSuggestions`/`FilteredCurrentTags`/`FavoriteTagSuggestions` 集合，视觉子元素提前释放后再 `Close()`。同时将 `SetImageTagsAsync` 和 `SaveSettingsAsync` 中的同步 SQLite 操作包裹进 `Task.Run`，移除冗余的重复 `RefreshTagCountsAsync` 调用。
 - **架构优化**：
   - 提取 `PageManager`（250 行）：页面缓存、缩略图加载、缩放控制、搜索恢复
   - 提取 `TagSearchController`（280 行）：标签搜索解析、前缀联想、共现标签、状态循环
@@ -79,9 +82,20 @@ Avalonia 桌面应用（MVVM）：
 - 深色模式输入框文字可见性：所有 TextBox 背景改用 `DynamicResource InputBgBrush`（浅色 #FFF / 深色 #1A1A24）
 - 修复前缀模式点击 tag 建议崩溃（`SelectTagSuggestion` 绕开 backing field 避免 mid-click 清空 ObservableCollection 导致 Avalonia NPE）
 - 修复返回搜索前按钮页表恢复（`BackFromSearch` / `ClearFilter`：直接调用 `ShowPageAsync` + 先清 page cache 再注入恢复页，消除搜索结果残留）
+- **修复 Tag 重命名/合并 UI 死锁**：嵌套 `ShowDialog`（RenameTagWindow 位于 TagManage/TagEdit 之上）关闭后立即 `await` 异步操作导致 Avalonia `DispatcherFrame` 混乱。修复：`Rename_Click` / `AutoTag_Rename_Click` 用 `Dispatcher.UIThread.InvokeAsync` 延迟执行重命名逻辑；`RenameTagAsync` / `MergeTagsAsync` 用 `Task.Run` 在线程池执行 DB 操作；`MenuTagManage_Click` 在 `ShowDialog` 返回后调 `RunJobs()` 刷新 dispatcher。
+- **TagManage/TagEdit 窗口打开速度优化**：`ApplyFilter` 和 `RebuildAutoSuggestions` 中的 LINQ 排序/过滤移至后台线程（`Task.Run` + 版本计数器去重），窗口立即弹出，列表异步填充。搜索框输入增加 200ms 防抖；重命名单项原地替换避免全量列表重建。
+- **统一缓存目录**：DB 路径从写死的 `%LocalAppData%\ImageManager\data.db` 迁移至 `{DiskCacheDirectory}\data.db`，与缩略图缓存、模型文件同目录，便于管理。
+  - 引导配置 `config.json` 始终位于 `%LocalAppData%\ImageManager\config.json`，存储 `CacheDirectory` 和 `PreviousCacheDirectory`。
+  - 首次启动：config.json 不存在→创建默认；旧 DB 从 `%LocalAppData%\ImageManager\` 自动复制到缓存目录。
+  - 切换缓存目录：设置保存时更新 config.json（含旧路径），下次启动自动从旧路径复制 DB（含 WAL/SHM）。运行时不再尝试复制 DB（避免文件锁损坏）。
+  - DB 损坏恢复：5 次重试，逐次删除主文件+WAL+SHM+.bak、清空连接池、50ms 延迟后重建空 DB。
+  - `DiskCacheDirectory` 同步：若 DB 恢复后设置中缓存的目录是默认值，自动用 config.json 的真实路径覆盖。
+  - `ThumbnailCacheService.CacheDirectory` setter 同步更新 `_diskCache.CacheDirectory`；`SwitchCacheDirectory` 切换时清理旧目录缩略图。
+  - ONNX 模型文件不自动迁移（用户手动复制）。
 - 修复连续删除图片时僵尸图重现（`RemoveFilesFromView` 开头调 `_pageManager.InvalidateCache()` 清除脏缓存，防止后续 `ShowPageAsync` 命中旧缓存返回已删除项）
 - 删除图片时同步清理磁盘缩略图缓存（`DiskThumbnailCache.DeleteAllWidths` 遍历所有 `w*` 子目录删除对应 `.jpg`）
 - 移除文件夹时同步清理该文件夹下所有图片的磁盘缩略图缓存（`RemoveFolderAsync` 通过 `GetByFolderIdAsync` 查全量路径后逐条删除）
+- **自动打标模块**（详见 `docs/自动打标模块/DEVELOPMENT_DOC.md`）：ONNX WD14 SwinV2-v3 推理 + DeepSeek API 翻译 → 审核确认建立英文→中文映射。支持文件夹批量打标（保存草稿/恢复审核）、单图打标（关闭丢弃未确认）、标签管理（全局删除/重命名/合并）、TagEdit 搜索过滤
 - 右键在线搜图自动上传（SauceNAO / IQDB / ascii2d / trace.moe 通过 HTTP POST 直接上传图片，结果自动在浏览器打开；Google / Yandex / soutubot 打开首页手动上传）
 - 文件夹实时监控（FileSystemWatcher：外部新增/删除文件自动 sync + 哈希补算）
 - 大文件夹导入哈希补算修复（sync → hash 串行，消除时序竞争导致新文件漏算哈希）
@@ -97,11 +111,9 @@ Avalonia 桌面应用（MVVM）：
 - 文件夹重定位（外部路径变更后更新 DB）
 
 ### 最近的 Git 提交
+- 2026-05-20：共现 tag 建议上限 50→300 + popup 高度 160→400 + 过滤输入框（DB LIKE 查全部共现 tag，突破缓存限制）
+- 2026-05-19：TagEditWindow 卡死修复、PageManager/TagSearchController 提取、架构优化、内存优化、自动打标模块
 - 2026-05-17：PageManager 提取（架构优化）、Tag 编辑优化、搜索框交互改进、缩略图可见区域优先加载、深色模式修复、前缀点击/返回搜索 bug 修复
-- `be379fd` — Revert "路径修改前备份"
-- `1ffa895` — 路径修改前备份
-- `296f308` — 添加项目文件
-- `9ae474e` — 添加 .gitattributes 和 .gitignore
 
 ### 未完成的 TODO / 已知问题
 - `DuplicateService` 中模糊重复（fuzzy）尚未实现，当前仅做精确 MD5 去重

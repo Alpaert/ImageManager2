@@ -9,6 +9,8 @@ public partial class MemorySettingViewModel : ViewModelBase
     [ObservableProperty] private string _cachePath = @"C:\ImageManagerCache";
     [ObservableProperty] private string _currentUsageHint = string.Empty;
     [ObservableProperty] private string _diskUsageHint = string.Empty;
+    [ObservableProperty] private string _deepSeekApiKey = string.Empty;
+    [ObservableProperty] private double _onnxConfidenceThreshold = 0.35;
 
     public Action<bool>? OnSave { get; set; }
     public Func<long>? GetCurrentCacheBytes { get; set; }
@@ -17,12 +19,15 @@ public partial class MemorySettingViewModel : ViewModelBase
     private string _originalCachePath = string.Empty;
 
     public MemorySettingViewModel(int maxCacheMB, string cachePath,
+        string deepSeekApiKey, double onnxConfidenceThreshold,
         Func<long>? getCurrentCacheBytes,
         Func<string, long>? getDiskUsage,
         Action<bool>? onSave)
     {
         _maxCacheMB = maxCacheMB > 0 ? maxCacheMB : 512;
         _cachePath = cachePath;
+        _deepSeekApiKey = deepSeekApiKey ?? string.Empty;
+        _onnxConfidenceThreshold = onnxConfidenceThreshold > 0 ? onnxConfidenceThreshold : 0.35;
         _originalCachePath = cachePath;
         GetCurrentCacheBytes = getCurrentCacheBytes;
         GetDiskUsage = getDiskUsage;

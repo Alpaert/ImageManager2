@@ -37,4 +37,8 @@ public class AppSettings
 
     /// <summary>Hash algorithm version — bump to force re-computation of all perceptual hashes</summary>
     public string HashVersion { get; set; } = "1";
+
+    // ==================== Auto-Tag Settings ====================
+    public double OnnxConfidenceThreshold { get; set; } = 0.35;
+    public string DeepSeekApiKey { get; set; } = string.Empty;
 }

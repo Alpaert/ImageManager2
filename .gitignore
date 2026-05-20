@@ -368,3 +368,13 @@ FodyWeavers.xsd
 
 # Claude Code 本地配置
 .claude/
+
+# 根目录大文件 - 不推送
+/*.ico
+/图标.png
+
+# AI 记忆文件 - 不推送
+/MEMORY.md
+
+# 文档目录 - 不推送
+/docs/

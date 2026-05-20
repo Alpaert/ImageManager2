@@ -244,6 +244,62 @@ public class ImageMetaRepository : IImageMetaRepository
         txn.Commit();
     }
 
+    public async Task AddAutoTagsAsync(long imageId, List<string> tagNames)
+    {
+        using var conn = _db.CreateConnection();
+        using var txn = conn.BeginTransaction();
+
+        foreach (var tagName in tagNames)
+        {
+            if (string.IsNullOrWhiteSpace(tagName)) continue;
+            var trimmed = tagName.Trim();
+
+            var tagId = await conn.ExecuteScalarAsync<long?>(@"
+                INSERT OR IGNORE INTO Tag (Name) VALUES (@Name);
+                SELECT Id FROM Tag WHERE Name = @Name;",
+                new { Name = trimmed }, txn);
+
+            if (tagId.HasValue)
+            {
+                await conn.ExecuteAsync(@"
+                    INSERT OR IGNORE INTO ImageTag (ImageMetaId, TagId, Source)
+                    VALUES (@ImageId, @TagId, 'AutoTag')",
+                    new { ImageId = imageId, TagId = tagId.Value }, txn);
+            }
+        }
+
+        txn.Commit();
+    }
+
+    public async Task ReplaceAutoTagAsync(long imageId, string englishTagName, long chineseTagId)
+    {
+        using var conn = _db.CreateConnection();
+        // Step 1: Insert Chinese tag first (IGNORE if already present, e.g. from another English→Chinese mapping)
+        await conn.ExecuteAsync(@"
+            INSERT OR IGNORE INTO ImageTag (ImageMetaId, TagId, Source)
+            VALUES (@ImageId, @ChineseId, 'AutoTagConfirmed')",
+            new { ImageId = imageId, ChineseId = chineseTagId });
+
+        // Step 2: Remove the old English AutoTag (won't affect the Chinese tag just inserted)
+        await conn.ExecuteAsync(@"
+            DELETE FROM ImageTag
+            WHERE ImageMetaId = @ImageId
+              AND TagId IN (SELECT Id FROM Tag WHERE Name = @EnglishName COLLATE NOCASE)
+              AND Source = 'AutoTag'",
+            new { ImageId = imageId, EnglishName = englishTagName.Trim() });
+    }
+
+    public async Task DeleteAutoTagFromImageAsync(long imageId, string tagName)
+    {
+        using var conn = _db.CreateConnection();
+        await conn.ExecuteAsync(@"
+            DELETE FROM ImageTag
+            WHERE ImageMetaId = @ImageId
+              AND TagId IN (SELECT Id FROM Tag WHERE Name = @TagName COLLATE NOCASE)
+              AND Source = 'AutoTag'",
+            new { ImageId = imageId, TagName = tagName.Trim() });
+    }
+
     public async Task<List<TagCount>> GetTagCountsAsync()
     {
         using var conn = _db.CreateConnection();
@@ -403,7 +459,7 @@ public class ImageMetaRepository : IImageMetaRepository
         return result.AsList();
     }
 
-    public async Task<List<TagCount>> GetCoOccurringTagsAsync(List<string> filePaths, List<string>? excludeNames = null)
+    public async Task<List<TagCount>> GetCoOccurringTagsAsync(List<string> filePaths, List<string>? excludeNames = null, string? nameFilter = null)
     {
         if (filePaths.Count == 0) return new List<TagCount>();
         using var conn = _db.CreateConnection();
@@ -415,10 +471,12 @@ public class ImageMetaRepository : IImageMetaRepository
             WHERE im.FilePath IN @FilePaths";
         if (excludeNames is { Count: > 0 })
             sql += "\n              AND t.Name NOT IN @ExcludeNames COLLATE NOCASE";
+        if (!string.IsNullOrEmpty(nameFilter))
+            sql += "\n              AND t.Name LIKE @NameFilter COLLATE NOCASE";
         sql += "\n            GROUP BY t.Id, t.Name\n            ORDER BY Count DESC, t.Name";
 
         var results = await conn.QueryAsync<TagCount>(sql,
-            new { FilePaths = filePaths, ExcludeNames = excludeNames ?? new List<string>() });
+            new { FilePaths = filePaths, ExcludeNames = excludeNames ?? new List<string>(), NameFilter = $"%{nameFilter}%" });
         return results.ToList();
     }
 
@@ -434,6 +492,24 @@ public class ImageMetaRepository : IImageMetaRepository
         return rows
             .Where(r => !string.IsNullOrEmpty(r.PerceptualHash))
             .ToDictionary(r => r.FilePath, r => r.PerceptualHash, StringComparer.OrdinalIgnoreCase);
+    }
+
+    public async Task<Dictionary<string, (int Width, int Height)>> GetDimensionsByPathsAsync(List<string> filePaths)
+    {
+        var result = new Dictionary<string, (int Width, int Height)>(StringComparer.OrdinalIgnoreCase);
+        if (filePaths.Count == 0) return result;
+
+        using var conn = _db.CreateConnection();
+        foreach (var chunk in filePaths.Chunk(900))
+        {
+            var rows = await conn.QueryAsync<(string FilePath, int Width, int Height)>(@"
+                SELECT FilePath, Width, Height FROM ImageMeta
+                WHERE FilePath IN @Paths AND Width > 0",
+                new { Paths = chunk });
+            foreach (var (path, w, h) in rows)
+                result[path] = (w, h);
+        }
+        return result;
     }
 
     private async Task<List<TagCount>> GetTagsForMetaAsync(SqliteConnection conn, long metaId)

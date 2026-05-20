@@ -68,10 +68,13 @@
         <Border Grid.Row="1" Grid.Column="1" Padding="8" Margin="0,0,8,0"
                 BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
             <DockPanel>
-                <TextBlock DockPanel.Dock="Top" Text="当前图片 Tag"
-                           FontWeight="SemiBold" FontSize="13" Margin="0,0,0,8"/>
+                <StackPanel DockPanel.Dock="Top" Spacing="4" Margin="0,0,0,8">
+                    <TextBlock Text="当前图片 Tag" FontWeight="SemiBold" FontSize="13"/>
+                    <TextBox Text="{Binding CurrentTagsFilterText}"
+                             Background="{DynamicResource InputBgBrush}" FontSize="12"/>
+                </StackPanel>
                 <ScrollViewer>
-                    <ItemsControl ItemsSource="{Binding CurrentTags}">
+                    <ItemsControl ItemsSource="{Binding FilteredCurrentTags}">
                         <ItemsControl.ItemTemplate>
                             <DataTemplate x:DataType="x:String">
                                 <Border Margin="2" Padding="6,3"

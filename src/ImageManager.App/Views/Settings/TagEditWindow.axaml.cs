@@ -13,8 +13,15 @@ public partial class TagEditWindow : Window
     public TagEditWindow()
     {
         InitializeComponent();
-        // KeyUp bubbling: unlike KeyDown (which Button converts to Click), KeyUp reliably bubbles to Window
         KeyUp += OnWindowKeyUp;
+        // Intercept all close paths (X button / Alt+F4 / Enter / buttons) to clear
+        // large collections before the window tears down 4000+ visual children
+        Closing += (_, _) =>
+        {
+            Vm.AutoTagSuggestions.Clear();
+            Vm.FilteredCurrentTags.Clear();
+            Vm.FavoriteTagSuggestions.Clear();
+        };
     }
 
     private bool _suppressNextEnterKeyUp;
@@ -23,6 +30,11 @@ public partial class TagEditWindow : Window
     {
         if (e.Source is not TextBox and not Button)
             RootGrid.Focus();
+    }
+
+    private void CloseWindow(bool result)
+    {
+        Close(result);
     }
 
     private void OnWindowKeyUp(object? sender, KeyEventArgs e)
@@ -38,7 +50,7 @@ public partial class TagEditWindow : Window
         // Don't intercept Enter in tag input TextBox — TxtTagInput_KeyDown handles adding the tag
         if (e.Source is TextBox) return;
 
-        Close(true);
+        CloseWindow(true);
         e.Handled = true;
     }
 
@@ -89,15 +101,19 @@ public partial class TagEditWindow : Window
         if (string.IsNullOrWhiteSpace(newName) || string.Equals(oldName, newName, StringComparison.OrdinalIgnoreCase))
             return;
 
-        var result = await Vm.HandleRenameAsync(oldName, newName);
-        if (result == RenameResult.Conflict)
+        // Defer rename to avoid nested dispatcher frame deadlock after ShowDialog
+        Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
         {
-            var confirm = new RenameTagWindow();
-            confirm.SetTitle("Tag 已存在 — 合并");
-            confirm.SetPrompt($"Tag \"{newName}\" 已存在，合并 \"{oldName}\" 到 \"{newName}\"?(确定请再输入一次)");
-            if (await confirm.ShowDialog<bool>(this))
-                await Vm.HandleMergeAsync(oldName, newName);
-        }
+            var result = await Vm.HandleRenameAsync(oldName, newName);
+            if (result == RenameResult.Conflict)
+            {
+                var confirm = new RenameTagWindow();
+                confirm.SetTitle("Tag 已存在 — 合并");
+                confirm.SetPrompt($"Tag \"{newName}\" 已存在，合并 \"{oldName}\" 到 \"{newName}\"?(确定请再输入一次)");
+                if (await confirm.ShowDialog<bool>(this))
+                    await Vm.HandleMergeAsync(oldName, newName);
+            }
+        });
     }
 
     private void DeleteCurrentTag_Click(object? sender, RoutedEventArgs e)
@@ -120,11 +136,11 @@ public partial class TagEditWindow : Window
 
     private void BtnOk_Click(object? sender, RoutedEventArgs e)
     {
-        Close(true);
+        CloseWindow(true);
     }
 
     private void BtnCancel_Click(object? sender, RoutedEventArgs e)
     {
-        Close(false);
+        CloseWindow(false);
     }
 }

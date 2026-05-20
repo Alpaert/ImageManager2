@@ -22,7 +22,7 @@ public class AppDbContext : IDisposable
         conn.Open();
         // Enable WAL mode for concurrent read/write
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;";
+        cmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA cache_size=-65536; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;";
         cmd.ExecuteNonQuery();
         return conn;
     }
@@ -81,11 +81,47 @@ public class AppDbContext : IDisposable
                 Key   TEXT PRIMARY KEY,
                 Value TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS TagMapping (
+                Id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                EnglishName TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                ChineseName TEXT NOT NULL,
+                ConfirmedAt TEXT NOT NULL DEFAULT (datetime('now')),
+                UpdatedAt   TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_tagmapping_english ON TagMapping(EnglishName COLLATE NOCASE);
+
+            CREATE TABLE IF NOT EXISTS AutoTagState (
+                FolderId      INTEGER PRIMARY KEY,
+                Status        TEXT NOT NULL DEFAULT 'Pending',
+                TotalFiles    INTEGER DEFAULT 0,
+                Processed     INTEGER DEFAULT 0,
+                LastFileCount INTEGER DEFAULT 0,
+                StartedAt     TEXT,
+                CompletedAt   TEXT,
+                ErrorMsg      TEXT,
+                FOREIGN KEY (FolderId) REFERENCES Folder(Id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS AutoTagTranslation (
+                Id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                FolderId           INTEGER NOT NULL,
+                EnglishTag         TEXT NOT NULL,
+                ChineseTranslation TEXT,
+                UserEditedText     TEXT,
+                IsConfirmed        INTEGER DEFAULT 0,
+                IsExistingMapping  INTEGER DEFAULT 0,
+                CreatedAt          TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY (FolderId) REFERENCES Folder(Id) ON DELETE CASCADE,
+                UNIQUE(FolderId, EnglishTag COLLATE NOCASE)
+            );
+            CREATE INDEX IF NOT EXISTS idx_autotagtrans_folder ON AutoTagTranslation(FolderId);
         ";
         cmd.ExecuteNonQuery();
 
         // Migration: add FolderId column (must run before index creation)
         RunMigration(conn);
+        RunMigrationV2(conn);
 
         // Create FolderId index after column exists
         using var idxCmd = conn.CreateCommand();
@@ -105,6 +141,28 @@ public class AppDbContext : IDisposable
         {
             // Column already exists
         }
+    }
+
+    private static void RunMigrationV2(SqliteConnection conn)
+    {
+        try
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "ALTER TABLE ImageTag ADD COLUMN Source TEXT DEFAULT NULL;";
+            cmd.ExecuteNonQuery();
+        }
+        catch (SqliteException ex) when (ex.Message.Contains("duplicate column"))
+        {
+            // Column already exists
+        }
+    }
+
+    public void Checkpoint()
+    {
+        using var conn = CreateConnection();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "PRAGMA wal_checkpoint(TRUNCATE);";
+        cmd.ExecuteNonQuery();
     }
 
     public void Dispose()

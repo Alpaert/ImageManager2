@@ -153,6 +153,7 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private OrientationFilter _orientationFilter = OrientationFilter.All;
     [ObservableProperty] private ObservableCollection<TagCount> _tagSearchSuggestions = new();
     [ObservableProperty] private bool _isTagSearchPopupOpen;
+    [ObservableProperty] private string _coTagFilterText = string.Empty;
 
     // ==================== Status ====================
     [ObservableProperty] private string _statusText = "就绪";
@@ -213,6 +214,9 @@ public partial class MainWindowViewModel : ViewModelBase
 
         _tagSearch.SearchCompleted += result =>
         {
+            CoTagFilterText = string.Empty;
+            OnPropertyChanged(nameof(IsSuggestionCoTagMode));
+
             if (!result.HasResults)
             {
                 CurrentTagFilter = string.Empty;
@@ -249,7 +253,9 @@ public partial class MainWindowViewModel : ViewModelBase
 
         _tagSearch.CoTagModeExited += () =>
         {
+            CoTagFilterText = string.Empty;
             OnPropertyChanged(nameof(SearchBoxBorderColor));
+            OnPropertyChanged(nameof(IsSuggestionCoTagMode));
         };
     }
 
@@ -953,7 +959,7 @@ partial void OnCornerRadiusDipChanged(double value)
     [RelayCommand]
     private async Task SelectTagSuggestion(TagCount tag)
     {
-        _tagSearch.SelectSuggestion(tag,
+        _tagSearch.SelectSuggestion(tag, TagSearchText,
             name =>
             {
                 _tagSearchText = name;
@@ -976,6 +982,12 @@ partial void OnCornerRadiusDipChanged(double value)
         _tagSearch.UpdateSuggestions(keyword,
             t => TagSearchSuggestions.Add(t),
             open => IsTagSearchPopupOpen = open);
+    }
+
+    partial void OnCoTagFilterTextChanged(string value)
+    {
+        if (_tagSearch.IsSuggestionCoTagMode)
+            _ = _tagSearch.SearchCoTagsAsync(value);
     }
 
     public void OnTagSearchGotFocus()
@@ -1099,20 +1111,34 @@ partial void OnCornerRadiusDipChanged(double value)
         }
         else
         {
-            _orientationFilteredFiles = new List<string>();
             var wantLandscape = OrientationFilter == OrientationFilter.Landscape;
-            await Task.Run(() =>
+            // Batch-load dimensions from DB (covers all hashed files in one query)
+            var dimensions = await _metaRepo.GetDimensionsByPathsAsync(source);
+
+            _orientationFilteredFiles = await Task.Run(() =>
             {
+                var filtered = new List<string>();
                 foreach (var path in source)
                 {
-                    try
+                    if (dimensions.TryGetValue(path, out var dim) && dim.Width > 0)
                     {
-                        var (w, h) = ThumbnailGenerator.GetDimensions(path);
-                        if ((wantLandscape && w >= h) || (!wantLandscape && w < h))
-                            _orientationFilteredFiles.Add(path);
+                        if ((wantLandscape && dim.Width >= dim.Height) ||
+                            (!wantLandscape && dim.Width < dim.Height))
+                            filtered.Add(path);
                     }
-                    catch { }
+                    else
+                    {
+                        // Fallback: read file header for unhashed files
+                        try
+                        {
+                            var (w, h) = ThumbnailGenerator.GetDimensions(path);
+                            if ((wantLandscape && w >= h) || (!wantLandscape && w < h))
+                                filtered.Add(path);
+                        }
+                        catch { }
+                    }
                 }
+                return filtered;
             });
         }
 
@@ -1425,13 +1451,17 @@ partial void OnCornerRadiusDipChanged(double value)
 
     public async Task SetImageTagsAsync(string filePath, List<string> tags)
     {
-        var meta = await _metaRepo.GetByPathAsync(filePath);
-        if (meta != null)
+        await Task.Run(async () =>
         {
-            await _metaRepo.SetTagsAsync(meta.Id, tags);
-            await RefreshTagCountsAsync();
-        }
+            var meta = await _metaRepo.GetByPathAsync(filePath);
+            if (meta != null)
+            {
+                await _metaRepo.SetTagsAsync(meta.Id, tags);
+            }
+        });
+
         _tagCacheByPath[filePath] = tags;
+        await RefreshTagCountsAsync();
     }
 
     public List<string> GetTagsForFile(string filePath)
@@ -1450,6 +1480,6 @@ partial void OnCornerRadiusDipChanged(double value)
 
     public async Task SaveSettingsAsync()
     {
-        await _settingsRepo.SaveAsync(AppSettings);
+        await Task.Run(() => _settingsRepo.SaveAsync(AppSettings));
     }
 }
