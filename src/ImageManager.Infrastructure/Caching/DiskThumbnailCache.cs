@@ -41,10 +41,28 @@ public class DiskThumbnailCache
 
     public string GetCacheFilePath(string filePath)
     {
+        var folderHash = GetFolderHash(filePath);
+        using var md5 = System.Security.Cryptography.MD5.Create();
+        var hashBytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(filePath.ToLowerInvariant()));
+        var hashName = Convert.ToHexString(hashBytes).ToLowerInvariant();
+        return Path.Combine(CurrentCacheDirectory, folderHash, hashName + ".jpg");
+    }
+
+    /// <summary>Old flat cache path (pre-folder-hierarchy) for backward compat migration</summary>
+    private string GetOldCacheFilePath(string filePath)
+    {
         using var md5 = System.Security.Cryptography.MD5.Create();
         var hashBytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(filePath.ToLowerInvariant()));
         var hashName = Convert.ToHexString(hashBytes).ToLowerInvariant();
         return Path.Combine(CurrentCacheDirectory, hashName + ".jpg");
+    }
+
+    private static string GetFolderHash(string filePath)
+    {
+        var dir = Path.GetDirectoryName(filePath) ?? "_root";
+        using var md5 = System.Security.Cryptography.MD5.Create();
+        var hashBytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(dir.ToLowerInvariant()));
+        return Convert.ToHexString(hashBytes).ToLowerInvariant()[..8];
     }
 
     public void Save(string filePath, byte[] pngData)
@@ -69,10 +87,19 @@ public class DiskThumbnailCache
         try
         {
             var cachePath = GetCacheFilePath(filePath);
-            if (!File.Exists(cachePath))
-                return null;
+            if (File.Exists(cachePath))
+                return File.ReadAllBytes(cachePath);
 
-            return File.ReadAllBytes(cachePath);
+            // Backward compat: migrate from old flat path to new folder-hierarchy path
+            var oldPath = GetOldCacheFilePath(filePath);
+            if (File.Exists(oldPath))
+            {
+                var data = File.ReadAllBytes(oldPath);
+                try { Save(filePath, data); } catch { }
+                try { File.Delete(oldPath); } catch { }
+                return data;
+            }
+            return null;
         }
         catch
         {
@@ -87,6 +114,10 @@ public class DiskThumbnailCache
             var cachePath = GetCacheFilePath(filePath);
             if (File.Exists(cachePath))
                 File.Delete(cachePath);
+            // Also clean up old flat-path cache
+            var oldPath = GetOldCacheFilePath(filePath);
+            if (File.Exists(oldPath))
+                File.Delete(oldPath);
         }
         catch { }
     }
@@ -96,12 +127,18 @@ public class DiskThumbnailCache
         try
         {
             var hashName = GetCacheFileName(filePath);
+            var folderHash = GetFolderHash(filePath);
             if (!Directory.Exists(_cacheRoot)) return;
             foreach (var dir in Directory.EnumerateDirectories(_cacheRoot, "w*"))
             {
-                var cachePath = Path.Combine(dir, hashName);
+                // New nested path
+                var cachePath = Path.Combine(dir, folderHash, hashName);
                 if (File.Exists(cachePath))
                     File.Delete(cachePath);
+                // Old flat path (backward compat cleanup)
+                var oldPath = Path.Combine(dir, hashName);
+                if (File.Exists(oldPath))
+                    File.Delete(oldPath);
             }
         }
         catch { }

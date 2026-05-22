@@ -18,11 +18,11 @@ public class AutoTagPipelineService
     private readonly IImageMetaRepository _metaRepo;
     private readonly ITagRepository _tagRepo;
     private readonly ITagMappingRepository _mappingRepo;
-    private readonly IAutoTagService _tagService;
-    private readonly ITranslationService _translationService;
+    private readonly IEnsembleTagService _tagService;
     private readonly IAutoTagStateRepository _stateRepo;
     private double _confidenceThreshold = 0.35;
     private int _maxTagsPerImage = 20;
+    private int _maxConcurrency = 1;  // GPU 推理时 1，避免显存争抢
     private List<ImageMeta>? _cachedMetas;
     private string? _cachedFolderPath;
 
@@ -32,22 +32,21 @@ public class AutoTagPipelineService
         IImageMetaRepository metaRepo,
         ITagRepository tagRepo,
         ITagMappingRepository mappingRepo,
-        IAutoTagService tagService,
-        ITranslationService translationService,
+        IEnsembleTagService tagService,
         IAutoTagStateRepository stateRepo)
     {
         _metaRepo = metaRepo;
         _tagRepo = tagRepo;
         _mappingRepo = mappingRepo;
         _tagService = tagService;
-        _translationService = translationService;
         _stateRepo = stateRepo;
     }
 
-    public void Configure(double confidenceThreshold, int maxTagsPerImage)
+    public void Configure(double confidenceThreshold, int maxTagsPerImage, int maxConcurrency = 1)
     {
         _confidenceThreshold = confidenceThreshold;
         _maxTagsPerImage = maxTagsPerImage;
+        _maxConcurrency = maxConcurrency;
     }
 
     // ==================== Situation Assessment ====================
@@ -61,11 +60,11 @@ public class AutoTagPipelineService
 
         return state.Status switch
         {
-            "Processing" => new FolderTagActionResult("Busy",
-                $"此文件夹正在打标中（已完成 {state.Processed}/{state.TotalFiles}），请等待完成。", false),
+            "Processing" => new FolderTagActionResult("Recover",
+                $"检测到上次打标中断（已完成 {state.Processed}/{state.TotalFiles}）。\n是否清理并重新打标？", true),
 
-            "Done" when state.LastFileCount == folderFileCount => new FolderTagActionResult("Blocked",
-                "此文件夹已完成打标，无需重复。", false),
+            "Done" when state.LastFileCount == folderFileCount => new FolderTagActionResult("ReTag",
+                "此文件夹已完成打标。\n是否删除所有自动标签并重新打标？\n（手动标签不受影响）", true),
 
             "Done" when state.LastFileCount < folderFileCount => new FolderTagActionResult("NewFiles",
                 $"此文件夹已打标，但检测到 {folderFileCount - state.LastFileCount} 张新图片。是否仅对新图片打标？", true),
@@ -73,8 +72,8 @@ public class AutoTagPipelineService
             "Done" => new FolderTagActionResult("Blocked",
                 "此文件夹已完成打标，无需重复。", false),
 
-            "AwaitingReview" when state.LastFileCount <= folderFileCount => new FolderTagActionResult("Resume",
-                "此文件夹有待确认的翻译，是否继续上次的审核？\n（提示：选择\"是\"继续审核，选择\"否\"可重新打标）", true),
+            "AwaitingReview" => new FolderTagActionResult("Resume",
+                "此文件夹推理已完成，是否直接确认标签？（不会重新推理）\n选择\"否\"可重新打标", true),
 
             "Failed" => new FolderTagActionResult("Retry",
                 $"上次打标失败。错误：{state.ErrorMsg ?? "未知"}\n是否重新打标？", true),
@@ -117,7 +116,7 @@ public class AutoTagPipelineService
             new BoundedChannelOptions(50) { SingleWriter = false, SingleReader = true,
                 FullMode = BoundedChannelFullMode.Wait });
 
-        var ioSemaphore = new SemaphoreSlim(2);
+        var ioSemaphore = new SemaphoreSlim(_maxConcurrency);
         int processed = 0;
         var errors = new ConcurrentQueue<string>();
 
@@ -251,28 +250,11 @@ public class AutoTagPipelineService
 
         var toTranslate = allTags.Where(t => !mappedSet.Contains(t)).ToList();
 
-        if (toTranslate.Count > 0 && _translationService.IsAvailable)
+        // Save untranslated tags as-is → ChineseTagLibrary provides Chinese at review time
+        foreach (var tag in toTranslate)
         {
-            ProgressChanged?.Invoke(new AutoTagPipelineProgress(
-                "Translation", 0, toTranslate.Count, $"正在翻译 {toTranslate.Count} 个标签..."));
-
-            var translations = await _translationService.TranslateBatchAsync(toTranslate);
-
-            foreach (var (english, chinese) in translations)
-            {
-                await _stateRepo.SaveTranslationAsync(folderId, english,
-                    string.IsNullOrEmpty(chinese) ? null : chinese,
-                    null, isConfirmed: false, isExistingMapping: false);
-            }
-        }
-        else
-        {
-            // Save untranslated tags as-is
-            foreach (var tag in toTranslate)
-            {
-                await _stateRepo.SaveTranslationAsync(folderId, tag,
-                    null, null, isConfirmed: false, isExistingMapping: false);
-            }
+            await _stateRepo.SaveTranslationAsync(folderId, tag,
+                null, null, isConfirmed: false, isExistingMapping: false);
         }
 
         ProgressChanged?.Invoke(new AutoTagPipelineProgress(

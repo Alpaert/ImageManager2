@@ -31,17 +31,26 @@ public static class OnlineSearchHelper
         ["soutubot"] = "https://soutubot.moe/",
         ["yandere"] = "https://yande.re/post/similar",
         ["baidu"] = "https://image.baidu.com/",
+        ["danbooru_iqdb"] = "https://danbooru.donmai.us/iqdb_queries",
     };
 
-    private static string _tempDir = Path.Combine(Path.GetTempPath(), "ImageManagerSearch");
+    private static string? _tempDir;
 
     public static void SetTempDir(string dir)
     {
+        // 清理旧 C 盘临时文件（如果之前用过默认路径）
+        var oldC = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ImageManagerSearch");
+        if (!string.Equals(oldC, dir, StringComparison.OrdinalIgnoreCase))
+        {
+            try { if (System.IO.Directory.Exists(oldC)) System.IO.Directory.Delete(oldC, recursive: true); }
+            catch { }
+        }
         _tempDir = dir;
     }
 
     public static void CleanupOldTempFiles()
     {
+        if (_tempDir == null) return;
         try
         {
             if (Directory.Exists(_tempDir))
@@ -114,6 +123,7 @@ public static class OnlineSearchHelper
                     return false;
                 }
 
+                if (_tempDir == null) return false;
                 var tempPath = Path.Combine(_tempDir, $"imgsearch_{Guid.NewGuid():N}.html");
                 Directory.CreateDirectory(_tempDir);
 

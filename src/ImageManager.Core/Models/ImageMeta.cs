@@ -14,5 +14,7 @@ public class ImageMeta
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 
+    public int SystemRating { get; set; } = -1;  // -1=Unknown, 0=General, 1=Sensitive, 2=Questionable, 3=Explicit
+
     public List<TagCount> Tags { get; set; } = new();
 }

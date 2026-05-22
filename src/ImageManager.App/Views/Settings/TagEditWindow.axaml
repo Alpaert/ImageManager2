@@ -69,7 +69,14 @@
                 BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
             <DockPanel>
                 <StackPanel DockPanel.Dock="Top" Spacing="4" Margin="0,0,0,8">
-                    <TextBlock Text="当前图片 Tag" FontWeight="SemiBold" FontSize="13"/>
+                    <Grid ColumnDefinitions="*,Auto">
+                        <TextBlock Text="当前图片 Tag" FontWeight="SemiBold" FontSize="13"
+                                   VerticalAlignment="Center"/>
+                        <Button Grid.Column="1" Content="清空" Width="50" Height="24"
+                                FontSize="16" Padding="7,1,0,0"
+                                ToolTip.Tip="双击清空当前图片全部标签"
+                                DoubleTapped="BtnClearAllCurrentTags_DoubleTapped"/>
+                    </Grid>
                     <TextBox Text="{Binding CurrentTagsFilterText}"
                              Background="{DynamicResource InputBgBrush}" FontSize="12"/>
                 </StackPanel>
@@ -82,7 +89,9 @@
                                     <Grid ColumnDefinitions="*,Auto">
                                         <TextBlock Text="{Binding}" VerticalAlignment="Center" FontSize="13"/>
                                         <Button Grid.Column="1" Content="×"
-                                                Width="24" Height="24" FontSize="14" Padding="0"
+                                                Width="24" Height="24" FontSize="20" Padding="0,-2,0,0"
+												HorizontalContentAlignment="Center"
+                                                VerticalContentAlignment="Center"
                                                 Click="DeleteCurrentTag_Click" Tag="{Binding}"/>
                                     </Grid>
                                 </Border>
@@ -105,7 +114,7 @@
                                  PlaceholderText="新 Tag..."
                                  Background="{DynamicResource InputBgBrush}"
                                  KeyDown="TxtFavoriteInput_KeyDown"/>
-                        <Button Content="+" Width="36" FontSize="16" Padding="0"
+                        <Button Content="+" Width="36" FontSize="16" Padding="11,-2,0,0"
                                 Command="{Binding AddFavoriteCommand}"/>
                     </StackPanel>
                 </StackPanel>

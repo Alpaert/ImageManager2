@@ -53,6 +53,12 @@ public partial class TagEditViewModel : ViewModelBase
     private int _autoSuggestVersion;
     private CancellationTokenSource? _autoSuggestCts;
 
+    // --- 多图模式 ---
+    public bool IsMultiImageMode { get; }
+    private readonly Func<string, Task>? _onAddTagToAll;
+    private readonly Func<string, Task>? _onRemoveTagFromAll;
+    private readonly Func<Task>? _onClearAllTags;
+
     public TagEditViewModel(
         string currentTagsText,
         List<TagCount> allTagCounts,
@@ -83,6 +89,31 @@ public partial class TagEditViewModel : ViewModelBase
         RefreshFilteredTags();
     }
 
+    /// <summary>多图模式构造函数：中间栏显示交集，操作应用到所有图片</summary>
+    public TagEditViewModel(
+        List<string> commonTags,
+        List<TagCount> allTagCounts,
+        IList<string> favoriteTags,
+        int maxSuggestionCount,
+        Func<string, Task> onAddTagToAll,
+        Func<string, Task> onRemoveTagFromAll,
+        Func<Task> onClearAllTags)
+    {
+        IsMultiImageMode = true;
+        _allTagCounts = allTagCounts;
+        _favoriteTagsBacking = favoriteTags;
+        _onAddTagToAll = onAddTagToAll;
+        _onRemoveTagFromAll = onRemoveTagFromAll;
+        _onClearAllTags = onClearAllTags;
+
+        foreach (var t in commonTags)
+            CurrentTags.Add(t);
+
+        RebuildAutoSuggestions(string.Empty);
+        RebuildFavoriteSuggestions(string.Empty);
+        RefreshFilteredTags();
+    }
+
     private bool IsReservedName(string name)
     {
         if (ReservedTagNames.Contains(name))
@@ -94,16 +125,24 @@ public partial class TagEditViewModel : ViewModelBase
     }
 
     [RelayCommand]
-    private void AddTag()
+    private async Task AddTag()
     {
         ErrorMessage = string.Empty;
         var name = TagInputText.Trim();
         if (string.IsNullOrWhiteSpace(name)) return;
-
         if (IsReservedName(name)) return;
 
-        if (!CurrentTags.Any(t => string.Equals(t, name, StringComparison.OrdinalIgnoreCase)))
-            CurrentTags.Add(name);
+        if (IsMultiImageMode && _onAddTagToAll != null)
+        {
+            await _onAddTagToAll(name);
+            if (!CurrentTags.Any(t => string.Equals(t, name, StringComparison.OrdinalIgnoreCase)))
+                CurrentTags.Add(name);
+        }
+        else
+        {
+            if (!CurrentTags.Any(t => string.Equals(t, name, StringComparison.OrdinalIgnoreCase)))
+                CurrentTags.Add(name);
+        }
 
         TagInputText = string.Empty;
         RebuildAutoSuggestions(string.Empty);
@@ -146,8 +185,12 @@ public partial class TagEditViewModel : ViewModelBase
     }
 
     [RelayCommand]
-    private void AddSuggestedTag(string name)
+    private async Task AddSuggestedTag(string name)
     {
+        if (IsMultiImageMode && _onAddTagToAll != null)
+        {
+            await _onAddTagToAll(name);
+        }
         if (!CurrentTags.Any(t => string.Equals(t, name, StringComparison.OrdinalIgnoreCase)))
         {
             CurrentTags.Add(name);
@@ -156,8 +199,12 @@ public partial class TagEditViewModel : ViewModelBase
     }
 
     [RelayCommand]
-    private void AddFavoriteTag(string name)
+    private async Task AddFavoriteTag(string name)
     {
+        if (IsMultiImageMode && _onAddTagToAll != null)
+        {
+            await _onAddTagToAll(name);
+        }
         if (!CurrentTags.Any(t => string.Equals(t, name, StringComparison.OrdinalIgnoreCase)))
         {
             CurrentTags.Add(name);
@@ -166,14 +213,29 @@ public partial class TagEditViewModel : ViewModelBase
     }
 
     [RelayCommand]
-    private void DeleteCurrentTag(string name)
+    private async Task DeleteCurrentTag(string name)
     {
+        if (IsMultiImageMode && _onRemoveTagFromAll != null)
+        {
+            await _onRemoveTagFromAll(name);
+        }
         for (int i = CurrentTags.Count - 1; i >= 0; i--)
         {
             if (string.Equals(CurrentTags[i], name, StringComparison.OrdinalIgnoreCase))
                 CurrentTags.RemoveAt(i);
         }
         RefreshFilteredTags();
+    }
+
+    [RelayCommand]
+    private async Task ClearAllCurrentTags()
+    {
+        if (IsMultiImageMode && _onClearAllTags != null)
+        {
+            await _onClearAllTags();
+        }
+        CurrentTags.Clear();
+        FilteredCurrentTags.Clear();
     }
 
     [RelayCommand]
@@ -263,6 +325,7 @@ public partial class TagEditViewModel : ViewModelBase
             }
 
             var results = query
+                .Take(1000)  // 限制显示数量，防止大数据量卡顿；搜索时先匹配全库再截断
                 .Select(t => new TagDisplayItem { Name = t.Name, Count = t.Count, Display = showCount ? $"{t.Name} ({t.Count})" : t.Name })
                 .ToList();
 

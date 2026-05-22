@@ -1,0 +1,60 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ImageManager.App.ViewModels"
+        x:Class="ImageManager.App.Views.Settings.ArtistDbBuilderWindow"
+        x:DataType="vm:ArtistDbBuilderViewModel"
+        Title="画师嵌入库构建工具"
+        Width="520" Height="400"
+        CanResize="False">
+
+    <Grid RowDefinitions="*,Auto" Margin="16">
+        <StackPanel Grid.Row="0" Spacing="14">
+            <Border Padding="14" BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="参考图目录" FontWeight="SemiBold" FontSize="14"/>
+                    <TextBlock Text="每个子文件夹 = 一位画师，文件夹名 = 画师名，文件夹内为该画师的参考图"
+                               Foreground="{DynamicResource MutedFgBrush}" FontSize="11" TextWrapping="Wrap"/>
+
+                    <StackPanel Orientation="Horizontal" Spacing="10">
+                        <TextBox Text="{Binding ReferenceDir}" Width="360" IsReadOnly="True"/>
+                        <Button Content="浏览..." Width="70" FontSize="12"
+                                Command="{Binding SelectFolderCommand}"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <Border Padding="14" BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="当前画师库" FontWeight="SemiBold" FontSize="14"/>
+
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="每位画师取所有参考图的嵌入均值"
+                                   Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
+                        <TextBlock Text="• 建议每位画师 5-20 张代表作"
+                                   Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
+                        <TextBlock Text="• 嵌入维度: 1024 (PixAI embedding)"
+                                   Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
+                        <TextBlock Text="• 新画师可随时添加，自动与已有库合并"
+                                   Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
+                    </StackPanel>
+
+                    <ProgressBar IsVisible="{Binding IsRunning}"
+                                 Minimum="0" Maximum="{Binding Total}"
+                                 Value="{Binding Progress}" Height="6"/>
+
+                    <TextBlock Text="{Binding StatusText}"
+                               Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
+                               TextWrapping="Wrap"/>
+                </StackPanel>
+            </Border>
+        </StackPanel>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Spacing="10" Margin="0,16,0,0">
+            <Button Content="取消" Width="80" Click="BtnCancel_Click"/>
+            <Button Content="开始建库" Width="100"
+                    Command="{Binding BuildCommand}"
+                    IsEnabled="{Binding !IsRunning}"/>
+        </StackPanel>
+    </Grid>
+</Window>

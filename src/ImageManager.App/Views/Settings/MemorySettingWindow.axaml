@@ -4,8 +4,8 @@
         x:Class="ImageManager.App.Views.Settings.MemorySettingWindow"
         x:DataType="vm:MemorySettingViewModel"
         Title="内存与缓存设置"
-        Width="500" Height="580"
-        CanResize="False">
+        Width="500" Height="760"
+        CanResize="True">
 
     <Grid RowDefinitions="*,Auto" Margin="16">
         <StackPanel Grid.Row="0" Spacing="14">
@@ -48,23 +48,74 @@
                 <StackPanel Spacing="8">
                     <TextBlock Text="AI 打标设置" FontWeight="SemiBold" FontSize="14"/>
 
+                    <!-- 打标模式 -->
                     <StackPanel Spacing="4">
-                        <TextBlock Text="DeepSeek API Key:"
+                        <TextBlock Text="打标模式:"
+                                   Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"/>
+                        <ComboBox SelectedIndex="{Binding TagMode}" Width="360">
+                            <ComboBoxItem Content="单模型 (仅 PixAI 打标) — 特征+角色"/>
+                            <ComboBoxItem Content="双模型流水线 (WD 分级 + PixAI 打标) — 含画师识别"/>
+                        </ComboBox>
+                        <TextBlock Text="{Binding TagModeHint}"
+                                   Foreground="{DynamicResource MutedFgBrush}" FontSize="11"
+                                   TextWrapping="Wrap"/>
+                    </StackPanel>
+
+                    <!-- 双模型流水线设置 -->
+                    <StackPanel Spacing="4" IsVisible="{Binding IsEnsembleMode}">
+                        <TextBlock Text="双模型流水线设置" FontWeight="SemiBold" FontSize="12"/>
+
+                        <StackPanel Spacing="2">
+                            <TextBlock Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12">
+                                <Run Text="每图最多标签数: "/><Run Text="{Binding EnsembleMaxTags}"/>
+                            </TextBlock>
+                            <Slider Minimum="10" Maximum="150"
+                                    Value="{Binding EnsembleMaxTags}"
+                                    TickFrequency="5" IsSnapToTickEnabled="True" Width="400"/>
+                        </StackPanel>
+
+                        <StackPanel Spacing="2">
+                            <TextBlock Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
+                                       Text="{Binding PixaiMinConfidence, StringFormat='PixAI 打标置信度: {0:0.00}'}"/>
+                            <Slider Minimum="0.05" Maximum="0.9"
+                                    Value="{Binding PixaiMinConfidence}"
+                                    TickFrequency="0.05" IsSnapToTickEnabled="True" Width="400"/>
+                            <TextBlock Text="特征和角色标签的最低置信度，低于此值的标签被过滤"
+                                       Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
+                        </StackPanel>
+
+                        <StackPanel Spacing="2">
+                            <TextBlock Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
+                                       Text="{Binding ArtistMatchThreshold, StringFormat='画师匹配阈值: {0:0.00}'}"/>
+                            <Slider Minimum="0.1" Maximum="0.9"
+                                    Value="{Binding ArtistMatchThreshold}"
+                                    TickFrequency="0.05" IsSnapToTickEnabled="True" Width="400"/>
+                            <TextBlock Text="嵌入向量余弦相似度阈值，越低越容易匹配但可能误判"
+                                       Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
+                        </StackPanel>
+
+                    </StackPanel>
+
+                    <!-- 单模型设置 -->
+                    <StackPanel Spacing="4" IsVisible="{Binding IsSingleModelMode}">
+                        <TextBlock Text="单模型设置" FontWeight="SemiBold" FontSize="12"/>
+                        <StackPanel Spacing="2">
+                            <TextBlock Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
+                                       Text="{Binding SingleModelMinConfidence, StringFormat='PixAI 打标置信度: {0:0.00}'}"/>
+                            <Slider Minimum="0.05" Maximum="0.9"
+                                    Value="{Binding SingleModelMinConfidence}"
+                                    TickFrequency="0.05" IsSnapToTickEnabled="True" Width="400"/>
+                        </StackPanel>
+                    </StackPanel>
+
+                    <Separator/>
+
+                    <StackPanel Spacing="4">
+                        <TextBlock Text="DeepSeek API Key (用于 AI 推荐):"
                                    Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"/>
                         <TextBox Text="{Binding DeepSeekApiKey}" Width="400"
                                  PasswordChar="*"/>
-                        <TextBlock Text="用于批量翻译英文标签为中文，不填写则跳过翻译步骤"
-                                   Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
-                    </StackPanel>
-
-                    <StackPanel Spacing="4">
-                        <TextBlock Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
-                                   Text="{Binding OnnxConfidenceThreshold, StringFormat='{}阈值: {0:0.00}'}"/>
-                        <Slider Minimum="0.1" Maximum="0.9"
-                                Value="{Binding OnnxConfidenceThreshold}"
-                                TickFrequency="0.05" IsSnapToTickEnabled="True"
-                                Width="400"/>
-                        <TextBlock Text="低于阈值的标签会被过滤，默认 0.35"
+                        <TextBlock Text="仅用于 AI 标签推荐功能，打标翻译已改用预翻译 CSV"
                                    Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
                     </StackPanel>
                 </StackPanel>

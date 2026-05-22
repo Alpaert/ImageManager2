@@ -182,6 +182,9 @@ public partial class MainWindowViewModel : ViewModelBase
     private FileSystemWatcher? _folderWatcher;
     private CancellationTokenSource? _folderWatchDebounceCts;
 
+    private readonly ImageManager.Infrastructure.Services.ArtistEmbeddingStore _artistStore;
+    private readonly ImageManager.Infrastructure.Services.ChineseTagLibrary _chineseLib;
+
     public MainWindowViewModel(
         ISettingsRepository settingsRepo,
         IFolderRepository folderRepo,
@@ -191,7 +194,9 @@ public partial class MainWindowViewModel : ViewModelBase
         IDuplicateService duplicateService,
         ThumbnailCacheService thumbCache,
         PageManager pageManager,
-        TagSearchController tagSearch)
+        TagSearchController tagSearch,
+        ImageManager.Infrastructure.Services.ArtistEmbeddingStore artistStore,
+        ImageManager.Infrastructure.Services.ChineseTagLibrary chineseLib)
     {
         _settingsRepo = settingsRepo;
         _folderRepo = folderRepo;
@@ -202,6 +207,8 @@ public partial class MainWindowViewModel : ViewModelBase
         _thumbCache = thumbCache;
         _pageManager = pageManager;
         _tagSearch = tagSearch;
+        _artistStore = artistStore;
+        _chineseLib = chineseLib;
 
         _pageManager.PageChanged += args =>
         {
@@ -923,6 +930,8 @@ partial void OnCornerRadiusDipChanged(double value)
     partial void OnZoomTickChanged(double value)
     {
         SaveZoomForMode(WaterfallMode);
+        _pageManager.UpdateUiState(new PageUiState(
+            (double)0, WaterfallMode, AppSettings.ThumbnailAspectRatio));
         var (baseWidth, _) = _pageManager.OnZoomTickChanged(value, CurrentPage, TotalPages,
             ActiveFileList, GetTagsForFile);
         ThumbnailBaseWidth = baseWidth;
@@ -1378,6 +1387,7 @@ partial void OnCornerRadiusDipChanged(double value)
             }
 
             _tagSearch.AllTagCounts = await _tagRepo.GetAllTagCountsAsync();
+            SyncArtistName(oldName, newName);
             return RenameResult.Success;
         });
     }
@@ -1403,7 +1413,36 @@ partial void OnCornerRadiusDipChanged(double value)
             }
 
             _tagSearch.AllTagCounts = await _tagRepo.GetAllTagCountsAsync();
+            SyncArtistName(oldName, newName);
         });
+    }
+
+    private void SyncArtistName(string oldName, string newName)
+    {
+        var modelsDir = System.IO.Path.Combine(_thumbCache.CacheDirectory, "models");
+        var embPath = System.IO.Path.Combine(modelsDir, "artist_embeddings.bin");
+        var namesPath = System.IO.Path.Combine(modelsDir, "artist_names.txt");
+
+        // 更新嵌入库中的画师名
+        var emb = _artistStore.Artists.GetValueOrDefault(oldName);
+        if (emb != null)
+        {
+            _artistStore.Add(newName, emb, _artistStore.GetImageCount(oldName));
+            // 如果新旧不同名，移除旧条目
+            if (!string.Equals(oldName, newName, StringComparison.OrdinalIgnoreCase))
+            {
+                _artistStore.Remove(oldName);
+            }
+            _artistStore.Save(embPath);
+        }
+
+        // 更新中文库映射
+        _chineseLib.Register(newName, newName);
+        if (!string.Equals(oldName, newName, StringComparison.OrdinalIgnoreCase))
+        {
+            _chineseLib.RemoveArtistName(oldName);
+        }
+        _chineseLib.SaveArtistNames(namesPath);
     }
 
     public async Task RefreshTagCountsAsync()
@@ -1462,6 +1501,25 @@ partial void OnCornerRadiusDipChanged(double value)
 
         _tagCacheByPath[filePath] = tags;
         await RefreshTagCountsAsync();
+    }
+
+    public async Task AddTagToImageAsync(string filePath, string tag)
+    {
+        var tags = _tagCacheByPath.GetValueOrDefault(filePath) ?? new List<string>();
+        if (!tags.Contains(tag, StringComparer.OrdinalIgnoreCase))
+        {
+            tags.Add(tag);
+            await SetImageTagsAsync(filePath, tags);
+        }
+    }
+
+    public async Task RemoveTagFromImageAsync(string filePath, string tag)
+    {
+        var tags = _tagCacheByPath.GetValueOrDefault(filePath);
+        if (tags != null && tags.RemoveAll(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase)) > 0)
+        {
+            await SetImageTagsAsync(filePath, tags);
+        }
     }
 
     public List<string> GetTagsForFile(string filePath)

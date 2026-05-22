@@ -35,6 +35,7 @@ public class PageManager
     private readonly SemaphoreSlim _thumbnailLoadSemaphore = new(4);
     private int _thumbnailDecodeWidth = 200;
     private int _currentZoomLevel;
+    private PageUiState _currentUiState;
     private CancellationTokenSource? _zoomDebounceCts;
 
     public event Action<PageChangedEventArgs>? PageChanged;
@@ -110,7 +111,7 @@ public class PageManager
 
     public int ComputeDecodeWidth()
     {
-        int w = (int)(ZoomLevels[_currentZoomLevel] * 2.5);
+        int w = (int)(ZoomLevels[_currentZoomLevel] * 2);
         return Math.Clamp(w, 300, 1600);
     }
 
@@ -130,6 +131,9 @@ public class PageManager
         if (frac > 1) frac = 1;
 
         double baseWidth = ZoomLevels[idx] + (ZoomLevels[idx + 1] - ZoomLevels[idx]) * frac;
+
+        // Keep WaterfallMode/AspectRatio from last UpdateUiState, replace baseWidth
+        _currentUiState = new PageUiState(baseWidth, _currentUiState.WaterfallMode, _currentUiState.ThumbnailAspectRatio);
 
         int newLevel = (int)Math.Round(t - 1);
         if (newLevel < 0) newLevel = 0;
@@ -156,10 +160,21 @@ public class PageManager
                     {
                         _thumbCache.DecodeWidth = _thumbnailDecodeWidth;
                         await _thumbCache.ClearAsync();
-                        InvalidateCache();
-                        await ShowPageAsync(currentPage, totalPages,
-                            capturedFileList, getTagsForFile,
-                            isSearchResult: false, currentFolder: null);
+                        // Mark cached items as unloaded — reloads in-place without destroying page
+                        lock (_pageCacheLock)
+                        {
+                            foreach (var kv in _pageCache)
+                                foreach (var item in kv.Value)
+                                {
+                                    item.IsLoaded = false;
+                                    item.IsLoading = true;
+                                }
+                        }
+                        if (_pageCache.TryGetValue(_activePageIndex, out var currentItems))
+                            PageChanged?.Invoke(new PageChangedEventArgs(
+                                currentItems, _activePageIndex, totalPages,
+                                $"当前页: {_activePageIndex + 1}/{totalPages}  每页 {PageSize} 张"));
+                        _ = LoadPageThumbnailsAsync(_activePageIndex);
                     });
                 }, token);
                 return (baseWidth, true);
@@ -178,8 +193,11 @@ public class PageManager
 
     public void InvalidateCache()
     {
+        _currentUiState = default;
         lock (_pageCacheLock) { _pageCache.Clear(); }
     }
+
+    public void UpdateUiState(PageUiState state) => _currentUiState = state;
 
     public void RemoveFromCache(int pageIndex)
     {
@@ -254,9 +272,7 @@ public class PageManager
         var unloaded = pageItems.Where(i => !i.IsLoaded).ToList();
         if (unloaded.Count == 0) return;
 
-        int visibleCount = EstimateVisibleItemCount(new PageUiState(
-            // Use a default — the actual state is passed from VM where needed
-            160, "None", 1.0));
+        int visibleCount = EstimateVisibleItemCount(_currentUiState);
         var priorityItems = unloaded.Take(visibleCount).ToList();
         var bgItems = unloaded.Skip(visibleCount).ToList();
 

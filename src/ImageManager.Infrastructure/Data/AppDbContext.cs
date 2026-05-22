@@ -44,7 +44,8 @@ public class AppDbContext : IDisposable
                 FileSize        INTEGER DEFAULT 0,
                 LastWriteTicks  INTEGER DEFAULT 0,
                 CreatedAt       TEXT NOT NULL DEFAULT (datetime('now')),
-                UpdatedAt       TEXT NOT NULL DEFAULT (datetime('now'))
+                UpdatedAt       TEXT NOT NULL DEFAULT (datetime('now')),
+                SystemRating    INTEGER DEFAULT -1
             );
 
             CREATE INDEX IF NOT EXISTS idx_imagemeta_filepath ON ImageMeta(FilePath);
@@ -122,6 +123,7 @@ public class AppDbContext : IDisposable
         // Migration: add FolderId column (must run before index creation)
         RunMigration(conn);
         RunMigrationV2(conn);
+        RunMigrationV3(conn);
 
         // Create FolderId index after column exists
         using var idxCmd = conn.CreateCommand();
@@ -149,6 +151,20 @@ public class AppDbContext : IDisposable
         {
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "ALTER TABLE ImageTag ADD COLUMN Source TEXT DEFAULT NULL;";
+            cmd.ExecuteNonQuery();
+        }
+        catch (SqliteException ex) when (ex.Message.Contains("duplicate column"))
+        {
+            // Column already exists
+        }
+    }
+
+    private static void RunMigrationV3(SqliteConnection conn)
+    {
+        try
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "ALTER TABLE ImageMeta ADD COLUMN SystemRating INTEGER DEFAULT -1;";
             cmd.ExecuteNonQuery();
         }
         catch (SqliteException ex) when (ex.Message.Contains("duplicate column"))

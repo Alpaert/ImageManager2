@@ -6,6 +6,7 @@ using Avalonia.Markup.Xaml;
 using ImageManager.App.Services;
 using ImageManager.App.ViewModels;
 using ImageManager.App.Views;
+using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Caching;
 using ImageManager.Infrastructure.Data;
@@ -20,7 +21,8 @@ namespace ImageManager.App;
 public partial class App : Application
 {
     public static ServiceProvider Services { get; private set; } = null!;
-    public static string CacheDirectoryPath { get; private set; } = @"C:\ImageManagerCache";
+    public static string CacheDirectoryPath { get; private set; } =
+        System.IO.Path.Combine(AppContext.BaseDirectory, "Cache");
 
     private static ServiceProvider ConfigureServices()
     {
@@ -60,6 +62,12 @@ public partial class App : Application
         }
 
         CacheDirectoryPath = cacheDir;
+
+        // Register GBK encoding provider for CSV reading
+        System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
+
+        // Initialize ensemble logger
+        Common.Helpers.AppLogger.Init(cacheDir);
 
         var dbPath = System.IO.Path.Combine(cacheDir, "data.db");
         System.IO.Directory.CreateDirectory(cacheDir);
@@ -139,10 +147,26 @@ public partial class App : Application
         services.AddSingleton<ThumbnailCacheService>();
         services.AddSingleton<IThumbnailCacheService>(sp => sp.GetRequiredService<ThumbnailCacheService>());
 
+        // Existing WD service
         services.AddSingleton<OnnxTagService>();
         services.AddSingleton<IAutoTagService>(sp => sp.GetRequiredService<OnnxTagService>());
+
+        // Translation (kept for backward compat, not used in ensemble pipeline)
         services.AddSingleton<DeepSeekTranslationService>();
         services.AddSingleton<ITranslationService>(sp => sp.GetRequiredService<DeepSeekTranslationService>());
+
+        // ==================== Ensemble Tag Services ====================
+        services.AddSingleton<ChineseTagLibrary>();
+        services.AddSingleton<ArtistEmbeddingStore>();
+        services.AddSingleton<PixaiTagService>();
+        services.AddSingleton<WdRatingService>();
+        services.AddSingleton<TagResultMerger>();
+        services.AddSingleton<SingleModelTagService>();
+        services.AddSingleton<EnsembleTagService>();
+        services.AddSingleton<TagServiceFactory>();
+        // Default → Ensemble mode, AutoTagController switches via TagServiceFactory
+        services.AddSingleton<IEnsembleTagService>(sp => sp.GetRequiredService<EnsembleTagService>());
+
         services.AddSingleton<IAutoTagStateRepository, AutoTagStateRepository>();
         services.AddSingleton<AutoTagPipelineService>();
         services.AddSingleton<AutoTagController>();

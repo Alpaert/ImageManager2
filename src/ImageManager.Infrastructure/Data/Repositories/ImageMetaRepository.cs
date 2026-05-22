@@ -274,19 +274,25 @@ public class ImageMetaRepository : IImageMetaRepository
     public async Task ReplaceAutoTagAsync(long imageId, string englishTagName, long chineseTagId)
     {
         using var conn = _db.CreateConnection();
-        // Step 1: Insert Chinese tag first (IGNORE if already present, e.g. from another English→Chinese mapping)
+        // Step 1: Upsert Chinese tag — UPDATE handles same-name, INSERT handles different-name
+        await conn.ExecuteAsync(@"
+            UPDATE ImageTag SET Source = 'AutoTagConfirmed'
+            WHERE ImageMetaId = @ImageId AND TagId = @ChineseId",
+            new { ImageId = imageId, ChineseId = chineseTagId });
+
         await conn.ExecuteAsync(@"
             INSERT OR IGNORE INTO ImageTag (ImageMetaId, TagId, Source)
             VALUES (@ImageId, @ChineseId, 'AutoTagConfirmed')",
             new { ImageId = imageId, ChineseId = chineseTagId });
 
-        // Step 2: Remove the old English AutoTag (won't affect the Chinese tag just inserted)
+        // Step 2: Remove old English AutoTag (skip if same TagId as Chinese to avoid deleting the upsert)
         await conn.ExecuteAsync(@"
             DELETE FROM ImageTag
             WHERE ImageMetaId = @ImageId
               AND TagId IN (SELECT Id FROM Tag WHERE Name = @EnglishName COLLATE NOCASE)
-              AND Source = 'AutoTag'",
-            new { ImageId = imageId, EnglishName = englishTagName.Trim() });
+              AND Source = 'AutoTag'
+              AND TagId != @ChineseId",
+            new { ImageId = imageId, EnglishName = englishTagName.Trim(), ChineseId = chineseTagId });
     }
 
     public async Task DeleteAutoTagFromImageAsync(long imageId, string tagName)
@@ -298,6 +304,18 @@ public class ImageMetaRepository : IImageMetaRepository
               AND TagId IN (SELECT Id FROM Tag WHERE Name = @TagName COLLATE NOCASE)
               AND Source = 'AutoTag'",
             new { ImageId = imageId, TagName = tagName.Trim() });
+    }
+
+    /// <summary>删除文件夹下所有自动标签（Source IN ('AutoTag','AutoTagConfirmed')），一条 SQL，批量高效</summary>
+    public async Task<int> DeleteAllAutoTagsByFolderAsync(string folderPath)
+    {
+        using var conn = _db.CreateConnection();
+        var normalized = Common.Helpers.PathHelper.NormalizeFolderPath(folderPath);
+        return await conn.ExecuteAsync(@"
+            DELETE FROM ImageTag
+            WHERE ImageMetaId IN (SELECT Id FROM ImageMeta WHERE FilePath LIKE @Prefix)
+              AND Source IN ('AutoTag', 'AutoTagConfirmed')",
+            new { Prefix = normalized + "%" });
     }
 
     public async Task<List<TagCount>> GetTagCountsAsync()

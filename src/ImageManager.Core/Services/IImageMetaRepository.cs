@@ -22,6 +22,7 @@ public interface IImageMetaRepository
     Task AddAutoTagsAsync(long imageId, List<string> tagNames);
     Task ReplaceAutoTagAsync(long imageId, string englishTagName, long chineseTagId);
     Task DeleteAutoTagFromImageAsync(long imageId, string tagName);
+    Task<int> DeleteAllAutoTagsByFolderAsync(string folderPath);
     Task<List<TagCount>> GetTagCountsAsync();
     Task<List<string>> GetFilePathsByTagAsync(string tagName);
     Task<List<string>> GetFilePathsByTagsAsync(List<string> tagNames, bool requireAll);

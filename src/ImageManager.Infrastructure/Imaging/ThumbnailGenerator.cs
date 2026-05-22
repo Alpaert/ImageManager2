@@ -82,7 +82,7 @@ public static class ThumbnailGenerator
             }
             else
             {
-                var sampling = new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None);
+                var sampling = new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear);
                 final = decoded.Resize(new SKSizeI(targetWidth, targetHeight), sampling);
                 if (final == null) return null;
             }
@@ -202,7 +202,7 @@ public static class ThumbnailGenerator
                     if (decodeW != targetW || decodeH != targetH)
                     {
                         var r = final.Resize(new SKSizeI(targetW, targetH),
-                            new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None));
+                            new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
                         if (r == null) return null;
                         final.Dispose();
                         final = r;
@@ -240,7 +240,7 @@ public static class ThumbnailGenerator
 
             return bitmap.Resize(
                 new SKSizeI(w, h),
-                new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None));
+                new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
         }
         catch
         {

@@ -143,4 +143,12 @@ public partial class TagEditWindow : Window
     {
         CloseWindow(false);
     }
+
+    private void BtnClearAllCurrentTags_DoubleTapped(object? sender, Avalonia.Input.TappedEventArgs e)
+    {
+        if (DataContext is ViewModels.TagEditViewModel vm)
+        {
+            vm.ClearAllCurrentTagsCommand.Execute(null);
+        }
+    }
 }

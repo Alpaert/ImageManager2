@@ -11,6 +11,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
         public byte[] Data { get; set; } = Array.Empty<byte>();
         public long SizeBytes { get; set; }
         public DateTime LastAccessUtc { get; set; }
+        public int DecodeWidth { get; set; }
     }
 
     private readonly ConcurrentDictionary<string, CacheEntry> _cache = new(StringComparer.OrdinalIgnoreCase);
@@ -29,12 +30,21 @@ public class ThumbnailCacheService : IThumbnailCacheService
             _diskCache.CacheDirectory = value;
         }
     }
-    public int DecodeWidth { get; set; } = 200;
+    private int _decodeWidth = 200;
+    public int DecodeWidth
+    {
+        get => _decodeWidth;
+        set
+        {
+            _decodeWidth = value;
+            _diskCache.DecodeWidth = value;
+        }
+    }
 
     public ThumbnailCacheService(string cacheRoot = @"C:\ImageManagerCache", int decodeWidth = 200)
     {
-        DecodeWidth = decodeWidth;
         _diskCache = new DiskThumbnailCache(cacheRoot, decodeWidth);
+        DecodeWidth = decodeWidth;
         _cacheDirectory = cacheRoot;
     }
 
@@ -74,8 +84,9 @@ public class ThumbnailCacheService : IThumbnailCacheService
             _diskCache.DecodeWidth = decodeWidth;
         }
 
-        // 1. Memory cache
-        if (_cache.TryGetValue(filePath, out var entry) && entry.Data != null)
+        // 1. Memory cache (must match decode width)
+        if (_cache.TryGetValue(filePath, out var entry) && entry.Data != null
+            && entry.DecodeWidth == decodeWidth)
         {
             entry.LastAccessUtc = DateTime.UtcNow;
             return entry.Data;
@@ -85,7 +96,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
         var cached = _diskCache.Load(filePath);
         if (cached != null)
         {
-            AddToMemory(filePath, cached);
+            AddToMemory(filePath, cached, decodeWidth);
             return cached;
         }
 
@@ -93,7 +104,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
         var data = await Task.Run(() => ThumbnailGenerator.Generate(filePath, decodeWidth));
         if (data != null)
         {
-            AddToMemory(filePath, data);
+            AddToMemory(filePath, data, decodeWidth);
             _diskCache.Save(filePath, data);
         }
 
@@ -135,13 +146,14 @@ public class ThumbnailCacheService : IThumbnailCacheService
             Interlocked.Exchange(ref _totalBytes, 0);
     }
 
-    private void AddToMemory(string filePath, byte[] data)
+    private void AddToMemory(string filePath, byte[] data, int decodeWidth)
     {
         var entry = new CacheEntry
         {
             Data = data,
             SizeBytes = data.Length,
-            LastAccessUtc = DateTime.UtcNow
+            LastAccessUtc = DateTime.UtcNow,
+            DecodeWidth = decodeWidth
         };
 
         _cache[filePath] = entry;

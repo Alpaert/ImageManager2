@@ -39,6 +39,12 @@ public class AppSettings
     public string HashVersion { get; set; } = "1";
 
     // ==================== Auto-Tag Settings ====================
-    public double OnnxConfidenceThreshold { get; set; } = 0.35;
     public string DeepSeekApiKey { get; set; } = string.Empty;
+
+    // ==================== Ensemble Tag Settings ====================
+    public int TagMode { get; set; } = 1;                    // 0=单模型(PixAI), 1=双模型(WD+PixAI)
+    public int EnsembleMaxTagsPerImage { get; set; } = 75;
+    public double EnsemblePixaiMinConfidence { get; set; } = 0.30;   // PixAI 打标置信度
+    public double ArtistMatchThreshold { get; set; } = 0.35;          // 画师嵌入匹配阈值
+    public double SingleModelMinConfidence { get; set; } = 0.15;
 }

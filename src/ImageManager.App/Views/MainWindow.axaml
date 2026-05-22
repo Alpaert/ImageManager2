@@ -101,6 +101,7 @@
                     <MenuItem Header="内存与缓存设置" Click="MenuMemorySettings_Click"/>
 
                     <MenuItem Header="标签管理" Click="MenuTagManage_Click"/>
+                    <MenuItem Header="画师嵌入库构建" Click="MenuArtistDbBuilder_Click"/>
                     <MenuItem Header="快捷键设置" Click="MenuShortcutSettings_Click"/>
                     <MenuItem Header="帮助" Click="MenuHelp_Click"/>
                 </MenuItem>
@@ -287,7 +288,7 @@
                             <Border.ContextMenu>
                                 <ContextMenu>
                                     <MenuItem Header="编辑 Tag" Click="MenuEditTag_Click"/>
-                                    <MenuItem Header="自动打标" Click="MenuAutoTagSingle_Click"/>
+                                    <MenuItem Header="自动打标" Click="MenuAutoTag_Click"/>
                                     <MenuItem Header="复制图片到剪贴板" Click="MenuCopyImage_Click"/>
                                     <MenuItem Header="查找相似图片（本文件夹）" Click="MenuFindSimilar_Click"/>
                                     <Separator/>
@@ -303,6 +304,7 @@
                                         <MenuItem Header="Yande" Click="MenuSearchOnline_Click" Tag="yandex"/>
                                         <MenuItem Header="Google" Click="MenuSearchOnline_Click" Tag="google"/>
                                         <MenuItem Header="Soutubot（本子）" Click="MenuSearchOnline_Click" Tag="soutubot"/>
+                                        <MenuItem Header="Danbooru IQDB" Click="MenuSearchOnline_Click" Tag="danbooru_iqdb"/>
                                     </MenuItem>
                                     <MenuItem Header="在资源管理器中打开" Click="MenuOpenInExplorer_Click"/>
                                     <Separator/>

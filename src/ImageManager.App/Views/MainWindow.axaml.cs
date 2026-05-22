@@ -758,9 +758,16 @@ public partial class MainWindow : Window
 
     private async void MenuEditTag_Click(object? sender, RoutedEventArgs e)
     {
-        var item = GetCtxItem(sender);
-        if (item != null)
-            await EditTagForItemAsync(item);
+        var selected = Vm.Images.Where(i => i.IsSelected).ToList();
+        if (selected.Count <= 1)
+        {
+            var item = GetCtxItem(sender);
+            if (item != null) await EditTagForItemAsync(item);
+        }
+        else
+        {
+            await EditTagsForItemsAsync(selected);
+        }
     }
 
     private async Task<bool> EditTagForItemAsync(ImageViewItem item)
@@ -822,13 +829,83 @@ public partial class MainWindow : Window
         return result;
     }
 
-    private async void MenuAutoTagSingle_Click(object? sender, RoutedEventArgs e)
+    private async Task EditTagsForItemsAsync(List<ImageViewItem> items)
     {
-        var item = GetCtxItem(sender);
-        if (item == null) return;
+        await Vm.RefreshTagCountsAsync();
+        var allTags = Vm.GetAllTagCounts();
+
+        // 计算交集：所有选中图片共有的 tag
+        var tagSets = items.Select(i => new HashSet<string>(i.Tags, StringComparer.OrdinalIgnoreCase)).ToList();
+        var intersection = new List<string>();
+        if (tagSets.Count > 0)
+        {
+            foreach (var tag in tagSets[0])
+            {
+                if (tagSets.Skip(1).All(s => s.Contains(tag)))
+                    intersection.Add(tag);
+            }
+        }
+
+        var tagVm = new TagEditViewModel(
+            intersection,
+            allTags,
+            Vm.AppSettings.FavoriteTags,
+            Vm.AppSettings.MaxTagSuggestionCount,
+            onAddTagToAll: async tag =>
+            {
+                foreach (var item in items)
+                {
+                    if (!item.Tags.Contains(tag, StringComparer.OrdinalIgnoreCase))
+                    {
+                        await Vm.AddTagToImageAsync(item.FilePath, tag);
+                        item.Tags.Add(tag);
+                    }
+                }
+            },
+            onRemoveTagFromAll: async tag =>
+            {
+                foreach (var item in items)
+                {
+                    await Vm.RemoveTagFromImageAsync(item.FilePath, tag);
+                    item.Tags.RemoveAll(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase));
+                }
+            },
+            onClearAllTags: async () =>
+            {
+                foreach (var item in items)
+                {
+                    await Vm.SetImageTagsAsync(item.FilePath, new List<string>());
+                    item.Tags.Clear();
+                }
+            });
+
+        var win = new Settings.TagEditWindow { DataContext = tagVm };
+        win.Title = $"编辑 Tag — {items.Count} 张图片";
+        await win.ShowDialog<bool>(this);
+
+        // Refresh all affected images
+        foreach (var item in items)
+        {
+            item.NotifyAll();
+            await Vm.RefreshImageTagsAsync(item.FilePath);
+        }
+    }
+
+    private async void MenuAutoTag_Click(object? sender, RoutedEventArgs e)
+    {
+        // 获取选中的图片（含右键点击的那张）
+        var selected = Vm.Images.Where(i => i.IsSelected).ToList();
+        var ctxItem = GetCtxItem(sender);
+        if (selected.Count == 0 && ctxItem != null)
+            selected.Add(ctxItem);
+
+        if (selected.Count == 0)
+        {
+            Vm.StatusText = "未找到图片";
+            return;
+        }
 
         var controller = App.Services.GetRequiredService<Services.AutoTagController>();
-
         if (!controller.IsModelLoaded)
         {
             Vm.StatusText = "正在加载打标模型...";
@@ -837,27 +914,45 @@ public partial class MainWindow : Window
         }
 
         var settings = Vm.AppSettings;
-        controller.Configure(settings.OnnxConfidenceThreshold, 20, settings.DeepSeekApiKey);
+        controller.Configure(
+            (Core.Services.TagMode)settings.TagMode,
+            settings.SingleModelMinConfidence, 75,
+            settings.EnsemblePixaiMinConfidence,
+            settings.ArtistMatchThreshold,
+            settings.DeepSeekApiKey);
 
-        Vm.StatusText = $"正在推理: {System.IO.Path.GetFileName(item.FilePath)}...";
-        var items = await controller.RunSingleImageAsync(item.FilePath);
+        var filePaths = selected.Select(i => i.FilePath).Distinct().ToList();
+        Vm.StatusText = $"正在推理 {filePaths.Count} 张图片...";
 
-        if (items.Count == 0)
+        _ = Task.Run(async () =>
         {
-            Vm.StatusText = "推理完成，未识别到标签";
-            return;
-        }
+            try
+            {
+                var pixai = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.PixaiTagService>();
+                for (int idx = 0; idx < filePaths.Count; idx++)
+                {
+                    var path = filePaths[idx];
+                    await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                        Vm.StatusText = $"推理中 ({idx + 1}/{filePaths.Count}): {System.IO.Path.GetFileName(path)}");
 
-        Vm.StatusText = $"推理完成，{items.Count} 个标签";
-        var reviewVm = new ViewModels.AutoTagReviewViewModel(controller, items,
-            isSingleImageMode: true, singleImagePath: item.FilePath);
-        var win = new Settings.AutoTagReviewWindow { DataContext = reviewVm };
-        win.Title = $"自动打标 — {System.IO.Path.GetFileName(item.FilePath)}";
+                    var items = await controller.RunSingleImageAsync(path);
+                    if (items.Count > 0)
+                        await controller.SaveMappingsAndTagsAsync(path, items);
+                }
 
-        await win.ShowDialog(this);
-        // Refresh displayed tags for this image
-        await Vm.RefreshImageTagsAsync(item.FilePath);
-        Vm.StatusText = "单图打标完成";
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
+                {
+                    foreach (var path in filePaths)
+                        await Vm.RefreshImageTagsAsync(path);
+                    Vm.StatusText = $"打标完成 ({filePaths.Count} 张)";
+                });
+            }
+            catch (Exception ex)
+            {
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                    Vm.StatusText = $"打标失败: {ex.Message}");
+            }
+        });
     }
 
     private async void MenuCopyImage_Click(object? sender, RoutedEventArgs e)
@@ -1294,18 +1389,32 @@ public partial class MainWindow : Window
 
         // Configure with current settings
         var settings = Vm.AppSettings;
-        controller.Configure(settings.OnnxConfidenceThreshold, 20, settings.DeepSeekApiKey);
+        controller.Configure(
+            (Core.Services.TagMode)settings.TagMode,
+            settings.SingleModelMinConfidence, 75,
+            settings.EnsemblePixaiMinConfidence,
+            settings.ArtistMatchThreshold,
+            settings.DeepSeekApiKey);
 
         // Confirm with user (Resume: 是=继续审核, 否=重新打标)
         var confirmResult = await ShowConfirmDialogAsync(action.Message);
 
         var effectiveAction = action.Action;
-        if (action.Action == "Resume")
+        if (action.Action is "ReTag" or "Recover")
+        {
+            if (!confirmResult)
+            {
+                Vm.StatusText = "已取消";
+                return;
+            }
+            effectiveAction = action.Action;
+        }
+        else if (action.Action == "Resume")
         {
             if (confirmResult)
                 effectiveAction = "Resume";
             else
-                effectiveAction = "Retry";
+                effectiveAction = "ReTag";  // 否→清旧标签重新推理
         }
         else if (!confirmResult)
         {
@@ -1329,20 +1438,13 @@ public partial class MainWindow : Window
             {
                 await controller.RunPipelineAsync(folder, filePaths, effectiveAction);
 
-                // Open review window on UI thread
+                // Auto-confirm all tags (Chinese names from CSV, no review needed)
                 await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
                 {
-                    var reviewData = await controller.GetReviewDataAsync();
-                    var reviewVm = new ViewModels.AutoTagReviewViewModel(controller, reviewData);
-                    var reviewWindow = new Settings.AutoTagReviewWindow { DataContext = reviewVm };
-
-                    reviewWindow.Closed += async (_, _) =>
-                    {
-                        await reviewVm.MarkDoneAsync();
-                        Vm.StatusText = "自动打标审核完成";
-                    };
-
-                    await reviewWindow.ShowDialog(this);
+                    Vm.StatusText = "自动打标完成";
+                    // 刷新所有图片的标签显示
+                    foreach (var path in filePaths)
+                        await Vm.RefreshImageTagsAsync(path);
                 });
             }
             catch (Exception ex)
@@ -1503,7 +1605,11 @@ public partial class MainWindow : Window
             Vm.AppSettings.ThumbnailCacheMaxMB,
             Vm.AppSettings.DiskCacheDirectory,
             Vm.AppSettings.DeepSeekApiKey,
-            Vm.AppSettings.OnnxConfidenceThreshold,
+            Vm.AppSettings.TagMode,
+            Vm.AppSettings.EnsembleMaxTagsPerImage,
+            Vm.AppSettings.EnsemblePixaiMinConfidence,
+            Vm.AppSettings.ArtistMatchThreshold,
+            Vm.AppSettings.SingleModelMinConfidence,
             () => App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>().EstimatedMemoryBytes,
             path => new Infrastructure.Caching.DiskThumbnailCache(path).EstimateDiskUsage(),
             pathChanged =>
@@ -1513,7 +1619,11 @@ public partial class MainWindow : Window
                 var newPath = memVm.CachePath;
                 Vm.AppSettings.DiskCacheDirectory = newPath;
                 Vm.AppSettings.DeepSeekApiKey = memVm.DeepSeekApiKey;
-                Vm.AppSettings.OnnxConfidenceThreshold = memVm.OnnxConfidenceThreshold;
+                Vm.AppSettings.TagMode = memVm.TagMode;
+                Vm.AppSettings.EnsembleMaxTagsPerImage = memVm.EnsembleMaxTags;
+                Vm.AppSettings.EnsemblePixaiMinConfidence = memVm.PixaiMinConfidence;
+                Vm.AppSettings.ArtistMatchThreshold = memVm.ArtistMatchThreshold;
+                Vm.AppSettings.SingleModelMinConfidence = memVm.SingleModelMinConfidence;
                 var cache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
                 cache.SwitchCacheDirectory(newPath);
                 OnlineSearchHelper.SetTempDir(Path.Combine(newPath, "search_temp"));
@@ -1544,6 +1654,135 @@ public partial class MainWindow : Window
             });
 
         var win = new Settings.ShortcutSettingWindow { DataContext = vm };
+        await win.ShowDialog(this);
+    }
+
+    private async void MenuArtistDbBuilder_Click(object? sender, RoutedEventArgs e)
+    {
+        var controller = App.Services.GetRequiredService<Services.AutoTagController>();
+
+        if (!controller.IsModelLoaded)
+        {
+            Vm.StatusText = "正在加载打标模型...";
+            try { await controller.LoadModelAsync(); }
+            catch (Exception ex) { Vm.StatusText = $"模型加载失败: {ex.Message}"; return; }
+        }
+
+        var vm = new ViewModels.ArtistDbBuilderViewModel();
+
+        vm.OnSelectFolder = async _ =>
+        {
+            var result = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+            {
+                Title = "选择画师参考图根目录（子文件夹名为画师名）",
+                AllowMultiple = false
+            });
+            if (result.Count > 0)
+                vm.ReferenceDir = result[0].Path.LocalPath;
+        };
+
+        vm.OnBuildAsync = dir =>
+        {
+            return Task.Run(async () =>
+            {
+                var pixai = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.PixaiTagService>();
+                var store = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.ArtistEmbeddingStore>();
+
+                // Phase 1: 扫描所有画师文件夹，比对图片数量
+                var artistDirs = Directory.GetDirectories(dir);
+                if (artistDirs.Length == 0)
+                {
+                    await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() => vm.StatusText = "未找到子文件夹");
+                    return;
+                }
+
+                var toBuild = new List<(string name, string dir, int imgCount)>();
+                int skipped = 0;
+                foreach (var artistDir in artistDirs)
+                {
+                    var artistName = Path.GetFileName(artistDir);
+                    var images = Directory.GetFiles(artistDir)
+                        .Where(f =>
+                        {
+                            var ext = Path.GetExtension(f).ToLower();
+                            return ext is ".jpg" or ".jpeg" or ".png" or ".webp";
+                        })
+                        .ToList();
+                    int currentCount = images.Count;
+                    int storedCount = store.GetImageCount(artistName);
+
+                    if (storedCount == currentCount && storedCount > 0)
+                    {
+                        skipped++;
+                        continue;
+                    }
+                    toBuild.Add((artistName, artistDir, currentCount));
+                }
+
+                if (toBuild.Count == 0)
+                {
+                    await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                        vm.StatusText = $"全部 {skipped} 位画师无需更新");
+                    return;
+                }
+
+                // Phase 2: 批量推理需要重建的画师
+                int built = 0;
+                int batchSize = 16;  // 每次批量处理 16 张
+                foreach (var (artistName, artistDir, imgCount) in toBuild)
+                {
+                    built++;
+                    var label = store.GetImageCount(artistName) > 0 ? $"重建 {artistName}" : $"新增 {artistName}";
+                    var hint = $"跳过{skipped} / 处理{built}/{toBuild.Count}: {label}";
+                    await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                    {
+                        vm.ReportProgress(built, toBuild.Count, $"{hint} ({imgCount}张)");
+                    });
+
+                    var images = Directory.GetFiles(artistDir)
+                        .Where(f =>
+                        {
+                            var ext = Path.GetExtension(f).ToLower();
+                            return ext is ".jpg" or ".jpeg" or ".png" or ".webp";
+                        })
+                        .ToList();
+
+                    if (images.Count == 0) continue;
+
+                    // 批量推理：每 batchSize 张一批
+                    float[]? sumEmb = null;
+                    int valid = 0;
+                    for (int batchStart = 0; batchStart < images.Count; batchStart += batchSize)
+                    {
+                        var batch = images.Skip(batchStart).Take(batchSize).ToList();
+                        try
+                        {
+                            var embs = await pixai.GetEmbeddingsBatchAsync(batch);
+                            if (embs == null) continue;
+                            foreach (var emb in embs)
+                            {
+                                if (sumEmb == null) sumEmb = new float[emb.Length];
+                                for (int j = 0; j < emb.Length; j++) sumEmb[j] += emb[j];
+                                valid++;
+                            }
+                        }
+                        catch { }
+                    }
+
+                    if (sumEmb != null && valid > 0)
+                    {
+                        for (int j = 0; j < sumEmb.Length; j++) sumEmb[j] /= valid;
+                        controller.RegisterArtistWithEmbeddingAsync(artistName, sumEmb, valid);
+                    }
+                }
+
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                    vm.ReportProgress(toBuild.Count, toBuild.Count,
+                        $"完成！跳过 {skipped} / 重建+新增 {toBuild.Count}，共 {controller.GetArtistStoreCount()} 位画师"));
+            });
+        };
+
+        var win = new Settings.ArtistDbBuilderWindow { DataContext = vm };
         await win.ShowDialog(this);
     }
 
