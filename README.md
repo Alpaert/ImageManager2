@@ -24,7 +24,7 @@ AI 驱动的本地图片管理工具，支持大规模图片库的标签搜索�
 | Avalonia UI 12.0 | 跨平台桌面 UI |
 | CommunityToolkit.Mvvm 8.4 | MVVM 源生成器 |
 | SQLite (Microsoft.Data.Sqlite + Dapper) | 嵌入式数据库，WAL 模式 |
-| ONNX Runtime 1.26 (GPU) | AI 打标模型推理（WD14 SwinV2-v3） |
+| ONNX Runtime 1.26 (GPU) | AI 打标模型推理（PixAI + WD14 双模型） |
 | SkiaSharp 3.116 | 图像解码、缩略图生成、感知哈希 |
 | DeepSeek API | AI 标签推荐 |
 
@@ -53,18 +53,23 @@ dotnet run --project src/ImageManager.App
 
 ### ONNX 模型准备
 
-将以下 ONNX 模型文件放入缓存目录的 `models\` 子目录：
+将以下模型文件放入缓存目录的 `models\` 子目录（默认 `C:\ImageManagerCache\models\`）：
 
 ```
 models\
-├── wd-swinv2-v3.onnx          # WD14 通用标签模型
-├── wd-swinv2-v3-rating.onnx   # 内容分级模型（可选）
-├── model_repository.onnx      # PixAI 模型
-├── model_artist.onnx          # 画师识别模型（可选）
-├── pixai_tags.csv             # 对应中文标签库
-├── wd14_tags.csv              # 对应中文标签库
-└── artist_names.txt           # 画师名列表
+├── pixai\                    # PixAI 标签模型
+│   ├── model.onnx
+│   └── selected_tags.csv     # 中文标签库
+├── wd14\                     # WD14 分级模型（Ensemble 模式需要）
+│   ├── model.onnx
+│   └── selected_tags.csv
+├── artist_embeddings.bin     # 画师嵌入库（可选）
+└── artist_names.txt          # 画师中文名列表（可选）
 ```
+
+**两种打标模式：**
+- **SingleModel** — 仅 PixAI，轻量快速
+- **Ensemble** — PixAI + WD14 双模型并行，带内容分级和画师识别
 
 ## 项目结构
 
@@ -78,13 +83,19 @@ src/
 
 ## AI 打标流程
 
+**Ensemble 模式：**
 ```
-图片文件 → ONNX SwinV2-v3 推理 → 英文标签列表
-    → ChineseTagLibrary 本地 CSV 查表 → 自动替换为中文标签
-    → 直接写入数据库，标记 Done
+图片文件 → PixAI（标签推理 + 嵌入提取） + WD14（内容分级）并行推理
+    → 合并去重 → ChineseTagLibrary 本地 CSV 查表替换中文
+    → 画师识别（嵌入向量匹配）→ 直接写入数据库，标记 Done
 ```
 
-全程自动，无需人工审核。中文标签库从模型附带的 CSV 文件加载，支持 pixai / wd14 / camie 三种标签体系的 CSV 格式。
+**SingleModel 模式：**
+```
+图片文件 → PixAI 单模型推理 → CSV 查表替换中文 → 写入数据库
+```
+
+全程自动，无需人工审核。中文标签库从 PixAI 模型附带的 `selected_tags.csv` 加载。
 
 ## 许可证
 
