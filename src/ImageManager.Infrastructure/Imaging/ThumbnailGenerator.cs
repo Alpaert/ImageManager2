@@ -63,6 +63,23 @@ public static class ThumbnailGenerator
                 var decodeSize = codec.GetScaledDimensions(jpegScale);
                 decodeW = decodeSize.Width;
                 decodeH = decodeSize.Height;
+                // PNG doesn't support native scale-down; reopen file and decode to target size
+                if (decodeW == 0 || decodeH == 0)
+                {
+                    using var stream2 = File.OpenRead(filePath);
+                    using var codec2 = SKCodec.Create(stream2);
+                    if (codec2 == null) return null;
+                    var cInfo = codec2.Info;
+                    var ct = cInfo.ColorType != SKColorType.Unknown ? cInfo.ColorType : SKColorType.Rgba8888;
+                    var at = cInfo.AlphaType != SKAlphaType.Unknown ? cInfo.AlphaType : SKAlphaType.Premul;
+                    var info = new SKImageInfo(targetWidth, targetHeight, ct, at);
+                    using var bitmap = new SKBitmap(info);
+                    if (codec2.GetPixels(info, bitmap.GetPixels()) != SKCodecResult.Success)
+                        return null;
+                    using var image = SKImage.FromBitmap(bitmap);
+                    using var data = image.Encode(SKEncodedImageFormat.Jpeg, 85);
+                    return data.ToArray();
+                }
             }
 
             // Match output format to codec's native color type
