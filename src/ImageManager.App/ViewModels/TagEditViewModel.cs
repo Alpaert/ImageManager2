@@ -281,6 +281,7 @@ public partial class TagEditViewModel : ViewModelBase
     private void ScheduleAutoSuggestRebuild(string keyword)
     {
         _autoSuggestCts?.Cancel();
+        _autoSuggestCts?.Dispose();
         _autoSuggestCts = new CancellationTokenSource();
         var token = _autoSuggestCts.Token;
         var captured = keyword;
@@ -366,5 +367,12 @@ public partial class TagEditViewModel : ViewModelBase
 
         foreach (var t in query)
             FavoriteTagSuggestions.Add(t!);
+    }
+
+    public void Dispose()
+    {
+        _autoSuggestCts?.Cancel();
+        _autoSuggestCts?.Dispose();
+        _autoSuggestCts = null;
     }
 }

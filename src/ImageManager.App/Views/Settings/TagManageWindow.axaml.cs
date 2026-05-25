@@ -13,6 +13,7 @@ public partial class TagManageWindow : Window
     public TagManageWindow()
     {
         InitializeComponent();
+        Closing += (_, _) => Vm.Dispose();
     }
 
     private async void Delete_Click(object? sender, RoutedEventArgs e)

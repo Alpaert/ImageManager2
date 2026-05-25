@@ -9,8 +9,10 @@ using ImageManager.App.Services;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Caching;
+using ImageManager.Common.Helpers;
 using ImageManager.Infrastructure.Hashing;
 using ImageManager.Infrastructure.Imaging;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace ImageManager.App.ViewModels;
 
@@ -102,9 +104,76 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     // ==================== Folder Panel ====================
-    [ObservableProperty] private ObservableCollection<FolderInfo> _folderList = new();
-    [ObservableProperty] private FolderInfo? _selectedFolder;
+    [ObservableProperty] private ObservableCollection<FolderTreeNode> _folderTree = new();
+    [ObservableProperty] private FolderTreeNode? _selectedFolderNode;
     [ObservableProperty] private string _folderSearchText = string.Empty;
+    [ObservableProperty] private ObservableCollection<FolderTreeNode> _folderSearchSuggestions = new();
+    [ObservableProperty] private bool _isFolderSearchPopupOpen;
+    [ObservableProperty] private int _searchScope; // 0=current folder, 1=recursive
+    [ObservableProperty] private bool _showAllSubfolders;
+    private int _currentResultIndex;
+    public string SearchResultInfo => IsShowingSearchResult && _tagSearch.SearchResultFiles.Count > 0
+        ? $"找到 {_tagSearch.SearchResultFiles.Count} 张相似图片  第 {_currentResultIndex + 1}/{_tagSearch.SearchResultFiles.Count}"
+        : "";
+    public bool HasSearchResults => _tagSearch.SearchResultFiles.Count > 0;
+    public event Action? ScrollToSelectedRequested;
+    public event Action<FolderTreeNode>? TreeScrollToNodeRequested;
+
+    private List<string> GetSearchScopeFiles()
+    {
+        if (SearchScope == 0 || string.IsNullOrEmpty(CurrentFolder))
+            return _allFiles;
+        return GetImageFilesRecursive(CurrentFolder);
+    }
+
+    private static List<string> GetImageFilesRecursive(string root)
+    {
+        var files = new List<string>();
+        var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
+        try
+        {
+            var dirs = new Queue<string>();
+            dirs.Enqueue(root);
+            while (dirs.Count > 0)
+            {
+                var dir = dirs.Dequeue();
+                try
+                {
+                    foreach (var f in Directory.EnumerateFiles(dir))
+                        if (exts.Contains(Path.GetExtension(f)))
+                            files.Add(f);
+                    foreach (var sub in Directory.EnumerateDirectories(dir))
+                        dirs.Enqueue(sub);
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return files;
+    }
+
+    private FolderTreeNode? FindNodeByPath(string path)
+    {
+        foreach (var root in FolderTree)
+        {
+            var found = FindNodeRecursive(root, path);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private static FolderTreeNode? FindNodeRecursive(FolderTreeNode node, string path)
+    {
+        if (string.Equals(node.Path, path, StringComparison.OrdinalIgnoreCase))
+            return node;
+        foreach (var child in node.Children)
+        {
+            var found = FindNodeRecursive(child, path);
+            if (found != null) return found;
+        }
+        return null;
+    }
 
     // ==================== Image Display ====================
     [ObservableProperty] private ObservableCollection<ImageViewItem> _images = new();
@@ -159,6 +228,16 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private string _statusText = "就绪";
     [ObservableProperty] private string _backgroundStatusText = string.Empty;
     [ObservableProperty] private string _loadedInfoText = string.Empty;
+
+    [ObservableProperty] private bool _isAutoTagRunning;
+
+    [RelayCommand]
+    private async Task StopAutoTag()
+    {
+        IsAutoTagRunning = false;
+        var controller = App.Services.GetRequiredService<ImageManager.App.Services.AutoTagController>();
+        await controller.CancelAsync();
+    }
     [ObservableProperty] private bool _isShowingSearchResult;
 
     public bool IsSuggestionCoTagMode => _tagSearch.IsSuggestionCoTagMode;
@@ -181,6 +260,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private CancellationTokenSource? _precomputeCts;
     private FileSystemWatcher? _folderWatcher;
     private CancellationTokenSource? _folderWatchDebounceCts;
+    private CancellationTokenSource? _widthDebounceCts;
 
     private readonly ImageManager.Infrastructure.Services.ArtistEmbeddingStore _artistStore;
     private readonly ImageManager.Infrastructure.Services.ChineseTagLibrary _chineseLib;
@@ -281,17 +361,35 @@ public partial class MainWindowViewModel : ViewModelBase
         _thumbCache.CacheDirectory = AppSettings.DiskCacheDirectory;
 
         var folders = await _folderRepo.GetAllAsync();
-        FolderList = new ObservableCollection<FolderInfo>(folders);
+        var nodes = folders.Select(f => new FolderTreeNode
+        {
+            Path = f.Path, DisplayName = f.DisplayName, DbId = f.Id
+        }).ToList();
+        foreach (var n in nodes) n.EnsureExpanderVisible();
+        FolderTree = new ObservableCollection<FolderTreeNode>(nodes);
 
         SyncUISettingsFromAppData();
+
+        // Clean orphan thumbnails from externally-deleted files
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var unlinked = await _metaRepo.GetAllUnlinkedAsync();
+                foreach (var m in unlinked)
+                    _thumbCache.DeleteFromDiskCache(m.FilePath);
+            }
+            catch { }
+        });
 
         // Defer tag count refresh — not needed for initial display
         _ = RefreshTagCountsAsync();
 
         if (!string.IsNullOrEmpty(AppSettings.LastFolder) && Directory.Exists(AppSettings.LastFolder))
         {
-            // Show page immediately, precompute in background
             await LoadFolderAsync(AppSettings.LastFolder);
+            SelectedFolderNode = FolderTree.FirstOrDefault(f =>
+                string.Equals(f.Path, AppSettings.LastFolder, StringComparison.OrdinalIgnoreCase));
         }
         else
         {
@@ -308,8 +406,15 @@ public partial class MainWindowViewModel : ViewModelBase
 
         await _folderRepo.AddAsync(folderPath);
         var info = await _folderRepo.GetByPathAsync(folderPath);
-        if (info != null && !FolderList.Any(f => string.Equals(f.Path, folderPath, StringComparison.OrdinalIgnoreCase)))
-            FolderList.Add(info);
+        if (info != null && FolderTree.All(f => !string.Equals(f.Path, folderPath, StringComparison.OrdinalIgnoreCase)))
+        {
+            var node = new FolderTreeNode
+            {
+                Path = info.Path, DisplayName = info.DisplayName, DbId = info.Id
+            };
+            node.EnsureExpanderVisible();
+            FolderTree.Add(node);
+        }
 
         await SaveSettingsAsync();
     }
@@ -317,64 +422,80 @@ public partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     private async Task RemoveFolderAsync()
     {
-        if (SelectedFolder == null) return;
+        if (SelectedFolderNode == null) return;
 
-        // Clean up disk thumbnail cache for all images in this folder
-        if (SelectedFolder.Id > 0)
+        if (SelectedFolderNode.DbId > 0 || !string.IsNullOrEmpty(SelectedFolderNode.Path))
         {
             try
             {
-                var metas = await _metaRepo.GetByFolderIdAsync(SelectedFolder.Id);
+                var metas = await _metaRepo.GetByFolderAsync(SelectedFolderNode.Path);
                 foreach (var meta in metas)
                     _thumbCache.DeleteFromDiskCache(meta.FilePath);
             }
             catch { }
         }
 
-        await _folderRepo.RemoveAsync(SelectedFolder.Path);
-        FolderList.Remove(SelectedFolder);
+        await _folderRepo.RemoveAsync(SelectedFolderNode.Path);
+        FolderTree.Remove(SelectedFolderNode);
         await SaveSettingsAsync();
     }
+
+    [RelayCommand]
+    private async Task SelectFolderSuggestion(FolderTreeNode folder)
+    {
+        FolderSearchText = string.Empty;
+        IsFolderSearchPopupOpen = false;
+        await ExpandAndHighlightFolderAsync(folder.Path);
+
+        if (!Directory.Exists(folder.Path))
+        {
+            StatusText = $"文件夹路径已变更: {folder.Path}";
+            return;
+        }
+
+        _isProgrammaticFolderSelection = true;
+        SelectedFolderNode = folder;
+        AppSettings.LastFolder = folder.Path;
+        await LoadFolderAsync(folder.Path);
+        await SaveSettingsAsync();
+        _isProgrammaticFolderSelection = false;
+        TreeScrollToNodeRequested?.Invoke(folder);
+    }
+
+    internal bool _isProgrammaticFolderSelection;
 
     public async Task UpdateFolderAliasAsync(string folderPath, string? alias)
     {
         await _folderRepo.UpdateAliasAsync(folderPath, alias);
-        var folder = FolderList.FirstOrDefault(f => string.Equals(f.Path, folderPath, StringComparison.OrdinalIgnoreCase));
-        if (folder != null)
-        {
-            folder.Alias = alias;
-            var idx = FolderList.IndexOf(folder);
-            if (idx >= 0)
-            {
-                FolderList.RemoveAt(idx);
-                FolderList.Insert(idx, folder);
-            }
-        }
+        var node = FindNodeByPath(folderPath);
+        if (node != null)
+            node.DisplayName = alias ?? System.IO.Path.GetFileName(folderPath.TrimEnd('\\', '/'));
     }
 
     /// <summary>Relocate a folder whose path changed externally. Updates all paths in DB.</summary>
     public async Task RelocateFolderAsync(long folderId, string newFolderPath)
     {
         await _folderRepo.RelocateFolderAsync(folderId, newFolderPath);
+        var node = FindNodeByPath(newFolderPath) ?? FindNodeByDbId(FolderTree, folderId);
+        if (node != null)
+            node.Path = newFolderPath;
+    }
 
-        // Update the FolderList display
-        var folder = FolderList.FirstOrDefault(f => f.Id == folderId);
-        if (folder != null)
+    private static FolderTreeNode? FindNodeByDbId(IEnumerable<FolderTreeNode> nodes, long id)
+    {
+        foreach (var n in nodes)
         {
-            folder.Path = newFolderPath;
-            var idx = FolderList.IndexOf(folder);
-            if (idx >= 0)
-            {
-                FolderList.RemoveAt(idx);
-                FolderList.Insert(idx, folder);
-            }
+            if (n.DbId == id) return n;
+            var found = FindNodeByDbId(n.Children, id);
+            if (found != null) return found;
         }
+        return null;
     }
 
     /// <summary>Returns true if folder needs relocation (path doesn't exist on disk)</summary>
-    public bool NeedsRelocation(FolderInfo folder) => folder.Id > 0 && !Directory.Exists(folder.Path);
+    public bool NeedsRelocation(FolderTreeNode folder) => folder.DbId > 0 && !Directory.Exists(folder.Path);
 
-    public async Task SelectFolderAsync(FolderInfo? folder)
+    public async Task SelectFolderAsync(FolderTreeNode? folder)
     {
         if (folder == null) return;
 
@@ -384,7 +505,7 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        SelectedFolder = folder;
+        SelectedFolderNode = folder;
         AppSettings.LastFolder = folder.Path;
         await LoadFolderAsync(folder.Path);
         await SaveSettingsAsync();
@@ -414,6 +535,8 @@ public partial class MainWindowViewModel : ViewModelBase
         _allFiles.Clear();
         _pageManager.InvalidateCache();
         _phashCache.Clear();
+        _tagCacheByPath.Clear();
+        _metaCache.Clear();
         BackgroundStatusText = "";
         CurrentPage = 0;
         TotalPages = 0;
@@ -447,11 +570,22 @@ public partial class MainWindowViewModel : ViewModelBase
                 PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
                 StatusText = $"总文件数: {_allFiles.Count}";
 
+                int totalTaggedFromDb = 0;
                 foreach (var m in indexedFiles)
                 {
                     _metaCache[m.FilePath] = m;
                     if (m.Tags.Count > 0)
+                    {
                         _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
+                        totalTaggedFromDb++;
+                    }
+                }
+
+                StatusText += $" | 索引图: {indexedFiles.Count} | DB有标签: {totalTaggedFromDb} 张";
+                if (totalTaggedFromDb > 0)
+                {
+                    var sample = indexedFiles.FirstOrDefault(m => m.Tags.Count > 0);
+                    StatusText += $" | 示例: {sample?.Tags.FirstOrDefault()?.Name}";
                 }
 
                 var lastPage = await _folderRepo.GetLastPageIndexAsync(folder);
@@ -496,7 +630,8 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        if (!folderId.HasValue)
+        if (!folderId.HasValue && FolderTree.Any(f =>
+                string.Equals(f.Path, folder, StringComparison.OrdinalIgnoreCase)))
         {
             await _folderRepo.AddAsync(folder);
             folderInfo = await _folderRepo.GetByPathAsync(folder);
@@ -506,18 +641,30 @@ public partial class MainWindowViewModel : ViewModelBase
         TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
 
-        _ = Task.Run(async () =>
+        // Load tag cache (must complete before ShowPageAsync so thumbnails show tags)
+        var tagLoadTask = Task.Run(async () =>
         {
             try
             {
                 var metas = await _metaRepo.GetByFolderAsync(folder);
+                int dbTagged = 0;
                 foreach (var m in metas)
                 {
                     _metaCache[m.FilePath] = m;
-                    _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
+                    if (m.Tags.Count > 0)
+                    {
+                        _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
+                        dbTagged++;
+                    }
                 }
+                Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                    StatusText = $"总文件数: {_allFiles.Count} | DB图: {metas.Count} | DB有标签: {dbTagged} 张");
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                    StatusText = $"标签加载失败: {ex.Message}");
+            }
         });
 
         var fileSet = new HashSet<string>(_allFiles, StringComparer.OrdinalIgnoreCase);
@@ -534,11 +681,14 @@ public partial class MainWindowViewModel : ViewModelBase
             await PrecomputeHashesAsync(captureCt2, folderId);
         });
 
+        await tagLoadTask;
+
         var lastPage2 = await _folderRepo.GetLastPageIndexAsync(folder);
         int startPage2 = lastPage2.HasValue && lastPage2.Value < TotalPages ? lastPage2.Value : 0;
 
         StatusText = $"总文件数: {_allFiles.Count}";
         await ShowPageAsync(startPage2);
+        if (ShowAllSubfolders) _ = RebuildFileListAsync();
     }
 
     /// <summary>Public wrapper for code-behind: sync current folder and refresh UI, then compute missing hashes</summary>
@@ -665,46 +815,80 @@ public partial class MainWindowViewModel : ViewModelBase
             var dbFiles = await _metaRepo.GetByFolderIdAsync(folderId);
             var dbSet = new HashSet<string>(dbFiles.Select(m => m.FilePath), StringComparer.OrdinalIgnoreCase);
 
-            var newFiles = new List<string>();
-            foreach (var file in diskFiles)
+            // MD5 + DB on background thread to avoid blocking UI
+            (List<string> newFiles, bool deleted) = await Task.Run(async () =>
             {
-                if (!dbSet.Contains(file))
+                var newFiles = new List<string>();
+                foreach (var file in diskFiles)
                 {
-                    await _metaRepo.SetFolderIdAsync(file, folderId);
-                    newFiles.Add(file);
+                    if (!dbSet.Contains(file))
+                    {
+                        string? md5 = null;
+                        try
+                        {
+                            using var fs = File.OpenRead(file);
+                            md5 = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(fs)).ToLowerInvariant();
+                        }
+                        catch { }
+                        if (!string.IsNullOrEmpty(md5))
+                        {
+                            var match = await _metaRepo.GetByFileHashAsync(md5);
+                            if (match != null)
+                            {
+                                var tagNames = match.Tags.Select(t => t.Name).ToList();
+                                if (!File.Exists(match.FilePath))
+                                {
+                                    await _metaRepo.UpdateFilePathAsync(match.Id, file, folderId);
+                                }
+                                else
+                                {
+                                    var fi = new FileInfo(file);
+                                    var newMeta = new ImageMeta
+                                    {
+                                        FilePath = file, FileHash = md5, FolderId = folderId,
+                                        FileSize = fi.Length, LastWriteTicks = fi.LastWriteTimeUtc.Ticks
+                                    };
+                                    var newId = await _metaRepo.UpsertAsync(newMeta);
+                                    if (tagNames.Count > 0)
+                                        await _metaRepo.SetTagsAsync(newId, tagNames);
+                                }
+                                _tagCacheByPath[file] = tagNames;
+                                newFiles.Add(file);
+                                continue;
+                            }
+                        }
+                        await _metaRepo.SetFolderIdAsync(file, folderId);
+                        newFiles.Add(file);
+                    }
                 }
-            }
 
-            bool deleted = false;
-            foreach (var meta in dbFiles)
-            {
-                if (!diskFiles.Contains(meta.FilePath))
+                bool deleted = false;
+                foreach (var meta in dbFiles)
                 {
-                    await _metaRepo.DeleteByPathAsync(meta.FilePath);
-                    deleted = true;
+                    if (!diskFiles.Contains(meta.FilePath))
+                    {
+                        await _metaRepo.SetFolderIdAsync(meta.FilePath, 0L);
+                        _thumbCache.DeleteFromDiskCache(meta.FilePath);
+                        deleted = true;
+                    }
                 }
-            }
+                return (newFiles, deleted);
+            });
 
             if (newFiles.Count > 0 || deleted)
             {
-                // Refresh UI on dispatcher
-                var dispatcher = Avalonia.Threading.Dispatcher.UIThread;
-                await dispatcher.InvokeAsync(async () =>
+                if (string.Equals(CurrentFolder, folder, StringComparison.OrdinalIgnoreCase))
                 {
-                    if (string.Equals(CurrentFolder, folder, StringComparison.OrdinalIgnoreCase))
-                    {
-                        int oldCount = _allFiles.Count;
-                        _allFiles = diskFiles.ToList();
-                        TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-                        PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-                        _pageManager.InvalidateCache();
-                        _phashCache.Clear();
-                        int targetPage = CurrentPage;
-                        if (targetPage >= TotalPages) targetPage = Math.Max(0, TotalPages - 1);
-                        await ShowPageAsync(targetPage);
-                        StatusText = $"总文件数: {_allFiles.Count}";
-                    }
-                });
+                    _allFiles = diskFiles.ToList();
+                    TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
+                    PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
+                    _pageManager.InvalidateCache();
+                    _phashCache.Clear();
+                    int targetPage = CurrentPage;
+                    if (targetPage >= TotalPages) targetPage = Math.Max(0, TotalPages - 1);
+                    await ShowPageAsync(targetPage);
+                    StatusText = $"总文件数: {_allFiles.Count}";
+                }
                 return true;
             }
         }
@@ -749,7 +933,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (needsHashing.Count == 0) return;
 
         // === Producer: I/O-bound file reading ===
-        var channel = Channel.CreateBounded<(string Path, byte[] Data, long FileSize, long LastWriteTicks)>(
+        var channel = Channel.CreateBounded<(string Path, byte[] Data, long FileSize, long LastWriteTicks, string FileHash)>(
             new BoundedChannelOptions(50)
             {
                 SingleWriter = false, SingleReader = false,
@@ -757,7 +941,7 @@ public partial class MainWindowViewModel : ViewModelBase
             });
 
         int ioConcurrency = 2;
-        var ioSlots = new SemaphoreSlim(ioConcurrency);
+        using var ioSlots = new SemaphoreSlim(ioConcurrency);
 
         var produceTasks = needsHashing.Select(async path =>
         {
@@ -768,11 +952,13 @@ public partial class MainWindowViewModel : ViewModelBase
                 try
                 {
                     var fi = new FileInfo(path);
-                    // Decode at 256px max for hash input — avoids loading full image into memory
+                    string fileHash;
+                    using (var fs = File.OpenRead(path))
+                        fileHash = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(fs)).ToLowerInvariant();
                     var hashInput = await Task.Run(() => ThumbnailGenerator.DecodeForHashInput(path, 256), ct);
                     if (hashInput == null) return;
                     await channel.Writer.WriteAsync(
-                        (path, hashInput, fi.Length, fi.LastWriteTimeUtc.Ticks), ct);
+                        (path, hashInput, fi.Length, fi.LastWriteTimeUtc.Ticks, fileHash), ct);
                 }
                 finally { ioSlots.Release(); }
             }
@@ -782,7 +968,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
         // === Consumer: CPU-bound hash computation ===
         int cpuConcurrency = Math.Max(1, Environment.ProcessorCount - 1);
-        var cpuSlots = new SemaphoreSlim(cpuConcurrency);
+        using var cpuSlots = new SemaphoreSlim(cpuConcurrency);
         var upsertBatch = new ConcurrentQueue<ImageMeta>();
         int processed = 0;
         int totalNeed = needsHashing.Count;
@@ -804,9 +990,10 @@ public partial class MainWindowViewModel : ViewModelBase
                             var meta = new ImageMeta
                             {
                                 FilePath = item.Path,
+                                FileHash = item.FileHash,
                                 FileSize = item.FileSize,
                                 LastWriteTicks = item.LastWriteTicks,
-                                FolderId = folderId,
+                                FolderId = folderId, // may be null — BulkUpsert will preserve existing non-null
                                 PerceptualHash = HashService.ComputeCombinedPerceptualHashFromBytes(item.Data)
                             };
                             try
@@ -893,6 +1080,9 @@ public partial class MainWindowViewModel : ViewModelBase
         _isNavigating = true;
         CurrentPage = pageIndex;
         _isNavigating = false;
+        // Preload tag cache for the current page's files (subfolder files especially)
+        var pageFiles = ActiveFileList.Skip(pageIndex * PageManager.PageSize).Take(PageManager.PageSize).ToList();
+        if (pageFiles.Count > 0) _ = PreloadTagsForFilesAsync(pageFiles);
         await _pageManager.ShowPageAsync(pageIndex, TotalPages,
             ActiveFileList, GetTagsForFile, IsShowingSearchResult, CurrentFolder);
     }
@@ -934,7 +1124,159 @@ partial void OnCornerRadiusDipChanged(double value)
             (double)0, WaterfallMode, AppSettings.ThumbnailAspectRatio));
         var (baseWidth, _) = _pageManager.OnZoomTickChanged(value, CurrentPage, TotalPages,
             ActiveFileList, GetTagsForFile);
-        ThumbnailBaseWidth = baseWidth;
+        if ((int)baseWidth != (int)ThumbnailBaseWidth)
+        {
+            _widthDebounceCts?.Cancel();
+            _widthDebounceCts?.Dispose();
+            _widthDebounceCts = new CancellationTokenSource();
+            var capturedWidth = baseWidth;
+            var token = _widthDebounceCts.Token;
+            _ = Task.Run(async () =>
+            {
+                try { await Task.Delay(50, token); }
+                catch { return; }
+                if (token.IsCancellationRequested) return;
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    if (!token.IsCancellationRequested)
+                        ThumbnailBaseWidth = capturedWidth;
+                });
+            }, token);
+        }
+    }
+
+    partial void OnShowAllSubfoldersChanged(bool value)
+    {
+        if (value) SearchScope = 1; // auto-switch to recursive
+        if (string.IsNullOrEmpty(CurrentFolder)) return;
+        _ = RebuildFileListAsync();
+    }
+
+    partial void OnFolderSearchTextChanged(string value)
+    {
+        FolderSearchSuggestions.Clear();
+        var keyword = value?.Trim();
+        if (string.IsNullOrEmpty(keyword))
+        {
+            IsFolderSearchPopupOpen = false;
+            return;
+        }
+        foreach (var root in FolderTree)
+            CollectLoadedNodes(root, FolderSearchSuggestions, keyword);
+        IsFolderSearchPopupOpen = FolderSearchSuggestions.Count > 0;
+    }
+
+    private static void CollectLoadedNodes(FolderTreeNode node,
+        ObservableCollection<FolderTreeNode> results, string keyword)
+    {
+        if (node.DisplayName.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+            results.Add(node);
+        foreach (var child in node.Children)
+        {
+            if (child.DisplayName != "...") // skip placeholder
+                CollectLoadedNodes(child, results, keyword);
+        }
+    }
+
+    public void ClearSearchHighlight()
+    {
+        foreach (var root in FolderTree)
+            ClearHighlightRecursive(root);
+    }
+
+    private static void ClearHighlightRecursive(FolderTreeNode node)
+    {
+        node.IsSearchHighlight = false;
+        foreach (var child in node.Children)
+            ClearHighlightRecursive(child);
+    }
+
+    public async Task ExpandAndHighlightFolderAsync(string targetPath)
+    {
+        ClearSearchHighlight();
+        var parts = new List<string>();
+        var current = targetPath;
+        while (!string.IsNullOrEmpty(current) && current.Length > 3)
+        {
+            parts.Insert(0, current);
+            current = Path.GetDirectoryName(current) ?? "";
+        }
+
+        // Find deepest part that already exists in the tree
+        int startIdx = parts.Count - 1;
+        for (; startIdx >= 0; startIdx--)
+        {
+            if (FindNodeByPath(parts[startIdx]) != null) break;
+        }
+        if (startIdx < 0) return; // no part exists in tree
+
+        // Expand from found ancestor down to target
+        FolderTreeNode? node = null;
+        for (int i = startIdx; i < parts.Count; i++)
+        {
+            node = FindNodeByPath(parts[i]);
+            if (node == null) break;
+            if (i < parts.Count - 1)
+            {
+                node.IsExpanded = true;
+                if (node.LoadTask != null) await node.LoadTask;
+            }
+        }
+
+        if (node != null)
+        {
+            node.IsSearchHighlight = true;
+            Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(
+                () => TreeScrollToNodeRequested?.Invoke(node),
+                Avalonia.Threading.DispatcherPriority.Background);
+        }
+    }
+
+    public async Task RebuildFileListAsync()
+    {
+        _allFiles = ShowAllSubfolders
+            ? GetImageFilesRecursive(CurrentFolder)
+            : await Task.Run(() =>
+                Directory.EnumerateFiles(CurrentFolder, "*.*", SearchOption.TopDirectoryOnly)
+                    .Where(f => new[] { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" }
+                        .Contains(Path.GetExtension(f).ToLower()))
+                    .ToList());
+
+        // Preload tags for subfolder files BEFORE SortImagesAsync (which triggers ShowPageAsync)
+        int subTagCount = 0;
+        if (ShowAllSubfolders)
+        {
+            try
+            {
+                var metas = await Task.Run(() => _metaRepo.GetByFolderAsync(CurrentFolder));
+                foreach (var m in metas)
+                {
+                    _metaCache[m.FilePath] = m;
+                    if (m.Tags.Count > 0 && !_tagCacheByPath.ContainsKey(m.FilePath))
+                    {
+                        _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
+                        subTagCount++;
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // Apply current sort (with folder grouping if ShowAllSubfolders)
+        await SortImagesAsync(CurrentSortOrder);
+
+        StatusText = subTagCount > 0
+            ? $"总文件数: {_allFiles.Count} (含子文件夹) | 标签: {subTagCount}"
+            : $"总文件数: {_allFiles.Count}";
+
+        if (ShowAllSubfolders)
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(3000);
+                await PrecomputeHashesAsync(CancellationToken.None, (await _folderRepo.GetByPathAsync(CurrentFolder))?.Id);
+            });
+        }
     }
 
     // ==================== Tag Search ====================
@@ -956,7 +1298,7 @@ partial void OnCornerRadiusDipChanged(double value)
 
         try
         {
-            await _tagSearch.SearchByTagAsync(raw, _allFiles, IsShowingSearchResult,
+            await _tagSearch.SearchByTagAsync(raw, GetSearchScopeFiles(), IsShowingSearchResult,
                 list => { foreach (var t in list) TagSearchSuggestions.Add(t); });
         }
         catch (Exception ex)
@@ -1198,7 +1540,23 @@ partial void OnCornerRadiusDipChanged(double value)
             _ => (a, b) => 0
         };
 
-        await Task.Run(() => files.Sort(comparison));
+        await Task.Run(() =>
+        {
+            if (ShowAllSubfolders)
+            {
+                files.Sort((a, b) =>
+                {
+                    int dirCmp = string.Compare(
+                        Path.GetDirectoryName(a), Path.GetDirectoryName(b),
+                        StringComparison.OrdinalIgnoreCase);
+                    return dirCmp != 0 ? dirCmp : comparison(a, b);
+                });
+            }
+            else
+            {
+                files.Sort(comparison);
+            }
+        });
         _tagSearch.SearchResultFiles.Sort(comparison);
         _orientationFilteredFiles.Clear();
 
@@ -1293,6 +1651,7 @@ partial void OnCornerRadiusDipChanged(double value)
     {
         StatusText = "正在搜索相似图片...";
         _searchCts?.Cancel();
+        _searchCts?.Dispose();
         _searchCts = new CancellationTokenSource();
 
         if (!IsShowingSearchResult)
@@ -1301,26 +1660,21 @@ partial void OnCornerRadiusDipChanged(double value)
         try
         {
             var results = await _similarService.FindSimilarAsync(
-                filePath, _allFiles, 5, _searchCts.Token);
+                filePath, GetSearchScopeFiles(), 5, _searchCts.Token);
 
             _tagSearch.SearchResultFiles = results.ToList();
 
             if (_tagSearch.SearchResultFiles.Count == 0)
             {
-                Images = new ObservableCollection<ImageViewItem>();
-                IsShowingSearchResult = true;
-                TotalPages = 0;
-                PageNumbers = new ObservableCollection<int>();
                 StatusText = "未找到相似图片";
+                OnPropertyChanged(nameof(HasSearchResults));
                 return;
             }
 
-            IsShowingSearchResult = true;
-            TotalPages = (_tagSearch.SearchResultFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-            PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-            _pageManager.InvalidateCache();
-            await ShowPageAsync(0);
             StatusText = $"找到 {_tagSearch.SearchResultFiles.Count} 张相似图片";
+            OnPropertyChanged(nameof(HasSearchResults));
+            _currentResultIndex = 0;
+            _ = NavigateToResultAsync();
         }
         catch (OperationCanceledException)
         {
@@ -1334,11 +1688,70 @@ partial void OnCornerRadiusDipChanged(double value)
     }
 
     [RelayCommand]
+    private async Task PrevResult()
+    {
+        var total = _tagSearch.SearchResultFiles.Count;
+        if (total == 0) return;
+        _currentResultIndex = (_currentResultIndex - 1 + total) % total;
+        await NavigateToResultAsync();
+    }
+
+    [RelayCommand]
+    private async Task NextResult()
+    {
+        var total = _tagSearch.SearchResultFiles.Count;
+        if (total == 0) return;
+        _currentResultIndex = (_currentResultIndex + 1) % total;
+        await NavigateToResultAsync();
+    }
+
+    private async Task NavigateToResultAsync()
+    {
+        var files = _tagSearch.SearchResultFiles;
+        if (files.Count == 0) return;
+        var targetPath = files[_currentResultIndex];
+        var targetDir = Path.GetDirectoryName(targetPath) ?? "";
+        _ = ExpandAndHighlightFolderAsync(targetDir);
+
+        var indexInList = ActiveFileList.FindIndex(f =>
+            string.Equals(f, targetPath, StringComparison.OrdinalIgnoreCase));
+        if (indexInList < 0)
+        {
+            // Target in subfolder — switch to that folder's view
+            if (!string.IsNullOrEmpty(targetDir) && Directory.Exists(targetDir))
+            {
+                await LoadFolderAsync(targetDir);
+                indexInList = ActiveFileList.FindIndex(f =>
+                    string.Equals(f, targetPath, StringComparison.OrdinalIgnoreCase));
+            }
+            if (indexInList < 0) return;
+        }
+
+        int targetPage = indexInList / PageManager.PageSize;
+        if (targetPage != CurrentPage)
+            await ShowPageAsync(targetPage);
+
+        var item = Images.FirstOrDefault(i =>
+            string.Equals(i.FilePath, targetPath, StringComparison.OrdinalIgnoreCase));
+        if (item != null)
+        {
+            foreach (var img in Images) img.IsSelected = false;
+            item.IsSelected = true;
+            Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(
+                () => ScrollToSelectedRequested?.Invoke(),
+                Avalonia.Threading.DispatcherPriority.Background);
+        }
+
+        OnPropertyChanged(nameof(SearchResultInfo));
+    }
+
+    [RelayCommand]
     private void BackFromSearch()
     {
         if (!IsShowingSearchResult) return;
         IsShowingSearchResult = false;
         _tagSearch.SearchResultFiles.Clear();
+        OnPropertyChanged(nameof(HasSearchResults));
 
         // Recalculate paging for normal folder view
         TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
@@ -1496,11 +1909,11 @@ partial void OnCornerRadiusDipChanged(double value)
             if (meta != null)
             {
                 await _metaRepo.SetTagsAsync(meta.Id, tags);
+                await _metaRepo.SetAutoTagStatusByPathAsync(filePath, 0);
             }
         });
 
         _tagCacheByPath[filePath] = tags;
-        await RefreshTagCountsAsync();
     }
 
     public async Task AddTagToImageAsync(string filePath, string tag)
@@ -1522,11 +1935,85 @@ partial void OnCornerRadiusDipChanged(double value)
         }
     }
 
+    public async Task AddTagToImagesBatchAsync(List<string> filePaths, string tag)
+    {
+        foreach (var path in filePaths)
+        {
+            var tags = _tagCacheByPath.GetValueOrDefault(path) ?? new List<string>();
+            if (!tags.Contains(tag, StringComparer.OrdinalIgnoreCase))
+            {
+                tags.Add(tag);
+                _tagCacheByPath[path] = tags;
+            }
+        }
+
+        var pathToId = await _metaRepo.GetIdsByPathsAsync(filePaths);
+        if (pathToId.Count > 0)
+            await _metaRepo.AddTagToImagesAsync(pathToId.Values.ToList(), tag);
+
+        await RefreshTagCountsAsync();
+    }
+
+    public async Task RemoveTagFromImagesBatchAsync(List<string> filePaths, string tag)
+    {
+        foreach (var path in filePaths)
+        {
+            if (_tagCacheByPath.TryGetValue(path, out var tags))
+                tags.RemoveAll(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase));
+        }
+
+        var pathToId = await _metaRepo.GetIdsByPathsAsync(filePaths);
+        if (pathToId.Count > 0)
+            await _metaRepo.RemoveTagFromImagesAsync(pathToId.Values.ToList(), tag);
+
+        await RefreshTagCountsAsync();
+    }
+
+    public async Task ClearTagsFromImagesBatchAsync(List<string> filePaths)
+    {
+        foreach (var path in filePaths)
+            _tagCacheByPath[path] = new List<string>();
+
+        var pathToId = await _metaRepo.GetIdsByPathsAsync(filePaths);
+        if (pathToId.Count > 0)
+        {
+            await _metaRepo.ClearTagsFromImagesAsync(pathToId.Values.ToList());
+            foreach (var path in filePaths)
+                await _metaRepo.SetAutoTagStatusByPathAsync(path, 0);
+        }
+
+        await RefreshTagCountsAsync();
+    }
+
     public List<string> GetTagsForFile(string filePath)
     {
-        return _tagCacheByPath.TryGetValue(filePath, out var tags)
-            ? new List<string>(tags) : new List<string>();
+        if (_tagCacheByPath.TryGetValue(filePath, out var tags))
+            return new List<string>(tags);
+        // Cache miss — preload will fill before page renders
+        return new List<string>();
     }
+
+    /// <summary>Batch-preload tag cache for a page's worth of files (for subfolder files not yet cached)</summary>
+    public async Task PreloadTagsForFilesAsync(List<string> paths)
+    {
+        var missing = paths.Where(p => !_tagCacheByPath.ContainsKey(p)).ToList();
+        if (missing.Count == 0) return;
+        await Task.Run(async () =>
+        {
+            foreach (var path in missing)
+            {
+                var meta = await _metaRepo.GetByPathAsync(path);
+                _tagCacheByPath[path] = meta?.Tags.Select(t => t.Name).ToList() ?? new List<string>();
+            }
+        });
+    }
+
+    public void ClearTagCacheForPath(string filePath)
+    {
+        _tagCacheByPath[filePath] = new List<string>();
+    }
+
+    public void InvalidatePageCache() => _pageManager.InvalidateCache();
 
     public async Task<List<string>> GetTagsForFileAsync(string filePath)
     {

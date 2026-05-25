@@ -18,7 +18,7 @@ public class OnnxTagService : IAutoTagService, IDisposable
     private string _modelShapeInfo = string.Empty;
     private string[] _tagNames = Array.Empty<string>();
     private int _predictCount;
-    private readonly HttpClient _http = new();
+    private static readonly HttpClient _http = new();
     private readonly SemaphoreSlim _initLock = new(1, 1);
     private string _modelDir = string.Empty;
 
@@ -190,7 +190,7 @@ public class OnnxTagService : IAutoTagService, IDisposable
     private async Task DownloadFileAsync(string repoFile, string destPath, string label)
     {
         var url = $"https://huggingface.co/{repoFile}";
-        using var response = _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).Result;
+        using var response = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
         response.EnsureSuccessStatusCode();
         var totalBytes = response.Content.Headers.ContentLength ?? -1;
 
@@ -218,7 +218,7 @@ public class OnnxTagService : IAutoTagService, IDisposable
     public void Dispose()
     {
         _session?.Dispose();
-        _http.Dispose();
+        _session = null;
         _initLock.Dispose();
     }
 }

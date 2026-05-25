@@ -28,8 +28,8 @@ public partial class PreviewViewModel : ViewModelBase
     [ObservableProperty] private bool _hasNext;
 
     // Saved position: set by MainWindow before Show, updated by PreviewWindow on close
-    public double SavedLeft { get; set; } = -1;
-    public double SavedTop { get; set; } = -1;
+    public double SavedLeft { get; set; } = double.NaN;
+    public double SavedTop { get; set; } = double.NaN;
 
     /// <summary>Called by PreviewWindow to navigate. Returns new file path or null.</summary>
     public string? Navigate(int delta)
@@ -37,11 +37,14 @@ public partial class PreviewViewModel : ViewModelBase
         if (ImagePaths.Count == 0) return null;
         int newIdx = CurrentIndex + delta;
         if (newIdx < 0 || newIdx >= ImagePaths.Count) return null;
+        ImageData = null; // release previous image before loading new
         CurrentIndex = newIdx;
         HasPrev = CurrentIndex > 0;
         HasNext = CurrentIndex < ImagePaths.Count - 1;
         return ImagePaths[CurrentIndex];
     }
+
+    public void ReleaseImage() => ImageData = null;
 
     public double MinZoom => Math.Min(FitZoom * 0.05, FitZoom);
     public const double MaxZoom = 10.0;

@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
 
@@ -39,6 +40,15 @@ public class TagSearchController
     // ==================== Public API ====================
 
     public void SetAllTagCounts(List<TagCount> counts) => AllTagCounts = counts;
+
+    public void ClearSearchResults()
+    {
+        SearchResultFiles = new List<string>();
+        AllTagCounts = new List<TagCount>();
+        _coTagMode = false;
+        _coTagStates.Clear();
+        _fullCoTags.Clear();
+    }
 
     public int GetCoTagState(string tagName)
     {
@@ -338,8 +348,9 @@ public class TagSearchController
             _fullCoTags = coTags.Take(300).ToList();
             SuggestionsChanged?.Invoke(new List<TagCount>(_fullCoTags), true);
         }
-        catch
+        catch (Exception ex)
         {
+            AppLogger.Warn($"Co-tag query failed: {ex.Message}");
             SuggestionsChanged?.Invoke(new List<TagCount>(), false);
         }
     }
@@ -358,8 +369,9 @@ public class TagSearchController
             var results = await _metaRepo.GetCoOccurringTagsAsync(SearchResultFiles, usedTags, keyword);
             SuggestionsChanged?.Invoke(results, true);
         }
-        catch
+        catch (Exception ex)
         {
+            AppLogger.Warn($"Co-tag query failed: {ex.Message}");
             SuggestionsChanged?.Invoke(new List<TagCount>(), false);
         }
     }

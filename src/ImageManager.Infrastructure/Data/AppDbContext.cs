@@ -22,7 +22,7 @@ public class AppDbContext : IDisposable
         conn.Open();
         // Enable WAL mode for concurrent read/write
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA cache_size=-65536; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;";
+        cmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA cache_size=-8192; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;";
         cmd.ExecuteNonQuery();
         return conn;
     }
@@ -124,6 +124,7 @@ public class AppDbContext : IDisposable
         RunMigration(conn);
         RunMigrationV2(conn);
         RunMigrationV3(conn);
+        RunMigrationV4(conn);
 
         // Create FolderId index after column exists
         using var idxCmd = conn.CreateCommand();
@@ -169,7 +170,19 @@ public class AppDbContext : IDisposable
         }
         catch (SqliteException ex) when (ex.Message.Contains("duplicate column"))
         {
-            // Column already exists
+        }
+    }
+
+    private static void RunMigrationV4(SqliteConnection conn)
+    {
+        try
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "ALTER TABLE ImageMeta ADD COLUMN AutoTagStatus INTEGER DEFAULT 0;";
+            cmd.ExecuteNonQuery();
+        }
+        catch (SqliteException ex) when (ex.Message.Contains("duplicate column"))
+        {
         }
     }
 

@@ -9,7 +9,7 @@ namespace ImageManager.Infrastructure.Services;
 /// 通过 Max 函数确定 SystemRating 分级。
 /// Rating 中文名硬编码，不查 CSV。
 /// </summary>
-public class WdRatingService
+public class WdRatingService : IDisposable
 {
     private readonly OnnxTagService _wdService;
     private static readonly string[] RatingNames = ["general", "sensitive", "questionable", "explicit"];
@@ -20,6 +20,8 @@ public class WdRatingService
     {
         _wdService = wdService;
     }
+
+    public void Dispose() => _wdService.Dispose();
 
     public async Task LoadAsync(string modelPath)
     {

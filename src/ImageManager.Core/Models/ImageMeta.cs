@@ -15,6 +15,7 @@ public class ImageMeta
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 
     public int SystemRating { get; set; } = -1;  // -1=Unknown, 0=General, 1=Sensitive, 2=Questionable, 3=Explicit
+    public int AutoTagStatus { get; set; } // 0=not AI-tagged, 1=AI-tagged
 
     public List<TagCount> Tags { get; set; } = new();
 }

@@ -7,10 +7,12 @@ using ImageManager.Core.Services;
 
 namespace ImageManager.Infrastructure.Data.Repositories;
 
-public class SettingsRepository : ISettingsRepository
+public class SettingsRepository : ISettingsRepository, IDisposable
 {
     private readonly AppDbContext _db;
     private readonly SemaphoreSlim _saveLock = new(1, 1);
+    private static readonly PropertyInfo[] AppSettingProperties =
+        typeof(AppSettings).GetProperties(BindingFlags.Public | BindingFlags.Instance);
 
     public SettingsRepository(AppDbContext db) => _db = db;
 
@@ -22,7 +24,7 @@ public class SettingsRepository : ISettingsRepository
         var dict = rows.ToDictionary(r => r.Key, r => r.Value, StringComparer.OrdinalIgnoreCase);
 
         var settings = new AppSettings();
-        var props = typeof(AppSettings).GetProperties(BindingFlags.Public | BindingFlags.Instance);
+        var props = AppSettingProperties;
 
         foreach (var prop in props)
         {
@@ -50,7 +52,7 @@ public class SettingsRepository : ISettingsRepository
 
             await conn.ExecuteAsync("DELETE FROM AppSetting", transaction: txn);
 
-            var props = typeof(AppSettings).GetProperties(BindingFlags.Public | BindingFlags.Instance);
+            var props = AppSettingProperties;
             foreach (var prop in props)
             {
                 var value = prop.GetValue(settings);
@@ -78,6 +80,8 @@ public class SettingsRepository : ISettingsRepository
             _saveLock.Release();
         }
     }
+
+    public void Dispose() => _saveLock.Dispose();
 
     private static object? ConvertValue(string raw, Type targetType)
     {

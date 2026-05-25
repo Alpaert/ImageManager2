@@ -1,4 +1,5 @@
 using ImageManager.App.ViewModels;
+using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Caching;
 using ImageManager.Infrastructure.Imaging;
@@ -16,7 +17,7 @@ public readonly record struct PageChangedEventArgs(
     int TotalPages,
     string LoadedInfoText);
 
-public class PageManager
+public class PageManager : IDisposable
 {
     public const int PageSize = 200;
     private const int MaxCachedPages = 3;
@@ -147,6 +148,7 @@ public class PageManager
             {
                 _thumbnailDecodeWidth = newDecodeWidth;
                 _zoomDebounceCts?.Cancel();
+                _zoomDebounceCts?.Dispose();
                 _zoomDebounceCts = new CancellationTokenSource();
                 var token = _zoomDebounceCts.Token;
                 var capturedFileList = activeFileList;
@@ -170,10 +172,6 @@ public class PageManager
                                     item.IsLoading = true;
                                 }
                         }
-                        if (_pageCache.TryGetValue(_activePageIndex, out var currentItems))
-                            PageChanged?.Invoke(new PageChangedEventArgs(
-                                currentItems, _activePageIndex, totalPages,
-                                $"当前页: {_activePageIndex + 1}/{totalPages}  每页 {PageSize} 张"));
                         _ = LoadPageThumbnailsAsync(_activePageIndex);
                     });
                 }, token);
@@ -189,6 +187,12 @@ public class PageManager
         _currentZoomLevel = currentZoomLevel;
         _thumbnailDecodeWidth = ComputeDecodeWidth();
         _thumbCache.DecodeWidth = _thumbnailDecodeWidth;
+    }
+
+    public void Dispose()
+    {
+        _thumbnailLoadSemaphore.Dispose();
+        _zoomDebounceCts?.Dispose();
     }
 
     public void InvalidateCache()
@@ -308,7 +312,7 @@ public class PageManager
                 item.IsLoaded = true;
             }
         }
-        catch { }
+        catch { AppLogger.Warn($"Failed to load thumbnail: {item.FilePath}"); }
         finally { _thumbnailLoadSemaphore.Release(); }
 
         item.IsLoading = false;
@@ -360,6 +364,8 @@ public class PageManager
             foreach (var key in _pageCache.Keys.ToList())
             {
                 if (mustKeep.Contains(key)) continue;
+                if (_pageCache.TryGetValue(key, out var evicted))
+                    foreach (var item in evicted) item.ThumbnailData = null;
                 _pageCache.Remove(key);
             }
         }

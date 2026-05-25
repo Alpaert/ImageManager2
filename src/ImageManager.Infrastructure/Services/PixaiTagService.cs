@@ -45,7 +45,7 @@ public class PixaiTagService : OnnxTagServiceBase
     {
         if (_session == null) return null;
 
-        return await Task.Run(() =>
+        var result = await Task.Run(() =>
         {
             var tensor = Preprocess(imagePath);
             if (tensor == null) return null;
@@ -60,6 +60,9 @@ public class PixaiTagService : OnnxTagServiceBase
             if (embOut == null) return null;
             return embOut.AsTensor<float>().ToArray();
         });
+
+        ResetIdleTimer();
+        return result;
     }
 
     /// <summary>合并推理：一次 session.Run 同时获取 prediction + embedding，省一次 Preprocess+Run</summary>
@@ -68,7 +71,7 @@ public class PixaiTagService : OnnxTagServiceBase
         if (_session == null)
             throw new InvalidOperationException("Pixai: Model not loaded");
 
-        return await Task.Run(() =>
+        var result = await Task.Run(() =>
         {
             var tensor = Preprocess(imagePath);
             if (tensor == null)
@@ -81,29 +84,36 @@ public class PixaiTagService : OnnxTagServiceBase
 
             using var results = _session.Run(inputs);
 
-            // 取 prediction
             var predOut = results.FirstOrDefault(r => r.Name == _outputName);
             var probs = predOut?.AsTensor<float>().ToArray() ?? Array.Empty<float>();
 
-            // 取 embedding
             var embOut = results.FirstOrDefault(r => r.Name == "embedding");
             var embedding = embOut?.AsTensor<float>().ToArray();
 
             var tags = Postprocess(probs, DefaultThreshold);
             return (tags, embedding);
         });
+
+        ResetIdleTimer();
+        return result;
     }
+
+    private const int MaxBatchSize = 16;
 
     /// <summary>批量提取嵌入：一次 session.Run 处理多张图，返回 [N, 1024] 的嵌入列表</summary>
     public async Task<List<float[]>?> GetEmbeddingsBatchAsync(List<string> imagePaths)
     {
         if (_session == null || imagePaths.Count == 0) return null;
 
-        return await Task.Run(() =>
+        var paths = imagePaths.Count > MaxBatchSize
+            ? imagePaths.Take(MaxBatchSize).ToList()
+            : imagePaths;
+
+        var result = await Task.Run(() =>
         {
             // 逐张预处理
             var tensors = new List<DenseTensor<float>>();
-            foreach (var path in imagePaths)
+            foreach (var path in paths)
             {
                 var t = Preprocess(path);
                 if (t != null) tensors.Add(t);
@@ -143,5 +153,8 @@ public class PixaiTagService : OnnxTagServiceBase
             }
             return embeddings;
         });
+
+        ResetIdleTimer();
+        return result;
     }
 }

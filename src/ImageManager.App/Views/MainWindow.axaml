@@ -15,6 +15,9 @@
 		<conv:HexToBrushConverter x:Key="HexToBrush"/>
 	</Window.Resources>
 	<Window.Styles>
+		<Style Selector="TreeViewItem">
+			<Setter Property="Padding" Value="0"/>
+		</Style>
 		<Style Selector="MenuItem">
 			<Setter Property="Foreground" Value="{DynamicResource AppFgBrush}" />
 		</Style>
@@ -35,10 +38,10 @@
 			<Setter Property="Foreground" Value="{Binding $parent[Button].Foreground}" />
 		</Style>
 	</Window.Styles>
-    <Grid x:Name="RootGrid" Focusable="True" ColumnDefinitions="230,*" RowDefinitions="Auto,Auto,Auto,Auto,*">
+    <Grid x:Name="RootGrid" Focusable="True" ColumnDefinitions="300,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,*">
 
         <!-- Left Sidebar -->
-        <Border Grid.Column="0" Grid.RowSpan="5"
+        <Border Grid.Column="0" Grid.RowSpan="6"
                 BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="0,0,1,0"
                 Padding="8" Background="{DynamicResource SidebarBgBrush}">
             <DockPanel>
@@ -54,37 +57,74 @@
                                 FontSize="12" Padding="6,4"
                                 Click="BtnRemoveFolder_Click"/>
                     </StackPanel>
-                    <TextBox PlaceholderText="搜索文件夹..."
-                             Margin="0,0,0,8" Background="{DynamicResource InputBgBrush}"
-                             Text="{Binding FolderSearchText}"/>
+                    <Panel Margin="0,0,0,8">
+                        <TextBox x:Name="TxtFolderSearch" PlaceholderText="搜索文件夹..."
+                                 Text="{Binding FolderSearchText}"
+                                 GotFocus="TxtFolderSearch_GotFocus"
+                                 Background="{DynamicResource InputBgBrush}"/>
+                        <Popup IsOpen="{Binding IsFolderSearchPopupOpen}"
+                               Placement="Bottom">
+                            <Border Background="{DynamicResource SurfaceBrush}"
+                                    BorderBrush="{DynamicResource CtrlBorderBrush}"
+                                    BorderThickness="1" CornerRadius="8" Padding="6"
+                                    MaxWidth="280">
+                                <ScrollViewer MaxHeight="300">
+                                    <ItemsControl ItemsSource="{Binding FolderSearchSuggestions}">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:FolderTreeNode">
+                                                <Button Margin="1" Padding="6,3" FontSize="12"
+                                                        Click="FolderSuggestion_Click"
+                                                        HorizontalContentAlignment="Stretch"
+                                                        HorizontalAlignment="Stretch">
+                                                    <StackPanel>
+                                                        <TextBlock Text="{Binding DisplayName}"
+                                                                   FontWeight="SemiBold"/>
+                                                        <TextBlock Text="{Binding Path}" FontSize="10"
+                                                                   Foreground="{DynamicResource MutedFgBrush}"
+                                                                   TextTrimming="CharacterEllipsis"/>
+                                                    </StackPanel>
+                                                </Button>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </ScrollViewer>
+                            </Border>
+                        </Popup>
+                    </Panel>
                 </StackPanel>
 
-                <ListBox x:Name="LstFolders"
-                         ItemsSource="{Binding FolderList}"
-                         SelectionChanged="LstFolders_SelectionChanged"
-                         DragDrop.AllowDrop="True"
-                         DragDrop.DragOver="LstFolders_DragOver"
-                         DragDrop.Drop="LstFolders_Drop"
-                         PointerPressed="LstFolders_PointerPressed">
-                    <ListBox.ContextMenu>
+                <TreeView x:Name="LstFolders"
+                          ItemsSource="{Binding FolderTree}"
+                          SelectedItem="{Binding SelectedFolderNode}"
+                          SelectionChanged="LstFolders_SelectionChanged"
+                          DragDrop.AllowDrop="True"
+                          DragDrop.DragOver="LstFolders_DragOver"
+                          DragDrop.Drop="LstFolders_Drop"
+                          PointerPressed="LstFolders_PointerPressed"
+                          ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                    <TreeView.ContextMenu>
                         <ContextMenu>
                             <MenuItem Header="重命名显示名称" Click="MenuRenameFolder_Click"/>
                             <MenuItem Header="清除显示名称" Click="MenuClearFolderAlias_Click"/>
                             <Separator/>
                             <MenuItem Header="计算此文件夹的图片标签" Click="MenuComputeAutoTags_Click"/>
+                            <MenuItem Header="计算此文件夹及所有子文件夹的图片标签" Click="MenuComputeAutoTagsRecursive_Click"/>
+                            <Separator/>
+                            <MenuItem Header="清空此文件夹所有图片的标签" Click="MenuClearFolderTags_Click"/>
                         </ContextMenu>
-                    </ListBox.ContextMenu>
-                    <ListBox.ItemTemplate>
-                        <DataTemplate x:DataType="models:FolderInfo">
-                            <StackPanel Margin="2">
+                    </TreeView.ContextMenu>
+                    <TreeView.ItemTemplate>
+                        <TreeDataTemplate ItemsSource="{Binding Children}">
+                            <StackPanel Margin="2" Background="{Binding HighlightColor,
+                                Converter={StaticResource HexToBrush}}">
                                 <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" FontSize="13"
                                            TextTrimming="CharacterEllipsis"/>
                                 <TextBlock Text="{Binding Path}" FontSize="11" Foreground="{DynamicResource MutedFgBrush}"
                                            TextTrimming="CharacterEllipsis"/>
                             </StackPanel>
-                        </DataTemplate>
-                    </ListBox.ItemTemplate>
-                </ListBox>
+                        </TreeDataTemplate>
+                    </TreeView.ItemTemplate>
+                </TreeView>
             </DockPanel>
         </Border>
 
@@ -106,6 +146,8 @@
                     <MenuItem Header="帮助" Click="MenuHelp_Click"/>
                 </MenuItem>
                 <MenuItem Header="AI推荐" Height="28" Padding="12,4" Click="MenuAiRecommend_Click"/>
+                <CheckBox Content="全展示" IsChecked="{Binding ShowAllSubfolders}"
+                          VerticalAlignment="Center" Margin="12,0,0,0" FontSize="12"/>
             </Menu>
             <Menu HorizontalAlignment="Right" Background="Transparent">
                 <MenuItem Header="排序 ▾" Height="28" Padding="12,4">
@@ -142,6 +184,10 @@
             <TextBlock Text="{Binding StatusText}"
                        Margin="10,0,0,0" Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
                        VerticalAlignment="Center"/>
+            <Button Content="⏹ 停止推理" Margin="10,0,0,0"
+                    FontSize="12" Padding="6,3"
+                    IsVisible="{Binding IsAutoTagRunning}"
+                    Command="{Binding StopAutoTagCommand}"/>
             <TextBlock Text="{Binding BackgroundStatusText}"
                        Margin="16,0,0,0" Foreground="{DynamicResource AccentBrush}" FontSize="12"
                        VerticalAlignment="Center"/>
@@ -149,8 +195,13 @@
 
         <!-- Toolbar Row 2: Filters -->
         <StackPanel Orientation="Horizontal" Margin="5,0,5,2" Grid.Row="2" Grid.Column="1">
-            <TextBlock Text="Tag 搜索:" VerticalAlignment="Center" Margin="0,0,5,0"
+            <TextBlock Text="搜索模式" VerticalAlignment="Center" Margin="0,0,5,0"
                        Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+            <ComboBox Width="70" Margin="-1,0,0,0" FontSize="11"
+                      SelectedIndex="{Binding SearchScope}">
+                <ComboBoxItem>当前</ComboBoxItem>
+                <ComboBoxItem>递归</ComboBoxItem>
+            </ComboBox>
             <StackPanel>
                 <Border BorderBrush="{Binding SearchBoxBorderColor}"
                         BorderThickness="1.5" CornerRadius="4">
@@ -257,8 +308,22 @@
             </Grid>
         </Border>
 
+        <!-- Search result navigation (visible only when showing search results) -->
+        <Border Grid.Row="4" Grid.Column="1" Padding="5,2" Margin="5,0,5,0"
+                IsVisible="{Binding HasSearchResults}"
+                Background="{DynamicResource SidebarBgBrush}" CornerRadius="4">
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
+                <TextBlock Text="{Binding SearchResultInfo}" VerticalAlignment="Center"
+                           Foreground="{DynamicResource AccentBrush}" FontSize="12" Margin="0,0,8,0"/>
+                <Button Content="上一张" Margin="0,0,5,0" FontSize="12" Padding="6,3"
+                        Command="{Binding PrevResultCommand}"/>
+                <Button Content="下一张" Margin="0,0,5,0" FontSize="12" Padding="6,3"
+                        Command="{Binding NextResultCommand}"/>
+            </StackPanel>
+        </Border>
+
         <!-- Image Grid Area -->
-        <ScrollViewer x:Name="ThumbnailScrollViewer" Grid.Row="4" Grid.Column="1">
+        <ScrollViewer x:Name="ThumbnailScrollViewer" Grid.Row="5" Grid.Column="1">
             <Grid x:Name="ImagePanelHost"
                   Background="Transparent"
                   PointerPressed="ImagePanelHost_PointerPressed"
@@ -284,11 +349,13 @@
                                 Opacity="{Binding $parent[Window].DataContext.ThumbnailOpacity}"
                                 PointerPressed="Thumbnail_PointerPressed"
                                 PointerMoved="Thumbnail_PointerMoved"
+                                PointerReleased="Thumbnail_PointerReleased"
                                 DoubleTapped="Thumbnail_DoubleTapped">
                             <Border.ContextMenu>
                                 <ContextMenu>
                                     <MenuItem Header="编辑 Tag" Click="MenuEditTag_Click"/>
                                     <MenuItem Header="自动打标" Click="MenuAutoTag_Click"/>
+                                    <MenuItem Header="清空选中图片的标签" Click="MenuClearSelectedTags_Click"/>
                                     <MenuItem Header="复制图片到剪贴板" Click="MenuCopyImage_Click"/>
                                     <MenuItem Header="查找相似图片（本文件夹）" Click="MenuFindSimilar_Click"/>
                                     <Separator/>

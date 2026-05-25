@@ -11,7 +11,7 @@ namespace ImageManager.Infrastructure.Services;
 /// Camie (档案管理员) → Category 1(artist) + 3(copyright)
 /// 三模型并行推理 → TagResultMerger 中文层去重合并。
 /// </summary>
-public class EnsembleTagService : IEnsembleTagService
+public class EnsembleTagService : IEnsembleTagService, IDisposable
 {
     private readonly WdRatingService _wd;
     private readonly PixaiTagService _pixai;
@@ -164,7 +164,10 @@ public class EnsembleTagService : IEnsembleTagService
 
     public void Dispose()
     {
+        _pixai?.Dispose();
+        _wd?.Dispose();
+        _chineseLib?.Clear();
+        _artistStore?.Clear();
         AppLogger.Info("EnsembleTagService Disposed");
-        _pixai.Dispose();
     }
 }

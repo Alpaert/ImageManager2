@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Threading.Channels;
+using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
 
@@ -13,7 +14,7 @@ public readonly record struct FolderTagActionResult(
     string Message,  // User-facing message
     bool CanProceed);
 
-public class AutoTagPipelineService
+public class AutoTagPipelineService : IDisposable
 {
     private readonly IImageMetaRepository _metaRepo;
     private readonly ITagRepository _tagRepo;
@@ -84,20 +85,23 @@ public class AutoTagPipelineService
 
     // ==================== Phase 1: Inference ====================
 
-    public async Task RunInferenceAsync(long folderId, List<(long Id, string FilePath)> metas, string action)
+    public async Task RunInferenceAsync(long folderId, List<(long Id, string FilePath)> metas, string action,
+        CancellationToken ct = default)
     {
-        var state = new AutoTagState
-        {
-            FolderId = folderId,
-            Status = "Processing",
-            TotalFiles = metas.Count,
-            Processed = 0,
-            LastFileCount = metas.Count,
-            StartedAt = DateTime.UtcNow
-        };
-        await _stateRepo.UpsertStateAsync(state);
+        bool hasState = folderId > 0;
 
-        if (action == "Resume")
+        if (hasState)
+        {
+            var state = new AutoTagState
+            {
+                FolderId = folderId, Status = "Processing",
+                TotalFiles = metas.Count, Processed = 0,
+                LastFileCount = metas.Count, StartedAt = DateTime.UtcNow
+            };
+            await _stateRepo.UpsertStateAsync(state);
+        }
+
+        if (hasState && action == "Resume")
         {
             // Clear only unconfirmed translations (keep confirmed)
             var existingTranslations = await _stateRepo.GetTranslationsAsync(folderId);
@@ -113,69 +117,107 @@ public class AutoTagPipelineService
         }
 
         var channel = Channel.CreateBounded<(long ImageId, string FilePath, List<TagPrediction> Predictions)>(
-            new BoundedChannelOptions(50) { SingleWriter = false, SingleReader = true,
+            new BoundedChannelOptions(200) { SingleWriter = false, SingleReader = true,
                 FullMode = BoundedChannelFullMode.Wait });
 
         var ioSemaphore = new SemaphoreSlim(_maxConcurrency);
         int processed = 0;
         var errors = new ConcurrentQueue<string>();
+        const int batchSize = 500;
 
-        // Producer tasks
-        var produceTasks = metas.Select(async meta =>
+        // Producer: launch in batches to avoid N concurrent Task objects
+        _ = Task.Run(async () =>
         {
             try
             {
-                await ioSemaphore.WaitAsync();
-                try
+                for (int batchStart = 0; batchStart < metas.Count; batchStart += batchSize)
                 {
-                    var predictions = await _tagService.PredictAsync(meta.FilePath);
-                    var filtered = predictions
-                        .Where(p => p.Confidence >= _confidenceThreshold)
-                        .Take(_maxTagsPerImage)
-                        .ToList();
-                    await channel.Writer.WriteAsync((meta.Id, meta.FilePath, filtered));
+                    if (ct.IsCancellationRequested) break;
+                    int batchEnd = Math.Min(batchStart + batchSize, metas.Count);
+                    var batch = metas.GetRange(batchStart, batchEnd - batchStart);
+                    var batchTasks = batch.Select(async meta =>
+                    {
+                        try
+                        {
+                            await ioSemaphore.WaitAsync();
+                            try
+                            {
+                                var predictions = await _tagService.PredictAsync(meta.FilePath);
+                                var filtered = predictions
+                                    .Where(p => p.Confidence >= _confidenceThreshold)
+                                    .Take(_maxTagsPerImage)
+                                    .ToList();
+                                await channel.Writer.WriteAsync((meta.Id, meta.FilePath, filtered));
+                            }
+                            finally { ioSemaphore.Release(); }
+                        }
+                        catch (Exception ex)
+                        {
+                            errors.Enqueue($"{Path.GetFileName(meta.FilePath)}: {ex.Message}");
+                        }
+                    });
+                    await Task.WhenAll(batchTasks);
                 }
-                finally { ioSemaphore.Release(); }
             }
-            catch (Exception ex)
-            {
-                errors.Enqueue($"{Path.GetFileName(meta.FilePath)}: {ex.Message}");
-            }
+            catch (Exception ex) { AppLogger.Error($"Producer tasks failed: {ex.Message}"); }
+            finally { channel.Writer.Complete(); }
         });
 
-        // Consumer
+        // Consumer: save tags + batch-stamp AutoTagStatus every 100 to survive mid-run exit
         var consumerTask = Task.Run(async () =>
         {
             var completed = 0;
-            await foreach (var item in channel.Reader.ReadAllAsync())
+            var stampBuffer = new List<string>(100);
+            try
             {
-                try
+                await foreach (var item in channel.Reader.ReadAllAsync(ct))
                 {
-                    if (item.Predictions.Count > 0)
+                    try
                     {
-                        var tagNames = item.Predictions.Select(p => p.TagName).ToList();
-                        await _metaRepo.AddAutoTagsAsync(item.ImageId, tagNames);
-                    }
-                    Interlocked.Increment(ref processed);
-                    completed++;
-                    if (completed % 10 == 0 || completed == metas.Count)
-                    {
-                        await _stateRepo.UpsertStateAsync(new AutoTagState
+                        if (item.Predictions.Count > 0)
                         {
-                            FolderId = folderId, Status = "Processing",
-                            TotalFiles = metas.Count, Processed = processed,
-                            LastFileCount = metas.Count
-                        });
-                        ProgressChanged?.Invoke(new AutoTagPipelineProgress(
-                            "Inference", processed, metas.Count,
-                            $"正在推理图片标签... {processed}/{metas.Count}"));
+                            var tagNames = item.Predictions.Select(p => p.TagName).ToList();
+                            await _metaRepo.AddAutoTagsAsync(item.ImageId, tagNames);
+                        }
+                        Interlocked.Increment(ref processed);
+                        completed++;
+                        stampBuffer.Add(item.FilePath);
+
+                        if (stampBuffer.Count >= 100)
+                        {
+                            await _metaRepo.SetAutoTagStatusBatchAsync(stampBuffer, 1);
+                            stampBuffer.Clear();
+                        }
+
+                        if (hasState && (completed % 10 == 0 || completed == metas.Count))
+                        {
+                            await _stateRepo.UpsertStateAsync(new AutoTagState
+                            {
+                                FolderId = folderId, Status = "Processing",
+                                TotalFiles = metas.Count, Processed = processed,
+                                LastFileCount = metas.Count
+                            });
+                            ProgressChanged?.Invoke(new AutoTagPipelineProgress(
+                                "Inference", processed, metas.Count,
+                                $"正在推理图片标签... {processed}/{metas.Count}"));
+                        }
                     }
-                }
-                catch (Exception ex)
-                {
-                    errors.Enqueue($"consumer: {ex.Message}");
+                    catch (Exception ex)
+                    {
+                        errors.Enqueue($"consumer: {ex.Message}");
+                    }
                 }
             }
+            catch (OperationCanceledException)
+            {
+                ProgressChanged?.Invoke(new AutoTagPipelineProgress(
+                    "Stopped", processed, metas.Count,
+                    $"推理已停止 ({processed}/{metas.Count})"));
+            }
+
+            // Flush remaining stamps
+            if (stampBuffer.Count > 0)
+                await _metaRepo.SetAutoTagStatusBatchAsync(stampBuffer, 1);
 
             if (!errors.IsEmpty)
             {
@@ -186,21 +228,22 @@ public class AutoTagPipelineService
             }
         });
 
-        _ = Task.Run(async () =>
-        {
-            await Task.WhenAll(produceTasks);
-            channel.Writer.Complete();
-        });
-
         await consumerTask;
 
-        await _stateRepo.UpsertStateAsync(new AutoTagState
+        if (hasState)
         {
-            FolderId = folderId, Status = "AwaitingReview",
-            TotalFiles = metas.Count, Processed = metas.Count,
-            LastFileCount = metas.Count,
-            CompletedAt = DateTime.UtcNow
-        });
+            var finished = Volatile.Read(ref processed);
+            var status = finished >= metas.Count ? "AwaitingReview" : "Processing";
+            await _stateRepo.UpsertStateAsync(new AutoTagState
+            {
+                FolderId = folderId, Status = status,
+                TotalFiles = metas.Count, Processed = finished,
+                LastFileCount = metas.Count,
+                CompletedAt = finished >= metas.Count ? DateTime.UtcNow : null
+            });
+        }
+
+        ClearMetaCache();
     }
 
     // ==================== Phase 2: Translation ====================
@@ -355,4 +398,6 @@ public class AutoTagPipelineService
             .Select(m => m.FilePath)
             .ToList();
     }
+
+    public void Dispose() => ProgressChanged = null;
 }

@@ -131,6 +131,13 @@ public class ChineseTagLibrary
             AppLogger.Info($"画师名映射已加载: {path} count={loaded}");
     }
 
+    public void Clear()
+    {
+        _enToZh.Clear();
+        _zhToEns.Clear();
+        _registeredNames.Clear();
+    }
+
     /// <summary>获取某个中文标签对应的所有英文同义标签</summary>
     public IReadOnlyList<string> GetEnglishAliases(string chineseTag)
         => _zhToEns.TryGetValue(chineseTag, out var list) ? list : Array.Empty<string>();

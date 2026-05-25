@@ -124,7 +124,8 @@ public class ThumbnailCacheService : IThumbnailCacheService
             return;
 
         var sorted = _cache
-            .OrderBy(kv => kv.Value.LastAccessUtc)
+            .Where(kv => kv.Value != null)
+            .OrderBy(kv => kv.Value!.LastAccessUtc)
             .ToList();
 
         foreach (var kv in sorted)
@@ -135,7 +136,13 @@ public class ThumbnailCacheService : IThumbnailCacheService
 
             if (_cache.TryRemove(kv.Key, out var entry))
             {
-                Interlocked.Add(ref _totalBytes, -entry.SizeBytes);
+                if (entry != null)
+                    Interlocked.Add(ref _totalBytes, -entry.SizeBytes);
+            }
+            else
+            {
+                // Value was null — force remove
+                _cache.TryRemove(kv.Key, out _);
             }
 
             if (Interlocked.Read(ref _totalBytes) <= maxBytes)
@@ -155,6 +162,9 @@ public class ThumbnailCacheService : IThumbnailCacheService
             LastAccessUtc = DateTime.UtcNow,
             DecodeWidth = decodeWidth
         };
+
+        if (_cache.TryGetValue(filePath, out var oldEntry))
+            Interlocked.Add(ref _totalBytes, -oldEntry.SizeBytes);
 
         _cache[filePath] = entry;
         Interlocked.Add(ref _totalBytes, data.Length);

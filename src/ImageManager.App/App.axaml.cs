@@ -186,11 +186,11 @@ public partial class App : Application
         AvaloniaXamlLoader.Load(this);
     }
 
-    public override void OnFrameworkInitializationCompleted()
+    public override async void OnFrameworkInitializationCompleted()
     {
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
-            ApplySavedTheme();
+            await ApplySavedThemeAsync();
 
             var vm = Services.GetRequiredService<MainWindowViewModel>();
             desktop.MainWindow = new MainWindow { DataContext = vm };
@@ -199,9 +199,9 @@ public partial class App : Application
         base.OnFrameworkInitializationCompleted();
     }
 
-    private void ApplySavedTheme()
+    private async Task ApplySavedThemeAsync()
     {
-        var settings = Services.GetRequiredService<ISettingsRepository>().LoadAsync().Result;
+        var settings = await Services.GetRequiredService<ISettingsRepository>().LoadAsync();
         bool dark = !string.Equals(settings.ThemeVariant, "Light", StringComparison.OrdinalIgnoreCase);
         ApplyColors(dark);
     }

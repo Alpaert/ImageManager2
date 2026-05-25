@@ -34,6 +34,30 @@ public interface IImageMetaRepository
     /// <summary>Batch-load perceptual hashes for a specific set of file paths (lightweight, no tags)</summary>
     Task<Dictionary<string, string>> GetPerceptualHashesByPathsAsync(List<string> filePaths);
 
+    /// <summary>Batch-load FileHash for a set of file paths.</summary>
+    Task<Dictionary<string, string>> GetFileHashesByPathsAsync(List<string> filePaths);
+
+    /// <summary>Find a record by its MD5 file hash.</summary>
+    Task<ImageMeta?> GetByFileHashAsync(string fileHash);
+
+    /// <summary>Update FilePath and FolderId for a moved file (preserves Id and tags).</summary>
+    Task UpdateFilePathAsync(long id, string newPath, long newFolderId);
+
+    /// <summary>Set AutoTagStatus for a given file path.</summary>
+    Task SetAutoTagStatusByPathAsync(string filePath, int status);
+
+    /// <summary>Batch set AutoTagStatus for multiple file paths.</summary>
+    Task SetAutoTagStatusBatchAsync(List<string> filePaths, int status);
+
+    /// <summary>Get all records with no folder link (externally deleted).</summary>
+    Task<List<ImageMeta>> GetAllUnlinkedAsync();
+
     /// <summary>Batch-load Width/Height for a set of file paths. Only returns entries with non-zero dimensions.</summary>
     Task<Dictionary<string, (int Width, int Height)>> GetDimensionsByPathsAsync(List<string> filePaths);
+
+    // Batch tag operations
+    Task<Dictionary<string, long>> GetIdsByPathsAsync(List<string> filePaths);
+    Task AddTagToImagesAsync(List<long> imageIds, string tag);
+    Task RemoveTagFromImagesAsync(List<long> imageIds, string tag);
+    Task ClearTagsFromImagesAsync(List<long> imageIds);
 }

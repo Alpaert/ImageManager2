@@ -11,7 +11,7 @@ public class DeepSeekTranslationService : ITranslationService
     private const double Temperature = 0.1;
     private const int MaxRetries = 2;
 
-    private readonly HttpClient _http = new();
+    private static readonly HttpClient _http = new();
     private string _apiKey = string.Empty;
 
     public bool IsAvailable => !string.IsNullOrEmpty(_apiKey);

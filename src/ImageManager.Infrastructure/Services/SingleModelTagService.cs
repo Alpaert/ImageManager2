@@ -8,7 +8,7 @@ namespace ImageManager.Infrastructure.Services;
 /// 使用 PixAI Tagger 全类别输出（EnabledCategories=null），
 /// 直接查 cnname 得中文，无 Rating 分级，无 camie 参与。
 /// </summary>
-public class SingleModelTagService : IEnsembleTagService
+public class SingleModelTagService : IEnsembleTagService, IDisposable
 {
     private readonly PixaiTagService _pixai;
     private readonly ChineseTagLibrary _chineseLib;
@@ -92,7 +92,8 @@ public class SingleModelTagService : IEnsembleTagService
 
     public void Dispose()
     {
+        _pixai?.Dispose();
+        _chineseLib?.Clear();
         AppLogger.Info("SingleModelTagService Disposed");
-        _pixai.Dispose();
     }
 }

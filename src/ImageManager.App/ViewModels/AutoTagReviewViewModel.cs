@@ -40,7 +40,7 @@ public partial class AutoTagReviewViewModel : ViewModelBase
         {
             await _controller.ConfirmTagAsync(item);
         }
-        ConfirmedCount = Items.Count(i => i.IsConfirmed);
+        ConfirmedCount++;
         UpdateStatus();
     }
 
@@ -90,7 +90,7 @@ public partial class AutoTagReviewViewModel : ViewModelBase
             await _controller.DeleteTagAsync(item);
         Items.Remove(item);
         TotalCount = Items.Count;
-        ConfirmedCount = Items.Count(i => i.IsConfirmed);
+        if (item.IsConfirmed) ConfirmedCount = Math.Max(0, ConfirmedCount - 1);
         UpdateStatus();
     }
 

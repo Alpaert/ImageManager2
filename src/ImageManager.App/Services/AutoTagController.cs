@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using ImageManager.App.ViewModels;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
@@ -25,6 +26,7 @@ public class AutoTagController
     private string _currentFolderPath = string.Empty;
     private long _currentFolderId;
     private TagMode _currentMode = TagMode.Ensemble;
+    private CancellationTokenSource? _cts;
 
     public event Action<AutoTagPipelineProgress>? ProgressChanged;
     public event Action? TranslationReady;
@@ -107,43 +109,68 @@ public class AutoTagController
             await svc.LoadModelAsync(ModelPath);
     }
 
-    public async Task<FolderTagActionResult> DetermineActionAsync(FolderInfo folder)
+    public async Task<FolderTagActionResult> DetermineActionAsync(long folderId)
     {
-        var metas = await _metaRepo.GetByFolderIdAsync(folder.Id);
-        return await _pipeline.DetermineActionAsync(folder.Id, metas.Count);
+        var metas = folderId > 0 ? await _metaRepo.GetByFolderIdAsync(folderId) : new List<Core.Models.ImageMeta>();
+        return await _pipeline.DetermineActionAsync(folderId, metas.Count);
     }
 
-    public async Task RunPipelineAsync(FolderInfo folder, List<string> filePaths, string action)
+    public async Task RunPipelineAsync(long folderId, string folderPath, List<string> filePaths, string action)
     {
-        _currentFolderPath = folder.Path;
-        _currentFolderId = folder.Id;
+        _currentFolderPath = folderPath;
+        _currentFolderId = folderId;
+        bool hasState = folderId > 0;
 
-        // Resume：推理已完成，跳过推理直接 AutoConfirm
-        if (action == "Resume")
-        {
-            AppLogger.Tag("Pipeline", "Resume: 跳过推理，直接 AutoConfirm");
-            await AutoConfirmAllAsync();
-            TranslationReady?.Invoke();
-            return;
-        }
-
-        // Recover / ReTag / Retry：先清旧自动标签再重新推理
-        if (action is "Recover" or "ReTag" or "Retry")
-        {
-            AppLogger.Tag("Pipeline", $"{action}: 删除旧自动标签");
-            await DeleteAllAutoTagsAsync(_currentFolderPath);
-        }
-
-        // Resolve ImageMeta IDs from file paths
+        // Resolve ImageMeta IDs from file paths; skip already AI-tagged; ensure DB record + MD5 for new files
+        var taggedPaths = new List<string>();
         var metas = new List<(long Id, string FilePath)>();
         foreach (var path in filePaths)
         {
             var meta = await _metaRepo.GetByPathAsync(path);
-            metas.Add(meta != null ? (meta.Id, path) : (0L, path));
+            if (meta != null)
+            {
+                if (meta.AutoTagStatus == 1) { AppLogger.Info($"AutoTag skip: {path}"); continue; }
+                metas.Add((meta.Id, path));
+                taggedPaths.Add(path);
+            }
+            else
+            {
+                // New file: compute MD5, check for match, otherwise create record
+                long newId = 0;
+                try
+                {
+                    string md5;
+                    using (var fs = File.OpenRead(path))
+                        md5 = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(fs)).ToLowerInvariant();
+                    var match = await _metaRepo.GetByFileHashAsync(md5);
+                    if (match != null && !File.Exists(match.FilePath))
+                    {
+                        // Moved: update path
+                        await _metaRepo.UpdateFilePathAsync(match.Id, path, folderId);
+                        newId = match.Id;
+                    }
+                    else
+                    {
+                        var fi = new FileInfo(path);
+                        var newMeta = new Core.Models.ImageMeta
+                        {
+                            FilePath = path, FileHash = md5, FolderId = folderId,
+                            FileSize = fi.Length, LastWriteTicks = fi.LastWriteTimeUtc.Ticks
+                        };
+                        newId = await _metaRepo.UpsertAsync(newMeta);
+                    }
+                }
+                catch { }
+                metas.Add((newId, path));
+                taggedPaths.Add(path);
+            }
         }
 
+        if (metas.Count == 0) { TranslationReady?.Invoke(); return; }
+
         // Phase 1: Inference
-        await _pipeline.RunInferenceAsync(folder.Id, metas, action);
+        _cts = new CancellationTokenSource();
+        await _pipeline.RunInferenceAsync(folderId, metas, action, _cts.Token);
 
         // Phase 2: Auto-confirm
         await AutoConfirmAllAsync();
@@ -180,50 +207,55 @@ public class AutoTagController
     public async Task AutoConfirmAllAsync()
     {
         var metas = await _metaRepo.GetByFolderAsync(_currentFolderPath);
-        var allEnglishTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var meta in metas)
-            foreach (var tag in meta.Tags)
-                allEnglishTags.Add(tag.Name);
 
-        AppLogger.Tag("AutoConfirm", $"folder={_currentFolderPath} images={metas.Count} uniqueTags={allEnglishTags.Count}");
+        // Build tag→imageIds reverse index (avoid O(N*M) nested loop)
+        var tagToImageIds = new Dictionary<string, List<long>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var meta in metas)
+        {
+            foreach (var tag in meta.Tags)
+            {
+                if (!tagToImageIds.TryGetValue(tag.Name, out var list))
+                {
+                    list = new List<long>();
+                    tagToImageIds[tag.Name] = list;
+                }
+                list.Add(meta.Id);
+            }
+        }
+
+        AppLogger.Tag("AutoConfirm", $"folder={_currentFolderPath} images={metas.Count} uniqueTags={tagToImageIds.Count}");
 
         int confirmed = 0;
-        foreach (var enTag in allEnglishTags)
+        foreach (var (enTag, imageIds) in tagToImageIds)
         {
             var zh = _chineseLib.Lookup(enTag);
             if (string.IsNullOrWhiteSpace(zh))
-            {
-                zh = enTag;  // 无翻译 → 使用英文原名
-            }
+                zh = enTag;
 
-            // Save to TagMapping
             await _mappingRepo.UpsertAsync(enTag, zh);
 
-            // Replace English → Chinese in ImageTag
             var chineseTagId = await _tagRepo.GetOrCreateTagIdAsync(zh);
-            foreach (var meta in metas)
+            foreach (var imageId in imageIds)
             {
-                var hasTag = meta.Tags.Any(t =>
-                    string.Equals(t.Name, enTag, StringComparison.OrdinalIgnoreCase));
-                if (hasTag)
-                {
-                    try { await _metaRepo.ReplaceAutoTagAsync(meta.Id, enTag, chineseTagId); }
-                    catch { /* best effort */ }
-                }
+                try { await _metaRepo.ReplaceAutoTagAsync(imageId, enTag, chineseTagId); }
+                catch { /* best effort */ }
             }
             confirmed++;
         }
 
-        await MarkFolderDoneAsync(_currentFolderId);
+        if (_currentFolderId > 0) await MarkFolderDoneAsync(_currentFolderId);
         AppLogger.Tag("AutoConfirm", $"完成 confirmed={confirmed}");
     }
 
     public async Task ConfirmAllAsync(List<TagTranslationItem> items)
     {
-        await _pipeline.PreloadMetasAsync(_currentFolderPath);
-        foreach (var item in items.Where(i => !i.IsConfirmed))
-            await ConfirmTagAsync(item);
-        _pipeline.ClearMetaCache();
+        try
+        {
+            await _pipeline.PreloadMetasAsync(_currentFolderPath);
+            foreach (var item in items.Where(i => !i.IsConfirmed))
+                await ConfirmTagAsync(item);
+        }
+        finally { _pipeline.ClearMetaCache(); }
     }
 
     public async Task SaveDraftAsync(List<TagTranslationItem> items)
@@ -341,6 +373,12 @@ public class AutoTagController
         var count = await _metaRepo.DeleteAllAutoTagsByFolderAsync(folderPath);
         AppLogger.Tag("DeleteAutoTags", $"folder={folderPath} deleted={count}");
         return count;
+    }
+
+    public async Task CancelAsync()
+    {
+        _cts?.Cancel();
+        await Task.CompletedTask;
     }
 
     public async Task MarkFolderDoneAsync(long folderId)

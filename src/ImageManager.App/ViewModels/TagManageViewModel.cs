@@ -6,7 +6,7 @@ using ImageManager.Core.Services;
 
 namespace ImageManager.App.ViewModels;
 
-public partial class TagManageViewModel : ViewModelBase
+public partial class TagManageViewModel : ViewModelBase, IDisposable
 {
     private readonly Func<string, string, Task<RenameResult>> _onRename;
     private readonly Func<string, string, Task> _onMerge;
@@ -30,12 +30,19 @@ public partial class TagManageViewModel : ViewModelBase
         _onRename = onRename;
         _onMerge = onMerge;
         _onDelete = onDelete;
+        // Pre-sort once: Count desc, then Name asc — filter only applies Where, no re-sort
+        _allTags.Sort((a, b) =>
+        {
+            int cmp = b.Count.CompareTo(a.Count);
+            return cmp != 0 ? cmp : string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+        });
         ApplyFilter(string.Empty);
     }
 
     partial void OnFilterTextChanged(string value)
     {
         _filterCts?.Cancel();
+        _filterCts?.Dispose();
         _filterCts = new CancellationTokenSource();
         var token = _filterCts.Token;
         var captured = value;
@@ -54,21 +61,22 @@ public partial class TagManageViewModel : ViewModelBase
     private void ApplyFilter(string keyword)
     {
         int version = Interlocked.Increment(ref _filterVersion);
-        var source = _allTags.ToList();
+        var source = _allTags; // pre-sorted, no copy needed
+        var hasFilter = !string.IsNullOrWhiteSpace(keyword);
 
         _ = Task.Run(() =>
         {
-            var filtered = string.IsNullOrWhiteSpace(keyword)
-                ? source
-                : source.Where(t => t.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase)).ToList();
-
-            var sorted = filtered.OrderByDescending(t => t.Count).ToList();
+            var result = hasFilter
+                ? source.Where(t => t.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase)).ToList()
+                : source;
 
             Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
             {
                 if (version != _filterVersion) return;
-                Tags = new ObservableCollection<TagCount>(sorted);
-                StatusText = $"共 {sorted.Count} 个标签";
+                Tags.Clear();
+                foreach (var t in result)
+                    Tags.Add(t);
+                StatusText = $"共 {result.Count} 个标签";
             });
         });
     }
@@ -76,11 +84,10 @@ public partial class TagManageViewModel : ViewModelBase
     [RelayCommand]
     private async Task DeleteTag(TagCount tag)
     {
-        var count = tag.Count;
         await _onDelete(tag.Name);
         _allTags.RemoveAll(t => string.Equals(t.Name, tag.Name, StringComparison.OrdinalIgnoreCase));
-        ApplyFilter(FilterText);
-        StatusText = $"已删除 \"{tag.Name}\"（{count} 张图片受影响）";
+        Tags.Remove(tag); // in-place remove, no full list rebuild
+        StatusText = $"已删除 \"{tag.Name}\"";
     }
 
     public async Task<RenameResult> HandleRenameAsync(string oldName, string newName)
@@ -117,5 +124,11 @@ public partial class TagManageViewModel : ViewModelBase
     public async Task RefreshAsync()
     {
         // Will be re-initialized by caller
+    }
+
+    public void Dispose()
+    {
+        _filterCts?.Cancel();
+        _filterCts?.Dispose();
     }
 }

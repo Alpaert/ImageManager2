@@ -9,7 +9,9 @@ using Avalonia.VisualTree;
 using System.Runtime.InteropServices;
 using ImageManager.App.Helpers;
 using ImageManager.App.ViewModels;
+using ImageManager.Common.Helpers;
 using ImageManager.Infrastructure.Data;
+using ImageManager.Infrastructure.Services;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace ImageManager.App.Views;
@@ -31,6 +33,31 @@ public partial class MainWindow : Window
         AddHandler(InputElement.KeyDownEvent, OnWindowKeyDown, RoutingStrategies.Tunnel);
         ThumbnailScrollViewer.AddHandler(ScrollViewer.PointerWheelChangedEvent,
             OnThumbnailScrollWheel, RoutingStrategies.Tunnel);
+        LstFolders.AddHandler(TreeViewItem.ExpandedEvent,
+            (_, e) =>
+            {
+                if (e.Source is TreeViewItem tvi && tvi.DataContext is ViewModels.FolderTreeNode node)
+                    node.IsExpanded = true;
+            },
+            RoutingStrategies.Bubble);
+        LstFolders.AddHandler(TreeViewItem.CollapsedEvent,
+            (_, e) =>
+            {
+                if (e.Source is TreeViewItem tvi && tvi.DataContext is ViewModels.FolderTreeNode node)
+                    node.IsExpanded = false;
+            },
+            RoutingStrategies.Bubble);
+        LstFolders.AddHandler(InputElement.PointerPressedEvent,
+            (_, e) =>
+            {
+                if (!e.GetCurrentPoint(LstFolders).Properties.IsRightButtonPressed) return;
+                e.Handled = true;
+                var el = e.Source as Control;
+                while (el != null && el is not TreeViewItem)
+                    el = el.Parent as Control;
+                _rightClickedFolder = (el as TreeViewItem)?.DataContext as ViewModels.FolderTreeNode;
+            },
+            RoutingStrategies.Tunnel);
     }
 
     private async Task OpenPreviewForFileAsync(string filePath)
@@ -59,10 +86,19 @@ public partial class MainWindow : Window
         pv.SavedLeft = Vm.AppSettings.PreviewLeft;
         pv.SavedTop = Vm.AppSettings.PreviewTop;
 
-        // Set position BEFORE Show so window appears at the right place from frame 0
         win.WindowStartupLocation = WindowStartupLocation.Manual;
-        if (pv.SavedLeft >= 0)
+        if (!double.IsNaN(pv.SavedLeft))
+        {
             win.Position = new PixelPoint((int)pv.SavedLeft, (int)pv.SavedTop);
+        }
+        else
+        {
+            var screen = Screens.ScreenFromVisual(this) ?? Screens.Primary;
+            var bounds = screen?.WorkingArea ?? new PixelRect(0, 0, 1920, 1080);
+            win.Position = new PixelPoint(
+                bounds.X + (bounds.Width - (int)win.Width) / 2,
+                bounds.Y + (bounds.Height - (int)win.Height) / 2);
+        }
 
         // Use Show instead of ShowDialog to avoid Avalonia bug #19255
         // where ShowDialog ignores Window.Position on Windows.
@@ -158,10 +194,9 @@ public partial class MainWindow : Window
         OnlineSearchHelper.SetTempDir(Path.Combine(Vm.AppSettings.DiskCacheDirectory, "search_temp"));
         OnlineSearchHelper.CleanupOldTempFiles();
 
-        Vm.ScrollRestoreRequested += () =>
-        {
-            ThumbnailScrollViewer.Offset = new Vector(0, Vm.PreSearchScrollOffset);
-        };
+        Vm.ScrollRestoreRequested += OnScrollRestore;
+        Vm.ScrollToSelectedRequested += OnScrollToSelected;
+        Vm.TreeScrollToNodeRequested += OnTreeScrollToNode;
 
         // Restore startup size
         if (Vm.AppSettings.StartupWidth > 0) Width = Vm.AppSettings.StartupWidth;
@@ -196,6 +231,29 @@ public partial class MainWindow : Window
             return;
         }
 
+        // Ctrl+A — select all images on current page
+        if (e.Key == Key.A && e.KeyModifiers == KeyModifiers.Control)
+        {
+            e.Handled = true;
+            foreach (var img in Vm.Images)
+                img.IsSelected = true;
+            return;
+        }
+
+        // Ctrl+Shift+G — force GC and show memory stats (debug)
+        if (e.Key == Key.G && e.KeyModifiers == (KeyModifiers.Control | KeyModifiers.Shift))
+        {
+            e.Handled = true;
+            var memBefore = GC.GetTotalMemory(false);
+            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            var memAfter = GC.GetTotalMemory(false);
+            var freedMB = (memBefore - memAfter) / 1024.0 / 1024.0;
+            Vm.StatusText = $"GC: {memBefore / 1024 / 1024}MB → {memAfter / 1024 / 1024}MB (释放 {freedMB:F1}MB)";
+            return;
+        }
+
         // Only handle modifier+key combos (Ctrl+X, Ctrl+Shift+X, etc.) for IME compatibility
         if (e.KeyModifiers == KeyModifiers.None)
             return;
@@ -220,9 +278,19 @@ public partial class MainWindow : Window
 
     private async void OnThumbnailScrollWheel(object? sender, PointerWheelEventArgs e)
     {
+        // Ctrl+Wheel = zoom
+        if (e.KeyModifiers.HasFlag(KeyModifiers.Control))
+        {
+            e.Handled = true;
+            double step = e.Delta.Y > 0 ? 0.5 : -0.5;
+            Vm.ZoomTick = Math.Clamp(Vm.ZoomTick + step, 1, 10);
+            return;
+        }
+
         e.Handled = true;
 
         _scrollAnimCts?.Cancel();
+        _scrollAnimCts?.Dispose();
         _scrollAnimCts = new CancellationTokenSource();
         var ct = _scrollAnimCts.Token;
 
@@ -278,13 +346,15 @@ public partial class MainWindow : Window
 
     private async void LstFolders_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
-        if (e.AddedItems.Count > 0 && e.AddedItems[0] is Core.Models.FolderInfo folder)
+        if (Vm._isProgrammaticFolderSelection) return;
+        Vm.ClearSearchHighlight();
+        if (e.AddedItems.Count > 0 && e.AddedItems[0] is ViewModels.FolderTreeNode folder)
         {
             await OpenFolderOrRelocateAsync(folder);
         }
     }
 
-    private async Task OpenFolderOrRelocateAsync(Core.Models.FolderInfo folder)
+    private async Task OpenFolderOrRelocateAsync(ViewModels.FolderTreeNode folder)
     {
         if (Vm.NeedsRelocation(folder))
         {
@@ -295,7 +365,7 @@ public partial class MainWindow : Window
             });
             if (result.Count > 0)
             {
-                await Vm.RelocateFolderAsync(folder.Id, result[0].Path.LocalPath);
+                await Vm.RelocateFolderAsync(folder.DbId, result[0].Path.LocalPath);
                 await Vm.SelectFolderAsync(folder);
             }
             else
@@ -305,6 +375,20 @@ public partial class MainWindow : Window
             return;
         }
         await Vm.SelectFolderAsync(folder);
+    }
+
+    // ==================== Folder Search ====================
+
+    private void TxtFolderSearch_GotFocus(object? sender, RoutedEventArgs e)
+    {
+        if (!string.IsNullOrWhiteSpace(Vm.FolderSearchText))
+            Vm.IsFolderSearchPopupOpen = Vm.FolderSearchSuggestions.Count > 0;
+    }
+
+    private void FolderSuggestion_Click(object? sender, RoutedEventArgs e)
+    {
+        if (sender is Button btn && btn.DataContext is FolderTreeNode folder)
+            Vm.SelectFolderSuggestionCommand.Execute(folder);
     }
 
     private void LstFolders_DragOver(object? sender, Avalonia.Input.DragEventArgs e)
@@ -320,21 +404,20 @@ public partial class MainWindow : Window
             var filePaths = ExtractAllFilePaths(e);
             if (filePaths.Count == 0) return;
 
-            // Get target folder from selected or hovered list item
+            // Get target folder from selected or hovered tree item
             string? targetFolder = null;
-            if (sender is ListBox lb)
+            if (sender is TreeView tv)
             {
-                // Try selected item first, then hit-test
-                targetFolder = (lb.SelectedItem as Core.Models.FolderInfo)?.Path;
+                targetFolder = (tv.SelectedItem as ViewModels.FolderTreeNode)?.Path;
                 if (string.IsNullOrEmpty(targetFolder))
                 {
-                    var pos = e.GetPosition(lb);
-                    var element = lb.InputHitTest(pos) as Avalonia.Visual;
+                    var pos = e.GetPosition(tv);
+                    var element = tv.InputHitTest(pos) as Avalonia.Visual;
                     while (element != null)
                     {
-                        if (element is ListBoxItem lbi && lbi.DataContext is Core.Models.FolderInfo fi)
+                        if (element is TreeViewItem tvi && tvi.DataContext is ViewModels.FolderTreeNode fn)
                         {
-                            targetFolder = fi.Path;
+                            targetFolder = fn.Path;
                             break;
                         }
                         element = element.GetVisualParent();
@@ -645,14 +728,33 @@ public partial class MainWindow : Window
         }
         else
         {
-            // Clear others, select this one
-            foreach (var img in Vm.Images)
+            bool multiSelected = Vm.Images.Count(i => i.IsSelected) > 1;
+            if (multiSelected && item.IsSelected)
             {
-                if (img.IsSelected) img.IsSelected = false;
+                // Defer single-select to pointer release (allow drag to cancel)
+                _pendingClick = item;
             }
-            item.IsSelected = true;
-            _lastSelectedIndex = Vm.Images.IndexOf(item);
+            else
+            {
+                foreach (var img in Vm.Images)
+                    img.IsSelected = false;
+                item.IsSelected = true;
+                _lastSelectedIndex = Vm.Images.IndexOf(item);
+            }
         }
+    }
+
+    private void Thumbnail_PointerReleased(object? sender, Avalonia.Input.PointerReleasedEventArgs e)
+    {
+        if (_pendingClick == null) return;
+        if (sender is not Avalonia.Controls.Border border) return;
+        if (border.DataContext is not ImageViewItem item) return;
+        if (item != _pendingClick) return;
+
+        foreach (var img in Vm.Images)
+            img.IsSelected = img == item;
+        _lastSelectedIndex = Vm.Images.IndexOf(item);
+        _pendingClick = null;
     }
 
     // ==================== Drag Thumbnail to Explorer / QQ / Browser ====================
@@ -661,6 +763,7 @@ public partial class MainWindow : Window
     private Avalonia.Input.PointerPressedEventArgs? _dragPressArgs;
     private Point? _lastClickScreenPos;
     private ImageViewItem? _lastHoveredItem;
+    private ImageViewItem? _pendingClick;
     private int _lastSelectedIndex = -1;
 
     private async void Thumbnail_PointerMoved(object? sender, Avalonia.Input.PointerEventArgs e)
@@ -669,6 +772,7 @@ public partial class MainWindow : Window
         if (border.DataContext is not ImageViewItem item) return;
 
         _lastHoveredItem = item;
+        _pendingClick = null; // movement cancels deferred single-select
 
         var point = e.GetCurrentPoint(border);
         if (!point.Properties.IsLeftButtonPressed) return;
@@ -823,6 +927,7 @@ public partial class MainWindow : Window
             await Vm.SetImageTagsAsync(item.FilePath, newTags);
             item.Tags = newTags;
             item.NotifyAll();
+            await Vm.RefreshTagCountsAsync();
             await Vm.SaveSettingsAsync();
         }
 
@@ -856,39 +961,68 @@ public partial class MainWindow : Window
                 foreach (var item in items)
                 {
                     if (!item.Tags.Contains(tag, StringComparer.OrdinalIgnoreCase))
-                    {
-                        await Vm.AddTagToImageAsync(item.FilePath, tag);
                         item.Tags.Add(tag);
-                    }
                 }
+                await Vm.AddTagToImagesBatchAsync(
+                    items.Select(i => i.FilePath).ToList(), tag);
             },
             onRemoveTagFromAll: async tag =>
             {
                 foreach (var item in items)
-                {
-                    await Vm.RemoveTagFromImageAsync(item.FilePath, tag);
                     item.Tags.RemoveAll(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase));
-                }
+                await Vm.RemoveTagFromImagesBatchAsync(
+                    items.Select(i => i.FilePath).ToList(), tag);
             },
             onClearAllTags: async () =>
             {
                 foreach (var item in items)
-                {
-                    await Vm.SetImageTagsAsync(item.FilePath, new List<string>());
                     item.Tags.Clear();
-                }
+                await Vm.ClearTagsFromImagesBatchAsync(
+                    items.Select(i => i.FilePath).ToList());
             });
 
         var win = new Settings.TagEditWindow { DataContext = tagVm };
         win.Title = $"编辑 Tag — {items.Count} 张图片";
         await win.ShowDialog<bool>(this);
 
-        // Refresh all affected images
         foreach (var item in items)
-        {
             item.NotifyAll();
-            await Vm.RefreshImageTagsAsync(item.FilePath);
+        await Vm.RefreshTagCountsAsync();
+    }
+
+    private async void MenuClearSelectedTags_Click(object? sender, RoutedEventArgs e)
+    {
+        var selected = Vm.Images.Where(i => i.IsSelected).ToList();
+        if (selected.Count == 0) { Vm.StatusText = "未选中图片"; return; }
+
+        var ok = await ShowConfirmDialogAsync($"确定要清空 {selected.Count} 张选中图片的所有标签？");
+        if (!ok) return;
+
+        var repo = App.Services.GetRequiredService<Core.Services.IImageMetaRepository>();
+        await Task.Run(async () =>
+        {
+            foreach (var item in selected)
+            {
+                try
+                {
+                    var meta = await repo.GetByPathAsync(item.FilePath);
+                    if (meta != null)
+                    {
+                        await repo.SetTagsAsync(meta.Id, new List<string>());
+                        await repo.SetAutoTagStatusByPathAsync(item.FilePath, 0);
+                    }
+                }
+                catch { }
+            }
+        });
+
+        foreach (var item in selected)
+        {
+            Vm.ClearTagCacheForPath(item.FilePath);
+            item.Tags.Clear();
+            item.NotifyAll();
         }
+        Vm.StatusText = $"已清空 {selected.Count} 张图片的标签";
     }
 
     private async void MenuAutoTag_Click(object? sender, RoutedEventArgs e)
@@ -922,29 +1056,39 @@ public partial class MainWindow : Window
             settings.DeepSeekApiKey);
 
         var filePaths = selected.Select(i => i.FilePath).Distinct().ToList();
-        Vm.StatusText = $"正在推理 {filePaths.Count} 张图片...";
+        var repo = App.Services.GetRequiredService<Core.Services.IImageMetaRepository>();
+        var actualPaths = new List<string>();
+        foreach (var p in filePaths)
+        {
+            var m = await repo.GetByPathAsync(p);
+            if (m?.AutoTagStatus == 1) continue;
+            actualPaths.Add(p);
+        }
+        if (actualPaths.Count == 0) { Vm.StatusText = "所选图片均已打标，跳过"; return; }
+
+        Vm.StatusText = $"正在推理 {actualPaths.Count} 张图片...";
 
         _ = Task.Run(async () =>
         {
             try
             {
-                var pixai = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.PixaiTagService>();
-                for (int idx = 0; idx < filePaths.Count; idx++)
+                for (int idx = 0; idx < actualPaths.Count; idx++)
                 {
-                    var path = filePaths[idx];
+                    var path = actualPaths[idx];
                     await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
-                        Vm.StatusText = $"推理中 ({idx + 1}/{filePaths.Count}): {System.IO.Path.GetFileName(path)}");
+                        Vm.StatusText = $"推理中 ({idx + 1}/{actualPaths.Count}): {System.IO.Path.GetFileName(path)}");
 
                     var items = await controller.RunSingleImageAsync(path);
                     if (items.Count > 0)
                         await controller.SaveMappingsAndTagsAsync(path, items);
+                    await repo.SetAutoTagStatusByPathAsync(path, 1);
                 }
 
                 await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
                 {
-                    foreach (var path in filePaths)
+                    foreach (var path in actualPaths)
                         await Vm.RefreshImageTagsAsync(path);
-                    Vm.StatusText = $"打标完成 ({filePaths.Count} 张)";
+                    Vm.StatusText = $"打标完成 ({actualPaths.Count} 张)";
                 });
             }
             catch (Exception ex)
@@ -1095,7 +1239,10 @@ public partial class MainWindow : Window
 
     private async void MenuRefreshFolder_Click(object? sender, RoutedEventArgs e)
     {
-        await Vm.SyncCurrentFolderAsync();
+        if (Vm.ShowAllSubfolders)
+            await Vm.RebuildFileListAsync();
+        else
+            await Vm.SyncCurrentFolderAsync();
     }
 
     private async void MenuWallpaperSettings_Click(object? sender, RoutedEventArgs e)
@@ -1112,6 +1259,8 @@ public partial class MainWindow : Window
         {
             try
             {
+                if (Background is Avalonia.Media.ImageBrush { Source: IDisposable oldBitmap })
+                    oldBitmap.Dispose();
                 var brush = new Avalonia.Media.ImageBrush(
                     new Avalonia.Media.Imaging.Bitmap(path));
                 brush.Opacity = Vm.AppSettings.WallpaperOpacity;
@@ -1301,17 +1450,15 @@ public partial class MainWindow : Window
         var pt = e.GetCurrentPoint(LstFolders);
 
         var element = e.Source as Control;
-        while (element != null && element is not ListBoxItem)
+        while (element != null && element is not TreeViewItem)
             element = element.Parent as Control;
 
-        if (element is not ListBoxItem { DataContext: Core.Models.FolderInfo fi })
+        if (element is not TreeViewItem { DataContext: ViewModels.FolderTreeNode fi })
             return;
 
-        if (pt.Properties.IsRightButtonPressed)
-        {
-            LstFolders.SelectedItem = fi;
-            return;
-        }
+        if (pt.Properties.IsRightButtonPressed) return; // handled in Tunnel
+
+        if (pt.Properties.IsLeftButtonPressed) _rightClickedFolder = null;
 
         // Left-click on a folder that needs relocation — trigger dialog even if already selected
         if (pt.Properties.IsLeftButtonPressed && Vm.NeedsRelocation(fi))
@@ -1321,9 +1468,11 @@ public partial class MainWindow : Window
         }
     }
 
-    private Core.Models.FolderInfo? GetContextMenuFolder(object? sender)
+    private ViewModels.FolderTreeNode? _rightClickedFolder;
+
+    private ViewModels.FolderTreeNode? GetContextMenuFolder(object? sender)
     {
-        return LstFolders.SelectedItem as Core.Models.FolderInfo;
+        return _rightClickedFolder ?? LstFolders.SelectedItem as ViewModels.FolderTreeNode;
     }
 
     private async void MenuRenameFolder_Click(object? sender, RoutedEventArgs e)
@@ -1331,8 +1480,7 @@ public partial class MainWindow : Window
         var folder = GetContextMenuFolder(sender);
         if (folder == null) return;
 
-        var alias = await ShowFolderAliasDialogAsync(
-            folder.Alias ?? System.IO.Path.GetFileName(folder.Path.TrimEnd('\\', '/')));
+        var alias = await ShowFolderAliasDialogAsync(folder.DisplayName);
         if (alias == null) return; // cancelled
 
         await Vm.UpdateFolderAliasAsync(folder.Path, string.IsNullOrWhiteSpace(alias) ? null! : alias);
@@ -1350,44 +1498,156 @@ public partial class MainWindow : Window
     {
         var folder = GetContextMenuFolder(sender);
         if (folder == null) return;
+        var files = GetImageFilesInFolder(folder.Path);
+        if (files.Count == 0) { Vm.StatusText = "文件夹无图片"; return; }
+        await RunAutoTagAsync(folder, files);
+    }
 
+    private async void MenuClearFolderTags_Click(object? sender, RoutedEventArgs e)
+    {
+        var folder = GetContextMenuFolder(sender);
+        if (folder == null) { Vm.StatusText = "未找到文件夹"; return; }
+        AppLogger.Info($"ClearTags: folder={folder.Path}");
+
+        var result = await ShowClearTagsDialogAsync();
+        if (result == null) { AppLogger.Info("ClearTags: cancelled"); return; }
+
+        bool recursive = result.Value;
+        AppLogger.Info($"ClearTags: recursive={recursive}");
+        var files = recursive ? GetImageFilesRecursive(folder.Path) : GetImageFilesInFolder(folder.Path);
+        AppLogger.Info($"ClearTags: found {files.Count} files");
+        if (files.Count == 0) { Vm.StatusText = "文件夹无图片"; return; }
+
+        Vm.StatusText = $"正在清空 {files.Count} 张图片的标签...";
+        var clearRepo = App.Services.GetRequiredService<Core.Services.IImageMetaRepository>();
+        int cleared = 0;
+        await Task.Run(async () =>
+        {
+            foreach (var path in files)
+            {
+                try
+                {
+                    var meta = await clearRepo.GetByPathAsync(path);
+                    if (meta != null)
+                    {
+                        await clearRepo.SetTagsAsync(meta.Id, new List<string>());
+                        await clearRepo.SetAutoTagStatusByPathAsync(path, 0);
+                        Interlocked.Increment(ref cleared);
+                    }
+                }
+                catch (Exception ex) { AppLogger.Warn($"ClearTags fail: {path} {ex.Message}"); }
+            }
+        });
+        AppLogger.Info($"ClearTags: done cleared={cleared}/{files.Count}");
+        foreach (var path in files)
+            Vm.ClearTagCacheForPath(path);
+        if (string.Equals(Vm.CurrentFolder, folder.Path, StringComparison.OrdinalIgnoreCase))
+        {
+            Vm.InvalidatePageCache();
+            await Vm.ShowPageAsync(Vm.CurrentPage);
+        }
+        Vm.StatusText = $"已清空 {cleared}/{files.Count} 张图片的标签";
+    }
+
+    private Task<bool?> ShowClearTagsDialogAsync()
+    {
+        var tcs = new TaskCompletionSource<bool?>();
+        var dialog = new Window
+        {
+            Title = "清空图片标签",
+            Width = 400, Height = 180,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner
+        };
+        var panel = new StackPanel { Margin = new Avalonia.Thickness(16) };
+        panel.Children.Add(new TextBlock
+        {
+            Text = "选择清空范围：", TextWrapping = Avalonia.Media.TextWrapping.Wrap,
+            Margin = new Avalonia.Thickness(0, 0, 0, 12)
+        });
+        var btnPanel = new StackPanel
+        {
+            Orientation = Avalonia.Layout.Orientation.Horizontal,
+            HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Center,
+            Spacing = 10
+        };
+        var currentBtn = new Button { Content = "仅当前文件夹", Width = 140 };
+        var recursiveBtn = new Button { Content = "包含所有子文件夹", Width = 140 };
+        var cancelBtn = new Button { Content = "取消", Width = 80 };
+
+        currentBtn.Click += (_, _) => { tcs.TrySetResult(false); dialog.Close(); };
+        recursiveBtn.Click += (_, _) => { tcs.TrySetResult(true); dialog.Close(); };
+        cancelBtn.Click += (_, _) => { tcs.TrySetResult(null); dialog.Close(); };
+        dialog.Closed += (_, _) => tcs.TrySetResult(null);
+
+        btnPanel.Children.Add(currentBtn);
+        btnPanel.Children.Add(recursiveBtn);
+        panel.Children.Add(btnPanel);
+        panel.Children.Add(cancelBtn);
+        dialog.Content = panel;
+        _ = dialog.ShowDialog(this);
+        return tcs.Task;
+    }
+
+    private async void MenuComputeAutoTagsRecursive_Click(object? sender, RoutedEventArgs e)
+    {
+        var folder = GetContextMenuFolder(sender);
+        if (folder == null) return;
+        var files = GetImageFilesRecursive(folder.Path);
+        if (files.Count == 0) { Vm.StatusText = "文件夹及子文件夹无图片"; return; }
+        await RunAutoTagAsync(folder, files);
+    }
+
+    private static List<string> GetImageFilesInFolder(string path)
+    {
+        try
+        {
+            var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
+            return Directory.EnumerateFiles(path)
+                .Where(f => exts.Contains(Path.GetExtension(f)))
+                .ToList();
+        }
+        catch { return new List<string>(); }
+    }
+
+    private static List<string> GetImageFilesRecursive(string root)
+    {
+        var files = new List<string>();
+        var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
+        try
+        {
+            var dirs = new Queue<string>();
+            dirs.Enqueue(root);
+            while (dirs.Count > 0)
+            {
+                var dir = dirs.Dequeue();
+                try
+                {
+                    foreach (var f in Directory.EnumerateFiles(dir))
+                        if (exts.Contains(Path.GetExtension(f)))
+                            files.Add(f);
+                    foreach (var sub in Directory.EnumerateDirectories(dir))
+                        dirs.Enqueue(sub);
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return files;
+    }
+
+    private async Task RunAutoTagAsync(ViewModels.FolderTreeNode folder, List<string> filePaths)
+    {
         var controller = App.Services.GetRequiredService<Services.AutoTagController>();
 
-        // Load model first
         if (!controller.IsModelLoaded)
         {
             Vm.StatusText = "正在加载打标模型...";
-            try
-            {
-                await controller.LoadModelAsync();
-            }
-            catch (Exception ex)
-            {
-                Vm.StatusText = $"模型加载失败: {ex.Message}";
-                return;
-            }
-        }
-        Vm.StatusText = $"模型就绪 路径:{controller.ModelPath}";
-
-        // Use currently displayed file list (doesn't rely on FolderId being set in DB)
-        var filePaths = Vm.ActiveFileList;
-        if (filePaths.Count == 0)
-        {
-            Vm.StatusText = "文件夹无图片";
-            return;
+            try { await controller.LoadModelAsync(); }
+            catch (Exception ex) { Vm.StatusText = $"模型加载失败: {ex.Message}"; return; }
         }
 
-        // Determine action
-        Vm.StatusText = "正在检查文件夹状态...";
-        var action = await controller.DetermineActionAsync(folder);
-
-        if (!action.CanProceed)
-        {
-            Vm.StatusText = action.Message;
-            return;
-        }
-
-        // Configure with current settings
         var settings = Vm.AppSettings;
         controller.Configure(
             (Core.Services.TagMode)settings.TagMode,
@@ -1396,53 +1656,24 @@ public partial class MainWindow : Window
             settings.ArtistMatchThreshold,
             settings.DeepSeekApiKey);
 
-        // Confirm with user (Resume: 是=继续审核, 否=重新打标)
-        var confirmResult = await ShowConfirmDialogAsync(action.Message);
-
-        var effectiveAction = action.Action;
-        if (action.Action is "ReTag" or "Recover")
+        void OnProgress(AutoTagPipelineProgress progress)
         {
-            if (!confirmResult)
-            {
-                Vm.StatusText = "已取消";
-                return;
-            }
-            effectiveAction = action.Action;
-        }
-        else if (action.Action == "Resume")
-        {
-            if (confirmResult)
-                effectiveAction = "Resume";
-            else
-                effectiveAction = "ReTag";  // 否→清旧标签重新推理
-        }
-        else if (!confirmResult)
-        {
-            Vm.StatusText = "已取消";
-            return;
-        }
-
-        // Hook progress to status bar
-        controller.ProgressChanged += progress =>
-        {
-            Console.WriteLine($"[AutoTag] {progress.Phase}: {progress.StatusText}");
             Avalonia.Threading.Dispatcher.UIThread.Post(() =>
                 Vm.StatusText = $"[{progress.Phase}] {progress.StatusText}");
-        };
+        }
+        controller.ProgressChanged += OnProgress;
 
-        // Run pipeline in background
-        Vm.StatusText = "正在推理图片标签...";
+        Vm.IsAutoTagRunning = true;
+        Vm.StatusText = $"正在推理 {filePaths.Count} 张图片...";
         _ = Task.Run(async () =>
         {
             try
             {
-                await controller.RunPipelineAsync(folder, filePaths, effectiveAction);
-
-                // Auto-confirm all tags (Chinese names from CSV, no review needed)
+                await controller.RunPipelineAsync(folder.DbId, folder.Path, filePaths, "Start");
                 await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
                 {
-                    Vm.StatusText = "自动打标完成";
-                    // 刷新所有图片的标签显示
+                    if (!Vm.StatusText.Contains("已停止"))
+                        Vm.StatusText = $"打标完成 ({filePaths.Count} 张)";
                     foreach (var path in filePaths)
                         await Vm.RefreshImageTagsAsync(path);
                 });
@@ -1451,6 +1682,12 @@ public partial class MainWindow : Window
             {
                 await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
                     Vm.StatusText = $"打标失败: {ex.Message}");
+            }
+            finally
+            {
+                controller.ProgressChanged -= OnProgress;
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                    Vm.IsAutoTagRunning = false);
             }
         });
     }
@@ -1577,10 +1814,45 @@ public partial class MainWindow : Window
         await win.ShowDialog(this);
     }
 
+    private void OnScrollRestore()
+    {
+        ThumbnailScrollViewer.Offset = new Vector(0, Vm.PreSearchScrollOffset);
+    }
+
+    private void OnScrollToSelected()
+    {
+        var selected = Vm.Images.FirstOrDefault(i => i.IsSelected);
+        if (selected == null) return;
+        var container = ItemsImages.ContainerFromItem(selected) as Control;
+        if (container == null) return;
+        container.BringIntoView();
+    }
+
+    private void OnTreeScrollToNode(ViewModels.FolderTreeNode node)
+    {
+        var container = LstFolders.TreeContainerFromItem(node);
+        if (container == null) return;
+        Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+        {
+            var sv = LstFolders.FindDescendantOfType<ScrollViewer>();
+            if (sv == null) return;
+            var bounds = container.Bounds;
+            var containerY = container.TranslatePoint(new Avalonia.Point(0, 0), sv)?.Y ?? 0;
+            double targetOffset = containerY - sv.Viewport.Height / 2 + bounds.Height / 2;
+            if (targetOffset < 0) targetOffset = 0;
+            double maxY = Math.Max(0, sv.Extent.Height - sv.Viewport.Height);
+            if (targetOffset > maxY) targetOffset = maxY;
+            sv.Offset = new Vector(0, targetOffset);
+        }, Avalonia.Threading.DispatcherPriority.Loaded);
+    }
+
     // ==================== Window Closing ====================
 
     private void Window_Closing(object? sender, Avalonia.Controls.WindowClosingEventArgs e)
     {
+        Vm.ScrollRestoreRequested -= OnScrollRestore;
+        Vm.ScrollToSelectedRequested -= OnScrollToSelected;
+        Vm.TreeScrollToNodeRequested -= OnTreeScrollToNode;
         _ = Vm.SaveSettingsAsync();
     }
     private async void MenuThumbnailSettings_Click(object? sender, RoutedEventArgs e)

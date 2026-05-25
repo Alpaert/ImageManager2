@@ -75,7 +75,7 @@ public class DuplicateService : IDuplicateService
                     continue;
                 if (moved.Contains(img.FilePath)) continue;
 
-                MoveFile(img.FilePath, targetDir);
+                await MoveFileAsync(img.FilePath, targetDir);
                 moved.Add(img.FilePath);
                 exactCount++;
             }
@@ -84,7 +84,7 @@ public class DuplicateService : IDuplicateService
         return (exactCount, 0);
     }
 
-    private void MoveFile(string oldPath, string targetDir)
+    private async Task MoveFileAsync(string oldPath, string targetDir)
     {
         try
         {
@@ -93,11 +93,11 @@ public class DuplicateService : IDuplicateService
                 Path.Combine(targetDir, fileName));
             File.Move(oldPath, destPath);
 
-            var meta = _metaRepo.GetByPathAsync(oldPath).Result;
+            var meta = await _metaRepo.GetByPathAsync(oldPath);
             if (meta != null)
             {
                 meta.FilePath = destPath;
-                _metaRepo.UpsertAsync(meta).Wait();
+                await _metaRepo.UpsertAsync(meta);
             }
         }
         catch { }

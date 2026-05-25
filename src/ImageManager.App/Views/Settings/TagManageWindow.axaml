@@ -15,31 +15,32 @@
                        Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"/>
         </StackPanel>
 
-        <!-- List -->
-        <ScrollViewer Grid.Row="1">
-            <ItemsControl ItemsSource="{Binding Tags}">
-                <ItemsControl.ItemTemplate>
-                    <DataTemplate x:DataType="models:TagCount">
-                        <Border Padding="8,4" Margin="0,2"
-                                Background="{DynamicResource CtrlBgBrush}" CornerRadius="4">
-                            <Grid ColumnDefinitions="*,Auto,Auto,Auto">
-                                <TextBlock Grid.Column="0" Text="{Binding Name}"
-                                           VerticalAlignment="Center" FontSize="13"/>
-                                <TextBlock Grid.Column="1" Text="{Binding Count, StringFormat='{}{0} 张'}"
-                                           VerticalAlignment="Center" FontSize="12" Margin="8,0"
-                                           Foreground="{DynamicResource MutedFgBrush}"/>
-                                <Button Grid.Column="2" Content="重命名" Padding="6,2" FontSize="12"
-                                        Margin="4,0" Click="Rename_Click" Tag="{Binding}"/>
-                                <Button Grid.Column="3" Content="×" Width="28" Height="28"
-                                        Padding="0" FontSize="14" Background="Transparent"
-                                        Foreground="#E06060"
-                                        Click="Delete_Click" Tag="{Binding}"/>
-                            </Grid>
-                        </Border>
-                    </DataTemplate>
-                </ItemsControl.ItemTemplate>
-            </ItemsControl>
-        </ScrollViewer>
+        <!-- List (virtualized — only ~50 items materialized for 10k tags) -->
+        <ListBox Grid.Row="1" ItemsSource="{Binding Tags}">
+            <ListBox.ItemsPanel>
+                <ItemsPanelTemplate><VirtualizingStackPanel/></ItemsPanelTemplate>
+            </ListBox.ItemsPanel>
+            <ListBox.ItemTemplate>
+                <DataTemplate x:DataType="models:TagCount">
+                    <Border Padding="8,4" Margin="0,2"
+                            Background="{DynamicResource CtrlBgBrush}" CornerRadius="4">
+                        <Grid ColumnDefinitions="*,Auto,Auto,Auto">
+                            <TextBlock Grid.Column="0" Text="{Binding Name}"
+                                       VerticalAlignment="Center" FontSize="13"/>
+                            <TextBlock Grid.Column="1" Text="{Binding Count, StringFormat='{}{0} 张'}"
+                                       VerticalAlignment="Center" FontSize="12" Margin="8,0"
+                                       Foreground="{DynamicResource MutedFgBrush}"/>
+                            <Button Grid.Column="2" Content="重命名" Padding="6,2" FontSize="12"
+                                    Margin="4,0" Click="Rename_Click" Tag="{Binding}"/>
+                            <Button Grid.Column="3" Content="×" Width="28" Height="28"
+                                    Padding="0" FontSize="14" Background="Transparent"
+                                    Foreground="#E06060"
+                                    Click="Delete_Click" Tag="{Binding}"/>
+                        </Grid>
+                    </Border>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
 
         <!-- Bottom -->
         <TextBlock Grid.Row="2" FontSize="11" Margin="0,8,0,0"

@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Imaging;
 using SkiaSharp;
@@ -82,8 +83,9 @@ public class HashService : IHashService
             if (hashInput == null) return string.Empty;
             return ComputeCombinedPerceptualHashFromBytes(hashInput);
         }
-        catch
+        catch (Exception ex)
         {
+            AppLogger.Warn($"Combined hash failed: {ex.Message}");
             return string.Empty;
         }
     }
@@ -397,7 +399,7 @@ public class HashService : IHashService
             }
             return intersection;
         }
-        catch { return 0; }
+        catch (Exception ex) { AppLogger.Warn($"Histogram compare failed: {ex.Message}"); return 0; }
     }
 
     /// <summary>

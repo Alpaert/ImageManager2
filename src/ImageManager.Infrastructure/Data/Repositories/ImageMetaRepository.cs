@@ -110,14 +110,17 @@ public class ImageMetaRepository : IImageMetaRepository
         using var conn = _db.CreateConnection();
         using var txn = conn.BeginTransaction();
 
-        var existing = await conn.QuerySingleOrDefaultAsync<ImageMeta>(
-            "SELECT Id FROM ImageMeta WHERE FilePath = @FilePath COLLATE NOCASE",
+        var existing = await conn.QuerySingleOrDefaultAsync<(long Id, long? FolderId)>(
+            "SELECT Id, FolderId FROM ImageMeta WHERE FilePath = @FilePath COLLATE NOCASE",
             new { meta.FilePath }, txn);
 
-        if (existing != null)
+        if (existing != default)
         {
             meta.Id = existing.Id;
             meta.UpdatedAt = DateTime.UtcNow;
+            // Preserve existing non-null FolderId (for subfolder files in "全展示" mode)
+            if (existing.FolderId.HasValue && existing.FolderId.Value != 0)
+                meta.FolderId = existing.FolderId.Value;
             await conn.ExecuteAsync(@"
                 UPDATE ImageMeta SET
                     FileHash = @FileHash, PerceptualHash = @PerceptualHash,
@@ -530,6 +533,62 @@ public class ImageMetaRepository : IImageMetaRepository
         return result;
     }
 
+    public async Task<Dictionary<string, string>> GetFileHashesByPathsAsync(List<string> filePaths)
+    {
+        if (filePaths.Count == 0) return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        using var conn = _db.CreateConnection();
+        var rows = await conn.QueryAsync<(string FilePath, string FileHash)>(@"
+            SELECT FilePath, FileHash FROM ImageMeta WHERE FilePath IN @Paths AND FileHash IS NOT NULL",
+            new { Paths = filePaths });
+        return rows.Where(r => !string.IsNullOrEmpty(r.FileHash))
+                   .ToDictionary(r => r.FilePath, r => r.FileHash, StringComparer.OrdinalIgnoreCase);
+    }
+
+    public async Task<ImageMeta?> GetByFileHashAsync(string fileHash)
+    {
+        if (string.IsNullOrEmpty(fileHash)) return null;
+        using var conn = _db.CreateConnection();
+        var meta = await conn.QueryFirstOrDefaultAsync<ImageMeta>(@"
+            SELECT * FROM ImageMeta WHERE FileHash = @Hash LIMIT 1",
+            new { Hash = fileHash });
+        if (meta != null)
+            meta.Tags = await GetTagsForMetaAsync(conn, meta.Id);
+        return meta;
+    }
+
+    public async Task UpdateFilePathAsync(long id, string newPath, long newFolderId)
+    {
+        using var conn = _db.CreateConnection();
+        await conn.ExecuteAsync(@"
+            UPDATE ImageMeta SET FilePath = @Path, FolderId = @FolderId, UpdatedAt = @Now
+            WHERE Id = @Id",
+            new { Path = newPath, FolderId = newFolderId, Now = DateTime.UtcNow, Id = id });
+    }
+
+    public async Task SetAutoTagStatusByPathAsync(string filePath, int status)
+    {
+        using var conn = _db.CreateConnection();
+        await conn.ExecuteAsync(
+            "UPDATE ImageMeta SET AutoTagStatus = @Status WHERE FilePath = @Path COLLATE NOCASE",
+            new { Status = status, Path = filePath });
+    }
+
+    public async Task SetAutoTagStatusBatchAsync(List<string> filePaths, int status)
+    {
+        if (filePaths.Count == 0) return;
+        using var conn = _db.CreateConnection();
+        await conn.ExecuteAsync(
+            "UPDATE ImageMeta SET AutoTagStatus = @Status WHERE FilePath IN @Paths",
+            new { Status = status, Paths = filePaths });
+    }
+
+    public async Task<List<ImageMeta>> GetAllUnlinkedAsync()
+    {
+        using var conn = _db.CreateConnection();
+        return (await conn.QueryAsync<ImageMeta>(
+            "SELECT * FROM ImageMeta WHERE FolderId IS NULL OR FolderId = 0")).ToList();
+    }
+
     private async Task<List<TagCount>> GetTagsForMetaAsync(SqliteConnection conn, long metaId)
     {
         var tags = await conn.QueryAsync<TagCount>(@"
@@ -560,5 +619,59 @@ public class ImageMetaRepository : IImageMetaRepository
             list.Add(new TagCount { Name = name });
         }
         return map;
+    }
+
+    public async Task<Dictionary<string, long>> GetIdsByPathsAsync(List<string> filePaths)
+    {
+        if (filePaths.Count == 0) return new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        using var conn = _db.CreateConnection();
+        var rows = await conn.QueryAsync<(string FilePath, long Id)>(
+            "SELECT FilePath, Id FROM ImageMeta WHERE FilePath IN @Paths",
+            new { Paths = filePaths });
+        return rows.ToDictionary(r => r.FilePath, r => r.Id, StringComparer.OrdinalIgnoreCase);
+    }
+
+    public async Task AddTagToImagesAsync(List<long> imageIds, string tag)
+    {
+        if (imageIds.Count == 0 || string.IsNullOrWhiteSpace(tag)) return;
+        var trimmed = tag.Trim();
+        using var conn = _db.CreateConnection();
+        using var txn = conn.BeginTransaction();
+
+        var tagId = await conn.ExecuteScalarAsync<long>(@"
+            INSERT OR IGNORE INTO Tag (Name) VALUES (@Name);
+            SELECT Id FROM Tag WHERE Name = @Name;",
+            new { Name = trimmed }, txn);
+
+        // Batch insert ImageTag rows — Dapper doesn't support multi-row VALUES with parameters
+        // so we use a single INSERT with a parameterized IN clause via a temp table or direct loop
+        foreach (var imageId in imageIds)
+        {
+            await conn.ExecuteAsync(
+                "INSERT OR IGNORE INTO ImageTag (ImageMetaId, TagId) VALUES (@ImageId, @TagId)",
+                new { ImageId = imageId, TagId = tagId }, txn);
+        }
+
+        txn.Commit();
+    }
+
+    public async Task RemoveTagFromImagesAsync(List<long> imageIds, string tag)
+    {
+        if (imageIds.Count == 0 || string.IsNullOrWhiteSpace(tag)) return;
+        using var conn = _db.CreateConnection();
+        await conn.ExecuteAsync(@"
+            DELETE FROM ImageTag
+            WHERE ImageMetaId IN @Ids
+              AND TagId = (SELECT Id FROM Tag WHERE Name = @TagName COLLATE NOCASE)",
+            new { Ids = imageIds, TagName = tag.Trim() });
+    }
+
+    public async Task ClearTagsFromImagesAsync(List<long> imageIds)
+    {
+        if (imageIds.Count == 0) return;
+        using var conn = _db.CreateConnection();
+        await conn.ExecuteAsync(
+            "DELETE FROM ImageTag WHERE ImageMetaId IN @Ids",
+            new { Ids = imageIds });
     }
 }

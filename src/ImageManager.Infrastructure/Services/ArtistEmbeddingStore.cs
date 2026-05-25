@@ -25,6 +25,12 @@ public class ArtistEmbeddingStore
     public int GetImageCount(string artistName)
         => _imageCounts.TryGetValue(artistName, out var c) ? c : -1;
 
+    public void Clear()
+    {
+        _artists.Clear();
+        _imageCounts.Clear();
+    }
+
     /// <summary>移除画师</summary>
     public void Remove(string artistName)
     {

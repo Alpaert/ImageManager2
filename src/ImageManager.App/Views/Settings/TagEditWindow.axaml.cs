@@ -18,6 +18,7 @@ public partial class TagEditWindow : Window
         // large collections before the window tears down 4000+ visual children
         Closing += (_, _) =>
         {
+            Vm.Dispose();
             Vm.AutoTagSuggestions.Clear();
             Vm.FilteredCurrentTags.Clear();
             Vm.FavoriteTagSuggestions.Clear();

@@ -11,7 +11,7 @@ public class DeepSeekRecommendService : IAiRecommendService
     private const string Model = "deepseek-chat";
     private const double Temperature = 0.4;
 
-    private readonly HttpClient _http = new();
+    private static readonly HttpClient _http = new();
     private string _apiKey = string.Empty;
 
     public bool IsAvailable => !string.IsNullOrEmpty(_apiKey);

@@ -52,9 +52,12 @@ public abstract class OnnxTagServiceBase : IDisposable
     protected int[] _tagCategories = [];
     protected int _totalTagCount;
 
-    private readonly HttpClient _http = new();
+    private static readonly HttpClient _http = new();
     private readonly SemaphoreSlim _initLock = new(1, 1);
     private string _modelDir = string.Empty;
+    private DenseTensor<float>? _cachedTensor;
+    private CancellationTokenSource? _idleCts;
+    private readonly object _idleLock = new();
 
     public event Action<AutoTagProgress>? ProgressChanged;
     public bool IsModelLoaded => _session != null && _tagNames.Length > 0;
@@ -130,7 +133,7 @@ public abstract class OnnxTagServiceBase : IDisposable
         if (_session == null)
             throw new InvalidOperationException($"{ModelSubDir}: Model not loaded");
 
-        return await Task.Run(() =>
+        var result = await Task.Run(() =>
         {
             var tensor = Preprocess(imagePath);
             if (tensor == null)
@@ -153,21 +156,56 @@ public abstract class OnnxTagServiceBase : IDisposable
 
             return Postprocess(probs, DefaultThreshold);
         });
+
+        ResetIdleTimer();
+        return result;
+    }
+
+    protected void ResetIdleTimer()
+    {
+        lock (_idleLock)
+        {
+            _idleCts?.Cancel();
+            _idleCts?.Dispose();
+            _idleCts = new CancellationTokenSource();
+            var ct = _idleCts.Token;
+            _ = Task.Run(async () =>
+            {
+                try { await Task.Delay(TimeSpan.FromMinutes(3), ct); }
+                catch { return; }
+                if (!ct.IsCancellationRequested)
+                    DisposeSession();
+            });
+        }
+    }
+
+    private void DisposeSession()
+    {
+        lock (_idleLock)
+        {
+            if (_session == null) return;
+            AppLogger.Info($"[{ModelSubDir}] 3 分钟未使用，释放 GPU 显存");
+            _session.Dispose();
+            _session = null;
+            _cachedTensor = null;
+        }
     }
 
     private InferenceSession CreateSession(string onnxPath)
     {
+        InferenceSession? session = null;
         try
         {
             var opts = new SessionOptions();
             opts.AppendExecutionProvider_CUDA(0);
             opts.EnableMemoryPattern = true;
-            var session = new InferenceSession(onnxPath, opts);
+            session = new InferenceSession(onnxPath, opts);
             AppLogger.Info($"[{ModelSubDir}] CUDA GPU 加速已启用");
             return session;
         }
         catch (Exception ex)
         {
+            session?.Dispose();
             AppLogger.Warn($"[{ModelSubDir}] CUDA 不可用，回退 CPU: {ex.Message}");
             return new InferenceSession(onnxPath);
         }
@@ -197,8 +235,10 @@ public abstract class OnnxTagServiceBase : IDisposable
                 new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
             if (resized == null) return null;
 
-            // NCHW tensor: [1, 3, InputSize, InputSize]
-            var tensor = new DenseTensor<float>(new[] { 1, 3, InputSize, InputSize });
+            // NCHW tensor: [1, 3, InputSize, InputSize] — reused across inferences
+            if (_cachedTensor == null)
+                _cachedTensor = new DenseTensor<float>(new[] { 1, 3, InputSize, InputSize });
+            var tensor = _cachedTensor;
 
             unsafe
             {
@@ -403,7 +443,8 @@ public abstract class OnnxTagServiceBase : IDisposable
     {
         AppLogger.Info($"Dispose {ModelSubDir}");
         _session?.Dispose();
-        _http.Dispose();
+        _session = null;
+        _cachedTensor = null;
         _initLock.Dispose();
     }
 }

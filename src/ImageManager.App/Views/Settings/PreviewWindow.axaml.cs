@@ -31,6 +31,7 @@ public partial class PreviewWindow : Window
         // Save position BEFORE native window destruction (Closed fires too late)
         Vm.SavedLeft = Position.X;
         Vm.SavedTop = Position.Y;
+        Vm.ReleaseImage();
         base.OnClosing(e);
     }
 

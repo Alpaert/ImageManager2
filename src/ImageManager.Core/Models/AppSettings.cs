@@ -6,8 +6,8 @@ public class AppSettings
     public double StartupHeight { get; set; }
     public double PreviewWidth { get; set; }
     public double PreviewHeight { get; set; }
-    public double PreviewLeft { get; set; } = -1;
-    public double PreviewTop { get; set; } = -1;
+    public double PreviewLeft { get; set; } = double.NaN;
+    public double PreviewTop { get; set; } = double.NaN;
     public string WallpaperPath { get; set; } = string.Empty;
     public string WallpaperStretch { get; set; } = "UniformToFill";
     public string WallpaperAlignment { get; set; } = "Center";
@@ -17,7 +17,7 @@ public class AppSettings
     public bool ShowThumbnailOrientation { get; set; } = true;
     public double ThumbnailAspectRatio { get; set; } = 1.0;
     public string ThumbnailNoTextStretch { get; set; } = "Uniform";
-    public bool ThumbnailNoTextKeepPadding { get; set; } = true;
+    public bool ThumbnailNoTextKeepPadding { get; set; } = false;
     public double ThumbnailCornerRadius { get; set; }
     public string ThemeVariant { get; set; } = "Dark";
     public string WaterfallMode { get; set; } = "None";
