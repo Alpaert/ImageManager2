@@ -33,14 +33,14 @@ public class SingleModelTagService : IEnsembleTagService, IDisposable
         AppLogger.Info($"SingleModel 配置: minConfidence={minConfidence}");
     }
 
-    public async Task LoadModelAsync(string modelsRootDir)
+    public async Task LoadModelAsync(string modelsRootDir, CancellationToken ct = default)
     {
         _modelsRootDir = modelsRootDir;
         AppLogger.Info("=== 模式 A: 单模型打标 加载开始 ===");
 
         _pixai.SetAllCategoriesMode();
         var pixaiDir = Path.Combine(modelsRootDir, "pixai");
-        await _pixai.LoadModelAsync(pixaiDir);
+        await _pixai.LoadModelAsync(pixaiDir, ct);
 
         var csvPath = Path.Combine(pixaiDir, "selected_tags.csv");
         _chineseLib.LoadFromModelCsv("pixai", csvPath);
@@ -48,16 +48,16 @@ public class SingleModelTagService : IEnsembleTagService, IDisposable
         AppLogger.Info($"=== 模式 A 加载完成 pixai={_pixai.IsModelLoaded} zhTags={_chineseLib.Count} ===");
     }
 
-    public Task<SystemRating> PredictRatingAsync(string imagePath)
+    public Task<SystemRating> PredictRatingAsync(string imagePath, CancellationToken ct = default)
     {
         AppLogger.Tag("Rating", $"模式 A 不支持 Rating，返回 Unknown image={Path.GetFileName(imagePath)}");
         return Task.FromResult(SystemRating.Unknown);
     }
 
-    public async Task<List<TagPrediction>> PredictAsync(string imagePath)
+    public async Task<List<TagPrediction>> PredictAsync(string imagePath, CancellationToken ct = default)
     {
         AppLogger.Tag("Predict", $"模式 A 单模型推理 image={Path.GetFileName(imagePath)}");
-        var preds = await _pixai.PredictAsync(imagePath);
+        var preds = await _pixai.PredictAsync(imagePath, ct);
 
         var filtered = preds
             .Where(p => p.Confidence >= _minConfidence)
@@ -72,9 +72,9 @@ public class SingleModelTagService : IEnsembleTagService, IDisposable
         return filtered;
     }
 
-    public async Task<EnsembleResult> PredictWithSourcesAsync(string imagePath)
+    public async Task<EnsembleResult> PredictWithSourcesAsync(string imagePath, CancellationToken ct = default)
     {
-        var preds = await PredictAsync(imagePath);
+        var preds = await PredictAsync(imagePath, ct);
         var sourceTags = new Dictionary<string, List<TagPrediction>>
         {
             ["pixai"] = preds

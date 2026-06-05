@@ -23,14 +23,14 @@ public class WdRatingService : IDisposable
 
     public void Dispose() => _wdService.Dispose();
 
-    public async Task LoadAsync(string modelPath)
+    public async Task LoadAsync(string modelPath, CancellationToken ct = default)
     {
         AppLogger.Info("加载 WD Rating 服务...");
         await _wdService.LoadModelAsync(modelPath);
         AppLogger.Info("WD Rating 服务加载完成");
     }
 
-    public async Task<SystemRating> PredictRatingAsync(string imagePath)
+    public async Task<SystemRating> PredictRatingAsync(string imagePath, CancellationToken ct = default)
     {
         if (!_wdService.IsModelLoaded)
         {

@@ -1,9 +1,11 @@
-using Avalonia;
+﻿using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using ImageManager.App.ViewModels;
+using ImageManager.Common.Helpers;
 using ImageManager.Infrastructure.Imaging;
+using Avalonia.Threading;
 
 namespace ImageManager.App.Views.Settings;
 
@@ -16,11 +18,12 @@ public partial class PreviewWindow : Window
     private Point _dragStart;
     private double _dragStartOffX, _dragStartOffY;
     private bool _isNavigating;
+    private int _loadVersion;
 
     public PreviewWindow()
     {
         InitializeComponent();
-        // Tunnel = PreviewMouseWheel in WPF — fires before ScrollViewer's scroll handler
+        // Tunnel = PreviewMouseWheel in WPF �?fires before ScrollViewer's scroll handler
         Scroller.AddHandler(ScrollViewer.PointerWheelChangedEvent, OnPreviewPointerWheel, RoutingStrategies.Tunnel);
         // Keyboard navigation
         KeyDown += OnPreviewKeyDown;
@@ -31,8 +34,7 @@ public partial class PreviewWindow : Window
         // Save position BEFORE native window destruction (Closed fires too late)
         Vm.SavedLeft = Position.X;
         Vm.SavedTop = Position.Y;
-        Vm.ReleaseImage();
-        base.OnClosing(e);
+        StopGif(); Vm.ReleaseImage(); base.OnClosing(e);
     }
 
     /// <summary>Create with image list for navigation. Replace later with PNG icons via IconLeft/IconRight.</summary>
@@ -47,6 +49,8 @@ public partial class PreviewWindow : Window
             HasNext = startIndex < imagePaths.Count - 1
         };
         win.DataContext = vm;
+        if (imagePaths.Count == 0) return win;
+        if (startIndex >= imagePaths.Count) startIndex = imagePaths.Count - 1;
         win.LoadImage(imagePaths[startIndex]);
         return win;
     }
@@ -57,19 +61,101 @@ public partial class PreviewWindow : Window
         return Create(new List<string> { filePath }, 0);
     }
 
+
     private void LoadImage(string filePath)
     {
         if (!File.Exists(filePath)) return;
+        StopGif();
 
+        if (Path.GetExtension(filePath).ToLowerInvariant() == ".gif")
+        {
+            LoadGifAsync(filePath);
+            return;
+        }
+
+        Vm.IsGif = false;
+        Vm.GifCurrentFrame = null;
+        ImgFull.IsVisible = true;
+        LoadStatic(filePath);
+    }
+
+    private async void LoadGifAsync(string filePath)
+    {
+        int version = ++_loadVersion;
+        var (pixW, pixH) = ThumbnailGenerator.GetDimensions(filePath);
+        var fi = new FileInfo(filePath);
+
+        Vm.IsGif = true;
+        Vm.PixelWidth = pixW;
+        Vm.PixelHeight = pixH;
+        Vm.FileSizeBytes = fi.Length;
+        Vm.ImageWidthDip = pixW;
+        Vm.ImageHeightDip = pixH;
+        Vm.Title = Path.GetFileName(filePath);
+        Vm.ImageData = null;
+        Vm.GifFrames = null;
+        ImgFull.IsVisible = false;
+
+        var firstFrame = ThumbnailGenerator.DecodeFirstGifFrame(filePath, 800);
+        if (firstFrame != null)
+        {
+            Vm.GifCurrentFrame = firstFrame.JpegData;
+            _imageReady = true;
+            Vm.UpdateInfo();
+            FitToViewport();
+        }
+        else
+        {
+            Vm.GifCurrentFrame = null;
+            Vm.InfoText = $"分辨率：{pixW} x {pixH}    文件大小：{FileSizeFormatter.Format(fi.Length)}    加载中...";
+        }
+
+        var path = filePath;
+        var frames = await Task.Run(() => ThumbnailGenerator.DecodeGifFrames(path, 800));
+
+        if (version != _loadVersion) return;
+
+        if (frames != null && frames.Count > 1)
+        {
+            Vm.GifFrames = frames;
+            if (!_imageReady)
+            {
+                Vm.GifCurrentFrame = frames[0].JpegData;
+                _imageReady = true;
+                Vm.UpdateInfo();
+                FitToViewport();
+            }
+            Vm.GifFrameIndex = 0;
+            StartGifTimer(1);
+        }
+        else if (!_imageReady)
+        {
+            Vm.IsGif = false;
+            Vm.GifCurrentFrame = null;
+            ImgFull.IsVisible = true;
+            LoadStatic(filePath);
+        }
+    }
+
+    private void LoadStatic(string filePath)
+    {
         try
         {
             var (pixW, pixH) = ThumbnailGenerator.GetDimensions(filePath);
             var fi = new FileInfo(filePath);
 
-            // Decode at preview resolution capped to avoid OOM on huge images.
-            // 3840px covers 4K displays at 1x zoom with headroom for moderate zoom.
             int decodeWidth = Math.Min(pixW, 3840);
             var data = ThumbnailGenerator.Generate(filePath, decodeWidth);
+
+            if (data == null)
+            {
+                Vm.Title = Path.GetFileName(filePath);
+                Vm.InfoText = "预览失败：图片过大或格式不支持";
+                Vm.PixelWidth = pixW;
+                Vm.PixelHeight = pixH;
+                Vm.FileSizeBytes = fi.Length;
+                return;
+            }
 
             Vm.ImageData = data;
             Vm.PixelWidth = pixW;
@@ -81,13 +167,19 @@ public partial class PreviewWindow : Window
             _imageReady = true;
             Vm.UpdateInfo();
         }
-        catch { }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"Preview load failed for {filePath}: {ex.Message}");
+            Vm.Title = Path.GetFileName(filePath);
+            Vm.InfoText = "预览失败：图片过大或格式不支持";
+        }
     }
 
     private void NavigateTo(string filePath)
     {
         _isNavigating = true;
         Vm.UserZoomed = false;
+        StopGif();
         LoadImage(filePath);
         if (_imageReady) FitToViewport();
         _isNavigating = false;
@@ -166,6 +258,8 @@ public partial class PreviewWindow : Window
         // Apply zoom to image layout size
         ImgFull.Width = Vm.ImageWidthDip * fit;
         ImgFull.Height = Vm.ImageHeightDip * fit;
+        ImgGif.Width = Vm.ImageWidthDip * fit;
+        ImgGif.Height = Vm.ImageHeightDip * fit;
 
         ApplyZoomLayout();
         Scroller.UpdateLayout();
@@ -241,6 +335,8 @@ public partial class PreviewWindow : Window
         Vm.ZoomFactor = newZoom;
         ImgFull.Width = Vm.ImageWidthDip * newZoom;
         ImgFull.Height = Vm.ImageHeightDip * newZoom;
+        ImgGif.Width = Vm.ImageWidthDip * newZoom;
+        ImgGif.Height = Vm.ImageHeightDip * newZoom;
 
         ApplyZoomLayout();
         Scroller.UpdateLayout();
@@ -307,5 +403,47 @@ public partial class PreviewWindow : Window
 
         Scroller.Offset = new Vector(nx, ny);
         e.Handled = true;
+    }
+
+    private void StartGifTimer(int fromIndex)
+    {
+        Vm.GifTimer?.Stop();
+        Vm.GifTimer = null;
+        var frames = Vm.GifFrames;
+        if (frames == null || frames.Count <= 1) return;
+
+        Vm.GifFrameIndex = fromIndex % frames.Count;
+
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(Math.Max(30, frames[Vm.GifFrameIndex].DurationMs)) };
+        timer.Tick += GifTimer_Tick;
+        timer.Start();
+        Vm.GifTimer = timer;
+    }
+
+    private void GifTimer_Tick(object? sender, EventArgs e)
+    {
+        var frames = Vm.GifFrames;
+        if (frames == null || frames.Count <= 1)
+        {
+            StopGif();
+            return;
+        }
+
+        Vm.GifCurrentFrame = frames[Vm.GifFrameIndex].JpegData;
+        Vm.GifFrameIndex = (Vm.GifFrameIndex + 1) % frames.Count;
+
+        // Reschedule with the next frame's duration
+        var timer = (DispatcherTimer)sender!;
+        timer.Interval = TimeSpan.FromMilliseconds(Math.Max(30, frames[Vm.GifFrameIndex].DurationMs));
+    }
+
+    private void StopGif()
+    {
+        Vm.GifTimer?.Stop();
+        Vm.GifTimer = null;
+        Vm.GifFrames = null;
+        Vm.IsGif = false;
+        Vm.GifCurrentFrame = null;
+        ++_loadVersion;
     }
 }

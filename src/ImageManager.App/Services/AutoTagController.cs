@@ -8,7 +8,7 @@ using ImageManager.Infrastructure.Services;
 
 namespace ImageManager.App.Services;
 
-public class AutoTagController
+public class AutoTagController : IDisposable
 {
     private readonly AutoTagPipelineService _pipeline;
     private readonly IFolderRepository _folderRepo;
@@ -27,6 +27,9 @@ public class AutoTagController
     private long _currentFolderId;
     private TagMode _currentMode = TagMode.Ensemble;
     private CancellationTokenSource? _cts;
+
+    /// <summary>Paths actually processed in the last pipeline run (excluding skipped).</summary>
+    public List<string> LastProcessedPaths { get; private set; } = new();
 
     public event Action<AutoTagPipelineProgress>? ProgressChanged;
     public event Action? TranslationReady;
@@ -121,17 +124,17 @@ public class AutoTagController
         _currentFolderId = folderId;
         bool hasState = folderId > 0;
 
-        // Resolve ImageMeta IDs from file paths; skip already AI-tagged; ensure DB record + MD5 for new files
-        var taggedPaths = new List<string>();
+        // Batch-load AutoTagStatus for all file paths (single DB query)
+        var statusMap = await _metaRepo.GetStatusMapByPathsAsync(filePaths);
+
+        // Resolve ImageMeta IDs; skip already AI-tagged; ensure DB record + MD5 for new files
         var metas = new List<(long Id, string FilePath)>();
         foreach (var path in filePaths)
         {
-            var meta = await _metaRepo.GetByPathAsync(path);
-            if (meta != null)
+            if (statusMap.TryGetValue(path, out var existing))
             {
-                if (meta.AutoTagStatus == 1) { AppLogger.Info($"AutoTag skip: {path}"); continue; }
-                metas.Add((meta.Id, path));
-                taggedPaths.Add(path);
+                if (existing.Status == 1) { AppLogger.Info($"AutoTag skip: {path}"); continue; }
+                metas.Add((existing.Id, path));
             }
             else
             {
@@ -145,7 +148,6 @@ public class AutoTagController
                     var match = await _metaRepo.GetByFileHashAsync(md5);
                     if (match != null && !File.Exists(match.FilePath))
                     {
-                        // Moved: update path
                         await _metaRepo.UpdateFilePathAsync(match.Id, path, folderId);
                         newId = match.Id;
                     }
@@ -160,20 +162,35 @@ public class AutoTagController
                         newId = await _metaRepo.UpsertAsync(newMeta);
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    AppLogger.Warn($"AutoTag: failed to process new file {Path.GetFileName(path)}: {ex.Message}");
+                }
                 metas.Add((newId, path));
-                taggedPaths.Add(path);
             }
         }
 
-        if (metas.Count == 0) { TranslationReady?.Invoke(); return; }
+        if (metas.Count == 0)
+        {
+            LastProcessedPaths = new List<string>();
+            ProgressChanged?.Invoke(new AutoTagPipelineProgress("Done", 0, 0, "全部图片已打标，跳过"));
+            TranslationReady?.Invoke();
+            return;
+        }
+
+        // Track paths for post-pipeline refresh
+        LastProcessedPaths = metas.Select(m => m.FilePath).ToList();
 
         // Phase 1: Inference
-        _cts = new CancellationTokenSource();
-        await _pipeline.RunInferenceAsync(folderId, metas, action, _cts.Token);
-
-        // Phase 2: Auto-confirm
-        await AutoConfirmAllAsync();
+        ResetCts();
+        try
+        {
+            await _pipeline.RunInferenceAsync(folderId, metas, action, _cts!.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            AppLogger.Info("AutoTag pipeline cancelled by user");
+        }
 
         TranslationReady?.Invoke();
     }
@@ -225,26 +242,31 @@ public class AutoTagController
 
         AppLogger.Tag("AutoConfirm", $"folder={_currentFolderPath} images={metas.Count} uniqueTags={tagToImageIds.Count}");
 
+        // Collect all tag mappings
         int confirmed = 0;
-        foreach (var (enTag, imageIds) in tagToImageIds)
+        foreach (var (enTag, _) in tagToImageIds)
         {
             var zh = _chineseLib.Lookup(enTag);
-            if (string.IsNullOrWhiteSpace(zh))
-                zh = enTag;
-
+            if (string.IsNullOrWhiteSpace(zh)) zh = enTag;
             await _mappingRepo.UpsertAsync(enTag, zh);
-
-            var chineseTagId = await _tagRepo.GetOrCreateTagIdAsync(zh);
-            foreach (var imageId in imageIds)
-            {
-                try { await _metaRepo.ReplaceAutoTagAsync(imageId, enTag, chineseTagId); }
-                catch { /* best effort */ }
-            }
             confirmed++;
         }
 
+        // Batch replace: collect all (imageId, englishName, chineseId) into one list
+        var batch = new List<(long ImageId, string EnglishName, long ChineseId)>();
+        foreach (var (enTag, imageIds) in tagToImageIds)
+        {
+            var zh = _chineseLib.Lookup(enTag);
+            if (string.IsNullOrWhiteSpace(zh)) zh = enTag;
+            var chineseTagId = await _tagRepo.GetOrCreateTagIdAsync(zh);
+            foreach (var imageId in imageIds)
+                batch.Add((imageId, enTag, chineseTagId));
+        }
+
+        await _metaRepo.ReplaceAutoTagsBatchAsync(batch);
+
         if (_currentFolderId > 0) await MarkFolderDoneAsync(_currentFolderId);
-        AppLogger.Tag("AutoConfirm", $"完成 confirmed={confirmed}");
+        AppLogger.Tag("AutoConfirm", $"完成 confirmed={confirmed} batchSize={batch.Count}");
     }
 
     public async Task ConfirmAllAsync(List<TagTranslationItem> items)
@@ -335,7 +357,10 @@ public class AutoTagController
             {
                 var chineseTagId = await _tagRepo.GetOrCreateTagIdAsync(chinese);
                 try { await _metaRepo.ReplaceAutoTagAsync(meta.Id, item.EnglishTag, chineseTagId); }
-                catch { }
+                catch (Exception ex)
+                {
+                    AppLogger.Warn($"SaveMappingsAndTags: ReplaceAutoTagAsync failed for image={meta.Id} tag={item.EnglishTag}: {ex.Message}");
+                }
                 await _metaRepo.AddAutoTagsAsync(meta.Id, new List<string> { chinese });
             }
         }
@@ -357,7 +382,10 @@ public class AutoTagController
             var chineseTagId = await _tagRepo.GetOrCreateTagIdAsync(chineseName);
             // Add as confirmed auto-tag
             try { await _metaRepo.ReplaceAutoTagAsync(meta.Id, item.EnglishTag, chineseTagId); }
-            catch { /* might not exist yet — just add directly */ }
+            catch (Exception ex)
+            {
+                AppLogger.Warn($"WriteConfirmedTags: ReplaceAutoTagAsync failed for image={meta.Id} tag={item.EnglishTag}: {ex.Message}");
+            }
             await _metaRepo.AddAutoTagsAsync(meta.Id, new List<string> { chineseName });
         }
     }
@@ -379,6 +407,25 @@ public class AutoTagController
     {
         _cts?.Cancel();
         await Task.CompletedTask;
+    }
+
+    private void ResetCts()
+    {
+        if (_cts != null)
+        {
+            _cts.Cancel();
+            _cts.Dispose();
+        }
+        _cts = new CancellationTokenSource();
+    }
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _cts?.Dispose();
+        _cts = null;
+        ProgressChanged = null;
+        TranslationReady = null;
     }
 
     public async Task MarkFolderDoneAsync(long folderId)

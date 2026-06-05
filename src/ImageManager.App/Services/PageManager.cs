@@ -258,7 +258,8 @@ public class PageManager : IDisposable
                 FilePath = file,
                 FileName = System.IO.Path.GetFileName(file),
                 Tags = tags,
-                IsLoading = true
+                IsLoading = true,
+                IsVideo = ThumbnailGenerator.IsVideoFile(file)
             });
         }
 
@@ -306,7 +307,12 @@ public class PageManager : IDisposable
             if (data != null)
             {
                 item.ThumbnailData = data;
-                var (w, h) = ThumbnailGenerator.GetDimensions(item.FilePath);
+                bool isVideo = ThumbnailGenerator.IsVideoFile(item.FilePath);
+                item.IsVideo = isVideo;
+                var (w, h) = isVideo
+                    ? ParseJpegDimensions(data)
+                    : ThumbnailGenerator.GetDimensions(item.FilePath);
+                if (w <= 0 || h <= 0) (w, h) = (1920, 1080); // fallback
                 item.Width = w;
                 item.Height = h;
                 item.IsLoaded = true;
@@ -349,6 +355,20 @@ public class PageManager : IDisposable
             if (preloadNext.HasValue)
                 _ = LoadPageThumbnailsAsync(preloadNext.Value);
         });
+    }
+
+    private static (int Width, int Height) ParseJpegDimensions(byte[] jpeg)
+    {
+        int i = 2; // skip SOI marker (0xFF 0xD8)
+        while (i < jpeg.Length - 9)
+        {
+            if (jpeg[i] != 0xFF) return (0, 0);
+            byte m = jpeg[i + 1];
+            if (m == 0xC0 || m == 0xC2) // SOF0 or SOF2 (progressive)
+                return ((jpeg[i + 7] << 8) | jpeg[i + 8], (jpeg[i + 5] << 8) | jpeg[i + 6]);
+            i += 2 + ((jpeg[i + 2] << 8) | jpeg[i + 3]);
+        }
+        return (0, 0);
     }
 
     private void TrimPageCache(int currentPage, int totalPages)

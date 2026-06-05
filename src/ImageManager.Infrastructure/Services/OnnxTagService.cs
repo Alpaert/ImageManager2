@@ -25,7 +25,7 @@ public class OnnxTagService : IAutoTagService, IDisposable
     public event Action<AutoTagProgress>? ProgressChanged;
     public bool IsModelLoaded => _session != null;
 
-    public async Task LoadModelAsync(string modelPath)
+    public async Task LoadModelAsync(string modelPath, CancellationToken ct = default)
     {
         await _initLock.WaitAsync();
         try
@@ -56,7 +56,7 @@ public class OnnxTagService : IAutoTagService, IDisposable
         finally { _initLock.Release(); }
     }
 
-    public async Task<List<TagPrediction>> PredictAsync(string imagePath)
+    public async Task<List<TagPrediction>> PredictAsync(string imagePath, CancellationToken ct = default)
     {
         if (_session == null)
             throw new InvalidOperationException("Model not loaded");

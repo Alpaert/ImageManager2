@@ -6,6 +6,7 @@ namespace ImageManager.Infrastructure.Caching;
 
 public class ThumbnailCacheService : IThumbnailCacheService
 {
+    private readonly ImageManager.Core.Services.IVideoService? _videoService;
     private class CacheEntry
     {
         public byte[] Data { get; set; } = Array.Empty<byte>();
@@ -41,8 +42,9 @@ public class ThumbnailCacheService : IThumbnailCacheService
         }
     }
 
-    public ThumbnailCacheService(string cacheRoot = @"C:\ImageManagerCache", int decodeWidth = 200)
+    public ThumbnailCacheService(ImageManager.Core.Services.IVideoService? videoService = null, string cacheRoot = @"C:\ImageManagerCache", int decodeWidth = 200)
     {
+        _videoService = videoService;
         _diskCache = new DiskThumbnailCache(cacheRoot, decodeWidth);
         DecodeWidth = decodeWidth;
         _cacheDirectory = cacheRoot;
@@ -100,8 +102,16 @@ public class ThumbnailCacheService : IThumbnailCacheService
             return cached;
         }
 
-        // 3. Generate thumbnail
-        var data = await Task.Run(() => ThumbnailGenerator.Generate(filePath, decodeWidth));
+        // 3. Generate thumbnail (video or image)
+        byte[]? data;
+        if (ThumbnailGenerator.IsVideoFile(filePath) && _videoService != null)
+        {
+            data = await _videoService.ExtractThumbnailAsync(filePath, decodeWidth);
+        }
+        else
+        {
+            data = await Task.Run(() => ThumbnailGenerator.Generate(filePath, decodeWidth));
+        }
         if (data != null)
         {
             AddToMemory(filePath, data, decodeWidth);
@@ -141,7 +151,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
             }
             else
             {
-                // Value was null — force remove
+                // Value was null �?force remove
                 _cache.TryRemove(kv.Key, out _);
             }
 

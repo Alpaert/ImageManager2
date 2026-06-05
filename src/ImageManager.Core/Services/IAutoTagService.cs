@@ -1,3 +1,5 @@
+using System.Threading;
+
 namespace ImageManager.Core.Services;
 
 public readonly record struct AutoTagProgress(int Processed, int Total, string StatusText);
@@ -13,6 +15,6 @@ public interface IAutoTagService
 {
     event Action<AutoTagProgress>? ProgressChanged;
     bool IsModelLoaded { get; }
-    Task LoadModelAsync(string modelPath);
-    Task<List<TagPrediction>> PredictAsync(string imagePath);
+    Task LoadModelAsync(string modelPath, CancellationToken ct = default);
+    Task<List<TagPrediction>> PredictAsync(string imagePath, CancellationToken ct = default);
 }

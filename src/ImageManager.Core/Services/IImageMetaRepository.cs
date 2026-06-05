@@ -21,8 +21,10 @@ public interface IImageMetaRepository
     Task SetTagsAsync(long imageId, List<string> tags);
     Task AddAutoTagsAsync(long imageId, List<string> tagNames);
     Task ReplaceAutoTagAsync(long imageId, string englishTagName, long chineseTagId);
+    Task ReplaceAutoTagsBatchAsync(List<(long ImageId, string EnglishName, long ChineseId)> replacements);
     Task DeleteAutoTagFromImageAsync(long imageId, string tagName);
     Task<int> DeleteAllAutoTagsByFolderAsync(string folderPath);
+    Task ClearTagsAndStatusBatchAsync(List<string> filePaths);
     Task<List<TagCount>> GetTagCountsAsync();
     Task<List<string>> GetFilePathsByTagAsync(string tagName);
     Task<List<string>> GetFilePathsByTagsAsync(List<string> tagNames, bool requireAll);
@@ -42,6 +44,9 @@ public interface IImageMetaRepository
 
     /// <summary>Update FilePath and FolderId for a moved file (preserves Id and tags).</summary>
     Task UpdateFilePathAsync(long id, string newPath, long newFolderId);
+
+    /// <summary>Batch-load (FilePath, Id, AutoTagStatus) for a list of paths. Only returns records where AutoTagStatus=0 or no record exists.</summary>
+    Task<Dictionary<string, (long Id, int Status)>> GetStatusMapByPathsAsync(List<string> filePaths);
 
     /// <summary>Set AutoTagStatus for a given file path.</summary>
     Task SetAutoTagStatusByPathAsync(string filePath, int status);

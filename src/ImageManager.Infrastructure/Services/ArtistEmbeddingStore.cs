@@ -67,14 +67,18 @@ public class ArtistEmbeddingStore
     public (string artistName, double similarity)? Search(float[] queryEmbedding, double minSimilarity = 0.6)
     {
         if (_artists.Count == 0) return null;
-        Normalize(queryEmbedding);
+
+        // Copy to avoid mutating caller's array
+        var normalized = new float[queryEmbedding.Length];
+        Array.Copy(queryEmbedding, normalized, queryEmbedding.Length);
+        Normalize(normalized);
 
         string? bestArtist = null;
         double bestSim = -1;
 
         foreach (var (artistName, emb) in _artists)
         {
-            double sim = CosineSimilarity(queryEmbedding, emb);
+            double sim = CosineSimilarity(normalized, emb);
             if (sim > bestSim)
             {
                 bestSim = sim;

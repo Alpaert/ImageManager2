@@ -173,6 +173,9 @@ public partial class App : Application
         services.AddSingleton<DeepSeekRecommendService>();
         services.AddSingleton<IAiRecommendService>(sp => sp.GetRequiredService<DeepSeekRecommendService>());
 
+
+        services.AddSingleton<ImageManager.Core.Services.IVideoService, VideoService>();
+        services.AddSingleton<VideoService>();
         services.AddSingleton<PageManager>();
         services.AddSingleton<TagSearchController>();
         services.AddSingleton<MainWindowViewModel>();
@@ -183,6 +186,8 @@ public partial class App : Application
     public override void Initialize()
     {
         Services = ConfigureServices();
+        // Initialize LibVLC once at startup (must be on main thread before any usage)
+        try { LibVLCSharp.Shared.Core.Initialize(); } catch { }
         AvaloniaXamlLoader.Load(this);
     }
 

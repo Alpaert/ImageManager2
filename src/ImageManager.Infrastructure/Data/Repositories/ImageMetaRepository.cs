@@ -40,7 +40,8 @@ public class ImageMetaRepository : IImageMetaRepository
             "SELECT * FROM ImageMeta WHERE FilePath LIKE @Prefix",
             new { Prefix = normalized + "%" })).ToList();
 
-        var allTags = await GetTagMapAsync(conn);
+        var metaIds = metas.Select(m => m.Id).ToList();
+        var allTags = await GetTagMapAsync(conn, metaIds);
         foreach (var meta in metas)
         {
             if (allTags.TryGetValue(meta.Id, out var tags))
@@ -59,7 +60,8 @@ public class ImageMetaRepository : IImageMetaRepository
             "SELECT * FROM ImageMeta WHERE FolderId = @FolderId",
             new { FolderId = folderId })).ToList();
 
-        var allTags = await GetTagMapAsync(conn);
+        var metaIds = metas.Select(m => m.Id).ToList();
+        var allTags = await GetTagMapAsync(conn, metaIds);
         foreach (var meta in metas)
         {
             if (allTags.TryGetValue(meta.Id, out var tags))
@@ -296,6 +298,35 @@ public class ImageMetaRepository : IImageMetaRepository
               AND Source = 'AutoTag'
               AND TagId != @ChineseId",
             new { ImageId = imageId, EnglishName = englishTagName.Trim(), ChineseId = chineseTagId });
+    }
+
+    public async Task ReplaceAutoTagsBatchAsync(List<(long ImageId, string EnglishName, long ChineseId)> replacements)
+    {
+        if (replacements.Count == 0) return;
+        using var conn = _db.CreateConnection();
+        using var txn = conn.BeginTransaction();
+        foreach (var (imageId, englishName, chineseId) in replacements)
+        {
+            var name = englishName.Trim();
+            await conn.ExecuteAsync(@"
+                UPDATE ImageTag SET Source = 'AutoTagConfirmed'
+                WHERE ImageMetaId = @ImageId AND TagId = @ChineseId",
+                new { ImageId = imageId, ChineseId = chineseId }, txn);
+
+            await conn.ExecuteAsync(@"
+                INSERT OR IGNORE INTO ImageTag (ImageMetaId, TagId, Source)
+                VALUES (@ImageId, @ChineseId, 'AutoTagConfirmed')",
+                new { ImageId = imageId, ChineseId = chineseId }, txn);
+
+            await conn.ExecuteAsync(@"
+                DELETE FROM ImageTag
+                WHERE ImageMetaId = @ImageId
+                  AND TagId IN (SELECT Id FROM Tag WHERE Name = @EnglishName COLLATE NOCASE)
+                  AND Source = 'AutoTag'
+                  AND TagId != @ChineseId",
+                new { ImageId = imageId, EnglishName = name, ChineseId = chineseId }, txn);
+        }
+        txn.Commit();
     }
 
     public async Task DeleteAutoTagFromImageAsync(long imageId, string tagName)
@@ -565,6 +596,19 @@ public class ImageMetaRepository : IImageMetaRepository
             new { Path = newPath, FolderId = newFolderId, Now = DateTime.UtcNow, Id = id });
     }
 
+    public async Task<Dictionary<string, (long Id, int Status)>> GetStatusMapByPathsAsync(List<string> filePaths)
+    {
+        var result = new Dictionary<string, (long, int)>(StringComparer.OrdinalIgnoreCase);
+        if (filePaths.Count == 0) return result;
+        using var conn = _db.CreateConnection();
+        var rows = await conn.QueryAsync<(long Id, string FilePath, int Status)>(
+            "SELECT Id, FilePath, AutoTagStatus AS Status FROM ImageMeta WHERE FilePath IN @Paths",
+            new { Paths = filePaths });
+        foreach (var row in rows)
+            result[row.FilePath] = (row.Id, row.Status);
+        return result;
+    }
+
     public async Task SetAutoTagStatusByPathAsync(string filePath, int status)
     {
         using var conn = _db.CreateConnection();
@@ -600,13 +644,25 @@ public class ImageMetaRepository : IImageMetaRepository
         return tags.ToList();
     }
 
-    private async Task<Dictionary<long, List<TagCount>>> GetTagMapAsync(SqliteConnection conn)
+    private async Task<Dictionary<long, List<TagCount>>> GetTagMapAsync(SqliteConnection conn, List<long>? imageIds = null)
     {
-        var rows = await conn.QueryAsync<(long ImageMetaId, string Name)>(@"
-            SELECT it.ImageMetaId, t.Name
-            FROM Tag t
-            INNER JOIN ImageTag it ON t.Id = it.TagId
-            ORDER BY t.Name");
+        string sql;
+        object param;
+        if (imageIds != null && imageIds.Count > 0)
+        {
+            sql = @"SELECT it.ImageMetaId, t.Name
+                    FROM Tag t INNER JOIN ImageTag it ON t.Id = it.TagId
+                    WHERE it.ImageMetaId IN @Ids ORDER BY t.Name";
+            param = new { Ids = imageIds };
+        }
+        else
+        {
+            sql = @"SELECT it.ImageMetaId, t.Name
+                    FROM Tag t INNER JOIN ImageTag it ON t.Id = it.TagId
+                    ORDER BY t.Name";
+            param = new { };
+        }
+        var rows = await conn.QueryAsync<(long ImageMetaId, string Name)>(sql, param);
 
         var map = new Dictionary<long, List<TagCount>>();
         foreach (var (metaId, name) in rows)
@@ -664,6 +720,20 @@ public class ImageMetaRepository : IImageMetaRepository
             WHERE ImageMetaId IN @Ids
               AND TagId = (SELECT Id FROM Tag WHERE Name = @TagName COLLATE NOCASE)",
             new { Ids = imageIds, TagName = tag.Trim() });
+    }
+
+    public async Task ClearTagsAndStatusBatchAsync(List<string> filePaths)
+    {
+        if (filePaths.Count == 0) return;
+        using var conn = _db.CreateConnection();
+        using var txn = conn.BeginTransaction();
+        await conn.ExecuteAsync(
+            "DELETE FROM ImageTag WHERE ImageMetaId IN (SELECT Id FROM ImageMeta WHERE FilePath IN @Paths)",
+            new { Paths = filePaths }, txn);
+        await conn.ExecuteAsync(
+            "UPDATE ImageMeta SET AutoTagStatus = 0 WHERE FilePath IN @Paths",
+            new { Paths = filePaths }, txn);
+        txn.Commit();
     }
 
     public async Task ClearTagsFromImagesAsync(List<long> imageIds)

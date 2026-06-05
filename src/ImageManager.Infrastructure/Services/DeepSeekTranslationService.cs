@@ -18,13 +18,13 @@ public class DeepSeekTranslationService : ITranslationService
 
     public void SetApiKey(string key) => _apiKey = key;
 
-    public async Task<string?> TranslateSingleAsync(string englishTag)
+    public async Task<string?> TranslateSingleAsync(string englishTag, CancellationToken ct = default)
     {
-        var results = await TranslateBatchAsync(new List<string> { englishTag });
+        var results = await TranslateBatchAsync(new List<string> { englishTag }, ct);
         return results.TryGetValue(englishTag, out var chinese) ? chinese : null;
     }
 
-    public async Task<Dictionary<string, string>> TranslateBatchAsync(List<string> englishTags)
+    public async Task<Dictionary<string, string>> TranslateBatchAsync(List<string> englishTags, CancellationToken ct = default)
     {
         if (englishTags.Count == 0) return new Dictionary<string, string>();
         if (string.IsNullOrEmpty(_apiKey)) return FailedAll(englishTags);

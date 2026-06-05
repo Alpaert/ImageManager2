@@ -54,6 +54,7 @@ public abstract class OnnxTagServiceBase : IDisposable
 
     private static readonly HttpClient _http = new();
     private readonly SemaphoreSlim _initLock = new(1, 1);
+    private readonly SemaphoreSlim _inferenceLock = new(1, 1);
     private string _modelDir = string.Empty;
     private DenseTensor<float>? _cachedTensor;
     private CancellationTokenSource? _idleCts;
@@ -66,7 +67,7 @@ public abstract class OnnxTagServiceBase : IDisposable
 
     // ==================== 模型加载 ====================
 
-    public async Task LoadModelAsync(string modelDir)
+    public async Task LoadModelAsync(string modelDir, CancellationToken ct = default)
     {
         await _initLock.WaitAsync();
         try
@@ -128,37 +129,45 @@ public abstract class OnnxTagServiceBase : IDisposable
 
     // ==================== 推理 ====================
 
-    public virtual async Task<List<TagPrediction>> PredictAsync(string imagePath)
+    public virtual async Task<List<TagPrediction>> PredictAsync(string imagePath, CancellationToken ct = default)
     {
         if (_session == null)
             throw new InvalidOperationException($"{ModelSubDir}: Model not loaded");
 
-        var result = await Task.Run(() =>
+        await _inferenceLock.WaitAsync();
+        try
         {
-            var tensor = Preprocess(imagePath);
-            if (tensor == null)
+            var result = await Task.Run(() =>
             {
-                AppLogger.Warn($"预处理失败: {Path.GetFileName(imagePath)}");
-                return new List<TagPrediction>();
-            }
+                var tensor = Preprocess(imagePath);
+                if (tensor == null)
+                {
+                    AppLogger.Warn($"预处理失败: {Path.GetFileName(imagePath)}");
+                    return new List<TagPrediction>();
+                }
 
-            var inputs = new List<NamedOnnxValue>
-            {
-                NamedOnnxValue.CreateFromTensor(_inputName, tensor)
-            };
+                var inputs = new List<NamedOnnxValue>
+                {
+                    NamedOnnxValue.CreateFromTensor(_inputName, tensor)
+                };
 
-            using var results = _session.Run(inputs);
-            var output = results.First(r => r.Name == _outputName);
-            var probs = output.AsTensor<float>().ToArray();
+                using var results = _session.Run(inputs);
+                var output = results.First(r => r.Name == _outputName);
+                var probs = output.AsTensor<float>().ToArray();
 
-            AppLogger.Tag(ModelSubDir,
-                $"推理完成 image={Path.GetFileName(imagePath)} output={_outputName} len={probs.Length} maxProb={probs.Max():F4} aboveThreshold={probs.Count(p => p >= DefaultThreshold)}");
+                AppLogger.Tag(ModelSubDir,
+                    $"推理完成 image={Path.GetFileName(imagePath)} output={_outputName} len={probs.Length} maxProb={probs.Max():F4} aboveThreshold={probs.Count(p => p >= DefaultThreshold)}");
 
-            return Postprocess(probs, DefaultThreshold);
-        });
+                return Postprocess(probs, DefaultThreshold);
+            });
 
-        ResetIdleTimer();
-        return result;
+            ResetIdleTimer();
+            return result;
+        }
+        finally
+        {
+            _inferenceLock.Release();
+        }
     }
 
     protected void ResetIdleTimer()
@@ -442,9 +451,24 @@ public abstract class OnnxTagServiceBase : IDisposable
     public virtual void Dispose()
     {
         AppLogger.Info($"Dispose {ModelSubDir}");
-        _session?.Dispose();
-        _session = null;
-        _cachedTensor = null;
+
+        // Cancel and dispose idle timer first
+        lock (_idleLock)
+        {
+            _idleCts?.Cancel();
+            _idleCts?.Dispose();
+            _idleCts = null;
+        }
+
+        // Acquire idle lock before touching _session to avoid race with DisposeSession()
+        lock (_idleLock)
+        {
+            _session?.Dispose();
+            _session = null;
+            _cachedTensor = null;
+        }
+
+        _inferenceLock.Dispose();
         _initLock.Dispose();
     }
 }

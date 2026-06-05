@@ -1,3 +1,5 @@
+using System.Threading;
+
 namespace ImageManager.Core.Services;
 
 // ==================== Enums ====================
@@ -54,7 +56,7 @@ public class MergeConfig
 public interface IEnsembleTagService : IAutoTagService
 {
     TagMode Mode { get; }
-    Task<EnsembleResult> PredictWithSourcesAsync(string imagePath);
-    Task<SystemRating> PredictRatingAsync(string imagePath);
+    Task<EnsembleResult> PredictWithSourcesAsync(string imagePath, CancellationToken ct = default);
+    Task<SystemRating> PredictRatingAsync(string imagePath, CancellationToken ct = default);
     IReadOnlyList<ModelStatus> GetModelStatuses();
 }

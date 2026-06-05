@@ -22,7 +22,7 @@ public class AppDbContext : IDisposable
         conn.Open();
         // Enable WAL mode for concurrent read/write
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA cache_size=-8192; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;";
+        cmd.CommandText = "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; PRAGMA cache_size=-8192; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;";
         cmd.ExecuteNonQuery();
         return conn;
     }

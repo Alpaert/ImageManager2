@@ -26,6 +26,7 @@ public class AutoTagPipelineService : IDisposable
     private int _maxConcurrency = 1;  // GPU 推理时 1，避免显存争抢
     private List<ImageMeta>? _cachedMetas;
     private string? _cachedFolderPath;
+    private readonly object _cacheLock = new();
 
     public event Action<AutoTagPipelineProgress>? ProgressChanged;
 
@@ -126,7 +127,7 @@ public class AutoTagPipelineService : IDisposable
         const int batchSize = 500;
 
         // Producer: launch in batches to avoid N concurrent Task objects
-        _ = Task.Run(async () =>
+        var producerTask = Task.Run(async () =>
         {
             try
             {
@@ -137,23 +138,27 @@ public class AutoTagPipelineService : IDisposable
                     var batch = metas.GetRange(batchStart, batchEnd - batchStart);
                     var batchTasks = batch.Select(async meta =>
                     {
+                        if (ct.IsCancellationRequested) return;
+                        var acquired = false;
                         try
                         {
-                            await ioSemaphore.WaitAsync();
-                            try
-                            {
-                                var predictions = await _tagService.PredictAsync(meta.FilePath);
-                                var filtered = predictions
-                                    .Where(p => p.Confidence >= _confidenceThreshold)
-                                    .Take(_maxTagsPerImage)
-                                    .ToList();
-                                await channel.Writer.WriteAsync((meta.Id, meta.FilePath, filtered));
-                            }
-                            finally { ioSemaphore.Release(); }
+                            await ioSemaphore.WaitAsync(ct);
+                            acquired = true;
+                            var predictions = await _tagService.PredictAsync(meta.FilePath);
+                            var filtered = predictions
+                                .Where(p => p.Confidence >= _confidenceThreshold)
+                                .Take(_maxTagsPerImage)
+                                .ToList();
+                            await channel.Writer.WriteAsync((meta.Id, meta.FilePath, filtered), ct);
                         }
+                        catch (OperationCanceledException) { }
                         catch (Exception ex)
                         {
                             errors.Enqueue($"{Path.GetFileName(meta.FilePath)}: {ex.Message}");
+                        }
+                        finally
+                        {
+                            if (acquired) ioSemaphore.Release();
                         }
                     });
                     await Task.WhenAll(batchTasks);
@@ -176,7 +181,7 @@ public class AutoTagPipelineService : IDisposable
                     {
                         if (item.Predictions.Count > 0)
                         {
-                            var tagNames = item.Predictions.Select(p => p.TagName).ToList();
+                            var tagNames = item.Predictions.Select(p => p.ChineseName ?? p.TagName).ToList();
                             await _metaRepo.AddAutoTagsAsync(item.ImageId, tagNames);
                         }
                         Interlocked.Increment(ref processed);
@@ -189,14 +194,17 @@ public class AutoTagPipelineService : IDisposable
                             stampBuffer.Clear();
                         }
 
-                        if (hasState && (completed % 10 == 0 || completed == metas.Count))
+                        if (completed % 10 == 0 || completed == metas.Count)
                         {
-                            await _stateRepo.UpsertStateAsync(new AutoTagState
+                            if (hasState)
                             {
-                                FolderId = folderId, Status = "Processing",
-                                TotalFiles = metas.Count, Processed = processed,
-                                LastFileCount = metas.Count
-                            });
+                                await _stateRepo.UpsertStateAsync(new AutoTagState
+                                {
+                                    FolderId = folderId, Status = "Processing",
+                                    TotalFiles = metas.Count, Processed = processed,
+                                    LastFileCount = metas.Count
+                                });
+                            }
                             ProgressChanged?.Invoke(new AutoTagPipelineProgress(
                                 "Inference", processed, metas.Count,
                                 $"正在推理图片标签... {processed}/{metas.Count}"));
@@ -228,7 +236,7 @@ public class AutoTagPipelineService : IDisposable
             }
         });
 
-        await consumerTask;
+        await Task.WhenAll(producerTask, consumerTask);
 
         if (hasState)
         {
@@ -286,7 +294,10 @@ public class AutoTagPipelineService : IDisposable
                 if (hasTag)
                 {
                     try { await _metaRepo.ReplaceAutoTagAsync(meta.Id, mapping.EnglishName, chineseTagId); }
-                    catch { }
+                    catch (Exception ex)
+                    {
+                        AppLogger.Warn($"TranslateAndPrepareReview: ReplaceAutoTag failed image={meta.Id} en={mapping.EnglishName}: {ex.Message}");
+                    }
                 }
             }
         }
@@ -347,9 +358,15 @@ public class AutoTagPipelineService : IDisposable
             null, isConfirmed: true, isExistingMapping: false);
 
         // Use cached metas if preloaded, otherwise load on demand
-        var metas = (_cachedFolderPath == folderPath && _cachedMetas != null)
-            ? _cachedMetas
-            : (await _metaRepo.GetByFolderAsync(folderPath)).ToList();
+        List<ImageMeta> metas;
+        lock (_cacheLock)
+        {
+            if (_cachedFolderPath == folderPath && _cachedMetas != null)
+                metas = _cachedMetas;
+            else
+                metas = null!;
+        }
+        metas ??= (await _metaRepo.GetByFolderAsync(folderPath)).ToList();
         var chineseTagId = await _tagRepo.GetOrCreateTagIdAsync(chineseName);
 
         foreach (var meta in metas)
@@ -364,34 +381,56 @@ public class AutoTagPipelineService : IDisposable
 
     public async Task PreloadMetasAsync(string folderPath)
     {
-        _cachedMetas = (await _metaRepo.GetByFolderAsync(folderPath)).ToList();
-        _cachedFolderPath = folderPath;
+        var metas = (await _metaRepo.GetByFolderAsync(folderPath)).ToList();
+        lock (_cacheLock)
+        {
+            _cachedMetas = metas;
+            _cachedFolderPath = folderPath;
+        }
     }
 
     public void ClearMetaCache()
     {
-        _cachedMetas = null;
-        _cachedFolderPath = null;
+        lock (_cacheLock)
+        {
+            _cachedMetas = null;
+            _cachedFolderPath = null;
+        }
     }
 
     public async Task DeleteAutoTagAsync(long folderId, string folderPath, string englishTag)
     {
         await _stateRepo.DeleteTranslationAsync(folderId, englishTag);
-        var metas = (_cachedFolderPath == folderPath && _cachedMetas != null)
-            ? _cachedMetas
-            : (await _metaRepo.GetByFolderAsync(folderPath)).ToList();
+        List<ImageMeta> metas;
+        lock (_cacheLock)
+        {
+            if (_cachedFolderPath == folderPath && _cachedMetas != null)
+                metas = _cachedMetas;
+            else
+                metas = null!;
+        }
+        metas ??= (await _metaRepo.GetByFolderAsync(folderPath)).ToList();
         foreach (var meta in metas)
         {
             try { await _metaRepo.DeleteAutoTagFromImageAsync(meta.Id, englishTag); }
-            catch { }
+            catch (Exception ex)
+            {
+                AppLogger.Warn($"DeleteAutoTag: failed for image={meta.Id} tag={englishTag}: {ex.Message}");
+            }
         }
     }
 
     public async Task<List<string>> GetImagesWithTagAsync(long folderId, string folderPath, string englishTag)
     {
-        var metas = (_cachedFolderPath == folderPath && _cachedMetas != null)
-            ? _cachedMetas
-            : (await _metaRepo.GetByFolderAsync(folderPath)).ToList();
+        List<ImageMeta> metas;
+        lock (_cacheLock)
+        {
+            if (_cachedFolderPath == folderPath && _cachedMetas != null)
+                metas = _cachedMetas;
+            else
+                metas = null!;
+        }
+        metas ??= (await _metaRepo.GetByFolderAsync(folderPath)).ToList();
         return metas
             .Where(m => m.Tags.Any(t =>
                 string.Equals(t.Name, englishTag, StringComparison.OrdinalIgnoreCase)))

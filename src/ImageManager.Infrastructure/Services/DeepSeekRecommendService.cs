@@ -18,7 +18,7 @@ public class DeepSeekRecommendService : IAiRecommendService
 
     public void SetApiKey(string key) => _apiKey = key;
 
-    public async Task<string> RecommendAsync(string userInput, List<TagMapping> tagMappings)
+    public async Task<string> RecommendAsync(string userInput, List<TagMapping> tagMappings, CancellationToken ct = default)
     {
         if (string.IsNullOrEmpty(_apiKey)) return "错误：未设置 API Key，请在内存与缓存设置中配置 DeepSeek API Key。";
         if (tagMappings.Count == 0) return "错误：本地标签库为空。";

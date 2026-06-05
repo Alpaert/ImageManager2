@@ -48,7 +48,7 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
         AppLogger.Info($"Ensemble 配置: maxTags={config.MaxTags} thresholds={string.Join(",", config.ModelThresholds.Select(kv => $"{kv.Key}={kv.Value}"))}");
     }
 
-    public async Task LoadModelAsync(string modelsRootDir)
+    public async Task LoadModelAsync(string modelsRootDir, CancellationToken ct = default)
     {
         _modelsRootDir = modelsRootDir;
         AppLogger.Info("=== 模式 B: 三模型专家流水线 加载开始 ===");
@@ -72,17 +72,17 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
         AppLogger.Info($"=== 模式 B 加载完成 wd={_wd.IsLoaded} pixai={_pixai.IsModelLoaded} zhTags={_chineseLib.Count} artists={_artistStore.Count} ===");
     }
 
-    public async Task<SystemRating> PredictRatingAsync(string imagePath)
+    public async Task<SystemRating> PredictRatingAsync(string imagePath, CancellationToken ct = default)
         => await _wd.PredictRatingAsync(imagePath);
 
-    public async Task<List<TagPrediction>> PredictAsync(string imagePath)
+    public async Task<List<TagPrediction>> PredictAsync(string imagePath, CancellationToken ct = default)
     {
-        var result = await PredictWithSourcesAsync(imagePath);
+        var result = await PredictWithSourcesAsync(imagePath, ct);
         // artist 已在 PredictWithSourcesAsync 中插入 MergedTags 首位
         return result.MergedTags;
     }
 
-    public async Task<EnsembleResult> PredictWithSourcesAsync(string imagePath)
+    public async Task<EnsembleResult> PredictWithSourcesAsync(string imagePath, CancellationToken ct = default)
     {
         var fileName = Path.GetFileName(imagePath);
         AppLogger.Tag("Ensemble", $"三模型并行推理开始 image={fileName}");

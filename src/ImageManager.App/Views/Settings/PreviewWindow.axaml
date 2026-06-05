@@ -1,4 +1,4 @@
-<Window xmlns="https://github.com/avaloniaui"
+﻿<Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:ImageManager.App.ViewModels"
         xmlns:conv="using:ImageManager.App.Converters"
@@ -27,6 +27,10 @@
                     <Image x:Name="ImgFull"
                            Source="{Binding ImageData, Converter={StaticResource BytesToBitmap}}"
                            Stretch="Uniform"/>
+                    <Image x:Name="ImgGif"
+                           Source="{Binding GifCurrentFrame, Converter={StaticResource BytesToBitmap}}"
+                           Stretch="Uniform"
+                           IsVisible="{Binding IsGif}"/>
                 </Grid>
             </ScrollViewer>
 

@@ -4,6 +4,9 @@ namespace ImageManager.App.ViewModels;
 
 public partial class ImageViewItem : ObservableObject
 {
+
+    // Whether this item is a video file (affects preview behavior)
+    public bool IsVideo { get; set; }
     public string FilePath { get; set; } = string.Empty;
     public string FileName { get; set; } = string.Empty;
 

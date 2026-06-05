@@ -44,6 +44,13 @@ public partial class PreviewViewModel : ViewModelBase
         return ImagePaths[CurrentIndex];
     }
 
+
+    // GIF animation state
+    [ObservableProperty] private bool _isGif;
+    [ObservableProperty] private byte[]? _gifCurrentFrame;
+    public List<ImageManager.Infrastructure.Imaging.GifFrame>? GifFrames;
+    public int GifFrameIndex;
+    public Avalonia.Threading.DispatcherTimer? GifTimer;
     public void ReleaseImage() => ImageData = null;
 
     public double MinZoom => Math.Min(FitZoom * 0.05, FitZoom);
