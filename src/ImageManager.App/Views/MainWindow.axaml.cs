@@ -1819,13 +1819,26 @@ public partial class MainWindow : Window
         ThumbnailScrollViewer.Offset = new Vector(0, Vm.PreSearchScrollOffset);
     }
 
-    private void OnScrollToSelected()
+    private async void OnScrollToSelected()
     {
-        var selected = Vm.Images.FirstOrDefault(i => i.IsSelected);
-        if (selected == null) return;
-        var container = ItemsImages.ContainerFromItem(selected) as Control;
-        if (container == null) return;
-        container.BringIntoView();
+        for (var attempt = 0; attempt < 8; attempt++)
+        {
+            var scrolled = await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                ItemsImages.UpdateLayout();
+                var selected = Vm.Images.FirstOrDefault(i => i.IsSelected);
+                if (selected == null) return true;
+
+                var container = ItemsImages.ContainerFromItem(selected) as Control;
+                if (container == null) return false;
+
+                container.BringIntoView();
+                return true;
+            }, Avalonia.Threading.DispatcherPriority.Loaded);
+
+            if (scrolled) return;
+            await Task.Delay(50);
+        }
     }
 
     private async void OnTreeScrollToNode(ViewModels.FolderTreeNode node)

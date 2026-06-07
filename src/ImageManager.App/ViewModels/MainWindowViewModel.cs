@@ -262,6 +262,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private FileSystemWatcher? _folderWatcher;
     private CancellationTokenSource? _folderWatchDebounceCts;
     private CancellationTokenSource? _widthDebounceCts;
+    private int _resultNavigationVersion;
 
     private readonly ImageManager.Infrastructure.Services.ArtistEmbeddingStore _artistStore;
     private readonly ImageManager.Infrastructure.Services.ChineseTagLibrary _chineseLib;
@@ -514,7 +515,20 @@ public partial class MainWindowViewModel : ViewModelBase
 
     // ==================== Folder Loading ====================
 
-    public async Task LoadFolderAsync(string folder)
+    private int GetStartPageForLoadedFolder(string? preferredFilePath, int? lastPage)
+    {
+        if (!string.IsNullOrEmpty(preferredFilePath))
+        {
+            var preferredIndex = _allFiles.FindIndex(f =>
+                string.Equals(f, preferredFilePath, StringComparison.OrdinalIgnoreCase));
+            if (preferredIndex >= 0)
+                return preferredIndex / PageManager.PageSize;
+        }
+
+        return lastPage.HasValue && lastPage.Value < TotalPages ? lastPage.Value : 0;
+    }
+
+    public async Task LoadFolderAsync(string folder, string? preferredFilePath = null, Func<bool>? isCurrent = null)
     {
         var requestVersion = BeginFolderViewRequest();
         var showAllSubfolders = ShowAllSubfolders;
@@ -547,6 +561,8 @@ public partial class MainWindowViewModel : ViewModelBase
         CurrentFolder = folder;
         StartWatchingCurrentFolder();
         await Task.Yield();
+        if (isCurrent?.Invoke() == false)
+            return;
 
         if (showAllSubfolders)
         {
@@ -556,6 +572,8 @@ public partial class MainWindowViewModel : ViewModelBase
 
         // Check if this folder already has FolderId markers in DB
         var folderInfo = await _folderRepo.GetByPathAsync(folder);
+        if (isCurrent?.Invoke() == false)
+            return;
         long? folderId = folderInfo?.Id;
         var exts = new[] { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
 
@@ -564,11 +582,15 @@ public partial class MainWindowViewModel : ViewModelBase
             // Path A: Try indexed DB query first (fast, no disk IO)
             var indexedFiles = await Task.Run(() =>
                 _metaRepo.GetByFolderIdAsync(folderId.Value));
+            if (isCurrent?.Invoke() == false)
+                return;
 
             if (indexedFiles.Count > 0)
             {
                 _allFiles = await Task.Run(() =>
                     indexedFiles.Select(m => m.FilePath).Where(File.Exists).ToList());
+                if (isCurrent?.Invoke() == false)
+                    return;
 
                 if (_allFiles.Count == 0)
                 {
@@ -598,12 +620,20 @@ public partial class MainWindowViewModel : ViewModelBase
                     StatusText += $" | 示例: {sample?.Tags.FirstOrDefault()?.Name}";
                 }
 
-                var lastPage = await _folderRepo.GetLastPageIndexAsync(folder);
-                int startPage = lastPage.HasValue && lastPage.Value < TotalPages ? lastPage.Value : 0;
+                int? lastPage = string.IsNullOrEmpty(preferredFilePath)
+                    ? await _folderRepo.GetLastPageIndexAsync(folder)
+                    : null;
+                if (isCurrent?.Invoke() == false)
+                    return;
+                int startPage = GetStartPageForLoadedFolder(preferredFilePath, lastPage);
                 await ShowPageAsync(startPage);
+                if (isCurrent?.Invoke() == false)
+                    return;
 
                 // Sync: check for new/removed files, then compute hashes for newcomers
-                await SyncFolderAsync(folder, folderId.Value, exts);
+                await SyncFolderAsync(folder, folderId.Value, exts, isCurrent);
+                if (isCurrent?.Invoke() == false)
+                    return;
                 _precomputeCts?.Cancel();
                 _precomputeCts?.Dispose();
                 _precomputeCts = new CancellationTokenSource();
@@ -627,6 +657,8 @@ public partial class MainWindowViewModel : ViewModelBase
                     .Where(f => exts.Contains(Path.GetExtension(f).ToLower()))
                     .ToList()
             );
+            if (isCurrent?.Invoke() == false)
+                return;
         }
         catch (Exception ex)
         {
@@ -693,8 +725,15 @@ public partial class MainWindowViewModel : ViewModelBase
 
         await tagLoadTask;
 
-        var lastPage2 = await _folderRepo.GetLastPageIndexAsync(folder);
-        int startPage2 = lastPage2.HasValue && lastPage2.Value < TotalPages ? lastPage2.Value : 0;
+        if (isCurrent?.Invoke() == false)
+            return;
+
+        int? lastPage2 = string.IsNullOrEmpty(preferredFilePath)
+            ? await _folderRepo.GetLastPageIndexAsync(folder)
+            : null;
+        if (isCurrent?.Invoke() == false)
+            return;
+        int startPage2 = GetStartPageForLoadedFolder(preferredFilePath, lastPage2);
 
         StatusText = $"总文件数: {_allFiles.Count}";
         await ShowPageAsync(startPage2);
@@ -812,7 +851,7 @@ public partial class MainWindowViewModel : ViewModelBase
     /// Sync folder: detect new/deleted files, compute hashes for new files, refresh UI if changed.
     /// Returns true if any files were added or removed.
     /// </summary>
-    private async Task<bool> SyncFolderAsync(string folder, long folderId, string[] exts)
+    private async Task<bool> SyncFolderAsync(string folder, long folderId, string[] exts, Func<bool>? isCurrent = null)
     {
         try
         {
@@ -888,6 +927,9 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 if (string.Equals(CurrentFolder, folder, StringComparison.OrdinalIgnoreCase))
                 {
+                    if (isCurrent?.Invoke() == false)
+                        return false;
+
                     _allFiles = diskFiles.ToList();
                     TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
                     PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
@@ -1202,8 +1244,42 @@ partial void OnCornerRadiusDipChanged(double value)
             ClearHighlightRecursive(child);
     }
 
-    public async Task<FolderTreeNode?> ExpandAndHighlightFolderAsync(string targetPath, bool syncSelection = false)
+    private bool IsPathHighlighted(string normalizedPath)
     {
+        foreach (var root in FolderTree)
+        {
+            if (IsPathHighlightedRecursive(root, normalizedPath))
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsPathHighlightedRecursive(FolderTreeNode node, string normalizedPath)
+    {
+        if (node.IsSearchHighlight &&
+            string.Equals(NormalizePath(node.Path), normalizedPath, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        foreach (var child in node.Children)
+        {
+            if (IsPathHighlightedRecursive(child, normalizedPath))
+                return true;
+        }
+
+        return false;
+    }
+
+    public async Task<FolderTreeNode?> ExpandAndHighlightFolderAsync(
+        string targetPath,
+        bool syncSelection = false,
+        Func<bool>? isCurrent = null)
+    {
+        targetPath = NormalizePath(targetPath);
+        var targetWasAlreadyHighlighted = IsPathHighlighted(targetPath);
+        if (isCurrent?.Invoke() == false)
+            return null;
+
         ClearSearchHighlight();
 
         // 标准化输入路径
@@ -1265,13 +1341,35 @@ partial void OnCornerRadiusDipChanged(double value)
                 currentNode.IsExpanded = true;
                 if (currentNode.LoadTask != null)
                     await currentNode.LoadTask;
+                if (isCurrent?.Invoke() == false)
+                    return null;
             }
             else
             {
-                // 节点已展开，但可能子节点还未加载完成
-                // 等待正在进行的加载任务
-                if (currentNode.LoadTask != null)
+                // 节点已展开，需要确保子节点真的加载完成
+                if (!currentNode.ChildrenLoaded)
+                {
+                    // 子节点未加载，但LoadTask可能为null（节点初始就是展开状态）
+                    if (currentNode.LoadTask == null)
+                    {
+                        // LoadTask为null说明OnIsExpandedChanged未触发，强制重新触发
+                        currentNode.IsExpanded = false;
+                        await Task.Delay(1); // 确保UI处理属性变化
+                        currentNode.IsExpanded = true;
+                    }
+
+                    // 现在LoadTask应该存在了，等待它完成
+                    if (currentNode.LoadTask != null)
+                        await currentNode.LoadTask;
+                }
+                else if (currentNode.LoadTask != null && !currentNode.LoadTask.IsCompleted)
+                {
+                    // 已加载但可能有正在进行的任务
                     await currentNode.LoadTask;
+                }
+
+                if (isCurrent?.Invoke() == false)
+                    return null;
             }
 
             // 3.2 在当前节点的直接子节点中查找下一级路径
@@ -1294,6 +1392,11 @@ partial void OnCornerRadiusDipChanged(double value)
         // 4. 到达目标节点，高亮并滚动
         if (currentNode != null)
         {
+            if (targetWasAlreadyHighlighted)
+                await Task.Delay(45);
+            if (isCurrent?.Invoke() == false)
+                return null;
+
             currentNode.IsSearchHighlight = true;
 
             if (syncSelection)
@@ -1809,7 +1912,7 @@ partial void OnCornerRadiusDipChanged(double value)
             StatusText = $"找到 {_tagSearch.SearchResultFiles.Count} 张相似图片";
             OnPropertyChanged(nameof(HasSearchResults));
             _currentResultIndex = 0;
-            _ = NavigateToResultAsync();
+            await NavigateToResultAsync();
         }
         catch (OperationCanceledException)
         {
@@ -1842,6 +1945,9 @@ partial void OnCornerRadiusDipChanged(double value)
 
     private async Task NavigateToResultAsync()
     {
+        var navigationVersion = Interlocked.Increment(ref _resultNavigationVersion);
+        bool IsCurrentNavigation() => navigationVersion == Volatile.Read(ref _resultNavigationVersion);
+
         var files = _tagSearch.SearchResultFiles;
         if (files.Count == 0) return;
 
@@ -1856,7 +1962,8 @@ partial void OnCornerRadiusDipChanged(double value)
             // - 左侧：展开、高亮、滚动到目标文件夹（但不改变选中节点）
             // - 右侧：保持当前的全展示列表，直接定位图片
 
-            await ExpandAndHighlightFolderAsync(targetDir, syncSelection: false);
+            await ExpandAndHighlightFolderAsync(targetDir, syncSelection: false, IsCurrentNavigation);
+            if (!IsCurrentNavigation()) return;
 
             // 在当前的 ActiveFileList 中查找目标图片
             var indexInList = ActiveFileList.FindIndex(f =>
@@ -1872,6 +1979,7 @@ partial void OnCornerRadiusDipChanged(double value)
             int targetPage = indexInList / PageManager.PageSize;
             if (targetPage != CurrentPage)
                 await ShowPageAsync(targetPage);
+            if (!IsCurrentNavigation()) return;
 
             // 选中目标图片并滚动到可见区域
             SelectAndScrollToImage(targetPath);
@@ -1888,7 +1996,8 @@ partial void OnCornerRadiusDipChanged(double value)
             if (needSwitchFolder)
             {
                 // 需要切换文件夹：展开树、更新选中节点、加载文件夹
-                var targetNode = await ExpandAndHighlightFolderAsync(targetDir, syncSelection: false);
+                var targetNode = await ExpandAndHighlightFolderAsync(targetDir, syncSelection: false, IsCurrentNavigation);
+                if (!IsCurrentNavigation()) return;
 
                 if (targetNode == null)
                 {
@@ -1908,12 +2017,14 @@ partial void OnCornerRadiusDipChanged(double value)
                 _isProgrammaticFolderSelection = false;
                 TreeScrollToNodeRequested?.Invoke(targetNode);
 
-                await LoadFolderAsync(targetDir);
+                await LoadFolderAsync(targetDir, targetPath, IsCurrentNavigation);
+                if (!IsCurrentNavigation()) return;
             }
             else
             {
                 // 目标图片在当前文件夹，只需要确保树高亮
-                await ExpandAndHighlightFolderAsync(targetDir, syncSelection: false);
+                await ExpandAndHighlightFolderAsync(targetDir, syncSelection: false, IsCurrentNavigation);
+                if (!IsCurrentNavigation()) return;
             }
 
             // 在当前文件夹的列表中查找目标图片
@@ -1930,6 +2041,7 @@ partial void OnCornerRadiusDipChanged(double value)
             int targetPage = indexInList / PageManager.PageSize;
             if (targetPage != CurrentPage)
                 await ShowPageAsync(targetPage);
+            if (!IsCurrentNavigation()) return;
 
             // 选中目标图片并滚动到可见区域
             SelectAndScrollToImage(targetPath);

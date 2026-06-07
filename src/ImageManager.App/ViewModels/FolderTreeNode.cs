@@ -21,6 +21,7 @@ public partial class FolderTreeNode : ObservableObject
     partial void OnIsSearchHighlightChanged(bool value) => OnPropertyChanged(nameof(HighlightColor));
 
     private bool _childrenLoaded;
+    public bool ChildrenLoaded => _childrenLoaded;
     public Task? LoadTask { get; private set; }
 
     public FolderTreeNode()
@@ -73,6 +74,6 @@ public partial class FolderTreeNode : ObservableObject
         foreach (var n in buffer)
             Children.Add(n);
         _childrenLoaded = true;
-        LoadTask = null;
+        LoadTask = Task.CompletedTask;
     }
 }
