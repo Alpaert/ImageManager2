@@ -17,6 +17,7 @@
 	<Window.Styles>
 		<Style Selector="TreeViewItem">
 			<Setter Property="Padding" Value="0"/>
+			<Setter Property="IsExpanded" Value="{ReflectionBinding IsExpanded, Mode=TwoWay}"/>
 		</Style>
 		<Style Selector="MenuItem">
 			<Setter Property="Foreground" Value="{DynamicResource AppFgBrush}" />

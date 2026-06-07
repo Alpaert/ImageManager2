@@ -1828,22 +1828,36 @@ public partial class MainWindow : Window
         container.BringIntoView();
     }
 
-    private void OnTreeScrollToNode(ViewModels.FolderTreeNode node)
+    private async void OnTreeScrollToNode(ViewModels.FolderTreeNode node)
     {
-        var container = LstFolders.TreeContainerFromItem(node);
-        if (container == null) return;
-        Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+        for (var attempt = 0; attempt < 8; attempt++)
         {
-            var sv = LstFolders.FindDescendantOfType<ScrollViewer>();
-            if (sv == null) return;
-            var bounds = container.Bounds;
-            var containerY = container.TranslatePoint(new Avalonia.Point(0, 0), sv)?.Y ?? 0;
-            double targetOffset = containerY - sv.Viewport.Height / 2 + bounds.Height / 2;
-            if (targetOffset < 0) targetOffset = 0;
-            double maxY = Math.Max(0, sv.Extent.Height - sv.Viewport.Height);
-            if (targetOffset > maxY) targetOffset = maxY;
-            sv.Offset = new Vector(0, targetOffset);
-        }, Avalonia.Threading.DispatcherPriority.Loaded);
+            var scrolled = await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                LstFolders.UpdateLayout();
+                var container = LstFolders.TreeContainerFromItem(node);
+                if (container == null) return false;
+
+                var sv = LstFolders.FindDescendantOfType<ScrollViewer>();
+                if (sv == null)
+                {
+                    container.BringIntoView();
+                    return true;
+                }
+
+                var bounds = container.Bounds;
+                var containerY = container.TranslatePoint(new Avalonia.Point(0, 0), sv)?.Y ?? 0;
+                double targetOffset = containerY - sv.Viewport.Height / 2 + bounds.Height / 2;
+                if (targetOffset < 0) targetOffset = 0;
+                double maxY = Math.Max(0, sv.Extent.Height - sv.Viewport.Height);
+                if (targetOffset > maxY) targetOffset = maxY;
+                sv.Offset = new Vector(0, targetOffset);
+                return true;
+            }, Avalonia.Threading.DispatcherPriority.Loaded);
+
+            if (scrolled) return;
+            await Task.Delay(50);
+        }
     }
 
     // ==================== Window Closing ====================

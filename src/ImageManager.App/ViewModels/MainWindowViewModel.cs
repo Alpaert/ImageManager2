@@ -1205,6 +1205,11 @@ partial void OnCornerRadiusDipChanged(double value)
     public async Task<FolderTreeNode?> ExpandAndHighlightFolderAsync(string targetPath, bool syncSelection = false)
     {
         ClearSearchHighlight();
+
+        // 标准化输入路径
+        targetPath = NormalizePath(targetPath);
+
+        // 1. 构建路径层级列表
         var parts = new List<string>();
         var current = targetPath;
         while (!string.IsNullOrEmpty(current) && current.Length > 3)
@@ -1213,41 +1218,98 @@ partial void OnCornerRadiusDipChanged(double value)
             current = Path.GetDirectoryName(current) ?? "";
         }
 
-        // Find deepest part that already exists in the tree
-        int startIdx = parts.Count - 1;
-        for (; startIdx >= 0; startIdx--)
+        if (parts.Count == 0)
         {
-            if (FindNodeByPath(parts[startIdx]) != null) break;
+            StatusText = "路径解析失败";
+            return null;
         }
-        if (startIdx < 0) return null; // no part exists in tree
 
-        // Expand from found ancestor down to target
-        FolderTreeNode? node = null;
-        for (int i = startIdx; i < parts.Count; i++)
+        // 2. 找到路径的根节点（FolderTree 中的顶层节点）
+        FolderTreeNode? rootNode = null;
+        int startIdx = -1;
+
+        // 从开头向后查找，找到第一个存在于 FolderTree 中的节点
+        for (int i = 0; i < parts.Count; i++)
         {
-            node = FindNodeByPath(parts[i]);
-            if (node == null) break;
-            if (i < parts.Count - 1)
+            rootNode = FolderTree.FirstOrDefault(n =>
+                string.Equals(
+                    NormalizePath(n.Path),
+                    NormalizePath(parts[i]),
+                    StringComparison.OrdinalIgnoreCase));
+            if (rootNode != null)
             {
-                node.IsExpanded = true;
-                if (node.LoadTask != null) await node.LoadTask;
+                startIdx = i;
+                break;
             }
         }
 
-        if (node != null)
+        if (rootNode == null || startIdx < 0)
         {
-            node.IsSearchHighlight = true;
+            // 调试信息：显示尝试匹配的路径和可用的根节点
+            var availableRoots = string.Join(", ", FolderTree.Select(n => $"[{NormalizePath(n.Path)}]"));
+            var attemptedPaths = string.Join(", ", parts.Select(p => $"[{NormalizePath(p)}]"));
+            StatusText = $"无法找到根节点。尝试: {attemptedPaths}；可用根节点: {availableRoots}";
+            return null;
+        }
+
+        // 3. 从根节点开始，逐层向下展开
+        var currentNode = rootNode;
+
+        for (int i = startIdx + 1; i < parts.Count; i++)
+        {
+            var targetPathAtLevel = parts[i];
+
+            // 3.1 确保当前节点已展开并加载子节点
+            if (!currentNode.IsExpanded)
+            {
+                currentNode.IsExpanded = true;
+                if (currentNode.LoadTask != null)
+                    await currentNode.LoadTask;
+            }
+            else
+            {
+                // 节点已展开，但可能子节点还未加载完成
+                // 等待正在进行的加载任务
+                if (currentNode.LoadTask != null)
+                    await currentNode.LoadTask;
+            }
+
+            // 3.2 在当前节点的直接子节点中查找下一级路径
+            var nextNode = currentNode.Children.FirstOrDefault(child =>
+                string.Equals(
+                    NormalizePath(child.Path),
+                    NormalizePath(targetPathAtLevel),
+                    StringComparison.OrdinalIgnoreCase));
+
+            if (nextNode == null)
+            {
+                // 找不到子节点，可能是路径不存在或未加载
+                StatusText = $"无法展开到 {Path.GetFileName(targetPathAtLevel)}";
+                return null;
+            }
+
+            currentNode = nextNode;
+        }
+
+        // 4. 到达目标节点，高亮并滚动
+        if (currentNode != null)
+        {
+            currentNode.IsSearchHighlight = true;
+
             if (syncSelection)
             {
                 _isProgrammaticFolderSelection = true;
-                SelectedFolderNode = node;
+                SelectedFolderNode = currentNode;
                 _isProgrammaticFolderSelection = false;
             }
+
+            // 使用 Loaded 优先级确保 TreeView 容器已渲染
             Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(
-                () => TreeScrollToNodeRequested?.Invoke(node),
-                Avalonia.Threading.DispatcherPriority.Background);
+                () => TreeScrollToNodeRequested?.Invoke(currentNode),
+                Avalonia.Threading.DispatcherPriority.Loaded);
         }
-        return node;
+
+        return currentNode;
     }
 
     public Task RebuildFileListAsync()
@@ -1782,40 +1844,117 @@ partial void OnCornerRadiusDipChanged(double value)
     {
         var files = _tagSearch.SearchResultFiles;
         if (files.Count == 0) return;
+
         var targetPath = files[_currentResultIndex];
         var targetDir = Path.GetDirectoryName(targetPath) ?? "";
-        _ = ExpandAndHighlightFolderAsync(targetDir);
 
-        var indexInList = ActiveFileList.FindIndex(f =>
-            string.Equals(f, targetPath, StringComparison.OrdinalIgnoreCase));
-        if (indexInList < 0)
+        // ===== 根据"全展示"状态分两种情况处理 =====
+
+        if (ShowAllSubfolders)
         {
-            // Target in subfolder — switch to that folder's view
-            if (!string.IsNullOrEmpty(targetDir) && Directory.Exists(targetDir))
+            // 场景 1：全展示模式
+            // - 左侧：展开、高亮、滚动到目标文件夹（但不改变选中节点）
+            // - 右侧：保持当前的全展示列表，直接定位图片
+
+            await ExpandAndHighlightFolderAsync(targetDir, syncSelection: false);
+
+            // 在当前的 ActiveFileList 中查找目标图片
+            var indexInList = ActiveFileList.FindIndex(f =>
+                string.Equals(f, targetPath, StringComparison.OrdinalIgnoreCase));
+
+            if (indexInList < 0)
             {
-                await LoadFolderAsync(targetDir);
-                indexInList = ActiveFileList.FindIndex(f =>
-                    string.Equals(f, targetPath, StringComparison.OrdinalIgnoreCase));
+                StatusText = "目标图片不在当前列表中";
+                return;
             }
-            if (indexInList < 0) return;
+
+            // 跳转到目标图片所在的页
+            int targetPage = indexInList / PageManager.PageSize;
+            if (targetPage != CurrentPage)
+                await ShowPageAsync(targetPage);
+
+            // 选中目标图片并滚动到可见区域
+            SelectAndScrollToImage(targetPath);
+        }
+        else
+        {
+            // 场景 2：非全展示模式
+            // - 左侧：展开、高亮、滚动、选中目标文件夹节点
+            // - 右侧：切换到目标文件夹，只显示该文件夹的图片
+
+            // 检查目标图片是否在当前文件夹
+            bool needSwitchFolder = !string.Equals(CurrentFolder, targetDir, StringComparison.OrdinalIgnoreCase);
+
+            if (needSwitchFolder)
+            {
+                // 需要切换文件夹：展开树、更新选中节点、加载文件夹
+                var targetNode = await ExpandAndHighlightFolderAsync(targetDir, syncSelection: false);
+
+                if (targetNode == null)
+                {
+                    StatusText = $"无法展开到目标文件夹";
+                    return;
+                }
+
+                if (!Directory.Exists(targetDir))
+                {
+                    StatusText = "目标文件夹不存在";
+                    return;
+                }
+
+                _isProgrammaticFolderSelection = true;
+                SelectedFolderNode = targetNode;
+                AppSettings.LastFolder = targetDir;
+                _isProgrammaticFolderSelection = false;
+                TreeScrollToNodeRequested?.Invoke(targetNode);
+
+                await LoadFolderAsync(targetDir);
+            }
+            else
+            {
+                // 目标图片在当前文件夹，只需要确保树高亮
+                await ExpandAndHighlightFolderAsync(targetDir, syncSelection: false);
+            }
+
+            // 在当前文件夹的列表中查找目标图片
+            var indexInList = ActiveFileList.FindIndex(f =>
+                string.Equals(f, targetPath, StringComparison.OrdinalIgnoreCase));
+
+            if (indexInList < 0)
+            {
+                StatusText = "目标图片不在当前文件夹中";
+                return;
+            }
+
+            // 跳转到目标图片所在的页
+            int targetPage = indexInList / PageManager.PageSize;
+            if (targetPage != CurrentPage)
+                await ShowPageAsync(targetPage);
+
+            // 选中目标图片并滚动到可见区域
+            SelectAndScrollToImage(targetPath);
         }
 
-        int targetPage = indexInList / PageManager.PageSize;
-        if (targetPage != CurrentPage)
-            await ShowPageAsync(targetPage);
+        OnPropertyChanged(nameof(SearchResultInfo));
+    }
 
+    /// <summary>选中指定图片并滚动到可见区域</summary>
+    private void SelectAndScrollToImage(string targetPath)
+    {
         var item = Images.FirstOrDefault(i =>
             string.Equals(i.FilePath, targetPath, StringComparison.OrdinalIgnoreCase));
+
         if (item != null)
         {
-            foreach (var img in Images) img.IsSelected = false;
+            foreach (var img in Images)
+                img.IsSelected = false;
+
             item.IsSelected = true;
+
             Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(
                 () => ScrollToSelectedRequested?.Invoke(),
                 Avalonia.Threading.DispatcherPriority.Background);
         }
-
-        OnPropertyChanged(nameof(SearchResultInfo));
     }
 
     [RelayCommand]
