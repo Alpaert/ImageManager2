@@ -256,6 +256,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private Dictionary<string, List<string>> _tagCacheByPath = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, ImageMeta> _metaCache = new(StringComparer.OrdinalIgnoreCase);
     [ObservableProperty] private ImageSortOrder _currentSortOrder = ImageSortOrder.FileNameAsc;
+    private int _folderViewRequestVersion;
     private CancellationTokenSource? _searchCts;
     private CancellationTokenSource? _precomputeCts;
     private FileSystemWatcher? _folderWatcher;
@@ -515,6 +516,9 @@ public partial class MainWindowViewModel : ViewModelBase
 
     public async Task LoadFolderAsync(string folder)
     {
+        var requestVersion = BeginFolderViewRequest();
+        var showAllSubfolders = ShowAllSubfolders;
+
         if (!Directory.Exists(folder))
         {
             // Try to relocate if this was a previously imported folder
@@ -543,6 +547,12 @@ public partial class MainWindowViewModel : ViewModelBase
         CurrentFolder = folder;
         StartWatchingCurrentFolder();
         await Task.Yield();
+
+        if (showAllSubfolders)
+        {
+            await RebuildFileListAsync(requestVersion, folder, true);
+            return;
+        }
 
         // Check if this folder already has FolderId markers in DB
         var folderInfo = await _folderRepo.GetByPathAsync(folder);
@@ -688,7 +698,6 @@ public partial class MainWindowViewModel : ViewModelBase
 
         StatusText = $"总文件数: {_allFiles.Count}";
         await ShowPageAsync(startPage2);
-        if (ShowAllSubfolders) _ = RebuildFileListAsync();
     }
 
     /// <summary>Public wrapper for code-behind: sync current folder and refresh UI, then compute missing hashes</summary>
@@ -1149,7 +1158,9 @@ partial void OnCornerRadiusDipChanged(double value)
     {
         if (value) SearchScope = 1; // auto-switch to recursive
         if (string.IsNullOrEmpty(CurrentFolder)) return;
-        _ = RebuildFileListAsync();
+        var requestVersion = BeginFolderViewRequest();
+        var folder = CurrentFolder;
+        _ = RebuildFileListAsync(requestVersion, folder, value);
     }
 
     partial void OnFolderSearchTextChanged(string value)
@@ -1191,7 +1202,7 @@ partial void OnCornerRadiusDipChanged(double value)
             ClearHighlightRecursive(child);
     }
 
-    public async Task ExpandAndHighlightFolderAsync(string targetPath)
+    public async Task<FolderTreeNode?> ExpandAndHighlightFolderAsync(string targetPath, bool syncSelection = false)
     {
         ClearSearchHighlight();
         var parts = new List<string>();
@@ -1208,7 +1219,7 @@ partial void OnCornerRadiusDipChanged(double value)
         {
             if (FindNodeByPath(parts[startIdx]) != null) break;
         }
-        if (startIdx < 0) return; // no part exists in tree
+        if (startIdx < 0) return null; // no part exists in tree
 
         // Expand from found ancestor down to target
         FolderTreeNode? node = null;
@@ -1226,29 +1237,50 @@ partial void OnCornerRadiusDipChanged(double value)
         if (node != null)
         {
             node.IsSearchHighlight = true;
+            if (syncSelection)
+            {
+                _isProgrammaticFolderSelection = true;
+                SelectedFolderNode = node;
+                _isProgrammaticFolderSelection = false;
+            }
             Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(
                 () => TreeScrollToNodeRequested?.Invoke(node),
                 Avalonia.Threading.DispatcherPriority.Background);
         }
+        return node;
     }
 
-    public async Task RebuildFileListAsync()
+    public Task RebuildFileListAsync()
     {
-        _allFiles = ShowAllSubfolders
-            ? GetImageFilesRecursive(CurrentFolder)
+        var requestVersion = BeginFolderViewRequest();
+        return RebuildFileListAsync(requestVersion, CurrentFolder, ShowAllSubfolders);
+    }
+
+    private async Task RebuildFileListAsync(int requestVersion, string folderPath, bool showAllSubfolders)
+    {
+        if (string.IsNullOrEmpty(folderPath) || !Directory.Exists(folderPath))
+            return;
+
+        var rebuiltFiles = showAllSubfolders
+            ? GetImageFilesRecursive(folderPath)
             : await Task.Run(() =>
-                Directory.EnumerateFiles(CurrentFolder, "*.*", SearchOption.TopDirectoryOnly)
+                Directory.EnumerateFiles(folderPath, "*.*", SearchOption.TopDirectoryOnly)
                     .Where(f => new[] { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" }
                         .Contains(Path.GetExtension(f).ToLower()))
                     .ToList());
 
+        if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
+            return;
+
         // Preload tags for subfolder files BEFORE SortImagesAsync (which triggers ShowPageAsync)
         int subTagCount = 0;
-        if (ShowAllSubfolders)
+        if (showAllSubfolders)
         {
             try
             {
-                var metas = await Task.Run(() => _metaRepo.GetByFolderAsync(CurrentFolder));
+                var metas = await Task.Run(() => _metaRepo.GetByFolderAsync(folderPath));
+                if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
+                    return;
                 foreach (var m in metas)
                 {
                     _metaCache[m.FilePath] = m;
@@ -1262,21 +1294,100 @@ partial void OnCornerRadiusDipChanged(double value)
             catch { }
         }
 
-        // Apply current sort (with folder grouping if ShowAllSubfolders)
-        await SortImagesAsync(CurrentSortOrder);
+        await SortFilesAsync(rebuiltFiles, CurrentSortOrder, showAllSubfolders);
+        if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
+            return;
+
+        _allFiles = rebuiltFiles;
+        _tagSearch.SearchResultFiles.Sort(CreateSortComparison(CurrentSortOrder));
+        _orientationFilteredFiles.Clear();
+
+        var active = ActiveFileList;
+        TotalPages = active.Count == 0 ? 0 : (active.Count + PageManager.PageSize - 1) / PageManager.PageSize;
+        PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
+        _pageManager.InvalidateCache();
+
+        if (active.Count == 0)
+        {
+            Images = new ObservableCollection<ImageViewItem>();
+        }
+        else
+        {
+            await ShowPageAsync(0);
+        }
 
         StatusText = subTagCount > 0
             ? $"总文件数: {_allFiles.Count} (含子文件夹) | 标签: {subTagCount}"
             : $"总文件数: {_allFiles.Count}";
 
-        if (ShowAllSubfolders)
+        if (showAllSubfolders)
         {
             _ = Task.Run(async () =>
             {
                 await Task.Delay(3000);
-                await PrecomputeHashesAsync(CancellationToken.None, (await _folderRepo.GetByPathAsync(CurrentFolder))?.Id);
+                if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
+                    return;
+                await PrecomputeHashesAsync(CancellationToken.None, (await _folderRepo.GetByPathAsync(folderPath))?.Id);
             });
         }
+    }
+
+    private int BeginFolderViewRequest()
+    {
+        return Interlocked.Increment(ref _folderViewRequestVersion);
+    }
+
+    private bool IsFolderViewRequestCurrent(int requestVersion, string folderPath, bool showAllSubfolders)
+    {
+        return Volatile.Read(ref _folderViewRequestVersion) == requestVersion
+            && string.Equals(CurrentFolder, folderPath, StringComparison.OrdinalIgnoreCase)
+            && ShowAllSubfolders == showAllSubfolders;
+    }
+
+    private Comparison<string> CreateSortComparison(ImageSortOrder order)
+    {
+        return order switch
+        {
+            ImageSortOrder.FileNameAsc => (a, b) =>
+                string.Compare(Path.GetFileName(a), Path.GetFileName(b), StringComparison.OrdinalIgnoreCase),
+            ImageSortOrder.FileNameDesc => (a, b) =>
+                string.Compare(Path.GetFileName(b), Path.GetFileName(a), StringComparison.OrdinalIgnoreCase),
+            ImageSortOrder.ModifiedAsc => (a, b) =>
+                GetMetaTicks(a).CompareTo(GetMetaTicks(b)),
+            ImageSortOrder.ModifiedDesc => (a, b) =>
+                GetMetaTicks(b).CompareTo(GetMetaTicks(a)),
+            ImageSortOrder.FileSizeAsc => (a, b) =>
+                GetMetaFileSize(a).CompareTo(GetMetaFileSize(b)),
+            ImageSortOrder.FileSizeDesc => (a, b) =>
+                GetMetaFileSize(b).CompareTo(GetMetaFileSize(a)),
+            ImageSortOrder.ResolutionAsc => (a, b) =>
+                GetMetaResolution(a).CompareTo(GetMetaResolution(b)),
+            ImageSortOrder.ResolutionDesc => (a, b) =>
+                GetMetaResolution(b).CompareTo(GetMetaResolution(a)),
+            _ => (a, b) => 0
+        };
+    }
+
+    private async Task SortFilesAsync(List<string> files, ImageSortOrder order, bool showAllSubfolders)
+    {
+        var comparison = CreateSortComparison(order);
+        await Task.Run(() =>
+        {
+            if (showAllSubfolders)
+            {
+                files.Sort((a, b) =>
+                {
+                    int dirCmp = string.Compare(
+                        Path.GetDirectoryName(a), Path.GetDirectoryName(b),
+                        StringComparison.OrdinalIgnoreCase);
+                    return dirCmp != 0 ? dirCmp : comparison(a, b);
+                });
+            }
+            else
+            {
+                files.Sort(comparison);
+            }
+        });
     }
 
     // ==================== Tag Search ====================
@@ -1516,48 +1627,10 @@ partial void OnCornerRadiusDipChanged(double value)
     {
         CurrentSortOrder = order;
 
-        var files = (_allFiles.Count > 0 ? _allFiles : null);
-        if (files == null) return;
+        if (_allFiles.Count == 0) return;
 
-        var comparison = order switch
-        {
-            ImageSortOrder.FileNameAsc => (Comparison<string>)((a, b) =>
-                string.Compare(Path.GetFileName(a), Path.GetFileName(b), StringComparison.OrdinalIgnoreCase)),
-            ImageSortOrder.FileNameDesc => (a, b) =>
-                string.Compare(Path.GetFileName(b), Path.GetFileName(a), StringComparison.OrdinalIgnoreCase),
-            ImageSortOrder.ModifiedAsc => (a, b) =>
-                GetMetaTicks(a).CompareTo(GetMetaTicks(b)),
-            ImageSortOrder.ModifiedDesc => (a, b) =>
-                GetMetaTicks(b).CompareTo(GetMetaTicks(a)),
-            ImageSortOrder.FileSizeAsc => (a, b) =>
-                GetMetaFileSize(a).CompareTo(GetMetaFileSize(b)),
-            ImageSortOrder.FileSizeDesc => (a, b) =>
-                GetMetaFileSize(b).CompareTo(GetMetaFileSize(a)),
-            ImageSortOrder.ResolutionAsc => (a, b) =>
-                GetMetaResolution(a).CompareTo(GetMetaResolution(b)),
-            ImageSortOrder.ResolutionDesc => (a, b) =>
-                GetMetaResolution(b).CompareTo(GetMetaResolution(a)),
-            _ => (a, b) => 0
-        };
-
-        await Task.Run(() =>
-        {
-            if (ShowAllSubfolders)
-            {
-                files.Sort((a, b) =>
-                {
-                    int dirCmp = string.Compare(
-                        Path.GetDirectoryName(a), Path.GetDirectoryName(b),
-                        StringComparison.OrdinalIgnoreCase);
-                    return dirCmp != 0 ? dirCmp : comparison(a, b);
-                });
-            }
-            else
-            {
-                files.Sort(comparison);
-            }
-        });
-        _tagSearch.SearchResultFiles.Sort(comparison);
+        await SortFilesAsync(_allFiles, order, ShowAllSubfolders);
+        _tagSearch.SearchResultFiles.Sort(CreateSortComparison(order));
         _orientationFilteredFiles.Clear();
 
         var active = ActiveFileList;
