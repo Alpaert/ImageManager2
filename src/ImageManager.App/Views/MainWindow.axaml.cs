@@ -1848,8 +1848,9 @@ public partial class MainWindow : Window
 
     private async void OnTreeScrollToNode(ViewModels.FolderTreeNode node)
     {
-        const int maxAttempts = 12;  // 增加到12次
-        const int delayMs = 50;
+        // 递增延迟重试：50ms, 100ms, 150ms, 200ms, 250ms, 300ms = 共 1050ms 总等待
+        // 首次展开子节点时 TreeViewItem 容器需要更多时间渲染
+        const int maxAttempts = 6;
 
         for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
@@ -1871,7 +1872,7 @@ public partial class MainWindow : Window
                     return true;
                 }
 
-                // === 改进：检测节点是否已在视野内 ===
+                // === 检测节点是否已在视野内 ===
                 var bounds = container.Bounds;
                 var containerY = container.TranslatePoint(new Avalonia.Point(0, 0), sv)?.Y ?? 0;
 
@@ -1895,10 +1896,10 @@ public partial class MainWindow : Window
 
             if (scrolled) return;
 
-            await Task.Delay(delayMs);
+            await Task.Delay(50 * (attempt + 1));  // 递增延迟
         }
 
-        // === 新增：滚动失败时的调试信息 ===
+        // === 滚动失败时的调试信息 ===
         System.Diagnostics.Debug.WriteLine($"[TreeScroll] Failed to scroll to node: {node.Path}");
     }
 

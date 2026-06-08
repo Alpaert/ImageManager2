@@ -1992,20 +1992,7 @@ partial void OnCornerRadiusDipChanged(double value)
             return;
         }
 
-        // === 阶段1.5：确保树容器已渲染（关键改进）===
-        if (shouldScroll)
-        {
-            var containerReady = await WaitForTreeContainerAsync(targetNode, IsCurrentNavigation);
-            if (!IsCurrentNavigation()) return;
-
-            // 如果容器未就绪，记录警告但继续
-            if (!containerReady)
-            {
-                StatusText = "树节点容器未就绪，滚动可能失败";
-            }
-        }
-
-        // === 阶段2：切换文件夹（如果需要）===
+        // === 阶段2：切换文件夹（轻量级 — 不调用 LoadFolderAsync，避免销毁缓存和搜索状态）===
         if (needSwitchFolder)
         {
             if (!Directory.Exists(targetDir))
@@ -2014,27 +2001,55 @@ partial void OnCornerRadiusDipChanged(double value)
                 return;
             }
 
+            // 轻量级文件枚举：仅加载目标文件夹的文件列表，不清除缓存和搜索状态
+            var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
+            var folderFiles = await Task.Run(() =>
+            {
+                try
+                {
+                    return Directory.EnumerateFiles(targetDir, "*.*", SearchOption.TopDirectoryOnly)
+                        .Where(f => exts.Contains(Path.GetExtension(f)))
+                        .ToList();
+                }
+                catch { return new List<string>(); }
+            });
+
+            if (!IsCurrentNavigation()) return;
+
+            if (folderFiles.Count == 0)
+            {
+                StatusText = "该文件夹内没有图片文件";
+                return;
+            }
+
+            // 更新文件列表并跳到目标文件所在页
+            _allFiles = folderFiles;
+            CurrentFolder = targetDir;
+            _pageManager.InvalidateCache();
+            TotalPages = (folderFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
+            PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
+
+            int fileIdx = folderFiles.FindIndex(f =>
+                string.Equals(f, targetPath, StringComparison.OrdinalIgnoreCase));
+            int page = fileIdx >= 0 ? fileIdx / PageManager.PageSize : 0;
+            await ShowPageAsync(page);
+            if (!IsCurrentNavigation()) return;
+
+            // 更新文件夹树选中状态（抑制 SelectionChanged 重入）
             _isProgrammaticFolderSelection = true;
             SelectedFolderNode = targetNode;
             AppSettings.LastFolder = targetDir;
             _isProgrammaticFolderSelection = false;
-
-            // 加载文件夹并等待完成
-            await LoadFolderAsync(targetDir, targetPath, IsCurrentNavigation);
-            if (!IsCurrentNavigation()) return;
-
-            // === 关键改进：等待 Images 集合更新，确保目标文件已加载 ===
-            await WaitForImagesUpdatedAsync(targetPath, IsCurrentNavigation);
-            if (!IsCurrentNavigation()) return;
         }
 
-        // === 阶段3：定位并显示目标图片 ===
+        // === 阶段3：定位并选中目标图片 ===
         var indexInList = ActiveFileList.FindIndex(f =>
             string.Equals(f, targetPath, StringComparison.OrdinalIgnoreCase));
 
         if (indexInList < 0)
         {
-            StatusText = $"目标图片不在当前列表中（列表长度：{ActiveFileList.Count}）";
+            StatusText = $"目标图片不在当前列表中";
             return;
         }
 
@@ -2105,12 +2120,15 @@ partial void OnCornerRadiusDipChanged(double value)
     }
 
     /// <summary>
-    /// 等待 Images 集合更新完成
+    /// 等待 Images 集合更新完成。
+    /// 如果 _imagesUpdatedTcs 已在外部提前创建（如在 LoadFolderAsync 之前），则复用已存在的 TCS，
+    /// 避免 PageChanged 事件在 LoadFolderAsync 内触发时 TCS 尚未创建的竞态问题。
     /// </summary>
     private async Task WaitForImagesUpdatedAsync(string targetPath, Func<bool>? isCurrent = null)
     {
-        // 创建信号并等待 PageChanged 事件触发
-        _imagesUpdatedTcs = new TaskCompletionSource<bool>();
+        // 复用已存在的 TCS（由 NavigateToResultAsync 在 LoadFolderAsync 之前创建），否则创建新的
+        if (_imagesUpdatedTcs == null)
+            _imagesUpdatedTcs = new TaskCompletionSource<bool>();
 
         using var cts = new CancellationTokenSource(5000); // 5秒超时
         using var registration = cts.Token.Register(() =>
@@ -2118,7 +2136,7 @@ partial void OnCornerRadiusDipChanged(double value)
 
         try
         {
-            // 精确等待 PageChanged 事件触发
+            // 等待 PageChanged 事件触发（可能已经在 LoadFolderAsync 内触发过了）
             await _imagesUpdatedTcs.Task;
 
             // 额外延迟确保UI绑定完成
