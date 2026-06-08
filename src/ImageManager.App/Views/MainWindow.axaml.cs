@@ -1821,7 +1821,10 @@ public partial class MainWindow : Window
 
     private async void OnScrollToSelected()
     {
-        for (var attempt = 0; attempt < 8; attempt++)
+        const int maxAttempts = 12;  // 增加到12次
+        const int delayMs = 50;
+
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
             var scrolled = await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
             {
@@ -1834,22 +1837,32 @@ public partial class MainWindow : Window
 
                 container.BringIntoView();
                 return true;
-            }, Avalonia.Threading.DispatcherPriority.Loaded);
+            }, Avalonia.Threading.DispatcherPriority.Loaded);  // 统一使用 Loaded
 
             if (scrolled) return;
-            await Task.Delay(50);
+            await Task.Delay(delayMs);
         }
+
+        System.Diagnostics.Debug.WriteLine("[ImageScroll] Failed to scroll to selected image");
     }
 
     private async void OnTreeScrollToNode(ViewModels.FolderTreeNode node)
     {
-        for (var attempt = 0; attempt < 8; attempt++)
+        const int maxAttempts = 12;  // 增加到12次
+        const int delayMs = 50;
+
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
             var scrolled = await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
             {
                 LstFolders.UpdateLayout();
                 var container = LstFolders.TreeContainerFromItem(node);
-                if (container == null) return false;
+
+                if (container == null)
+                {
+                    // 容器未就绪，继续重试
+                    return false;
+                }
 
                 var sv = LstFolders.FindDescendantOfType<ScrollViewer>();
                 if (sv == null)
@@ -1858,19 +1871,35 @@ public partial class MainWindow : Window
                     return true;
                 }
 
+                // === 改进：检测节点是否已在视野内 ===
                 var bounds = container.Bounds;
                 var containerY = container.TranslatePoint(new Avalonia.Point(0, 0), sv)?.Y ?? 0;
+
+                // 如果节点完全可见，无需滚动
+                if (containerY >= 0 && containerY + bounds.Height <= sv.Viewport.Height)
+                {
+                    return true;
+                }
+
+                // 计算目标偏移（居中显示）
                 double targetOffset = containerY - sv.Viewport.Height / 2 + bounds.Height / 2;
                 if (targetOffset < 0) targetOffset = 0;
+
                 double maxY = Math.Max(0, sv.Extent.Height - sv.Viewport.Height);
                 if (targetOffset > maxY) targetOffset = maxY;
+
                 sv.Offset = new Vector(0, targetOffset);
                 return true;
+
             }, Avalonia.Threading.DispatcherPriority.Loaded);
 
             if (scrolled) return;
-            await Task.Delay(50);
+
+            await Task.Delay(delayMs);
         }
+
+        // === 新增：滚动失败时的调试信息 ===
+        System.Diagnostics.Debug.WriteLine($"[TreeScroll] Failed to scroll to node: {node.Path}");
     }
 
     // ==================== Window Closing ====================

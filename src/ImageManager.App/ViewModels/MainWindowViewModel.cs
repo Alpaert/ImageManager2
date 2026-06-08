@@ -447,7 +447,9 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         FolderSearchText = string.Empty;
         IsFolderSearchPopupOpen = false;
-        await ExpandAndHighlightFolderAsync(folder.Path);
+
+        // 传递 syncSelection: true，让 ExpandAndHighlightFolderAsync 内部处理滚动
+        await ExpandAndHighlightFolderAsync(folder.Path, syncSelection: true);
 
         if (!Directory.Exists(folder.Path))
         {
@@ -461,7 +463,9 @@ public partial class MainWindowViewModel : ViewModelBase
         await LoadFolderAsync(folder.Path);
         await SaveSettingsAsync();
         _isProgrammaticFolderSelection = false;
-        TreeScrollToNodeRequested?.Invoke(folder);
+
+        // 删除显式滚动调用，避免双重滚动
+        // TreeScrollToNodeRequested?.Invoke(folder);
     }
 
     internal bool _isProgrammaticFolderSelection;
@@ -1273,10 +1277,10 @@ partial void OnCornerRadiusDipChanged(double value)
     public async Task<FolderTreeNode?> ExpandAndHighlightFolderAsync(
         string targetPath,
         bool syncSelection = false,
+        bool forceScroll = false,
         Func<bool>? isCurrent = null)
     {
         targetPath = NormalizePath(targetPath);
-        var targetWasAlreadyHighlighted = IsPathHighlighted(targetPath);
         if (isCurrent?.Invoke() == false)
             return null;
 
@@ -1392,11 +1396,6 @@ partial void OnCornerRadiusDipChanged(double value)
         // 4. 到达目标节点，高亮并滚动
         if (currentNode != null)
         {
-            if (targetWasAlreadyHighlighted)
-                await Task.Delay(45);
-            if (isCurrent?.Invoke() == false)
-                return null;
-
             currentNode.IsSearchHighlight = true;
 
             if (syncSelection)
@@ -1406,10 +1405,20 @@ partial void OnCornerRadiusDipChanged(double value)
                 _isProgrammaticFolderSelection = false;
             }
 
-            // 使用 Loaded 优先级确保 TreeView 容器已渲染
-            Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(
-                () => TreeScrollToNodeRequested?.Invoke(currentNode),
-                Avalonia.Threading.DispatcherPriority.Loaded);
+            // 滚动条件：
+            // 1. forceScroll=true: 强制滚动（以图搜图切换场景）
+            // 2. syncSelection=true: 需要选中节点，滚动确保可见
+            if (forceScroll || syncSelection)
+            {
+                // 延迟滚动请求，确保节点容器已渲染
+                await Task.Delay(50);
+                if (isCurrent?.Invoke() == false)
+                    return currentNode;
+
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(
+                    () => TreeScrollToNodeRequested?.Invoke(currentNode),
+                    Avalonia.Threading.DispatcherPriority.Loaded);
+            }
         }
 
         return currentNode;
@@ -1945,6 +1954,7 @@ partial void OnCornerRadiusDipChanged(double value)
 
     private async Task NavigateToResultAsync()
     {
+        // === 阶段0：版本控制 ===
         var navigationVersion = Interlocked.Increment(ref _resultNavigationVersion);
         bool IsCurrentNavigation() => navigationVersion == Volatile.Read(ref _resultNavigationVersion);
 
@@ -1954,98 +1964,75 @@ partial void OnCornerRadiusDipChanged(double value)
         var targetPath = files[_currentResultIndex];
         var targetDir = Path.GetDirectoryName(targetPath) ?? "";
 
-        // ===== 根据"全展示"状态分两种情况处理 =====
+        // === 阶段1：展开并高亮目标文件夹 ===
+        bool needSwitchFolder = !ShowAllSubfolders &&
+                                !string.Equals(CurrentFolder, targetDir, StringComparison.OrdinalIgnoreCase);
+        bool shouldScroll = ShowAllSubfolders || needSwitchFolder;
 
-        if (ShowAllSubfolders)
+        var targetNode = await ExpandAndHighlightFolderAsync(
+            targetDir,
+            syncSelection: false,
+            forceScroll: shouldScroll,
+            IsCurrentNavigation);
+
+        if (!IsCurrentNavigation()) return;
+        if (targetNode == null)
         {
-            // 场景 1：全展示模式
-            // - 左侧：展开、高亮、滚动到目标文件夹（但不改变选中节点）
-            // - 右侧：保持当前的全展示列表，直接定位图片
+            StatusText = "无法展开到目标文件夹";
+            return;
+        }
 
-            await ExpandAndHighlightFolderAsync(targetDir, syncSelection: false, IsCurrentNavigation);
+        // === 阶段1.5：确保树容器已渲染（关键改进）===
+        if (shouldScroll)
+        {
+            await WaitForTreeContainerAsync(targetNode, IsCurrentNavigation);
             if (!IsCurrentNavigation()) return;
+        }
 
-            // 在当前的 ActiveFileList 中查找目标图片
-            var indexInList = ActiveFileList.FindIndex(f =>
-                string.Equals(f, targetPath, StringComparison.OrdinalIgnoreCase));
-
-            if (indexInList < 0)
+        // === 阶段2：切换文件夹（如果需要）===
+        if (needSwitchFolder)
+        {
+            if (!Directory.Exists(targetDir))
             {
-                StatusText = "目标图片不在当前列表中";
+                StatusText = "目标文件夹不存在";
                 return;
             }
 
-            // 跳转到目标图片所在的页
-            int targetPage = indexInList / PageManager.PageSize;
-            if (targetPage != CurrentPage)
-                await ShowPageAsync(targetPage);
+            _isProgrammaticFolderSelection = true;
+            SelectedFolderNode = targetNode;
+            AppSettings.LastFolder = targetDir;
+            _isProgrammaticFolderSelection = false;
+
+            // 加载文件夹并等待完成
+            await LoadFolderAsync(targetDir, targetPath, IsCurrentNavigation);
             if (!IsCurrentNavigation()) return;
 
-            // 选中目标图片并滚动到可见区域
-            SelectAndScrollToImage(targetPath);
+            // === 关键改进：等待 Images 集合更新，确保目标文件已加载 ===
+            await WaitForImagesUpdatedAsync(targetPath, IsCurrentNavigation);
+            if (!IsCurrentNavigation()) return;
         }
-        else
+
+        // === 阶段3：定位并显示目标图片 ===
+        var indexInList = ActiveFileList.FindIndex(f =>
+            string.Equals(f, targetPath, StringComparison.OrdinalIgnoreCase));
+
+        if (indexInList < 0)
         {
-            // 场景 2：非全展示模式
-            // - 左侧：展开、高亮、滚动、选中目标文件夹节点
-            // - 右侧：切换到目标文件夹，只显示该文件夹的图片
-
-            // 检查目标图片是否在当前文件夹
-            bool needSwitchFolder = !string.Equals(CurrentFolder, targetDir, StringComparison.OrdinalIgnoreCase);
-
-            if (needSwitchFolder)
-            {
-                // 需要切换文件夹：展开树、更新选中节点、加载文件夹
-                var targetNode = await ExpandAndHighlightFolderAsync(targetDir, syncSelection: false, IsCurrentNavigation);
-                if (!IsCurrentNavigation()) return;
-
-                if (targetNode == null)
-                {
-                    StatusText = $"无法展开到目标文件夹";
-                    return;
-                }
-
-                if (!Directory.Exists(targetDir))
-                {
-                    StatusText = "目标文件夹不存在";
-                    return;
-                }
-
-                _isProgrammaticFolderSelection = true;
-                SelectedFolderNode = targetNode;
-                AppSettings.LastFolder = targetDir;
-                _isProgrammaticFolderSelection = false;
-                TreeScrollToNodeRequested?.Invoke(targetNode);
-
-                await LoadFolderAsync(targetDir, targetPath, IsCurrentNavigation);
-                if (!IsCurrentNavigation()) return;
-            }
-            else
-            {
-                // 目标图片在当前文件夹，只需要确保树高亮
-                await ExpandAndHighlightFolderAsync(targetDir, syncSelection: false, IsCurrentNavigation);
-                if (!IsCurrentNavigation()) return;
-            }
-
-            // 在当前文件夹的列表中查找目标图片
-            var indexInList = ActiveFileList.FindIndex(f =>
-                string.Equals(f, targetPath, StringComparison.OrdinalIgnoreCase));
-
-            if (indexInList < 0)
-            {
-                StatusText = "目标图片不在当前文件夹中";
-                return;
-            }
-
-            // 跳转到目标图片所在的页
-            int targetPage = indexInList / PageManager.PageSize;
-            if (targetPage != CurrentPage)
-                await ShowPageAsync(targetPage);
-            if (!IsCurrentNavigation()) return;
-
-            // 选中目标图片并滚动到可见区域
-            SelectAndScrollToImage(targetPath);
+            StatusText = $"目标图片不在当前列表中（列表长度：{ActiveFileList.Count}）";
+            return;
         }
+
+        // 切换到目标页
+        int targetPage = indexInList / PageManager.PageSize;
+        if (targetPage != CurrentPage)
+        {
+            await ShowPageAsync(targetPage);
+            if (!IsCurrentNavigation()) return;
+        }
+
+        // 选中并滚动到图片
+        await SelectAndScrollToImageAsync(targetPath, IsCurrentNavigation);
+        if (!IsCurrentNavigation()) return;
 
         OnPropertyChanged(nameof(SearchResultInfo));
     }
@@ -2067,6 +2054,82 @@ partial void OnCornerRadiusDipChanged(double value)
                 () => ScrollToSelectedRequested?.Invoke(),
                 Avalonia.Threading.DispatcherPriority.Background);
         }
+    }
+
+    /// <summary>
+    /// 等待树节点的UI容器生成完成
+    /// </summary>
+    private async Task WaitForTreeContainerAsync(FolderTreeNode node, Func<bool>? isCurrent = null)
+    {
+        const int maxAttempts = 10;
+        const int delayMs = 30;
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            if (isCurrent?.Invoke() == false) return;
+
+            var containerReady = await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                return TreeScrollToNodeRequested?.GetInvocationList().Length > 0;
+            }, Avalonia.Threading.DispatcherPriority.Loaded);
+
+            if (containerReady)
+            {
+                await Task.Delay(delayMs);
+                return;
+            }
+
+            await Task.Delay(delayMs);
+        }
+    }
+
+    /// <summary>
+    /// 等待 Images 集合更新完成
+    /// </summary>
+    private async Task WaitForImagesUpdatedAsync(string targetPath, Func<bool>? isCurrent = null)
+    {
+        const int maxAttempts = 40;  // 2000ms 总超时
+        const int delayMs = 50;
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            if (isCurrent?.Invoke() == false) return;
+
+            // 简化等待条件：只要 Images 非空即可
+            // 不检查具体路径，因为事件处理器异步执行，路径比较不可靠
+            if (Images.Count > 0)
+            {
+                await Task.Delay(50);  // 额外延迟确保UI绑定完成
+                return;
+            }
+
+            await Task.Delay(delayMs);
+        }
+    }
+
+    /// <summary>
+    /// 异步选中并滚动到指定图片
+    /// </summary>
+    private async Task SelectAndScrollToImageAsync(string targetPath, Func<bool>? isCurrent = null)
+    {
+        var item = Images.FirstOrDefault(i =>
+            string.Equals(i.FilePath, targetPath, StringComparison.OrdinalIgnoreCase));
+
+        if (item == null) return;
+
+        foreach (var img in Images)
+            img.IsSelected = false;
+
+        item.IsSelected = true;
+
+        await Task.Delay(20);
+        if (isCurrent?.Invoke() == false) return;
+
+        await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(
+            () => ScrollToSelectedRequested?.Invoke(),
+            Avalonia.Threading.DispatcherPriority.Loaded);
+
+        await Task.Delay(100);
     }
 
     [RelayCommand]
