@@ -264,6 +264,9 @@ public partial class MainWindowViewModel : ViewModelBase
     private CancellationTokenSource? _widthDebounceCts;
     private int _resultNavigationVersion;
 
+    // 用于精确等待 Images 集合更新完成的信号
+    private TaskCompletionSource<bool>? _imagesUpdatedTcs;
+
     private readonly ImageManager.Infrastructure.Services.ArtistEmbeddingStore _artistStore;
     private readonly ImageManager.Infrastructure.Services.ChineseTagLibrary _chineseLib;
 
@@ -299,6 +302,9 @@ public partial class MainWindowViewModel : ViewModelBase
             CurrentPage = args.PageIndex;
             _isNavigating = false;
             LoadedInfoText = args.LoadedInfoText;
+
+            // 发送 Images 更新完成信号
+            _imagesUpdatedTcs?.TrySetResult(true);
         };
 
         _tagSearch.SearchCompleted += result =>
@@ -1410,14 +1416,18 @@ partial void OnCornerRadiusDipChanged(double value)
             // 2. syncSelection=true: 需要选中节点，滚动确保可见
             if (forceScroll || syncSelection)
             {
-                // 延迟滚动请求，确保节点容器已渲染
-                await Task.Delay(50);
-                if (isCurrent?.Invoke() == false)
-                    return currentNode;
+                // 多次重试滚动，递增延迟以应对大型树渲染
+                for (int retry = 0; retry < 3; retry++)
+                {
+                    if (isCurrent?.Invoke() == false)
+                        return currentNode;
 
-                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(
-                    () => TreeScrollToNodeRequested?.Invoke(currentNode),
-                    Avalonia.Threading.DispatcherPriority.Loaded);
+                    await Task.Delay(50 * (retry + 1));  // 50ms, 100ms, 150ms
+
+                    await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(
+                        () => TreeScrollToNodeRequested?.Invoke(currentNode),
+                        Avalonia.Threading.DispatcherPriority.Loaded);
+                }
             }
         }
 
@@ -1985,8 +1995,14 @@ partial void OnCornerRadiusDipChanged(double value)
         // === 阶段1.5：确保树容器已渲染（关键改进）===
         if (shouldScroll)
         {
-            await WaitForTreeContainerAsync(targetNode, IsCurrentNavigation);
+            var containerReady = await WaitForTreeContainerAsync(targetNode, IsCurrentNavigation);
             if (!IsCurrentNavigation()) return;
+
+            // 如果容器未就绪，记录警告但继续
+            if (!containerReady)
+            {
+                StatusText = "树节点容器未就绪，滚动可能失败";
+            }
         }
 
         // === 阶段2：切换文件夹（如果需要）===
@@ -2059,28 +2075,33 @@ partial void OnCornerRadiusDipChanged(double value)
     /// <summary>
     /// 等待树节点的UI容器生成完成
     /// </summary>
-    private async Task WaitForTreeContainerAsync(FolderTreeNode node, Func<bool>? isCurrent = null)
+    private async Task<bool> WaitForTreeContainerAsync(FolderTreeNode node, Func<bool>? isCurrent = null)
     {
-        const int maxAttempts = 10;
-        const int delayMs = 30;
+        const int maxAttempts = 20;  // 增加到20次，1秒总等待
+        const int delayMs = 50;
 
         for (int attempt = 0; attempt < maxAttempts; attempt++)
         {
-            if (isCurrent?.Invoke() == false) return;
+            if (isCurrent?.Invoke() == false) return false;
 
-            var containerReady = await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+            var ready = await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
             {
-                return TreeScrollToNodeRequested?.GetInvocationList().Length > 0;
+                // 改进检测：节点已展开且子节点已加载
+                return TreeScrollToNodeRequested?.GetInvocationList().Length > 0
+                       && node.IsExpanded
+                       && node.ChildrenLoaded;
             }, Avalonia.Threading.DispatcherPriority.Loaded);
 
-            if (containerReady)
+            if (ready)
             {
-                await Task.Delay(delayMs);
-                return;
+                await Task.Delay(100);  // 更长的稳定时间
+                return true;
             }
 
             await Task.Delay(delayMs);
         }
+
+        return false;  // 超时返回false
     }
 
     /// <summary>
@@ -2088,22 +2109,32 @@ partial void OnCornerRadiusDipChanged(double value)
     /// </summary>
     private async Task WaitForImagesUpdatedAsync(string targetPath, Func<bool>? isCurrent = null)
     {
-        const int maxAttempts = 40;  // 2000ms 总超时
-        const int delayMs = 50;
+        // 创建信号并等待 PageChanged 事件触发
+        _imagesUpdatedTcs = new TaskCompletionSource<bool>();
 
-        for (int attempt = 0; attempt < maxAttempts; attempt++)
+        using var cts = new CancellationTokenSource(5000); // 5秒超时
+        using var registration = cts.Token.Register(() =>
+            _imagesUpdatedTcs.TrySetCanceled());
+
+        try
         {
+            // 精确等待 PageChanged 事件触发
+            await _imagesUpdatedTcs.Task;
+
+            // 额外延迟确保UI绑定完成
+            await Task.Delay(50);
+
+            // 再次检查导航版本
             if (isCurrent?.Invoke() == false) return;
-
-            // 简化等待条件：只要 Images 非空即可
-            // 不检查具体路径，因为事件处理器异步执行，路径比较不可靠
-            if (Images.Count > 0)
-            {
-                await Task.Delay(50);  // 额外延迟确保UI绑定完成
-                return;
-            }
-
-            await Task.Delay(delayMs);
+        }
+        catch (OperationCanceledException)
+        {
+            // 超时或取消
+            StatusText = "图片加载超时";
+        }
+        finally
+        {
+            _imagesUpdatedTcs = null;
         }
     }
 
