@@ -298,7 +298,7 @@ public partial class MainWindow : Window
         double maxY = Math.Max(0, sv.Extent.Height - sv.Viewport.Height);
         if (maxY <= 0) return;
 
-        double scrollAmount = e.Delta.Y * 100;
+        double scrollAmount = e.Delta.Y * 400;
         double startY = sv.Offset.Y;
         double targetY = Math.Clamp(startY - scrollAmount, 0, maxY);
 
