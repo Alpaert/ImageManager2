@@ -499,6 +499,49 @@ public class ImageMetaRepository : IImageMetaRepository
         return results.ToList();
     }
 
+    public async Task<List<string>> GetFilePathsExcludingTagsAsync(List<string> excludeTags, bool requireAll)
+    {
+        using var conn = _db.CreateConnection();
+        if (requireAll)
+        {
+            // Exclude files that have ALL specified tags
+            var sql = @"
+                SELECT im.FilePath
+                FROM ImageMeta im
+                WHERE im.FilePath NOT IN (
+                    SELECT im2.FilePath
+                    FROM ImageMeta im2
+                    INNER JOIN ImageTag it2 ON im2.Id = it2.ImageMetaId
+                    INNER JOIN Tag t2 ON it2.TagId = t2.Id
+                    WHERE t2.Name IN @ExcludeTags COLLATE NOCASE
+                    GROUP BY im2.FilePath
+                    HAVING COUNT(DISTINCT t2.Name) = @TagCount
+                )
+                ORDER BY im.FilePath";
+            var result = await conn.QueryAsync<string>(sql,
+                new { ExcludeTags = excludeTags, TagCount = excludeTags.Count });
+            return result.AsList();
+        }
+        else
+        {
+            // Exclude files that have ANY of the specified tags
+            var sql = @"
+                SELECT im.FilePath
+                FROM ImageMeta im
+                WHERE im.FilePath NOT IN (
+                    SELECT DISTINCT im2.FilePath
+                    FROM ImageMeta im2
+                    INNER JOIN ImageTag it2 ON im2.Id = it2.ImageMetaId
+                    INNER JOIN Tag t2 ON it2.TagId = t2.Id
+                    WHERE t2.Name IN @ExcludeTags COLLATE NOCASE
+                )
+                ORDER BY im.FilePath";
+            var result = await conn.QueryAsync<string>(sql,
+                new { ExcludeTags = excludeTags });
+            return result.AsList();
+        }
+    }
+
     public async Task<List<string>> GetFilePathsWithNoTagsAsync()
     {
         using var conn = _db.CreateConnection();

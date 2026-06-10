@@ -147,19 +147,71 @@ public class TagSearchController
             return;
         }
 
+        // Normalize leading "-" for pure-exclude: "-tag" → " - tag"
+        if (raw.StartsWith('-') && !raw.Contains(" - ", StringComparison.OrdinalIgnoreCase))
+        {
+            raw = " - " + raw[1..].TrimStart();
+        }
+
         // Parse " - " first: left side = include, right side = exclude
         List<string> excludeTags = new();
+        bool excludeIsAnd = false;
         string includePart;
         if (raw.Contains(" - ", StringComparison.OrdinalIgnoreCase))
         {
             var parts = raw.Split(new[] { " - " }, 2, StringSplitOptions.None);
             includePart = parts[0].Trim();
-            excludeTags = parts[1].Split(new[] { " o " }, StringSplitOptions.None)
-                               .Select(t => t.Trim()).Where(t => t.Length > 0).ToList();
+            var excludePart = parts[1].Trim();
+            if (excludePart.Contains(" a ", StringComparison.OrdinalIgnoreCase))
+            {
+                excludeTags = excludePart.Split(new[] { " a " }, StringSplitOptions.None)
+                                       .Select(t => t.Trim()).Where(t => t.Length > 0).ToList();
+                excludeIsAnd = true;
+            }
+            else
+            {
+                excludeTags = excludePart.Split(new[] { " o " }, StringSplitOptions.None)
+                                       .Select(t => t.Trim()).Where(t => t.Length > 0).ToList();
+            }
         }
         else
         {
             includePart = raw;
+        }
+
+        // Pure-exclude mode: no include tags, only exclude tags
+        if (string.IsNullOrWhiteSpace(includePart) && excludeTags.Count > 0)
+        {
+            var excludedPaths = await _metaRepo.GetFilePathsExcludingTagsAsync(excludeTags, excludeIsAnd);
+            var pureFileSet = new HashSet<string>(allFiles, StringComparer.OrdinalIgnoreCase);
+            SearchResultFiles = excludedPaths.Where(p => pureFileSet.Contains(p)).ToList();
+
+            if (SearchResultFiles.Count == 0)
+            {
+                SearchCompleted?.Invoke(new TagSearchResult
+                {
+                    HasResults = true, TotalPages = 0,
+                    StatusText = "排除标签: 未找到匹配的图片"
+                });
+                return;
+            }
+
+            _coTagMode = true;
+            _lastSearchText = raw;
+
+            var pureTotalPages = (SearchResultFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
+            var exclDesc = excludeIsAnd ? string.Join(" 且 ", excludeTags) : string.Join(" 或 ", excludeTags);
+            SearchCompleted?.Invoke(new TagSearchResult
+            {
+                ResultFiles = SearchResultFiles,
+                TotalPages = pureTotalPages,
+                StatusText = $"排除标签（{exclDesc}）: 找到 {SearchResultFiles.Count} 张图片",
+                HasResults = true,
+                OpName = "排除"
+            });
+
+            _ = RefreshCoTagSuggestionsAsync(setSuggestions);
+            return;
         }
 
         // Parse " e " = AND-each, " a " = AND-all, " o " = OR
@@ -292,7 +344,7 @@ public class TagSearchController
     public string SearchBoxBorderColor(string text)
     {
         var t = text ?? "";
-        if (t.Contains(" - ", StringComparison.OrdinalIgnoreCase))
+        if (t.StartsWith('-') || t.Contains(" - ", StringComparison.OrdinalIgnoreCase))
             return "#E8A0A0";
         if (t.Contains(" e ", StringComparison.OrdinalIgnoreCase))
             return "#8CB8E8";
@@ -380,15 +432,37 @@ public class TagSearchController
     {
         if (string.IsNullOrWhiteSpace(text)) return string.Empty;
 
+        // Pure-exclude mode: strip leading "-" for suggestion matching
+        var t = text.TrimStart();
+        if (t.StartsWith('-') && !t.Contains(" - ", StringComparison.OrdinalIgnoreCase))
+        {
+            t = t[1..].TrimStart();
+            var parts = t.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            return parts.LastOrDefault() ?? string.Empty;
+        }
+
         var segments = text.Split(new[] { " a ", " o ", " e ", " - " }, StringSplitOptions.None);
         var lastSegment = segments.LastOrDefault()?.Trim() ?? string.Empty;
 
-        var parts = lastSegment.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        return parts.LastOrDefault() ?? string.Empty;
+        var segmentParts = lastSegment.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        return segmentParts.LastOrDefault() ?? string.Empty;
     }
 
     internal static string ReplaceActiveToken(string text, string tagName)
     {
+        // Pure-exclude mode: text starts with "-" and has no " - " separator
+        var trimmedStart = text.TrimStart();
+        if (trimmedStart.StartsWith('-') && !text.Contains(" - ", StringComparison.OrdinalIgnoreCase))
+        {
+            // Find where the active token begins (after leading "-" and any spaces)
+            var dashIdx = text.IndexOf('-');
+            var afterDash = text[(dashIdx + 1)..];
+            var lastSpaceIdx = afterDash.LastIndexOf(' ');
+            if (lastSpaceIdx >= 0)
+                return text[..(dashIdx + 1 + lastSpaceIdx + 1)] + tagName;
+            return text[..(dashIdx + 1)] + tagName;
+        }
+
         var operators = new[] { " a ", " o ", " e ", " - " };
 
         int lastSepIdx = -1;
@@ -408,9 +482,9 @@ public class TagSearchController
         if (startIdx < text.Length)
         {
             var afterSep = text[startIdx..];
-            var lastSpaceIdx = afterSep.LastIndexOf(' ');
-            if (lastSpaceIdx >= 0)
-                startIdx += lastSpaceIdx + 1;
+            var lastSpaceIdx2 = afterSep.LastIndexOf(' ');
+            if (lastSpaceIdx2 >= 0)
+                startIdx += lastSpaceIdx2 + 1;
         }
 
         return text[..startIdx] + tagName;

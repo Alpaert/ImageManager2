@@ -30,6 +30,7 @@ public interface IImageMetaRepository
     Task<List<string>> GetFilePathsByTagsAsync(List<string> tagNames, bool requireAll);
     Task<List<string>> GetFilePathsByTagsExcludingAsync(List<string> includeTags, bool requireAll, List<string> excludeTags);
     Task<List<string>> GetFilePathsByTagAndEachAsync(List<string> baseTags, bool requireAllBase, List<string> eachTags, List<string>? excludeTags = null);
+    Task<List<string>> GetFilePathsExcludingTagsAsync(List<string> excludeTags, bool requireAll);
     Task<List<string>> GetFilePathsWithNoTagsAsync();
     Task<List<TagCount>> GetCoOccurringTagsAsync(List<string> filePaths, List<string>? excludeNames = null, string? nameFilter = null);
 
