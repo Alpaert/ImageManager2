@@ -876,7 +876,6 @@ public partial class MainWindow : Window
 
     private async Task<bool> EditTagForItemAsync(ImageViewItem item)
     {
-        await Vm.RefreshTagCountsAsync();
         var allTags = Vm.GetAllTagCounts();
 
         var tagVm = new TagEditViewModel(
@@ -927,7 +926,7 @@ public partial class MainWindow : Window
             await Vm.SetImageTagsAsync(item.FilePath, newTags);
             item.Tags = newTags;
             item.NotifyAll();
-            await Vm.RefreshTagCountsAsync();
+            await Vm.RefreshTagCountsAsync(forceRefresh: true);
             await Vm.SaveSettingsAsync();
         }
 
@@ -936,7 +935,6 @@ public partial class MainWindow : Window
 
     private async Task EditTagsForItemsAsync(List<ImageViewItem> items)
     {
-        await Vm.RefreshTagCountsAsync();
         var allTags = Vm.GetAllTagCounts();
 
         // 计算交集：所有选中图片共有的 tag
@@ -987,7 +985,7 @@ public partial class MainWindow : Window
 
         foreach (var item in items)
             item.NotifyAll();
-        await Vm.RefreshTagCountsAsync();
+        await Vm.RefreshTagCountsAsync(forceRefresh: true);
     }
 
     private async void MenuClearSelectedTags_Click(object? sender, RoutedEventArgs e)

@@ -36,6 +36,12 @@ public partial class MainWindowViewModel : ViewModelBase
     private readonly IDuplicateService _duplicateService;
     private readonly ThumbnailCacheService _thumbCache;
 
+    // Tag counts cache
+    private List<TagCount>? _cachedTagCounts;
+    private DateTime _tagCountsCacheTime = DateTime.MinValue;
+    private readonly TimeSpan _tagCountsCacheDuration = TimeSpan.FromMinutes(5);
+    private readonly object _tagCountsCacheLock = new();
+
     // ==================== Settings ====================
     [ObservableProperty] private AppSettings _appSettings = new();
 
@@ -254,6 +260,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private readonly ConcurrentDictionary<string, string> _phashCache = new(StringComparer.OrdinalIgnoreCase);
 
     private Dictionary<string, List<string>> _tagCacheByPath = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _tagCacheLock = new();
     private Dictionary<string, ImageMeta> _metaCache = new(StringComparer.OrdinalIgnoreCase);
     [ObservableProperty] private ImageSortOrder _currentSortOrder = ImageSortOrder.FileNameAsc;
     private int _folderViewRequestVersion;
@@ -563,7 +570,10 @@ public partial class MainWindowViewModel : ViewModelBase
         _allFiles.Clear();
         _pageManager.InvalidateCache();
         _phashCache.Clear();
-        _tagCacheByPath.Clear();
+        lock (_tagCacheLock)
+        {
+            _tagCacheByPath.Clear();
+        }
         _metaCache.Clear();
         BackgroundStatusText = "";
         CurrentPage = 0;
@@ -613,13 +623,16 @@ public partial class MainWindowViewModel : ViewModelBase
                 StatusText = $"总文件数: {_allFiles.Count}";
 
                 int totalTaggedFromDb = 0;
-                foreach (var m in indexedFiles)
+                lock (_tagCacheLock)
                 {
-                    _metaCache[m.FilePath] = m;
-                    if (m.Tags.Count > 0)
+                    foreach (var m in indexedFiles)
                     {
-                        _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
-                        totalTaggedFromDb++;
+                        _metaCache[m.FilePath] = m;
+                        if (m.Tags.Count > 0)
+                        {
+                            _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
+                            totalTaggedFromDb++;
+                        }
                     }
                 }
 
@@ -700,13 +713,16 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 var metas = await _metaRepo.GetByFolderAsync(folder);
                 int dbTagged = 0;
-                foreach (var m in metas)
+                lock (_tagCacheLock)
                 {
-                    _metaCache[m.FilePath] = m;
-                    if (m.Tags.Count > 0)
+                    foreach (var m in metas)
                     {
-                        _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
-                        dbTagged++;
+                        _metaCache[m.FilePath] = m;
+                        if (m.Tags.Count > 0)
+                        {
+                            _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
+                            dbTagged++;
+                        }
                     }
                 }
                 Avalonia.Threading.Dispatcher.UIThread.Post(() =>
@@ -910,7 +926,10 @@ public partial class MainWindowViewModel : ViewModelBase
                                     if (tagNames.Count > 0)
                                         await _metaRepo.SetTagsAsync(newId, tagNames);
                                 }
-                                _tagCacheByPath[file] = tagNames;
+                                lock (_tagCacheLock)
+                                {
+                                    _tagCacheByPath[file] = tagNames;
+                                }
                                 newFiles.Add(file);
                                 continue;
                             }
@@ -1465,13 +1484,16 @@ partial void OnCornerRadiusDipChanged(double value)
                 var metas = await Task.Run(() => _metaRepo.GetByFolderAsync(folderPath));
                 if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
                     return;
-                foreach (var m in metas)
+                lock (_tagCacheLock)
                 {
-                    _metaCache[m.FilePath] = m;
-                    if (m.Tags.Count > 0 && !_tagCacheByPath.ContainsKey(m.FilePath))
+                    foreach (var m in metas)
                     {
-                        _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
-                        subTagCount++;
+                        _metaCache[m.FilePath] = m;
+                        if (m.Tags.Count > 0 && !_tagCacheByPath.ContainsKey(m.FilePath))
+                        {
+                            _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
+                            subTagCount++;
+                        }
                     }
                 }
             }
@@ -2228,14 +2250,18 @@ partial void OnCornerRadiusDipChanged(double value)
             var result = await _tagRepo.RenameTagAsync(oldName, newName);
             if (result == RenameResult.Conflict) return RenameResult.Conflict;
 
-            foreach (var tags in _tagCacheByPath.Values)
+            lock (_tagCacheLock)
             {
-                for (int i = 0; i < tags.Count; i++)
-                    if (string.Equals(tags[i], oldName, StringComparison.OrdinalIgnoreCase))
-                        tags[i] = newName;
+                foreach (var tags in _tagCacheByPath.Values)
+                {
+                    for (int i = 0; i < tags.Count; i++)
+                        if (string.Equals(tags[i], oldName, StringComparison.OrdinalIgnoreCase))
+                            tags[i] = newName;
+                }
             }
 
-            _tagSearch.AllTagCounts = await _tagRepo.GetAllTagCountsAsync();
+            InvalidateTagCountsCache();
+            await RefreshTagCountsAsync(forceRefresh: true);
             SyncArtistName(oldName, newName);
             return RenameResult.Success;
         });
@@ -2247,21 +2273,25 @@ partial void OnCornerRadiusDipChanged(double value)
         {
             await _tagRepo.MergeTagsAsync(oldName, newName);
 
-            foreach (var tags in _tagCacheByPath.Values)
+            lock (_tagCacheLock)
             {
-                for (int i = tags.Count - 1; i >= 0; i--)
+                foreach (var tags in _tagCacheByPath.Values)
                 {
-                    if (string.Equals(tags[i], oldName, StringComparison.OrdinalIgnoreCase))
+                    for (int i = tags.Count - 1; i >= 0; i--)
                     {
-                        if (!tags.Contains(newName, StringComparer.OrdinalIgnoreCase))
-                            tags[i] = newName;
-                        else
-                            tags.RemoveAt(i);
+                        if (string.Equals(tags[i], oldName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (!tags.Contains(newName, StringComparer.OrdinalIgnoreCase))
+                                tags[i] = newName;
+                            else
+                                tags.RemoveAt(i);
+                        }
                     }
                 }
             }
 
-            _tagSearch.AllTagCounts = await _tagRepo.GetAllTagCountsAsync();
+            InvalidateTagCountsCache();
+            await RefreshTagCountsAsync(forceRefresh: true);
             SyncArtistName(oldName, newName);
         });
     }
@@ -2294,20 +2324,61 @@ partial void OnCornerRadiusDipChanged(double value)
         _chineseLib.SaveArtistNames(namesPath);
     }
 
-    public async Task RefreshTagCountsAsync()
+    public async Task RefreshTagCountsAsync(bool forceRefresh = false)
     {
-        _tagSearch.AllTagCounts = await Task.Run(() => _tagRepo.GetAllTagCountsAsync());
+        lock (_tagCountsCacheLock)
+        {
+            if (!forceRefresh && _cachedTagCounts != null &&
+                DateTime.Now - _tagCountsCacheTime < _tagCountsCacheDuration)
+            {
+                _tagSearch.AllTagCounts = _cachedTagCounts;
+                return;
+            }
+        }
+
+        var counts = await Task.Run(() => _tagRepo.GetAllTagCountsAsync());
+
+        lock (_tagCountsCacheLock)
+        {
+            _cachedTagCounts = counts;
+            _tagCountsCacheTime = DateTime.Now;
+        }
+
+        _tagSearch.AllTagCounts = counts;
     }
 
-    public List<TagCount> GetAllTagCounts() => _tagSearch.AllTagCounts;
+    public List<TagCount> GetAllTagCounts()
+    {
+        lock (_tagCountsCacheLock)
+        {
+            if (_cachedTagCounts != null &&
+                DateTime.Now - _tagCountsCacheTime < _tagCountsCacheDuration)
+            {
+                return _cachedTagCounts;
+            }
+        }
+        return _tagSearch.AllTagCounts;
+    }
+
+    private void InvalidateTagCountsCache()
+    {
+        lock (_tagCountsCacheLock)
+        {
+            _cachedTagCounts = null;
+            _tagCountsCacheTime = DateTime.MinValue;
+        }
+    }
 
     public async Task DeleteTagFromAllImagesAsync(string tagName)
     {
         await _tagRepo.DeleteTagAsync(tagName);
 
         // Clear from in-memory caches
-        foreach (var kv in _tagCacheByPath)
-            kv.Value.RemoveAll(t => string.Equals(t, tagName, StringComparison.OrdinalIgnoreCase));
+        lock (_tagCacheLock)
+        {
+            foreach (var kv in _tagCacheByPath)
+                kv.Value.RemoveAll(t => string.Equals(t, tagName, StringComparison.OrdinalIgnoreCase));
+        }
 
         // Update displayed images
         foreach (var img in Images)
@@ -2316,7 +2387,8 @@ partial void OnCornerRadiusDipChanged(double value)
             img.NotifyAll();
         }
 
-        await RefreshTagCountsAsync();
+        InvalidateTagCountsCache();
+        await RefreshTagCountsAsync(forceRefresh: true);
     }
 
     public async Task RefreshImageTagsAsync(string filePath)
@@ -2325,7 +2397,10 @@ partial void OnCornerRadiusDipChanged(double value)
         if (meta == null) return;
 
         var tags = meta.Tags.Select(t => t.Name).ToList();
-        _tagCacheByPath[filePath] = tags;
+        lock (_tagCacheLock)
+        {
+            _tagCacheByPath[filePath] = tags;
+        }
 
         // Update the displayed ImageViewItem if present
         var imgItem = Images.FirstOrDefault(i =>
@@ -2349,12 +2424,19 @@ partial void OnCornerRadiusDipChanged(double value)
             }
         });
 
-        _tagCacheByPath[filePath] = tags;
+        lock (_tagCacheLock)
+        {
+            _tagCacheByPath[filePath] = tags;
+        }
     }
 
     public async Task AddTagToImageAsync(string filePath, string tag)
     {
-        var tags = _tagCacheByPath.GetValueOrDefault(filePath) ?? new List<string>();
+        List<string> tags;
+        lock (_tagCacheLock)
+        {
+            tags = _tagCacheByPath.GetValueOrDefault(filePath) ?? new List<string>();
+        }
         if (!tags.Contains(tag, StringComparer.OrdinalIgnoreCase))
         {
             tags.Add(tag);
@@ -2364,7 +2446,11 @@ partial void OnCornerRadiusDipChanged(double value)
 
     public async Task RemoveTagFromImageAsync(string filePath, string tag)
     {
-        var tags = _tagCacheByPath.GetValueOrDefault(filePath);
+        List<string>? tags;
+        lock (_tagCacheLock)
+        {
+            tags = _tagCacheByPath.GetValueOrDefault(filePath);
+        }
         if (tags != null && tags.RemoveAll(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase)) > 0)
         {
             await SetImageTagsAsync(filePath, tags);
@@ -2373,13 +2459,16 @@ partial void OnCornerRadiusDipChanged(double value)
 
     public async Task AddTagToImagesBatchAsync(List<string> filePaths, string tag)
     {
-        foreach (var path in filePaths)
+        lock (_tagCacheLock)
         {
-            var tags = _tagCacheByPath.GetValueOrDefault(path) ?? new List<string>();
-            if (!tags.Contains(tag, StringComparer.OrdinalIgnoreCase))
+            foreach (var path in filePaths)
             {
-                tags.Add(tag);
-                _tagCacheByPath[path] = tags;
+                var tags = _tagCacheByPath.GetValueOrDefault(path) ?? new List<string>();
+                if (!tags.Contains(tag, StringComparer.OrdinalIgnoreCase))
+                {
+                    tags.Add(tag);
+                    _tagCacheByPath[path] = tags;
+                }
             }
         }
 
@@ -2387,28 +2476,36 @@ partial void OnCornerRadiusDipChanged(double value)
         if (pathToId.Count > 0)
             await _metaRepo.AddTagToImagesAsync(pathToId.Values.ToList(), tag);
 
-        await RefreshTagCountsAsync();
+        InvalidateTagCountsCache();
+        await RefreshTagCountsAsync(forceRefresh: true);
     }
 
     public async Task RemoveTagFromImagesBatchAsync(List<string> filePaths, string tag)
     {
-        foreach (var path in filePaths)
+        lock (_tagCacheLock)
         {
-            if (_tagCacheByPath.TryGetValue(path, out var tags))
-                tags.RemoveAll(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase));
+            foreach (var path in filePaths)
+            {
+                if (_tagCacheByPath.TryGetValue(path, out var tags))
+                    tags.RemoveAll(t => string.Equals(t, tag, StringComparison.OrdinalIgnoreCase));
+            }
         }
 
         var pathToId = await _metaRepo.GetIdsByPathsAsync(filePaths);
         if (pathToId.Count > 0)
             await _metaRepo.RemoveTagFromImagesAsync(pathToId.Values.ToList(), tag);
 
-        await RefreshTagCountsAsync();
+        InvalidateTagCountsCache();
+        await RefreshTagCountsAsync(forceRefresh: true);
     }
 
     public async Task ClearTagsFromImagesBatchAsync(List<string> filePaths)
     {
-        foreach (var path in filePaths)
-            _tagCacheByPath[path] = new List<string>();
+        lock (_tagCacheLock)
+        {
+            foreach (var path in filePaths)
+                _tagCacheByPath[path] = new List<string>();
+        }
 
         var pathToId = await _metaRepo.GetIdsByPathsAsync(filePaths);
         if (pathToId.Count > 0)
@@ -2418,35 +2515,50 @@ partial void OnCornerRadiusDipChanged(double value)
                 await _metaRepo.SetAutoTagStatusByPathAsync(path, 0);
         }
 
-        await RefreshTagCountsAsync();
+        InvalidateTagCountsCache();
+        await RefreshTagCountsAsync(forceRefresh: true);
     }
 
     public List<string> GetTagsForFile(string filePath)
     {
-        if (_tagCacheByPath.TryGetValue(filePath, out var tags))
-            return new List<string>(tags);
-        // Cache miss — preload will fill before page renders
-        return new List<string>();
+        lock (_tagCacheLock)
+        {
+            if (_tagCacheByPath.TryGetValue(filePath, out var tags))
+                return new List<string>(tags);
+            // Cache miss — preload will fill before page renders
+            return new List<string>();
+        }
     }
 
     /// <summary>Batch-preload tag cache for a page's worth of files (for subfolder files not yet cached)</summary>
     public async Task PreloadTagsForFilesAsync(List<string> paths)
     {
-        var missing = paths.Where(p => !_tagCacheByPath.ContainsKey(p)).ToList();
+        List<string> missing;
+        lock (_tagCacheLock)
+        {
+            missing = paths.Where(p => !_tagCacheByPath.ContainsKey(p)).ToList();
+        }
         if (missing.Count == 0) return;
         await Task.Run(async () =>
         {
             foreach (var path in missing)
             {
                 var meta = await _metaRepo.GetByPathAsync(path);
-                _tagCacheByPath[path] = meta?.Tags.Select(t => t.Name).ToList() ?? new List<string>();
+                var tags = meta?.Tags.Select(t => t.Name).ToList() ?? new List<string>();
+                lock (_tagCacheLock)
+                {
+                    _tagCacheByPath[path] = tags;
+                }
             }
         });
     }
 
     public void ClearTagCacheForPath(string filePath)
     {
-        _tagCacheByPath[filePath] = new List<string>();
+        lock (_tagCacheLock)
+        {
+            _tagCacheByPath[filePath] = new List<string>();
+        }
     }
 
     public void InvalidatePageCache() => _pageManager.InvalidateCache();
