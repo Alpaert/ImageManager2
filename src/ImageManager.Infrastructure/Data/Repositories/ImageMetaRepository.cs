@@ -625,16 +625,21 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<Dictionary<string, string>> GetPerceptualHashesByPathsAsync(List<string> filePaths)
     {
-        if (filePaths.Count == 0) return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (filePaths.Count == 0) return result;
 
         using var conn = _db.CreateConnection();
-        var rows = await conn.QueryAsync<(string FilePath, string PerceptualHash)>(@"
-            SELECT FilePath, PerceptualHash FROM ImageMeta WHERE FilePath IN @Paths",
-            new { Paths = filePaths });
+        foreach (var chunk in filePaths.Chunk(900))
+        {
+            var rows = await conn.QueryAsync<(string FilePath, string PerceptualHash)>(@"
+                SELECT FilePath, PerceptualHash FROM ImageMeta WHERE FilePath IN @Paths",
+                new { Paths = chunk });
 
-        return rows
-            .Where(r => !string.IsNullOrEmpty(r.PerceptualHash))
-            .ToDictionary(r => r.FilePath, r => r.PerceptualHash, StringComparer.OrdinalIgnoreCase);
+            foreach (var (path, hash) in rows)
+                if (!string.IsNullOrEmpty(hash))
+                    result[path] = hash;
+        }
+        return result;
     }
 
     public async Task<Dictionary<string, (int Width, int Height)>> GetDimensionsByPathsAsync(List<string> filePaths)

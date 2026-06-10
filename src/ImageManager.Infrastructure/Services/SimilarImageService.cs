@@ -27,9 +27,9 @@ public class SimilarImageService : ISimilarImageService
         var files = candidates.ToList();
         if (files.Count == 0) return new List<string>();
 
-        // === Step 1: Preload all hashes from DB into memory ===
+        // === Step 1: Preload hashes for candidate files from DB into memory ===
         var hashCache = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        await PreloadHashCacheAsync(hashCache);
+        await PreloadHashCacheAsync(hashCache, files);
 
         // === Step 2: Get / compute hash for the base image ===
         var baseHash = await GetOrComputeBaseHashAsync(baseFilePath, hashCache);
@@ -45,7 +45,7 @@ public class SimilarImageService : ISimilarImageService
             Parallel.ForEach(files, new ParallelOptions
             {
                 CancellationToken = ct,
-                MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1)
+                MaxDegreeOfParallelism = Environment.ProcessorCount
             }, path =>
             {
                 if (ct.IsCancellationRequested) return;
@@ -78,18 +78,19 @@ public class SimilarImageService : ISimilarImageService
 
     // ==================== Helpers ====================
 
-    /// <summary>Load all perceptual hashes from DB into a concurrent dictionary.</summary>
-    private async Task PreloadHashCacheAsync(ConcurrentDictionary<string, string> cache)
+    /// <summary>Load perceptual hashes for candidate files from DB into a concurrent dictionary.</summary>
+    private async Task PreloadHashCacheAsync(ConcurrentDictionary<string, string> cache, List<string> candidates)
     {
         try
         {
-            var allMetas = await _metaRepo.GetAllAsync();
-            foreach (var m in allMetas)
+            if (candidates.Count == 0) return;
+
+            var hashes = await _metaRepo.GetPerceptualHashesByPathsAsync(candidates);
+            foreach (var kv in hashes)
             {
-                if (!string.IsNullOrEmpty(m.PerceptualHash)
-                    && m.PerceptualHash.Split('|').Length >= 4)
+                if (!string.IsNullOrEmpty(kv.Value) && kv.Value.Split('|').Length >= 4)
                 {
-                    cache[m.FilePath] = m.PerceptualHash;
+                    cache[kv.Key] = kv.Value;
                 }
             }
         }
