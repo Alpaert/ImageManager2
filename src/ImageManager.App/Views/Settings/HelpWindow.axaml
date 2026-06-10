@@ -1,7 +1,7 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         x:Class="ImageManager.App.Views.Settings.HelpWindow"
-        Title="搜索帮助" Width="480" Height="380"
+        Title="搜索帮助" Width="540" Height="640"
         CanResize="False">
 
     <Grid RowDefinitions="*,Auto" Margin="16">
@@ -11,38 +11,77 @@
                     <Run FontWeight="SemiBold" FontSize="15" Text="Tag 搜索规则"/>
                     <LineBreak/>
                     <LineBreak/>
-                    <Run FontWeight="SemiBold" Text="基本搜索"/>
+
+                    <Run FontWeight="SemiBold" Text="分隔符（前后须有空格）"/>
                     <LineBreak/>
-                    <Run Text="  tag          单一标签（包含该标签的图片）"/>
+                    <Run Text="  a    且（AND）—— 同时包含所有标签"/>
                     <LineBreak/>
-                    <Run Text="  tag1 o tag2  或（包含任一标签）"/>
+                    <Run Text="  o    或（OR）—— 包含任一标签"/>
                     <LineBreak/>
-                    <Run Text="  tag1 a tag2  且（同时包含所有标签，搜索框绿色边框）"/>
+                    <Run Text="  e    逐项且（AND-each）—— 基础组匹配 + 每个额外标签分别匹配"/>
                     <LineBreak/>
-                    <Run Text="  tag1 e tag2  逐项且（基础组 AND 每个额外标签，蓝色边框）"/>
-                    <LineBreak/>
-                    <Run Text="  tag1 - tag2  排除（左侧包含，右侧排除，排除项以 o 分隔，红色边框）"/>
-                    <LineBreak/>
-                    <LineBreak/>
-                    <Run FontWeight="SemiBold" Text="特殊搜索"/>
-                    <LineBreak/>
-                    <Run Text="  -every        筛选未标记任何标签的图片"/>
+                    <Run Text="  -    排除（NOT）—— 不包含指定标签"/>
                     <LineBreak/>
                     <LineBreak/>
-                    <Run FontWeight="SemiBold" Text="共现标签模式"/>
+
+                    <Run FontWeight="SemiBold" Text="包含搜索"/>
                     <LineBreak/>
-                    <Run Text="  搜索后联想框显示与结果共现的其他标签。"/>
+                    <Run Text="  灰色边框 = 单标签 或 o    绿色 = a    蓝色 = e"/>
+                    <LineBreak/>
+                    <LineBreak/>
+                    <Run Text="  tag                 单一标签：包含该标签的图片"/>
+                    <LineBreak/>
+                    <Run Text="  tag1 o tag2         或：包含 tag1 或 tag2"/>
+                    <LineBreak/>
+                    <Run Text="  tag1 a tag2         且：同时包含 tag1 和 tag2（绿色边框）"/>
+                    <LineBreak/>
+                    <Run Text="  tag1 e tag2         逐项且：含 tag1，且每项额外标签各自匹配（蓝色边框）"/>
+                    <LineBreak/>
+                    <Run Text="  tag1 a tag2 e tag3  混合：基础(tag1 且 tag2) + tag3 额外逐项"/>
+                    <LineBreak/>
+                    <LineBreak/>
+
+                    <Run FontWeight="SemiBold" Text="排除搜索（红色边框）"/>
+                    <LineBreak/>
+                    <Run Text="  -tag                 纯排除：所有图片中排除含 tag 的"/>
+                    <LineBreak/>
+                    <Run Text="  -tag1 o tag2         纯排除或：排除含 tag1 或 tag2 的图片"/>
+                    <LineBreak/>
+                    <Run Text="  -tag1 - tag2         同上（排除项可用 - 或 o 分隔，效果相同）"/>
+                    <LineBreak/>
+                    <Run Text="  -tag1 a tag2         纯排除且：排除同时含 tag1 和 tag2 的图片"/>
+                    <LineBreak/>
+                    <Run Text="  tag1 - tag2          混合：包含 tag1，排除含 tag2 的"/>
+                    <LineBreak/>
+                    <Run Text="  tag1 a tag2 - tag3   包含(tag1 且 tag2)，排除含 tag3 的"/>
+                    <LineBreak/>
+                    <Run Text="  tag1 - tag2 - tag3   包含 tag1，排除 tag2 或 tag3"/>
+                    <LineBreak/>
+                    <LineBreak/>
+
+                    <Run FontWeight="SemiBold" Text="特殊关键字"/>
+                    <LineBreak/>
+                    <Run Text="  -every    筛选未标记任何标签的图片"/>
+                    <LineBreak/>
+                    <LineBreak/>
+
+                    <Run FontWeight="SemiBold" Text="共现标签模式（搜索后自动进入）"/>
+                    <LineBreak/>
+                    <Run Text="  搜索完成后联想框显示与结果集共现的其他标签。"/>
                     <LineBreak/>
                     <Run Text="  点击联想标签循环切换状态："/>
                     <LineBreak/>
                     <Run Text="    未选 → 且(绿色) → 逐项且(蓝色) → 排除(红色) → 移除"/>
                     <LineBreak/>
+                    <Run Text="  修改搜索文字或重新按 Enter 搜索退出共现模式。"/>
                     <LineBreak/>
+                    <LineBreak/>
+
                     <Run FontWeight="SemiBold" Text="快捷键"/>
                     <LineBreak/>
-                    <Run Text="  Enter     执行搜索（搜索后自动失焦）"/>
+                    <Run Text="  Enter     执行搜索"/>
                     <LineBreak/>
-                    <Run Text="  点击图片  关闭联想框并失焦搜索框"/>
+                    <Run Text="  点击图片  关闭联想框"/>
                     <LineBreak/>
                     <Run Text="  点击搜索框 重新打开联想框"/>
                 </TextBlock.Inlines>

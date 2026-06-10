@@ -364,6 +364,63 @@ public class ImageMetaRepository : IImageMetaRepository
         return results.ToList();
     }
 
+    public async Task<Dictionary<string, List<string>>> GetTagMapByFolderAsync(string folderPath)
+    {
+        using var conn = _db.CreateConnection();
+        var normalized = Common.Helpers.PathHelper.NormalizeFolderPath(folderPath);
+        var rows = await conn.QueryAsync<(string FilePath, string TagName)>(@"
+            SELECT im.FilePath, t.Name
+            FROM ImageMeta im
+            LEFT JOIN ImageTag it ON im.Id = it.ImageMetaId
+            LEFT JOIN Tag t ON it.TagId = t.Id
+            WHERE im.FilePath LIKE @Prefix",
+            new { Prefix = normalized + "%" });
+
+        var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (filePath, tagName) in rows)
+        {
+            if (!result.TryGetValue(filePath, out var tags))
+            {
+                tags = new List<string>();
+                result[filePath] = tags;
+            }
+            if (tagName != null)
+                tags.Add(tagName);
+        }
+        return result;
+    }
+
+    public async Task<Dictionary<string, List<string>>> GetTagMapByPathsAsync(List<string> filePaths)
+    {
+        var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        if (filePaths.Count == 0) return result;
+
+        using var conn = _db.CreateConnection();
+        // Process in chunks to avoid overly large IN clauses
+        foreach (var chunk in filePaths.Chunk(500))
+        {
+            var rows = await conn.QueryAsync<(string FilePath, string TagName)>(@"
+                SELECT im.FilePath, t.Name
+                FROM ImageMeta im
+                LEFT JOIN ImageTag it ON im.Id = it.ImageMetaId
+                LEFT JOIN Tag t ON it.TagId = t.Id
+                WHERE im.FilePath IN @Paths",
+                new { Paths = chunk });
+
+            foreach (var (filePath, tagName) in rows)
+            {
+                if (!result.TryGetValue(filePath, out var tags))
+                {
+                    tags = new List<string>();
+                    result[filePath] = tags;
+                }
+                if (tagName != null)
+                    tags.Add(tagName);
+            }
+        }
+        return result;
+    }
+
     public async Task<List<string>> GetFilePathsByTagAsync(string tagName)
     {
         using var conn = _db.CreateConnection();
@@ -372,8 +429,7 @@ public class ImageMetaRepository : IImageMetaRepository
             FROM ImageMeta im
             INNER JOIN ImageTag it ON im.Id = it.ImageMetaId
             INNER JOIN Tag t ON it.TagId = t.Id
-            WHERE t.Name = @TagName COLLATE NOCASE
-            ORDER BY im.FilePath",
+            WHERE t.Name = @TagName COLLATE NOCASE",
             new { TagName = tagName });
         return results.ToList();
     }
@@ -391,8 +447,7 @@ public class ImageMetaRepository : IImageMetaRepository
                 INNER JOIN Tag t ON it.TagId = t.Id
                 WHERE t.Name IN @TagNames COLLATE NOCASE
                 GROUP BY im.FilePath
-                HAVING COUNT(DISTINCT t.Name) = @TagCount
-                ORDER BY im.FilePath",
+                HAVING COUNT(DISTINCT t.Name) = @TagCount",
                 new { TagNames = tagNames, TagCount = tagNames.Count });
             return results.ToList();
         }
@@ -404,8 +459,7 @@ public class ImageMetaRepository : IImageMetaRepository
                 FROM ImageMeta im
                 INNER JOIN ImageTag it ON im.Id = it.ImageMetaId
                 INNER JOIN Tag t ON it.TagId = t.Id
-                WHERE t.Name IN @TagNames COLLATE NOCASE
-                ORDER BY im.FilePath",
+                WHERE t.Name IN @TagNames COLLATE NOCASE",
                 new { TagNames = tagNames });
             return results.ToList();
         }
@@ -432,8 +486,7 @@ public class ImageMetaRepository : IImageMetaRepository
                     WHERE t2.Name IN @ExcludeTags COLLATE NOCASE
                   )
                 GROUP BY im.FilePath
-                HAVING COUNT(DISTINCT t.Name) = @IncludeCount
-                ORDER BY im.FilePath",
+                HAVING COUNT(DISTINCT t.Name) = @IncludeCount",
                 new { IncludeTags = includeTags, ExcludeTags = excludeTags, IncludeCount = includeTags.Count });
             return results.ToList();
         }
@@ -451,8 +504,7 @@ public class ImageMetaRepository : IImageMetaRepository
                     INNER JOIN ImageTag it2 ON im2.Id = it2.ImageMetaId
                     INNER JOIN Tag t2 ON it2.TagId = t2.Id
                     WHERE t2.Name IN @ExcludeTags COLLATE NOCASE
-                  )
-                ORDER BY im.FilePath",
+                  )",
                 new { IncludeTags = includeTags, ExcludeTags = excludeTags });
             return results.ToList();
         }
@@ -492,8 +544,6 @@ public class ImageMetaRepository : IImageMetaRepository
         if (requireAllBase)
             sql += "\n            GROUP BY im.FilePath\n            HAVING COUNT(DISTINCT t.Name) = @BaseCount";
 
-        sql += "\n            ORDER BY im.FilePath";
-
         var results = await conn.QueryAsync<string>(sql,
             new { BaseTags = baseTags, EachTags = eachTags, ExcludeTags = excludeTags ?? new List<string>(), BaseCount = baseTags.Count });
         return results.ToList();
@@ -516,8 +566,7 @@ public class ImageMetaRepository : IImageMetaRepository
                     WHERE t2.Name IN @ExcludeTags COLLATE NOCASE
                     GROUP BY im2.FilePath
                     HAVING COUNT(DISTINCT t2.Name) = @TagCount
-                )
-                ORDER BY im.FilePath";
+                )";
             var result = await conn.QueryAsync<string>(sql,
                 new { ExcludeTags = excludeTags, TagCount = excludeTags.Count });
             return result.AsList();
@@ -534,8 +583,7 @@ public class ImageMetaRepository : IImageMetaRepository
                     INNER JOIN ImageTag it2 ON im2.Id = it2.ImageMetaId
                     INNER JOIN Tag t2 ON it2.TagId = t2.Id
                     WHERE t2.Name IN @ExcludeTags COLLATE NOCASE
-                )
-                ORDER BY im.FilePath";
+                )";
             var result = await conn.QueryAsync<string>(sql,
                 new { ExcludeTags = excludeTags });
             return result.AsList();

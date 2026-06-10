@@ -134,29 +134,15 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private static List<string> GetImageFilesRecursive(string root)
     {
-        var files = new List<string>();
         var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
             { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
         try
         {
-            var dirs = new Queue<string>();
-            dirs.Enqueue(root);
-            while (dirs.Count > 0)
-            {
-                var dir = dirs.Dequeue();
-                try
-                {
-                    foreach (var f in Directory.EnumerateFiles(dir))
-                        if (exts.Contains(Path.GetExtension(f)))
-                            files.Add(f);
-                    foreach (var sub in Directory.EnumerateDirectories(dir))
-                        dirs.Enqueue(sub);
-                }
-                catch { }
-            }
+            return Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirectories)
+                .Where(f => exts.Contains(Path.GetExtension(f)))
+                .ToList();
         }
-        catch { }
-        return files;
+        catch { return new List<string>(); }
     }
 
     private FolderTreeNode? FindNodeByPath(string path)
@@ -1475,31 +1461,6 @@ partial void OnCornerRadiusDipChanged(double value)
         if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
             return;
 
-        // Preload tags for subfolder files BEFORE SortImagesAsync (which triggers ShowPageAsync)
-        int subTagCount = 0;
-        if (showAllSubfolders)
-        {
-            try
-            {
-                var metas = await Task.Run(() => _metaRepo.GetByFolderAsync(folderPath));
-                if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
-                    return;
-                lock (_tagCacheLock)
-                {
-                    foreach (var m in metas)
-                    {
-                        _metaCache[m.FilePath] = m;
-                        if (m.Tags.Count > 0 && !_tagCacheByPath.ContainsKey(m.FilePath))
-                        {
-                            _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
-                            subTagCount++;
-                        }
-                    }
-                }
-            }
-            catch { }
-        }
-
         await SortFilesAsync(rebuiltFiles, CurrentSortOrder, showAllSubfolders);
         if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
             return;
@@ -1522,18 +1483,47 @@ partial void OnCornerRadiusDipChanged(double value)
             await ShowPageAsync(0);
         }
 
-        StatusText = subTagCount > 0
-            ? $"总文件数: {_allFiles.Count} (含子文件夹) | 标签: {subTagCount}"
-            : $"总文件数: {_allFiles.Count}";
+        StatusText = $"总文件数: {_allFiles.Count}";
 
+        // Load tags in background — page already visible, tags fill in asynchronously
         if (showAllSubfolders)
         {
             _ = Task.Run(async () =>
             {
-                await Task.Delay(3000);
-                if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
-                    return;
-                await PrecomputeHashesAsync(CancellationToken.None, (await _folderRepo.GetByPathAsync(folderPath))?.Id);
+                try
+                {
+                    var tagMap = await _metaRepo.GetTagMapByFolderAsync(folderPath);
+                    if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
+                        return;
+                    int loadedCount = 0;
+                    lock (_tagCacheLock)
+                    {
+                        foreach (var kv in tagMap)
+                        {
+                            if (kv.Value.Count > 0 && !_tagCacheByPath.ContainsKey(kv.Key))
+                            {
+                                _tagCacheByPath[kv.Key] = kv.Value;
+                                loadedCount++;
+                            }
+                        }
+                    }
+                    if (loadedCount > 0)
+                    {
+                        // Refresh current page to show newly loaded tags
+                        _ = Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                        {
+                            _pageManager.InvalidateCache();
+                            _ = ShowPageAsync(CurrentPage);
+                            StatusText = $"总文件数: {_allFiles.Count} (含子文件夹) | 标签: {loadedCount}";
+                        });
+                    }
+
+                    await Task.Delay(3000);
+                    if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
+                        return;
+                    await PrecomputeHashesAsync(CancellationToken.None, (await _folderRepo.GetByPathAsync(folderPath))?.Id);
+                }
+                catch { }
             });
         }
     }
@@ -2541,13 +2531,13 @@ partial void OnCornerRadiusDipChanged(double value)
         if (missing.Count == 0) return;
         await Task.Run(async () =>
         {
-            foreach (var path in missing)
+            var tagMap = await _metaRepo.GetTagMapByPathsAsync(missing);
+            lock (_tagCacheLock)
             {
-                var meta = await _metaRepo.GetByPathAsync(path);
-                var tags = meta?.Tags.Select(t => t.Name).ToList() ?? new List<string>();
-                lock (_tagCacheLock)
+                foreach (var path in missing)
                 {
-                    _tagCacheByPath[path] = tags;
+                    _tagCacheByPath[path] = tagMap.TryGetValue(path, out var tags)
+                        ? tags : new List<string>();
                 }
             }
         });

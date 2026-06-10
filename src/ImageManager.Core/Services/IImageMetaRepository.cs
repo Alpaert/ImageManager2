@@ -32,6 +32,12 @@ public interface IImageMetaRepository
     Task<List<string>> GetFilePathsByTagAndEachAsync(List<string> baseTags, bool requireAllBase, List<string> eachTags, List<string>? excludeTags = null);
     Task<List<string>> GetFilePathsExcludingTagsAsync(List<string> excludeTags, bool requireAll);
     Task<List<string>> GetFilePathsWithNoTagsAsync();
+
+    // Lightweight tag queries (avoid loading full ImageMeta)
+    /// <summary>Returns (FilePath → TagNames) for all images under a folder prefix</summary>
+    Task<Dictionary<string, List<string>>> GetTagMapByFolderAsync(string folderPath);
+    /// <summary>Returns (FilePath → TagNames) for a batch of file paths</summary>
+    Task<Dictionary<string, List<string>>> GetTagMapByPathsAsync(List<string> filePaths);
     Task<List<TagCount>> GetCoOccurringTagsAsync(List<string> filePaths, List<string>? excludeNames = null, string? nameFilter = null);
 
     /// <summary>Batch-load perceptual hashes for a specific set of file paths (lightweight, no tags)</summary>

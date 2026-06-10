@@ -164,13 +164,13 @@ public class TagSearchController
             var excludePart = parts[1].Trim();
             if (excludePart.Contains(" a ", StringComparison.OrdinalIgnoreCase))
             {
-                excludeTags = excludePart.Split(new[] { " a " }, StringSplitOptions.None)
+                excludeTags = excludePart.Split(new[] { " a ", " - " }, StringSplitOptions.None)
                                        .Select(t => t.Trim()).Where(t => t.Length > 0).ToList();
                 excludeIsAnd = true;
             }
             else
             {
-                excludeTags = excludePart.Split(new[] { " o " }, StringSplitOptions.None)
+                excludeTags = excludePart.Split(new[] { " o ", " - " }, StringSplitOptions.None)
                                        .Select(t => t.Trim()).Where(t => t.Length > 0).ToList();
             }
         }
@@ -185,6 +185,7 @@ public class TagSearchController
             var excludedPaths = await _metaRepo.GetFilePathsExcludingTagsAsync(excludeTags, excludeIsAnd);
             var pureFileSet = new HashSet<string>(allFiles, StringComparer.OrdinalIgnoreCase);
             SearchResultFiles = excludedPaths.Where(p => pureFileSet.Contains(p)).ToList();
+            SearchResultFiles.Sort(StringComparer.OrdinalIgnoreCase);
 
             if (SearchResultFiles.Count == 0)
             {
@@ -294,6 +295,7 @@ public class TagSearchController
         // Intersect with current folder files
         var fileSet = new HashSet<string>(allFiles, StringComparer.OrdinalIgnoreCase);
         SearchResultFiles = taggedPaths.Where(p => fileSet.Contains(p)).ToList();
+        SearchResultFiles.Sort(StringComparer.OrdinalIgnoreCase);
 
         if (SearchResultFiles.Count == 0)
         {
@@ -361,13 +363,42 @@ public class TagSearchController
         state = (state + 1) % 4;
         _coTagStates[tagName] = state;
 
+        // Split last search text into include / exclude sections
+        string includeSection, excludeSection;
+        if (_lastSearchText.Contains(" - ", StringComparison.OrdinalIgnoreCase))
+        {
+            var parts = _lastSearchText.Split(new[] { " - " }, 2, StringSplitOptions.None);
+            includeSection = parts[0].Trim();
+            excludeSection = parts[1].Trim();
+        }
+        else if (_lastSearchText.TrimStart().StartsWith('-'))
+        {
+            includeSection = "";
+            excludeSection = _lastSearchText.TrimStart()[1..].TrimStart();
+        }
+        else
+        {
+            includeSection = _lastSearchText;
+            excludeSection = "";
+        }
+
+        // Pre-populate co-tag states for tags originally in the exclude section
+        foreach (var t in ParseTagNames(excludeSection))
+        {
+            if (!_coTagStates.ContainsKey(t))
+                _coTagStates[t] = 3; // default to NOT (will stay excluded unless user cycles)
+        }
+
+        // Get include tags that are NOT in co-tag states (preserve their original operators)
+        var allIncludeTags = ParseTagNames(includeSection);
         var cleaned = new List<string>();
-        foreach (var t in ParseTagNames(_lastSearchText))
+        foreach (var t in allIncludeTags)
         {
             if (!_coTagStates.ContainsKey(t))
                 cleaned.Add(t);
         }
 
+        // Categorize tags by their co-tag state
         var andTags = new List<string>();
         var eachTags = new List<string>();
         var notTags = new List<string>();
@@ -396,7 +427,11 @@ public class TagSearchController
         try
         {
             var usedTags = ParseTagNames(_lastSearchText);
-            var coTags = await _metaRepo.GetCoOccurringTagsAsync(SearchResultFiles, usedTags);
+            // Sample result set for co-tag query when very large (IN clause perf)
+            var samplePaths = SearchResultFiles.Count > 5000
+                ? SearchResultFiles.Take(5000).ToList()
+                : SearchResultFiles;
+            var coTags = await _metaRepo.GetCoOccurringTagsAsync(samplePaths, usedTags);
             _fullCoTags = coTags.Take(300).ToList();
             SuggestionsChanged?.Invoke(new List<TagCount>(_fullCoTags), true);
         }
