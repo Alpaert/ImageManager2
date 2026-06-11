@@ -878,8 +878,21 @@ public partial class MainWindow : Window
     {
         var allTags = Vm.GetAllTagCounts();
 
+        // ✅ 如果 Tags 为空，主动从数据库加载
+        var currentTags = item.Tags;
+        if (currentTags.Count == 0)
+        {
+            var tagsFromDb = await Vm.GetTagsForFileAsync(item.FilePath);
+            if (tagsFromDb.Count > 0)
+            {
+                item.Tags = tagsFromDb;
+                item.NotifyAll();
+                currentTags = tagsFromDb;
+            }
+        }
+
         var tagVm = new TagEditViewModel(
-            string.Join(", ", item.Tags),
+            string.Join(", ", currentTags),
             allTags,
             Vm.AppSettings.FavoriteTags,
             Vm.AppSettings.MaxTagSuggestionCount,
@@ -936,6 +949,20 @@ public partial class MainWindow : Window
     private async Task EditTagsForItemsAsync(List<ImageViewItem> items)
     {
         var allTags = Vm.GetAllTagCounts();
+
+        // ✅ 批量从数据库加载 Tags（如果缓存未命中）
+        var filePaths = items.Select(i => i.FilePath).ToList();
+        var tagsDict = await Vm.EnsureTagsLoadedAsync(filePaths);
+
+        // 更新 ImageViewItem
+        foreach (var item in items)
+        {
+            if (item.Tags.Count == 0 && tagsDict.TryGetValue(item.FilePath, out var tags) && tags.Count > 0)
+            {
+                item.Tags = tags;
+                item.NotifyAll();
+            }
+        }
 
         // 计算交集：所有选中图片共有的 tag
         var tagSets = items.Select(i => new HashSet<string>(i.Tags, StringComparer.OrdinalIgnoreCase)).ToList();

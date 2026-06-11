@@ -2559,6 +2559,52 @@ partial void OnCornerRadiusDipChanged(double value)
         return meta?.Tags.Select(t => t.Name).ToList() ?? new List<string>();
     }
 
+    /// <summary>确保文件列表的 Tag 已加载，返回 FilePath → Tags 字典</summary>
+    public async Task<Dictionary<string, List<string>>> EnsureTagsLoadedAsync(List<string> filePaths)
+    {
+        var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        var missingPaths = new List<string>();
+
+        lock (_tagCacheLock)
+        {
+            foreach (var path in filePaths)
+            {
+                if (_tagCacheByPath.TryGetValue(path, out var tags))
+                    result[path] = tags;
+                else
+                    missingPaths.Add(path);
+            }
+        }
+
+        if (missingPaths.Count > 0)
+        {
+            try
+            {
+                var tagMap = await _metaRepo.GetTagMapByPathsAsync(missingPaths);
+                lock (_tagCacheLock)
+                {
+                    foreach (var kv in tagMap)
+                    {
+                        _tagCacheByPath[kv.Key] = kv.Value;
+                        result[kv.Key] = kv.Value;
+                    }
+                    // 对于数据库中也没有的文件，标记为空列表
+                    foreach (var path in missingPaths)
+                    {
+                        if (!result.ContainsKey(path))
+                            result[path] = new List<string>();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Error($"EnsureTagsLoadedAsync failed: {ex.Message}");
+            }
+        }
+
+        return result;
+    }
+
     // ==================== Settings ====================
 
     public async Task SaveSettingsAsync()
