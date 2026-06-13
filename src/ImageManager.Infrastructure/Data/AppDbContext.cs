@@ -125,6 +125,7 @@ public class AppDbContext : IDisposable
         RunMigrationV2(conn);
         RunMigrationV3(conn);
         RunMigrationV4(conn);
+        RunMigrationV5(conn);
 
         // Create FolderId index after column exists
         using var idxCmd = conn.CreateCommand();
@@ -183,6 +184,23 @@ public class AppDbContext : IDisposable
         }
         catch (SqliteException ex) when (ex.Message.Contains("duplicate column"))
         {
+        }
+    }
+
+    private static void RunMigrationV5(SqliteConnection conn)
+    {
+        try
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                ALTER TABLE ImageMeta ADD COLUMN Duration REAL DEFAULT NULL;
+                ALTER TABLE ImageMeta ADD COLUMN ThumbnailTimestamp REAL DEFAULT NULL;
+            ";
+            cmd.ExecuteNonQuery();
+        }
+        catch (SqliteException ex) when (ex.Message.Contains("duplicate column"))
+        {
+            // Columns already exist
         }
     }
 

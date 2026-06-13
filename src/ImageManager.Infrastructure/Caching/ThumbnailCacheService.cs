@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using ImageManager.Common.Constants;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Imaging;
+using ImageManager.Infrastructure.Video;
 
 namespace ImageManager.Infrastructure.Caching;
 
@@ -12,6 +14,8 @@ public class ThumbnailCacheService : IThumbnailCacheService
         public long SizeBytes { get; set; }
         public DateTime LastAccessUtc { get; set; }
         public int DecodeWidth { get; set; }
+        public int Width { get; set; }
+        public int Height { get; set; }
     }
 
     private readonly ConcurrentDictionary<string, CacheEntry> _cache = new(StringComparer.OrdinalIgnoreCase);
@@ -73,10 +77,10 @@ public class ThumbnailCacheService : IThumbnailCacheService
         });
     }
 
-    public async Task<byte[]?> GetOrCreateThumbnailAsync(string filePath, int decodeWidth)
+    public async Task<(byte[]? Data, int Width, int Height)> GetOrCreateThumbnailAsync(string filePath, int decodeWidth)
     {
         if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
-            return null;
+            return (null, 0, 0);
 
         if (decodeWidth != DecodeWidth)
         {
@@ -89,26 +93,60 @@ public class ThumbnailCacheService : IThumbnailCacheService
             && entry.DecodeWidth == decodeWidth)
         {
             entry.LastAccessUtc = DateTime.UtcNow;
-            return entry.Data;
+            return (entry.Data, entry.Width, entry.Height);
         }
 
         // 2. Disk cache
         var cached = _diskCache.Load(filePath);
         if (cached != null)
         {
-            AddToMemory(filePath, cached, decodeWidth);
-            return cached;
+            // 从磁盘加载时，需要重新获取尺寸
+            int w, h;
+            if (FileTypeConstants.IsVideoFile(filePath))
+            {
+                var (vw, vh) = await VideoThumbnailGenerator.GetDimensionsAsync(filePath);
+                w = vw; h = vh;
+            }
+            else
+            {
+                (w, h) = ThumbnailGenerator.GetDimensions(filePath);
+            }
+
+            AddToMemory(filePath, cached, decodeWidth, w, h);
+            return (cached, w, h);
         }
 
-        // 3. Generate thumbnail
-        var data = await Task.Run(() => ThumbnailGenerator.Generate(filePath, decodeWidth));
-        if (data != null)
+        // 3. Generate thumbnail - differentiate between images and videos
+        if (FileTypeConstants.IsVideoFile(filePath))
         {
-            AddToMemory(filePath, data, decodeWidth);
-            _diskCache.Save(filePath, data);
-        }
+            // Video: 一次性获取数据 + 尺寸
+            var result = await VideoThumbnailGenerator.GenerateAsync(
+                filePath,
+                decodeWidth,
+                CancellationToken.None
+            );
 
-        return data;
+            if (result != null && result.ThumbnailData != null)
+            {
+                AddToMemory(filePath, result.ThumbnailData, decodeWidth, result.Width, result.Height);
+                _diskCache.Save(filePath, result.ThumbnailData);
+                return (result.ThumbnailData, result.Width, result.Height);
+            }
+            return (null, 0, 0);
+        }
+        else
+        {
+            // Image: use existing ThumbnailGenerator
+            var data = await Task.Run(() => ThumbnailGenerator.Generate(filePath, decodeWidth));
+            if (data != null)
+            {
+                var (w, h) = ThumbnailGenerator.GetDimensions(filePath);
+                AddToMemory(filePath, data, decodeWidth, w, h);
+                _diskCache.Save(filePath, data);
+                return (data, w, h);
+            }
+            return (null, 0, 0);
+        }
     }
 
     public Task ClearAsync()
@@ -153,14 +191,16 @@ public class ThumbnailCacheService : IThumbnailCacheService
             Interlocked.Exchange(ref _totalBytes, 0);
     }
 
-    private void AddToMemory(string filePath, byte[] data, int decodeWidth)
+    private void AddToMemory(string filePath, byte[] data, int decodeWidth, int width, int height)
     {
         var entry = new CacheEntry
         {
             Data = data,
             SizeBytes = data.Length,
             LastAccessUtc = DateTime.UtcNow,
-            DecodeWidth = decodeWidth
+            DecodeWidth = decodeWidth,
+            Width = width,
+            Height = height
         };
 
         if (_cache.TryGetValue(filePath, out var oldEntry))

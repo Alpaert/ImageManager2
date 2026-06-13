@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using ImageManager.App.ViewModels;
+using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
@@ -123,6 +124,16 @@ public class AutoTagController : IDisposable
         _currentFolderPath = folderPath;
         _currentFolderId = folderId;
         bool hasState = folderId > 0;
+
+        // Filter out video files - only process images
+        filePaths = filePaths.Where(f => FileTypeConstants.IsImageFile(f)).ToList();
+        if (filePaths.Count == 0)
+        {
+            LastProcessedPaths = new List<string>();
+            ProgressChanged?.Invoke(new AutoTagPipelineProgress("Done", 0, 0, "没有图片文件需要处理"));
+            TranslationReady?.Invoke();
+            return;
+        }
 
         // Batch-load AutoTagStatus for all file paths (single DB query)
         var statusMap = await _metaRepo.GetStatusMapByPathsAsync(filePaths);

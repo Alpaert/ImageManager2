@@ -42,4 +42,12 @@
     <ProjectReference Include="..\ImageManager.Core\ImageManager.Core.csproj" />
     <ProjectReference Include="..\ImageManager.Infrastructure\ImageManager.Infrastructure.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <!-- Copy ffmpeg binaries to output directory -->
+    <None Include="..\..\libffmpeg\**\*.*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>libffmpeg\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </None>
+  </ItemGroup>
 </Project>

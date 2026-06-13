@@ -608,35 +608,64 @@ public partial class MainWindowViewModel : ViewModelBase
                 PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
                 StatusText = $"总文件数: {_allFiles.Count}";
 
-                int totalTaggedFromDb = 0;
-                lock (_tagCacheLock)
-                {
-                    foreach (var m in indexedFiles)
-                    {
-                        _metaCache[m.FilePath] = m;
-                        if (m.Tags.Count > 0)
-                        {
-                            _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
-                            totalTaggedFromDb++;
-                        }
-                    }
-                }
-
-                StatusText += $" | 索引图: {indexedFiles.Count} | DB有标签: {totalTaggedFromDb} 张";
-                if (totalTaggedFromDb > 0)
-                {
-                    var sample = indexedFiles.FirstOrDefault(m => m.Tags.Count > 0);
-                    StatusText += $" | 示例: {sample?.Tags.FirstOrDefault()?.Name}";
-                }
-
                 int? lastPage = string.IsNullOrEmpty(preferredFilePath)
                     ? await _folderRepo.GetLastPageIndexAsync(folder)
                     : null;
                 if (isCurrent?.Invoke() == false)
                     return;
                 int startPage = GetStartPageForLoadedFolder(preferredFilePath, lastPage);
+
+                // 立即触发页面显示，不等待标签加载
                 await ShowPageAsync(startPage);
                 if (isCurrent?.Invoke() == false)
+                    return;
+
+                // 标签异步加载（后台线程），不阻塞主线程
+                _ = Task.Run(() =>
+                {
+                    try
+                    {
+                        int totalTaggedFromDb = 0;
+                        lock (_tagCacheLock)
+                        {
+                            foreach (var m in indexedFiles)
+                            {
+                                _metaCache[m.FilePath] = m;
+                                if (m.Tags.Count > 0)
+                                {
+                                    _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
+                                    totalTaggedFromDb++;
+                                }
+                            }
+                        }
+
+                        // 标签加载完成后，通知 UI 刷新
+                        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                        {
+                            StatusText += $" | 索引图: {indexedFiles.Count} | DB有标签: {totalTaggedFromDb} 张";
+                            if (totalTaggedFromDb > 0)
+                            {
+                                var sample = indexedFiles.FirstOrDefault(m => m.Tags.Count > 0);
+                                StatusText += $" | 示例: {sample?.Tags.FirstOrDefault()?.Name}";
+                            }
+
+                            // 刷新当前页面的标签显示
+                            foreach (var item in Images)
+                            {
+                                if (_tagCacheByPath.TryGetValue(item.FilePath, out var tags))
+                                {
+                                    item.Tags = tags;
+                                    item.NotifyAll();
+                                }
+                            }
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        AppLogger.Error($"标签异步加载失败: {ex.Message}");
+                    }
+                });
+
                     return;
 
                 // Sync: check for new/removed files, then compute hashes for newcomers
@@ -824,8 +853,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void OnFolderFileCreated(object sender, FileSystemEventArgs e)
     {
-        var ext = Path.GetExtension(e.Name).ToLowerInvariant();
-        if (ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".bmp" && ext != ".gif" && ext != ".webp")
+        if (!FileTypeConstants.IsMediaFile(e.Name))
             return;
 
         _folderWatchDebounceCts?.Cancel();
@@ -846,8 +874,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void OnFolderFileDeleted(object sender, FileSystemEventArgs e)
     {
-        var ext = Path.GetExtension(e.Name).ToLowerInvariant();
-        if (ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".bmp" && ext != ".gif" && ext != ".webp")
+        if (!FileTypeConstants.IsMediaFile(e.Name))
             return;
 
         _folderWatchDebounceCts?.Cancel();
@@ -1004,6 +1031,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
         var needsHashing = files
             .Where(f => !existingSet.Contains(f))
+            .Where(f => FileTypeConstants.IsImageFile(f))  // Skip video files
             .ToList();
         if (needsHashing.Count == 0) return;
 

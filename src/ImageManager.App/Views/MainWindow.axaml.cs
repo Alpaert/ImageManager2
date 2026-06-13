@@ -845,7 +845,28 @@ public partial class MainWindow : Window
         if (border.DataContext is not ImageViewItem item) return;
         if (!File.Exists(item.FilePath)) return;
 
-        await OpenPreviewForFileAsync(item.FilePath);
+        // Video: open with system default player
+        if (FileTypeConstants.IsVideoFile(item.FilePath))
+        {
+            try
+            {
+                var psi = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = item.FilePath,
+                    UseShellExecute = true
+                };
+                System.Diagnostics.Process.Start(psi);
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Error($"Failed to open video: {ex.Message}");
+            }
+        }
+        else
+        {
+            // Image: use built-in preview window
+            await OpenPreviewForFileAsync(item.FilePath);
+        }
     }
 
     // ==================== Context Menu Handlers ====================

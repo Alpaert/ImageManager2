@@ -1,4 +1,5 @@
 using CommunityToolkit.Mvvm.ComponentModel;
+using ImageManager.Common.Constants;
 
 namespace ImageManager.App.ViewModels;
 
@@ -24,6 +25,7 @@ public partial class ImageViewItem : ObservableObject
     public bool IsNotLoaded => !IsLoaded;
     public bool IsLandscape => Width >= Height;
     public string OrientationText => IsLandscape ? "横图" : "竖图";
+    public bool IsVideo => FileTypeConstants.IsVideoFile(FilePath);
 
     // Deterministic placeholder color from filename — avoids empty white space during loading
     public string PlaceholderColor

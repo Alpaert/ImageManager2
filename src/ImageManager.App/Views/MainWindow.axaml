@@ -419,6 +419,23 @@
                                                        HorizontalAlignment="Center"/>
                                             </StackPanel>
                                         </Border>
+                                        <!-- Video play icon overlay -->
+                                        <Panel IsVisible="{Binding IsVideo}"
+                                               IsHitTestVisible="False">
+                                            <Border Width="48" Height="48"
+                                                    Background="#80000000"
+                                                    CornerRadius="24"
+                                                    HorizontalAlignment="Right"
+                                                    VerticalAlignment="Bottom"
+                                                    Margin="0,0,8,8">
+                                                <Path Fill="White"
+                                                      Width="24" Height="24"
+                                                      Data="M8 5v14l11-7z"
+                                                      Stretch="Uniform"
+                                                      HorizontalAlignment="Center"
+                                                      VerticalAlignment="Center"/>
+                                            </Border>
+                                        </Panel>
                                     </Grid>
                                 </Border>
                                 <!-- Selection highlight overlay -->

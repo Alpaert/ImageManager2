@@ -1,5 +1,6 @@
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 
 namespace ImageManager.App.ViewModels;
@@ -36,6 +37,15 @@ public partial class PreviewViewModel : ViewModelBase
     {
         if (ImagePaths.Count == 0) return null;
         int newIdx = CurrentIndex + delta;
+
+        // Skip video files when navigating
+        int direction = delta > 0 ? 1 : -1;
+        while (newIdx >= 0 && newIdx < ImagePaths.Count
+               && FileTypeConstants.IsVideoFile(ImagePaths[newIdx]))
+        {
+            newIdx += direction;
+        }
+
         if (newIdx < 0 || newIdx >= ImagePaths.Count) return null;
         ImageData = null; // release previous image before loading new
         CurrentIndex = newIdx;

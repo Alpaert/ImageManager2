@@ -1,8 +1,10 @@
 using ImageManager.App.ViewModels;
+using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Caching;
 using ImageManager.Infrastructure.Imaging;
+using ImageManager.Infrastructure.Video;
 
 namespace ImageManager.App.Services;
 
@@ -34,6 +36,7 @@ public class PageManager : IDisposable
     private int _preSearchPageIndex;
 
     private readonly SemaphoreSlim _thumbnailLoadSemaphore = new(8);
+    private readonly SemaphoreSlim _videoLoadSemaphore = new(4);
     private int _thumbnailDecodeWidth = 200;
     private int _currentZoomLevel;
     private PageUiState _currentUiState;
@@ -203,6 +206,7 @@ public class PageManager : IDisposable
     public void Dispose()
     {
         _thumbnailLoadSemaphore.Dispose();
+        _videoLoadSemaphore.Dispose();
         _zoomDebounceCts?.Dispose();
     }
 
@@ -312,22 +316,25 @@ public class PageManager : IDisposable
 
     private async Task LoadSingleThumbnailAsync(ImageViewItem item)
     {
-        await _thumbnailLoadSemaphore.WaitAsync();
+        // Choose queue based on file type
+        bool isVideo = FileTypeConstants.IsVideoFile(item.FilePath);
+        var semaphore = isVideo ? _videoLoadSemaphore : _thumbnailLoadSemaphore;
+
+        await semaphore.WaitAsync();
         try
         {
-            var data = await _thumbCache.GetOrCreateThumbnailAsync(item.FilePath, _thumbnailDecodeWidth);
+            // 一次性获取数据 + 尺寸，无需二次查询
+            var (data, w, h) = await _thumbCache.GetOrCreateThumbnailAsync(item.FilePath, _thumbnailDecodeWidth);
             if (data != null)
             {
                 item.ThumbnailData = data;
-                var (w, h) = ThumbnailGenerator.GetDimensions(item.FilePath);
-                if (w <= 0 || h <= 0) (w, h) = (1920, 1080); // fallback
-                item.Width = w;
-                item.Height = h;
+                item.Width = w > 0 ? w : 1920;
+                item.Height = h > 0 ? h : 1080;
                 item.IsLoaded = true;
             }
         }
         catch { AppLogger.Warn($"Failed to load thumbnail: {item.FilePath}"); }
-        finally { _thumbnailLoadSemaphore.Release(); }
+        finally { semaphore.Release(); }
 
         item.IsLoading = false;
         item.NotifyAll();
