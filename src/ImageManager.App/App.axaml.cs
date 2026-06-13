@@ -144,7 +144,14 @@ public partial class App : Application
         services.AddSingleton<ISimilarImageService, SimilarImageService>();
         services.AddSingleton<IDuplicateService, DuplicateService>();
 
-        services.AddSingleton<ThumbnailCacheService>();
+        // ==================== Media Processor Factory ====================
+        services.AddSingleton<IMediaProcessorFactory, MediaProcessorFactory>();
+
+        services.AddSingleton<ThumbnailCacheService>(sp =>
+            new ThumbnailCacheService(
+                sp.GetRequiredService<IMediaProcessorFactory>(),
+                cacheDir,
+                200));
         services.AddSingleton<IThumbnailCacheService>(sp => sp.GetRequiredService<ThumbnailCacheService>());
 
         // Existing WD service

@@ -223,14 +223,25 @@ public class SmartWaterfallPanel : Panel
         {
             var row = _rows[rowIdx];
             bool isLast = rowIdx == _rows.Count - 1;
-            double rowHeight = TargetRowHeight;
 
             if (isLast)
             {
+                // 最后一行：如果有多行，使用倒数第二行的高度保持一致；如果只有一行，使用目标高度
+                double rowHeight = _rows.Count > 1 ? _rows[_rows.Count - 2].Height : TargetRowHeight;
                 double x = 0;
                 foreach (var child in row.Children)
                 {
-                    double w = _childWidths.TryGetValue(child, out double cw) ? cw : rowHeight * 0.75;
+                    // 根据实际行高和原始比例重新计算宽度
+                    double w;
+                    if (child is Control ctrl && ctrl.DataContext is ImageViewItem item
+                        && item.Width > 0 && item.Height > 0)
+                    {
+                        w = rowHeight * (double)item.Width / item.Height + 10;
+                    }
+                    else
+                    {
+                        w = rowHeight * 0.75;
+                    }
                     child.Measure(new Size(w, rowHeight));
                     child.Arrange(new Rect(x, row.Y, w, rowHeight));
                     x += w;

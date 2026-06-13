@@ -5,7 +5,7 @@ namespace ImageManager.Infrastructure.Video;
 public static class VideoMetadataExtractor
 {
     /// <summary>
-    /// Extract video width, height, and duration using ffprobe
+    /// Extract video width, height, and duration using ffmpeg
     /// </summary>
     public static async Task<(int Width, int Height, double Duration)?> ExtractMetadataAsync(
         string filePath,
@@ -13,29 +13,44 @@ public static class VideoMetadataExtractor
     {
         try
         {
-            // Use ffprobe to extract metadata (ffprobe comes with ffmpeg)
-            string args = $"-v error -select_streams v:0 -show_entries stream=width,height,duration -of csv=p=0 \"{filePath}\"";
+            // Use ffmpeg to extract metadata (faster than ffprobe for our use case)
+            // -i: input file, output shows metadata in stderr
+            string args = $"-i \"{filePath}\"";
             var (exitCode, output, error) = await FFmpegManager.RunAsync(args, 10, ct);
 
-            if (exitCode != 0 || string.IsNullOrWhiteSpace(output))
-                return null;
+            // ffmpeg prints metadata to stderr
+            // Look for: "Stream #0:0: Video: ..., 1920x1080"
+            // Look for: "Duration: 00:24:00.09"
 
-            // Output format: "1920,1080,125.5"
-            var parts = output.Trim().Split(',');
-            if (parts.Length >= 2 &&
-                int.TryParse(parts[0], out int w) &&
-                int.TryParse(parts[1], out int h))
+            int width = 0, height = 0;
+            double duration = 0;
+
+            // Parse resolution from stderr
+            var resMatch = System.Text.RegularExpressions.Regex.Match(error, @"(\d{2,5})x(\d{2,5})");
+            if (resMatch.Success)
             {
-                double duration = 0;
-                if (parts.Length >= 3 && double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out double d))
-                    duration = d;
+                width = int.Parse(resMatch.Groups[1].Value);
+                height = int.Parse(resMatch.Groups[2].Value);
+            }
 
-                return (w, h, duration);
+            // Parse duration from stderr: "Duration: 00:24:00.09"
+            var durMatch = System.Text.RegularExpressions.Regex.Match(error, @"Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})");
+            if (durMatch.Success)
+            {
+                int hours = int.Parse(durMatch.Groups[1].Value);
+                int minutes = int.Parse(durMatch.Groups[2].Value);
+                double seconds = double.Parse(durMatch.Groups[3].Value, CultureInfo.InvariantCulture);
+                duration = hours * 3600 + minutes * 60 + seconds;
+            }
+
+            if (width > 0 && height > 0)
+            {
+                return (width, height, duration);
             }
 
             return null;
         }
-        catch
+        catch (Exception ex)
         {
             return null;
         }

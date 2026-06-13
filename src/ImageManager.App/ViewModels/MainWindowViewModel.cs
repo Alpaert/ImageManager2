@@ -666,23 +666,20 @@ public partial class MainWindowViewModel : ViewModelBase
                     }
                 });
 
-                    return;
-
-                // Sync: check for new/removed files, then compute hashes for newcomers
-                await SyncFolderAsync(folder, folderId.Value, exts, isCurrent);
-                if (isCurrent?.Invoke() == false)
-                    return;
-                _precomputeCts?.Cancel();
-                _precomputeCts?.Dispose();
-                _precomputeCts = new CancellationTokenSource();
-                // Delay hash precomputation to avoid competing with initial thumbnail loading
-                var captureCt = _precomputeCts.Token;
+                // 延迟后台同步：检查磁盘新文件并更新数据库
                 _ = Task.Run(async () =>
                 {
-                    try { await Task.Delay(3000, captureCt); }
-                    catch { return; }
-                    await PrecomputeHashesAsync(captureCt, folderId.Value);
+                    try
+                    {
+                        await Task.Delay(2000); // 延迟2秒，避免与页面加载竞争
+                        if (string.Equals(CurrentFolder, folder, StringComparison.OrdinalIgnoreCase))
+                        {
+                            await SyncFolderAsync(folder, folderId.Value, exts, isCurrent);
+                        }
+                    }
+                    catch { }
                 });
+
                 return;
             }
         }

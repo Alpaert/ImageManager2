@@ -20,6 +20,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
 
     private readonly ConcurrentDictionary<string, CacheEntry> _cache = new(StringComparer.OrdinalIgnoreCase);
     private readonly DiskThumbnailCache _diskCache;
+    private readonly IMediaProcessorFactory _factory;
     private long _totalBytes;
     private const long MaxMemoryBytes = 50 * 1024 * 1024; // 50 MB
 
@@ -45,8 +46,12 @@ public class ThumbnailCacheService : IThumbnailCacheService
         }
     }
 
-    public ThumbnailCacheService(string cacheRoot = @"C:\ImageManagerCache", int decodeWidth = 200)
+    public ThumbnailCacheService(
+        IMediaProcessorFactory factory,
+        string cacheRoot = @"C:\ImageManagerCache",
+        int decodeWidth = 200)
     {
+        _factory = factory;
         _diskCache = new DiskThumbnailCache(cacheRoot, decodeWidth);
         DecodeWidth = decodeWidth;
         _cacheDirectory = cacheRoot;
@@ -100,53 +105,24 @@ public class ThumbnailCacheService : IThumbnailCacheService
         var cached = _diskCache.Load(filePath);
         if (cached != null)
         {
-            // 从磁盘加载时，需要重新获取尺寸
-            int w, h;
-            if (FileTypeConstants.IsVideoFile(filePath))
-            {
-                var (vw, vh) = await VideoThumbnailGenerator.GetDimensionsAsync(filePath);
-                w = vw; h = vh;
-            }
-            else
-            {
-                (w, h) = ThumbnailGenerator.GetDimensions(filePath);
-            }
-
+            var processor = _factory.GetProcessor(filePath);
+            var (w, h) = processor.GetDimensions(filePath);
             AddToMemory(filePath, cached, decodeWidth, w, h);
             return (cached, w, h);
         }
 
-        // 3. Generate thumbnail - differentiate between images and videos
-        if (FileTypeConstants.IsVideoFile(filePath))
-        {
-            // Video: 一次性获取数据 + 尺寸
-            var result = await VideoThumbnailGenerator.GenerateAsync(
-                filePath,
-                decodeWidth,
-                CancellationToken.None
-            );
+        // 3. Generate thumbnail
+        var processorGen = _factory.GetProcessor(filePath);
+        var result = await processorGen.ExtractThumbnailAsync(filePath, decodeWidth, CancellationToken.None);
 
-            if (result != null && result.ThumbnailData != null)
-            {
-                AddToMemory(filePath, result.ThumbnailData, decodeWidth, result.Width, result.Height);
-                _diskCache.Save(filePath, result.ThumbnailData);
-                return (result.ThumbnailData, result.Width, result.Height);
-            }
-            return (null, 0, 0);
-        }
-        else
+        if (result != null && result.Data.Length > 0)
         {
-            // Image: use existing ThumbnailGenerator
-            var data = await Task.Run(() => ThumbnailGenerator.Generate(filePath, decodeWidth));
-            if (data != null)
-            {
-                var (w, h) = ThumbnailGenerator.GetDimensions(filePath);
-                AddToMemory(filePath, data, decodeWidth, w, h);
-                _diskCache.Save(filePath, data);
-                return (data, w, h);
-            }
-            return (null, 0, 0);
+            AddToMemory(filePath, result.Data, decodeWidth, result.Width, result.Height);
+            _diskCache.Save(filePath, result.Data);
+            return (result.Data, result.Width, result.Height);
         }
+
+        return (null, 0, 0);
     }
 
     public Task ClearAsync()

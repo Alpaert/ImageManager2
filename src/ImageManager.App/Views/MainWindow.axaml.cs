@@ -1648,10 +1648,8 @@ public partial class MainWindow : Window
     {
         try
         {
-            var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
             return Directory.EnumerateFiles(path)
-                .Where(f => exts.Contains(Path.GetExtension(f)))
+                .Where(f => FileTypeConstants.IsMediaFile(f))
                 .ToList();
         }
         catch { return new List<string>(); }
@@ -1660,8 +1658,6 @@ public partial class MainWindow : Window
     private static List<string> GetImageFilesRecursive(string root)
     {
         var files = new List<string>();
-        var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
         try
         {
             var dirs = new Queue<string>();
@@ -1672,7 +1668,7 @@ public partial class MainWindow : Window
                 try
                 {
                     foreach (var f in Directory.EnumerateFiles(dir))
-                        if (exts.Contains(Path.GetExtension(f)))
+                        if (FileTypeConstants.IsMediaFile(f))
                             files.Add(f);
                     foreach (var sub in Directory.EnumerateDirectories(dir))
                         dirs.Enqueue(sub);
@@ -2078,11 +2074,7 @@ public partial class MainWindow : Window
                 {
                     var artistName = Path.GetFileName(artistDir);
                     var images = Directory.GetFiles(artistDir)
-                        .Where(f =>
-                        {
-                            var ext = Path.GetExtension(f).ToLower();
-                            return ext is ".jpg" or ".jpeg" or ".png" or ".webp";
-                        })
+                        .Where(f => FileTypeConstants.IsMediaFile(f))
                         .ToList();
                     int currentCount = images.Count;
                     int storedCount = store.GetImageCount(artistName);
@@ -2116,11 +2108,7 @@ public partial class MainWindow : Window
                     });
 
                     var images = Directory.GetFiles(artistDir)
-                        .Where(f =>
-                        {
-                            var ext = Path.GetExtension(f).ToLower();
-                            return ext is ".jpg" or ".jpeg" or ".png" or ".webp";
-                        })
+                        .Where(f => FileTypeConstants.IsMediaFile(f))
                         .ToList();
 
                     if (images.Count == 0) continue;
