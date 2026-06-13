@@ -6,6 +6,7 @@ using Avalonia.Media;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using ImageManager.App.Services;
+using ImageManager.Common.Constants;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Caching;
@@ -134,8 +135,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private static List<string> GetImageFilesRecursive(string root)
     {
-        var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
+        var exts = FileTypeConstants.AllMediaExtensions;
         try
         {
             return Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirectories)
@@ -581,7 +581,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (isCurrent?.Invoke() == false)
             return;
         long? folderId = folderInfo?.Id;
-        var exts = new[] { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
+        var exts = FileTypeConstants.AllMediaExtensions.ToArray();
 
         if (folderId.HasValue)
         {
@@ -692,8 +692,35 @@ public partial class MainWindowViewModel : ViewModelBase
         TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
 
-        // Load tag cache (must complete before ShowPageAsync so thumbnails show tags)
-        var tagLoadTask = Task.Run(async () =>
+        var fileSet = new HashSet<string>(_allFiles, StringComparer.OrdinalIgnoreCase);
+        _ = CleanMetaForFolderAsync(folder, fileSet);
+
+        _precomputeCts?.Cancel();
+        _precomputeCts?.Dispose();
+        _precomputeCts = new CancellationTokenSource();
+        var captureCt2 = _precomputeCts.Token;
+        _ = Task.Run(async () =>
+        {
+            try { await Task.Delay(3000, captureCt2); }
+            catch { return; }
+            await PrecomputeHashesAsync(captureCt2, folderId);
+        });
+
+        if (isCurrent?.Invoke() == false)
+            return;
+
+        int? lastPage2 = string.IsNullOrEmpty(preferredFilePath)
+            ? await _folderRepo.GetLastPageIndexAsync(folder)
+            : null;
+        if (isCurrent?.Invoke() == false)
+            return;
+        int startPage2 = GetStartPageForLoadedFolder(preferredFilePath, lastPage2);
+
+        // 立即显示第一页（图片优先）
+        await ShowPageAsync(startPage2);
+
+        // 异步加载标签（不阻塞显示）
+        _ = Task.Run(async () =>
         {
             try
             {
@@ -711,8 +738,14 @@ public partial class MainWindowViewModel : ViewModelBase
                         }
                     }
                 }
-                Avalonia.Threading.Dispatcher.UIThread.Post(() =>
-                    StatusText = $"总文件数: {_allFiles.Count} | DB图: {metas.Count} | DB有标签: {dbTagged} 张");
+
+                // 刷新当前页面以显示标签
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    _pageManager.InvalidateCache();
+                    _ = ShowPageAsync(CurrentPage);
+                    StatusText = $"总文件数: {_allFiles.Count} | DB图: {metas.Count} | DB有标签: {dbTagged} 张";
+                });
             }
             catch (Exception ex)
             {
@@ -720,32 +753,6 @@ public partial class MainWindowViewModel : ViewModelBase
                     StatusText = $"标签加载失败: {ex.Message}");
             }
         });
-
-        var fileSet = new HashSet<string>(_allFiles, StringComparer.OrdinalIgnoreCase);
-        _ = CleanMetaForFolderAsync(folder, fileSet);
-
-        _precomputeCts?.Cancel();
-        _precomputeCts?.Dispose();
-        _precomputeCts = new CancellationTokenSource();
-        var captureCt2 = _precomputeCts.Token;
-        _ = Task.Run(async () =>
-        {
-            try { await Task.Delay(3000, captureCt2); }
-            catch { return; }
-            await PrecomputeHashesAsync(captureCt2, folderId);
-        });
-
-        await tagLoadTask;
-
-        if (isCurrent?.Invoke() == false)
-            return;
-
-        int? lastPage2 = string.IsNullOrEmpty(preferredFilePath)
-            ? await _folderRepo.GetLastPageIndexAsync(folder)
-            : null;
-        if (isCurrent?.Invoke() == false)
-            return;
-        int startPage2 = GetStartPageForLoadedFolder(preferredFilePath, lastPage2);
 
         StatusText = $"总文件数: {_allFiles.Count}";
         await ShowPageAsync(startPage2);
@@ -757,7 +764,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (string.IsNullOrEmpty(CurrentFolder)) return;
         var fi = await _folderRepo.GetByPathAsync(CurrentFolder);
         if (fi == null) return;
-        var exts = new[] { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
+        var exts = FileTypeConstants.AllMediaExtensions.ToArray();
         await SyncFolderAsync(CurrentFolder, fi.Id, exts);
 
         _precomputeCts?.Cancel();
@@ -869,7 +876,7 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             var diskFiles = new HashSet<string>(
                 Directory.EnumerateFiles(folder, "*.*", SearchOption.TopDirectoryOnly)
-                    .Where(f => exts.Contains(Path.GetExtension(f).ToLower())),
+                    .Where(f => FileTypeConstants.IsMediaFile(f)),
                 StringComparer.OrdinalIgnoreCase);
 
             var dbFiles = await _metaRepo.GetByFolderIdAsync(folderId);
@@ -995,7 +1002,9 @@ public partial class MainWindowViewModel : ViewModelBase
             }
         }
 
-        var needsHashing = files.Where(f => !existingSet.Contains(f)).ToList();
+        var needsHashing = files
+            .Where(f => !existingSet.Contains(f))
+            .ToList();
         if (needsHashing.Count == 0) return;
 
         // === Producer: I/O-bound file reading ===
@@ -1454,8 +1463,7 @@ partial void OnCornerRadiusDipChanged(double value)
             ? GetImageFilesRecursive(folderPath)
             : await Task.Run(() =>
                 Directory.EnumerateFiles(folderPath, "*.*", SearchOption.TopDirectoryOnly)
-                    .Where(f => new[] { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" }
-                        .Contains(Path.GetExtension(f).ToLower()))
+                    .Where(f => FileTypeConstants.IsMediaFile(f))
                     .ToList());
 
         if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))

@@ -1,13 +1,12 @@
+using ImageManager.Common.Constants;
+
 namespace ImageManager.Common.Helpers;
 
 public static class PathHelper
 {
-    private static readonly string[] ImageExtensions = { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
-
     public static bool IsImageFile(string path)
     {
-        var ext = Path.GetExtension(path).ToLowerInvariant();
-        return ImageExtensions.Contains(ext);
+        return FileTypeConstants.IsImageFile(path);
     }
 
     public static string GetNonConflictingPath(string targetPath)

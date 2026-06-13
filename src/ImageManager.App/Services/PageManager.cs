@@ -33,10 +33,11 @@ public class PageManager : IDisposable
     private List<ImageViewItem>? _preSearchPageItems;
     private int _preSearchPageIndex;
 
-    private readonly SemaphoreSlim _thumbnailLoadSemaphore = new(4);
+    private readonly SemaphoreSlim _thumbnailLoadSemaphore = new(8);
     private int _thumbnailDecodeWidth = 200;
     private int _currentZoomLevel;
     private PageUiState _currentUiState;
+    private long _zoomVersion = 0;  // 版本号机制，防止防抖竞态
     private CancellationTokenSource? _zoomDebounceCts;
 
     public event Action<PageChangedEventArgs>? PageChanged;
@@ -152,11 +153,20 @@ public class PageManager : IDisposable
                 _zoomDebounceCts = new CancellationTokenSource();
                 var token = _zoomDebounceCts.Token;
                 var capturedFileList = activeFileList;
+                var expectedVersion = Interlocked.Increment(ref _zoomVersion);  // 生成新版本号
+
                 _ = Task.Run(async () =>
                 {
                     try { await Task.Delay(300, token); }
                     catch { return; }
                     if (token.IsCancellationRequested) return;
+
+                    // 版本号校验：确保只有最新的防抖任务生效
+                    if (Interlocked.Read(ref _zoomVersion) != expectedVersion)
+                    {
+                        return;  // 已有更新的任务，放弃执行
+                    }
+
                     var dispatcher = Avalonia.Threading.Dispatcher.UIThread;
                     await dispatcher.InvokeAsync(async () =>
                     {
@@ -170,6 +180,7 @@ public class PageManager : IDisposable
                                 {
                                     item.IsLoaded = false;
                                     item.IsLoading = true;
+                                    item.ThumbnailData = null;  // 清空旧数据，防止短暂显示
                                 }
                         }
                         _ = LoadPageThumbnailsAsync(_activePageIndex);
@@ -258,8 +269,7 @@ public class PageManager : IDisposable
                 FilePath = file,
                 FileName = System.IO.Path.GetFileName(file),
                 Tags = tags,
-                IsLoading = true,
-                IsVideo = ThumbnailGenerator.IsVideoFile(file)
+                IsLoading = true
             });
         }
 
@@ -281,6 +291,7 @@ public class PageManager : IDisposable
         var priorityItems = unloaded.Take(visibleCount).ToList();
         var bgItems = unloaded.Skip(visibleCount).ToList();
 
+        // 加载可见项
         int i = 0;
         foreach (var item in priorityItems)
         {
@@ -289,6 +300,7 @@ public class PageManager : IDisposable
                 await Task.Yield();
         }
 
+        // 加载背景项
         i = 0;
         foreach (var item in bgItems)
         {
@@ -307,11 +319,7 @@ public class PageManager : IDisposable
             if (data != null)
             {
                 item.ThumbnailData = data;
-                bool isVideo = ThumbnailGenerator.IsVideoFile(item.FilePath);
-                item.IsVideo = isVideo;
-                var (w, h) = isVideo
-                    ? ParseJpegDimensions(data)
-                    : ThumbnailGenerator.GetDimensions(item.FilePath);
+                var (w, h) = ThumbnailGenerator.GetDimensions(item.FilePath);
                 if (w <= 0 || h <= 0) (w, h) = (1920, 1080); // fallback
                 item.Width = w;
                 item.Height = h;

@@ -9,8 +9,10 @@ using Avalonia.VisualTree;
 using System.Runtime.InteropServices;
 using ImageManager.App.Helpers;
 using ImageManager.App.ViewModels;
+using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Infrastructure.Data;
+using ImageManager.Infrastructure.Imaging;
 using ImageManager.Infrastructure.Services;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -839,12 +841,11 @@ public partial class MainWindow : Window
 
     private async void Thumbnail_DoubleTapped(object? sender, Avalonia.Input.TappedEventArgs e)
     {
-        if (sender is Avalonia.Controls.Border border &&
-            border.DataContext is ImageViewItem item &&
-            File.Exists(item.FilePath))
-        {
-            await OpenPreviewForFileAsync(item.FilePath);
-        }
+        if (sender is not Avalonia.Controls.Border border) return;
+        if (border.DataContext is not ImageViewItem item) return;
+        if (!File.Exists(item.FilePath)) return;
+
+        await OpenPreviewForFileAsync(item.FilePath);
     }
 
     // ==================== Context Menu Handlers ====================
@@ -1332,7 +1333,7 @@ public partial class MainWindow : Window
     {
         var dt = e.DataTransfer;
         if (dt == null) return null;
-        var exts = new[] { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
+        var exts = FileTypeConstants.AllMediaExtensions.ToArray();
 
         foreach (var item in dt.Items)
         {

@@ -1,3 +1,4 @@
+using ImageManager.Common.Constants;
 using SkiaSharp;
 
 namespace ImageManager.Infrastructure.Imaging;
@@ -17,15 +18,6 @@ public sealed class GifFrame
 }
 public static class ThumbnailGenerator
 {
-    public static readonly HashSet<string> VideoExtensions = new(StringComparer.OrdinalIgnoreCase)
-        { ".mp4", ".mkv", ".avi", ".mov", ".webm", ".wmv" };
-
-    public static bool IsVideoFile(string filePath)
-    {
-        var ext = Path.GetExtension(filePath);
-        return VideoExtensions.Contains(ext);
-    }
-
     /// <summary>
     /// Generate thumbnail bytes (JPEG). Always uses SKCodec-based decode to avoid
     /// loading full-resolution bitmaps into memory, even for images with moderate

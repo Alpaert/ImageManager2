@@ -174,8 +174,6 @@ public partial class App : Application
         services.AddSingleton<IAiRecommendService>(sp => sp.GetRequiredService<DeepSeekRecommendService>());
 
 
-        services.AddSingleton<ImageManager.Core.Services.IVideoService, VideoService>();
-        services.AddSingleton<VideoService>();
         services.AddSingleton<PageManager>();
         services.AddSingleton<TagSearchController>();
         services.AddSingleton<MainWindowViewModel>();
