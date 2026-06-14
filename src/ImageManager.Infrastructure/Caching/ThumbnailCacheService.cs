@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using ImageManager.Common.Constants;
+using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Imaging;
 using ImageManager.Infrastructure.Video;
@@ -87,6 +88,8 @@ public class ThumbnailCacheService : IThumbnailCacheService
         if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
             return (null, 0, 0);
 
+        var isVideo = FileTypeConstants.IsVideoFile(filePath);
+
         if (decodeWidth != DecodeWidth)
         {
             DecodeWidth = decodeWidth;
@@ -105,13 +108,34 @@ public class ThumbnailCacheService : IThumbnailCacheService
         var cached = _diskCache.Load(filePath);
         if (cached != null)
         {
+            if (isVideo) PerfLogger.Log($"[Cache] DISK HIT {Path.GetFileName(filePath)}");
+            // 优先从磁盘 meta 读取尺寸（JSON sidecar，零成本）
+            var meta = _diskCache.LoadMeta(filePath);
+            if (meta.HasValue)
+            {
+                AddToMemory(filePath, cached, decodeWidth, meta.Value.Width, meta.Value.Height);
+                return (cached, meta.Value.Width, meta.Value.Height);
+            }
+
+            // 从缓存的 JPEG 头解析宽高（微秒级，完全避免 ffmpeg）
+            var (w, h) = ParseJpegDimensions(cached);
+            if (w > 0 && h > 0)
+            {
+                _diskCache.SaveMeta(filePath, w, h);
+                AddToMemory(filePath, cached, decodeWidth, w, h);
+                return (cached, w, h);
+            }
+
+            // JPEG 解析失败（极少见）→ 回退到 GetDimensions（图片快，视频可能慢）
             var processor = _factory.GetProcessor(filePath);
-            var (w, h) = processor.GetDimensions(filePath);
+            (w, h) = processor.GetDimensions(filePath);
+            _diskCache.SaveMeta(filePath, w, h);
             AddToMemory(filePath, cached, decodeWidth, w, h);
             return (cached, w, h);
         }
 
         // 3. Generate thumbnail
+        if (isVideo) PerfLogger.Log($"[Cache] GENERATE start {Path.GetFileName(filePath)}");
         var processorGen = _factory.GetProcessor(filePath);
         var result = await processorGen.ExtractThumbnailAsync(filePath, decodeWidth, CancellationToken.None);
 
@@ -119,6 +143,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
         {
             AddToMemory(filePath, result.Data, decodeWidth, result.Width, result.Height);
             _diskCache.Save(filePath, result.Data);
+            _diskCache.SaveMeta(filePath, result.Width, result.Height);
             return (result.Data, result.Width, result.Height);
         }
 
@@ -192,4 +217,24 @@ public class ThumbnailCacheService : IThumbnailCacheService
     public void DeleteFromDiskCache(string filePath) => _diskCache.DeleteAllWidths(filePath);
 
     public long EstimateDiskUsage() => _diskCache.EstimateDiskUsage();
+
+    /// <summary>
+    /// 从 JPEG 字节数组头部解析图像宽高（微秒级，不涉及解码）。
+    /// 遍历 JPEG marker 段，找到 SOF0/SOF2 marker 读取尺寸。
+    /// </summary>
+    private static (int Width, int Height) ParseJpegDimensions(byte[] jpeg)
+    {
+        if (jpeg.Length < 10) return (0, 0);
+        int i = 2; // skip SOI marker (0xFF 0xD8)
+        while (i < jpeg.Length - 9)
+        {
+            if (jpeg[i] != 0xFF) return (0, 0);
+            byte m = jpeg[i + 1];
+            // SOF0 (baseline) or SOF2 (progressive)
+            if (m == 0xC0 || m == 0xC2)
+                return ((jpeg[i + 7] << 8) | jpeg[i + 8], (jpeg[i + 5] << 8) | jpeg[i + 6]);
+            i += 2 + ((jpeg[i + 2] << 8) | jpeg[i + 3]);
+        }
+        return (0, 0);
+    }
 }

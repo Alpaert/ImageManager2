@@ -111,7 +111,7 @@ public static class VideoThumbnailGenerator
         {
             tempFile = Path.Combine(Path.GetTempPath(), $"thumb_{Guid.NewGuid():N}.jpg");
             string tsStr = timestamp.ToString("F2", CultureInfo.InvariantCulture);
-            string args = $"-ss {tsStr} -i \"{filePath}\" -vf \"thumbnail,scale={width}:-1\" -frames:v 1 -update 1 -q:v 5 \"{tempFile}\"";
+            string args = $"-ss {tsStr} -i \"{filePath}\" -t 5 -vf \"thumbnail,scale={width}:-1\" -frames:v 1 -update 1 -q:v 5 \"{tempFile}\"";
 
             var (exitCode, _, error) = await FFmpegManager.RunAsync(args, 30, ct);
 

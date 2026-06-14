@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using ImageManager.App.ViewModels;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
@@ -5,6 +6,7 @@ using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Caching;
 using ImageManager.Infrastructure.Imaging;
 using ImageManager.Infrastructure.Video;
+using Avalonia.Threading;
 
 namespace ImageManager.App.Services;
 
@@ -62,6 +64,9 @@ public class PageManager : IDisposable
     {
         if (pageIndex < 0 || pageIndex >= totalPages) return;
 
+        var sw = Stopwatch.StartNew();
+        PerfLogger.Log($"[PageMgr] ShowPage START page={pageIndex}/{totalPages}");
+
         _activePageIndex = pageIndex;
 
         List<ImageViewItem> pageItems;
@@ -72,16 +77,21 @@ public class PageManager : IDisposable
             {
                 pageItems = CreatePlaceholderItems(pageIndex, totalPages, activeFileList, getTagsForFile);
                 _pageCache[pageIndex] = pageItems;
+                PerfLogger.Log($"[PageMgr] CreatePlaceholders {pageItems.Count} items elapsed={sw.ElapsedMilliseconds}ms");
             }
             needsLoad = !pageItems.TrueForAll(i => i.IsLoaded);
         }
 
         if (needsLoad)
+        {
+            PerfLogger.Log($"[PageMgr] LoadThumbnails START unloaded={pageItems.Count(i => !i.IsLoaded)}");
             _ = LoadPageThumbnailsAsync(pageIndex);
+        }
 
         PageChanged?.Invoke(new PageChangedEventArgs(
             pageItems, pageIndex, totalPages,
             $"当前页: {pageIndex + 1}/{totalPages}  每页 {PageSize} 张"));
+        PerfLogger.Log($"[PageMgr] ShowPage END elapsed={sw.ElapsedMilliseconds}ms");
 
         if (!isSearchResult && !string.IsNullOrEmpty(currentFolder))
             _ = Task.Run(() => _folderRepo.SetLastPageIndexAsync(currentFolder!, pageIndex));
@@ -291,53 +301,57 @@ public class PageManager : IDisposable
         var unloaded = pageItems.Where(i => !i.IsLoaded).ToList();
         if (unloaded.Count == 0) return;
 
-        int visibleCount = EstimateVisibleItemCount(_currentUiState);
-        var priorityItems = unloaded.Take(visibleCount).ToList();
-        var bgItems = unloaded.Skip(visibleCount).ToList();
-
-        // 加载可见项
-        int i = 0;
-        foreach (var item in priorityItems)
+        // 并行加载 → 批量 dispatch 到 UI（每 16 项一批，避免 Dispatcher 洪水）
+        const int batchSize = 16;
+        for (int batchStart = 0; batchStart < unloaded.Count; batchStart += batchSize)
         {
-            await LoadSingleThumbnailAsync(item);
-            if (++i % 10 == 0)
-                await Task.Yield();
-        }
+            var batch = unloaded.Skip(batchStart).Take(batchSize).ToList();
+            await Task.WhenAll(batch.Select(item => LoadSingleThumbnailAsync(item)));
 
-        // 加载背景项
-        i = 0;
-        foreach (var item in bgItems)
-        {
-            await LoadSingleThumbnailAsync(item);
-            if (++i % 10 == 0)
-                await Task.Yield();
+            // 每批完成后 dispatch 到 UI
+            var loadedInBatch = batch.Where(i => i.IsLoaded).ToList();
+            if (loadedInBatch.Count > 0)
+            {
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    foreach (var loadedItem in loadedInBatch)
+                    {
+                        loadedItem.IsLoading = false;
+                        loadedItem.NotifyAll();
+                    }
+                });
+            }
         }
     }
 
     private async Task LoadSingleThumbnailAsync(ImageViewItem item)
     {
-        // Choose queue based on file type
         bool isVideo = FileTypeConstants.IsVideoFile(item.FilePath);
+        if (isVideo) PerfLogger.Log($"[Thumb] VIDEO start {Path.GetFileName(item.FilePath)}");
+        var sw = isVideo ? Stopwatch.StartNew() : null;
+
         var semaphore = isVideo ? _videoLoadSemaphore : _thumbnailLoadSemaphore;
 
-        await semaphore.WaitAsync();
+        await semaphore.WaitAsync().ConfigureAwait(false);
         try
         {
-            // 一次性获取数据 + 尺寸，无需二次查询
-            var (data, w, h) = await _thumbCache.GetOrCreateThumbnailAsync(item.FilePath, _thumbnailDecodeWidth);
+            var (data, w, h) = await Task.Run(() =>
+                _thumbCache.GetOrCreateThumbnailAsync(item.FilePath, _thumbnailDecodeWidth)
+            ).ConfigureAwait(false);
+
             if (data != null)
             {
+                // 属性 set 触发 PropertyChanged → Avalonia 内部 Marshal 到 UI 线程
                 item.ThumbnailData = data;
                 item.Width = w > 0 ? w : 1920;
                 item.Height = h > 0 ? h : 1080;
                 item.IsLoaded = true;
             }
         }
-        catch { AppLogger.Warn($"Failed to load thumbnail: {item.FilePath}"); }
+        catch { if (isVideo) PerfLogger.Log($"[Thumb] VIDEO FAIL {Path.GetFileName(item.FilePath)}"); /* AppLogger.Warn logged inside cache layer */ }
         finally { semaphore.Release(); }
 
-        item.IsLoading = false;
-        item.NotifyAll();
+        if (isVideo) PerfLogger.Log($"[Thumb] VIDEO done {Path.GetFileName(item.FilePath)} elapsed={sw!.ElapsedMilliseconds}ms");
     }
 
     private void PreloadAdjacentPages(

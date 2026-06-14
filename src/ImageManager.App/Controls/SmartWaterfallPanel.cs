@@ -1,7 +1,10 @@
+using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Threading;
 using Avalonia.VisualTree;
 using ImageManager.App.ViewModels;
+using ImageManager.Common.Helpers;
 
 namespace ImageManager.App.Controls;
 
@@ -43,6 +46,7 @@ public class SmartWaterfallPanel : Panel
     private double _viewportHeight;
     private double _scrollOffsetY;
     private bool _scrollWired;
+    private bool _arrangePending;
 
     private readonly Dictionary<Control, double> _childWidths = new();
     private readonly List<RowInfo> _rows = new();
@@ -67,7 +71,16 @@ public class SmartWaterfallPanel : Panel
             {
                 _scrollOffsetY = _scrollViewer.Offset.Y;
                 _viewportHeight = _scrollViewer.Viewport.Height;
-                InvalidateArrange();
+                // 节流：合并同一帧内的多次 scroll 事件，最多每帧重排一次
+                if (!_arrangePending)
+                {
+                    _arrangePending = true;
+                    Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                    {
+                        _arrangePending = false;
+                        InvalidateArrange();
+                    }, Avalonia.Threading.DispatcherPriority.Render);
+                }
             };
             _scrollViewer.ScrollChanged += _scrollHandler;
         }
@@ -97,24 +110,32 @@ public class SmartWaterfallPanel : Panel
     protected override Size MeasureOverride(Size availableSize)
     {
         if (Children.Count == 0) return new Size(0, 0);
-        return Mode switch
+        var sw = Stopwatch.StartNew();
+        var result = Mode switch
         {
             "Vertical" => MeasureVertical(availableSize),
             "Horizontal" => MeasureHorizontal(availableSize),
             _ => MeasureDefault(availableSize)
         };
+        if (sw.ElapsedMilliseconds > 5)
+            PerfLogger.Log($"[Layout] MeasureOverride mode={Mode} children={Children.Count} elapsed={sw.ElapsedMilliseconds}ms");
+        return result;
     }
 
     protected override Size ArrangeOverride(Size finalSize)
     {
         if (Children.Count == 0) return finalSize;
+        var sw = Stopwatch.StartNew();
         EnsureScrollViewer();
-        return Mode switch
+        var result = Mode switch
         {
             "Vertical" => ArrangeVertical(finalSize),
             "Horizontal" => ArrangeHorizontal(finalSize),
             _ => ArrangeDefault(finalSize)
         };
+        if (sw.ElapsedMilliseconds > 5)
+            PerfLogger.Log($"[Layout] ArrangeOverride mode={Mode} children={Children.Count} elapsed={sw.ElapsedMilliseconds}ms");
+        return result;
     }
 
     #region Vertical (Masonry)
@@ -159,8 +180,11 @@ public class SmartWaterfallPanel : Panel
     {
         foreach (var (child, x, y, w, h) in _verticalLayout)
         {
-            child.Measure(new Size(w, h));
-            child.Arrange(new Rect(x, y, w, h));
+            // 视口裁剪：不可见行跳过 arrange，减少 GPU/布局开销
+            if (!IsRowVisible(y, h))
+                child.Arrange(new Rect(0, 0, 0, 0));
+            else
+                child.Arrange(new Rect(x, y, w, h));
         }
         return finalSize;
     }
@@ -222,27 +246,29 @@ public class SmartWaterfallPanel : Panel
         for (int rowIdx = 0; rowIdx < _rows.Count; rowIdx++)
         {
             var row = _rows[rowIdx];
+
+            // 视口裁剪：不可见行跳过 arrange
+            if (!IsRowVisible(row.Y, row.Height))
+            {
+                foreach (var child in row.Children)
+                    child.Arrange(new Rect(0, 0, 0, 0));
+                continue;
+            }
+
             bool isLast = rowIdx == _rows.Count - 1;
 
             if (isLast)
             {
-                // 最后一行：如果有多行，使用倒数第二行的高度保持一致；如果只有一行，使用目标高度
                 double rowHeight = _rows.Count > 1 ? _rows[_rows.Count - 2].Height : TargetRowHeight;
                 double x = 0;
                 foreach (var child in row.Children)
                 {
-                    // 根据实际行高和原始比例重新计算宽度
                     double w;
                     if (child is Control ctrl && ctrl.DataContext is ImageViewItem item
                         && item.Width > 0 && item.Height > 0)
-                    {
                         w = rowHeight * (double)item.Width / item.Height + 10;
-                    }
                     else
-                    {
                         w = rowHeight * 0.75;
-                    }
-                    child.Measure(new Size(w, rowHeight));
                     child.Arrange(new Rect(x, row.Y, w, rowHeight));
                     x += w;
                 }
@@ -258,7 +284,6 @@ public class SmartWaterfallPanel : Panel
                 foreach (var child in row.Children)
                 {
                     double w = (_childWidths.TryGetValue(child, out double cw) ? cw : 100) * ratio;
-                    child.Measure(new Size(w, actualHeight));
                     child.Arrange(new Rect(x, row.Y, w, actualHeight));
                     x += w;
                 }

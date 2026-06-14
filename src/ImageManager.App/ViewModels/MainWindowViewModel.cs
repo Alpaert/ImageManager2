@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
+using System.Diagnostics;
 using System.Threading.Channels;
 using Avalonia;
 using Avalonia.Media;
@@ -533,6 +534,8 @@ public partial class MainWindowViewModel : ViewModelBase
 
     public async Task LoadFolderAsync(string folder, string? preferredFilePath = null, Func<bool>? isCurrent = null)
     {
+        var sw = Stopwatch.StartNew();
+        PerfLogger.Log($"[LoadFolder] START folder={Path.GetFileName(folder)} showAll={ShowAllSubfolders}");
         var requestVersion = BeginFolderViewRequest();
         var showAllSubfolders = ShowAllSubfolders;
 
@@ -556,135 +559,37 @@ public partial class MainWindowViewModel : ViewModelBase
         _allFiles.Clear();
         _pageManager.InvalidateCache();
         _phashCache.Clear();
-        lock (_tagCacheLock)
-        {
-            _tagCacheByPath.Clear();
-        }
+        lock (_tagCacheLock) { _tagCacheByPath.Clear(); }
         _metaCache.Clear();
         BackgroundStatusText = "";
         CurrentPage = 0;
         TotalPages = 0;
         CurrentFolder = folder;
         StartWatchingCurrentFolder();
+        PerfLogger.Log($"[LoadFolder] 1-cleanup done {sw.ElapsedMilliseconds}ms");
         await Task.Yield();
+        PerfLogger.Log($"[LoadFolder] 2-yield done {sw.ElapsedMilliseconds}ms");
         if (isCurrent?.Invoke() == false)
             return;
 
         if (showAllSubfolders)
         {
             await RebuildFileListAsync(requestVersion, folder, true);
+            PerfLogger.Log($"[LoadFolder] END (showAll) total={_allFiles.Count} elapsed={sw.ElapsedMilliseconds}ms");
             return;
         }
 
         // Check if this folder already has FolderId markers in DB
+        PerfLogger.Log($"[LoadFolder] 3-db-query-folder start {sw.ElapsedMilliseconds}ms");
         var folderInfo = await _folderRepo.GetByPathAsync(folder);
+        PerfLogger.Log($"[LoadFolder] 3-db-query-folder done {sw.ElapsedMilliseconds}ms");
         if (isCurrent?.Invoke() == false)
             return;
         long? folderId = folderInfo?.Id;
         var exts = FileTypeConstants.AllMediaExtensions.ToArray();
 
-        if (folderId.HasValue)
-        {
-            // Path A: Try indexed DB query first (fast, no disk IO)
-            var indexedFiles = await Task.Run(() =>
-                _metaRepo.GetByFolderIdAsync(folderId.Value));
-            if (isCurrent?.Invoke() == false)
-                return;
-
-            if (indexedFiles.Count > 0)
-            {
-                _allFiles = await Task.Run(() =>
-                    indexedFiles.Select(m => m.FilePath).Where(File.Exists).ToList());
-                if (isCurrent?.Invoke() == false)
-                    return;
-
-                if (_allFiles.Count == 0)
-                {
-                    StatusText = "该文件夹内没有图片文件";
-                    return;
-                }
-
-                TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-                PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-                StatusText = $"总文件数: {_allFiles.Count}";
-
-                int? lastPage = string.IsNullOrEmpty(preferredFilePath)
-                    ? await _folderRepo.GetLastPageIndexAsync(folder)
-                    : null;
-                if (isCurrent?.Invoke() == false)
-                    return;
-                int startPage = GetStartPageForLoadedFolder(preferredFilePath, lastPage);
-
-                // 立即触发页面显示，不等待标签加载
-                await ShowPageAsync(startPage);
-                if (isCurrent?.Invoke() == false)
-                    return;
-
-                // 标签异步加载（后台线程），不阻塞主线程
-                _ = Task.Run(() =>
-                {
-                    try
-                    {
-                        int totalTaggedFromDb = 0;
-                        lock (_tagCacheLock)
-                        {
-                            foreach (var m in indexedFiles)
-                            {
-                                _metaCache[m.FilePath] = m;
-                                if (m.Tags.Count > 0)
-                                {
-                                    _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
-                                    totalTaggedFromDb++;
-                                }
-                            }
-                        }
-
-                        // 标签加载完成后，通知 UI 刷新
-                        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
-                        {
-                            StatusText += $" | 索引图: {indexedFiles.Count} | DB有标签: {totalTaggedFromDb} 张";
-                            if (totalTaggedFromDb > 0)
-                            {
-                                var sample = indexedFiles.FirstOrDefault(m => m.Tags.Count > 0);
-                                StatusText += $" | 示例: {sample?.Tags.FirstOrDefault()?.Name}";
-                            }
-
-                            // 刷新当前页面的标签显示
-                            foreach (var item in Images)
-                            {
-                                if (_tagCacheByPath.TryGetValue(item.FilePath, out var tags))
-                                {
-                                    item.Tags = tags;
-                                    item.NotifyAll();
-                                }
-                            }
-                        });
-                    }
-                    catch (Exception ex)
-                    {
-                        AppLogger.Error($"标签异步加载失败: {ex.Message}");
-                    }
-                });
-
-                // 延迟后台同步：检查磁盘新文件并更新数据库
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await Task.Delay(2000); // 延迟2秒，避免与页面加载竞争
-                        if (string.Equals(CurrentFolder, folder, StringComparison.OrdinalIgnoreCase))
-                        {
-                            await SyncFolderAsync(folder, folderId.Value, exts, isCurrent);
-                        }
-                    }
-                    catch { }
-                });
-
-                return;
-            }
-        }
-
-        // Path B: First time — full disk enumeration + mark with FolderId
+        // 磁盘枚举先行（<1ms），DB 查询在后台异步运行，不阻塞 LoadFolderAsync
+        PerfLogger.Log($"[LoadFolder] disk-enum start {sw.ElapsedMilliseconds}ms");
         try
         {
             _allFiles = await Task.Run(() =>
@@ -692,37 +597,74 @@ public partial class MainWindowViewModel : ViewModelBase
                     .Where(f => exts.Contains(Path.GetExtension(f).ToLower()))
                     .ToList()
             );
-            if (isCurrent?.Invoke() == false)
-                return;
         }
         catch (Exception ex)
         {
             StatusText = $"读取文件夹失败: {ex.Message}";
             return;
         }
+        PerfLogger.Log($"[LoadFolder] disk-enum done count={_allFiles.Count} {sw.ElapsedMilliseconds}ms");
 
         if (_allFiles.Count == 0)
         {
-            StatusText = "该文件夹内没有图片文件";
+            StatusText = "该文件夹内没有媒体文件";
             return;
-        }
-
-        if (!folderId.HasValue && FolderTree.Any(f =>
-                string.Equals(f.Path, folder, StringComparison.OrdinalIgnoreCase)))
-        {
-            await _folderRepo.AddAsync(folder);
-            folderInfo = await _folderRepo.GetByPathAsync(folder);
-            folderId = folderInfo?.Id;
         }
 
         TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
+        StatusText = $"总文件数: {_allFiles.Count}";
 
+        // DB 索引查询在后台运行（不阻塞显示），完成后更新标签
+        if (folderId.HasValue)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var indexedFiles = await _metaRepo.GetByFolderIdAsync(folderId.Value);
+                    if (indexedFiles.Count == 0) return;
+
+                    int totalTaggedFromDb = 0;
+                    lock (_tagCacheLock)
+                    {
+                        foreach (var m in indexedFiles)
+                        {
+                            _metaCache[m.FilePath] = m;
+                            if (m.Tags.Count > 0)
+                            {
+                                _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
+                                totalTaggedFromDb++;
+                            }
+                        }
+                    }
+                    Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                    {
+                        StatusText += $" | 索引图: {indexedFiles.Count} | DB有标签: {totalTaggedFromDb} 张";
+                        foreach (var item in Images)
+                        {
+                            if (_tagCacheByPath.TryGetValue(item.FilePath, out var tags))
+                            {
+                                item.Tags = tags;
+                                item.NotifyAll();
+                            }
+                        }
+                    });
+                }
+                catch (Exception ex) { AppLogger.Error($"后台标签加载失败: {ex.Message}"); }
+            });
+        }
+
+        // 后台同步+预计算哈希（不阻塞）
+        PerfLogger.Log($"[LoadFolder] A-clean-meta start {sw.ElapsedMilliseconds}ms");
         var fileSet = new HashSet<string>(_allFiles, StringComparer.OrdinalIgnoreCase);
-        _ = CleanMetaForFolderAsync(folder, fileSet);
+        _ = Task.Run(() => CleanMetaForFolderAsync(folder, fileSet));
+        PerfLogger.Log($"[LoadFolder] A-clean-meta done {sw.ElapsedMilliseconds}ms");
 
+        PerfLogger.Log($"[LoadFolder] A-cts-dispose start {sw.ElapsedMilliseconds}ms");
         _precomputeCts?.Cancel();
         _precomputeCts?.Dispose();
+        PerfLogger.Log($"[LoadFolder] A-cts-dispose done {sw.ElapsedMilliseconds}ms");
         _precomputeCts = new CancellationTokenSource();
         var captureCt2 = _precomputeCts.Token;
         _ = Task.Run(async () =>
@@ -731,57 +673,37 @@ public partial class MainWindowViewModel : ViewModelBase
             catch { return; }
             await PrecomputeHashesAsync(captureCt2, folderId);
         });
+        PerfLogger.Log($"[LoadFolder] A-precompute launched {sw.ElapsedMilliseconds}ms");
 
-        if (isCurrent?.Invoke() == false)
-            return;
-
-        int? lastPage2 = string.IsNullOrEmpty(preferredFilePath)
-            ? await _folderRepo.GetLastPageIndexAsync(folder)
-            : null;
-        if (isCurrent?.Invoke() == false)
-            return;
-        int startPage2 = GetStartPageForLoadedFolder(preferredFilePath, lastPage2);
-
-        // 立即显示第一页（图片优先）
-        await ShowPageAsync(startPage2);
-
-        // 异步加载标签（不阻塞显示）
-        _ = Task.Run(async () =>
+        if (!folderId.HasValue && FolderTree.Any(f =>
+                string.Equals(f.Path, folder, StringComparison.OrdinalIgnoreCase)))
         {
-            try
+            PerfLogger.Log($"[LoadFolder] A-add-folder start {sw.ElapsedMilliseconds}ms");
+            _ = Task.Run(async () =>
             {
-                var metas = await _metaRepo.GetByFolderAsync(folder);
-                int dbTagged = 0;
-                lock (_tagCacheLock)
+                try
                 {
-                    foreach (var m in metas)
-                    {
-                        _metaCache[m.FilePath] = m;
-                        if (m.Tags.Count > 0)
+                    await _folderRepo.AddAsync(folder);
+                    var fi = await _folderRepo.GetByPathAsync(folder);
+                    if (fi != null && string.Equals(CurrentFolder, folder, StringComparison.OrdinalIgnoreCase))
+                        _ = Task.Run(async () =>
                         {
-                            _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
-                            dbTagged++;
-                        }
-                    }
+                            await Task.Delay(2000);
+                            await SyncFolderAsync(folder, fi.Id, exts, isCurrent);
+                        });
                 }
+                catch { }
+            });
+        }
 
-                // 刷新当前页面以显示标签
-                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
-                {
-                    _pageManager.InvalidateCache();
-                    _ = ShowPageAsync(CurrentPage);
-                    StatusText = $"总文件数: {_allFiles.Count} | DB图: {metas.Count} | DB有标签: {dbTagged} 张";
-                });
-            }
-            catch (Exception ex)
-            {
-                Avalonia.Threading.Dispatcher.UIThread.Post(() =>
-                    StatusText = $"标签加载失败: {ex.Message}");
-            }
-        });
+        // 立即显示第一页 — 所有 DB 查询在后台执行
+        PerfLogger.Log($"[LoadFolder] A-before-getstart {sw.ElapsedMilliseconds}ms tid={Environment.CurrentManagedThreadId}");
+        int startPage = GetStartPageForLoadedFolder(preferredFilePath, null);
+        PerfLogger.Log($"[LoadFolder] A-before-showpage page={startPage} {sw.ElapsedMilliseconds}ms");
+        PerfLogger.Log($"[LoadFolder] show-page start page={startPage} {sw.ElapsedMilliseconds}ms");
+        await ShowPageAsync(startPage);
 
-        StatusText = $"总文件数: {_allFiles.Count}";
-        await ShowPageAsync(startPage2);
+        PerfLogger.Log($"[LoadFolder] END total={_allFiles.Count} elapsed={sw.ElapsedMilliseconds}ms");
     }
 
     /// <summary>Public wrapper for code-behind: sync current folder and refresh UI, then compute missing hashes</summary>
@@ -1177,6 +1099,8 @@ public partial class MainWindowViewModel : ViewModelBase
     public async Task ShowPageAsync(int pageIndex)
     {
         if (pageIndex < 0 || pageIndex >= TotalPages) return;
+        var sw = Stopwatch.StartNew();
+        PerfLogger.Log($"[ShowPage] START page={pageIndex}");
         _isNavigating = true;
         CurrentPage = pageIndex;
         _isNavigating = false;
@@ -1185,6 +1109,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (pageFiles.Count > 0) _ = PreloadTagsForFilesAsync(pageFiles);
         await _pageManager.ShowPageAsync(pageIndex, TotalPages,
             ActiveFileList, GetTagsForFile, IsShowingSearchResult, CurrentFolder);
+        PerfLogger.Log($"[ShowPage] END elapsed={sw.ElapsedMilliseconds}ms");
     }
 
     // ==================== Thumbnail Zoom ====================

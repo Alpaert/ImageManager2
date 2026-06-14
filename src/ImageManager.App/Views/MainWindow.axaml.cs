@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -5,6 +6,7 @@ using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
 using Avalonia.Platform.Storage;
 using Avalonia.Styling;
+using Avalonia.Threading;
 using Avalonia.VisualTree;
 using System.Runtime.InteropServices;
 using ImageManager.App.Helpers;
@@ -205,6 +207,17 @@ public partial class MainWindow : Window
         if (Vm.AppSettings.StartupHeight > 0) Height = Vm.AppSettings.StartupHeight;
 
         ApplyWallpaper();
+
+        // UI 心跳日志：检测 UI 线程是否被阻塞
+        var sw = Stopwatch.StartNew();
+        var timer = new DispatcherTimer(TimeSpan.FromSeconds(2), DispatcherPriority.Background, (_, _) =>
+        {
+            var elapsed = sw.ElapsedMilliseconds;
+            sw.Restart();
+            if (elapsed > 2500)
+                PerfLogger.Log($"[HEARTBEAT] UI THREAD BLOCKED! gap={elapsed}ms (expected ~2000ms)");
+        });
+        timer.Start();
     }
 
     // ==================== Keyboard Shortcuts ====================

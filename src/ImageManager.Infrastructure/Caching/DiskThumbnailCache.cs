@@ -82,6 +82,49 @@ public class DiskThumbnailCache
         }
     }
 
+    /// <summary>Save dimension metadata alongside thumbnail (avoids re-running ffmpeg for video dimensions on cold load)</summary>
+    public void SaveMeta(string filePath, int width, int height)
+    {
+        try
+        {
+            var metaPath = Path.ChangeExtension(GetCacheFilePath(filePath), ".json");
+            var dir = Path.GetDirectoryName(metaPath);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+            var meta = System.Text.Json.JsonSerializer.Serialize(
+                new { w = width, h = height, ts = DateTime.UtcNow.Ticks });
+            File.WriteAllText(metaPath, meta);
+        }
+        catch { }
+    }
+
+    public (int Width, int Height)? LoadMeta(string filePath)
+    {
+        try
+        {
+            var metaPath = Path.ChangeExtension(GetCacheFilePath(filePath), ".json");
+            if (!File.Exists(metaPath))
+            {
+                // Backward compat: check old flat path
+                var oldPath = Path.ChangeExtension(GetOldCacheFilePath(filePath), ".json");
+                if (File.Exists(oldPath))
+                {
+                    // Migrate to new path
+                    try { File.Move(oldPath, metaPath); } catch { metaPath = oldPath; }
+                }
+                else
+                {
+                    return null;
+                }
+            }
+            var json = File.ReadAllText(metaPath);
+            using var doc = System.Text.Json.JsonDocument.Parse(json);
+            var root = doc.RootElement;
+            return (root.GetProperty("w").GetInt32(), root.GetProperty("h").GetInt32());
+        }
+        catch { return null; }
+    }
+
     public byte[]? Load(string filePath)
     {
         try

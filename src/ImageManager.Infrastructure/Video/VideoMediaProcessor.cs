@@ -29,11 +29,17 @@ public class VideoMediaProcessor : IMediaProcessor
 
     public (int Width, int Height) GetDimensions(string filePath)
     {
-        // 使用 Task.Run 避免死锁
-        return Task.Run(async () =>
+        // 使用带超时的同步等待，避免无限期阻塞线程
+        try
         {
-            var metadata = await VideoMetadataExtractor.ExtractMetadataAsync(filePath, CancellationToken.None);
-            return metadata.HasValue ? (metadata.Value.Width, metadata.Value.Height) : (0, 0);
-        }).GetAwaiter().GetResult();
+            var task = VideoThumbnailGenerator.GetDimensionsAsync(filePath);
+            if (!task.Wait(TimeSpan.FromSeconds(10)))
+                return (1920, 1080);
+            return task.Result;
+        }
+        catch
+        {
+            return (1920, 1080);
+        }
     }
 }

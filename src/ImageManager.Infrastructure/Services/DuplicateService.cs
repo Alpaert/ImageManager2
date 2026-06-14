@@ -31,7 +31,7 @@ public class DuplicateService : IDuplicateService
             try
             {
                 var meta = await _metaRepo.GetByPathAsync(file);
-                var (width, height) = ThumbnailGenerator.GetDimensions(file);
+                var (width, height) = await Task.Run(() => ThumbnailGenerator.GetDimensions(file));
 
                 var fileHash = meta?.FileHash;
                 if (string.IsNullOrEmpty(fileHash))

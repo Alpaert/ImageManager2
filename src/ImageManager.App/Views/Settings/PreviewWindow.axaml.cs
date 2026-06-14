@@ -82,7 +82,7 @@ public partial class PreviewWindow : Window
     private async void LoadGifAsync(string filePath)
     {
         int version = ++_loadVersion;
-        var (pixW, pixH) = ThumbnailGenerator.GetDimensions(filePath);
+        var (pixW, pixH) = await Task.Run(() => ThumbnailGenerator.GetDimensions(filePath));
         var fi = new FileInfo(filePath);
 
         Vm.IsGif = true;
@@ -141,7 +141,8 @@ public partial class PreviewWindow : Window
     {
         try
         {
-            var (pixW, pixH) = ThumbnailGenerator.GetDimensions(filePath);
+            var (pixW, pixH) = Task.Run(() => ThumbnailGenerator.GetDimensions(filePath)).GetAwaiter().GetResult();
+            // ^ 安全：仅用于图片（非视频），SKCodec 读头 <5ms，不会阻塞 UI
             var fi = new FileInfo(filePath);
 
             int decodeWidth = Math.Min(pixW, 3840);
