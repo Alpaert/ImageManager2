@@ -193,7 +193,6 @@ public class PageManager : IDisposable
                                 {
                                     item.IsLoaded = false;
                                     item.IsLoading = true;
-                                    item.ThumbnailData = null;  // 清空旧数据，防止短暂显示
                                 }
                         }
                         _ = LoadPageThumbnailsAsync(_activePageIndex);
@@ -300,6 +299,10 @@ public class PageManager : IDisposable
 
         var unloaded = pageItems.Where(i => !i.IsLoaded).ToList();
         if (unloaded.Count == 0) return;
+
+        ThreadPool.GetAvailableThreads(out var w, out var io);
+        ThreadPool.GetMaxThreads(out var mw, out var mio);
+        PerfLogger.Log($"[PageMgr] LoadThumbnails unloaded={unloaded.Count} ThreadPool={mw-w}/{mw}");
 
         // 并行加载 → 批量 dispatch 到 UI（每 16 项一批，避免 Dispatcher 洪水）
         const int batchSize = 16;

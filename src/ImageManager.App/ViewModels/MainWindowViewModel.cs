@@ -569,6 +569,12 @@ public partial class MainWindowViewModel : ViewModelBase
         PerfLogger.Log($"[LoadFolder] 1-cleanup done {sw.ElapsedMilliseconds}ms");
         await Task.Yield();
         PerfLogger.Log($"[LoadFolder] 2-yield done {sw.ElapsedMilliseconds}ms");
+
+        // 线程池诊断
+        ThreadPool.GetAvailableThreads(out var w, out var io);
+        ThreadPool.GetMaxThreads(out var mw, out var mio);
+        PerfLogger.Log($"[ThreadPool] workers={mw-w}/{mw} io-threads={mio-io}/{mio}");
+
         if (isCurrent?.Invoke() == false)
             return;
 
@@ -615,88 +621,7 @@ public partial class MainWindowViewModel : ViewModelBase
         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
         StatusText = $"总文件数: {_allFiles.Count}";
 
-        // DB 索引查询在后台运行（不阻塞显示），完成后更新标签
-        if (folderId.HasValue)
-        {
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    var indexedFiles = await _metaRepo.GetByFolderIdAsync(folderId.Value);
-                    if (indexedFiles.Count == 0) return;
-
-                    int totalTaggedFromDb = 0;
-                    lock (_tagCacheLock)
-                    {
-                        foreach (var m in indexedFiles)
-                        {
-                            _metaCache[m.FilePath] = m;
-                            if (m.Tags.Count > 0)
-                            {
-                                _tagCacheByPath[m.FilePath] = m.Tags.Select(t => t.Name).ToList();
-                                totalTaggedFromDb++;
-                            }
-                        }
-                    }
-                    Avalonia.Threading.Dispatcher.UIThread.Post(() =>
-                    {
-                        StatusText += $" | 索引图: {indexedFiles.Count} | DB有标签: {totalTaggedFromDb} 张";
-                        foreach (var item in Images)
-                        {
-                            if (_tagCacheByPath.TryGetValue(item.FilePath, out var tags))
-                            {
-                                item.Tags = tags;
-                                item.NotifyAll();
-                            }
-                        }
-                    });
-                }
-                catch (Exception ex) { AppLogger.Error($"后台标签加载失败: {ex.Message}"); }
-            });
-        }
-
-        // 后台同步+预计算哈希（不阻塞）
-        PerfLogger.Log($"[LoadFolder] A-clean-meta start {sw.ElapsedMilliseconds}ms");
-        var fileSet = new HashSet<string>(_allFiles, StringComparer.OrdinalIgnoreCase);
-        _ = Task.Run(() => CleanMetaForFolderAsync(folder, fileSet));
-        PerfLogger.Log($"[LoadFolder] A-clean-meta done {sw.ElapsedMilliseconds}ms");
-
-        PerfLogger.Log($"[LoadFolder] A-cts-dispose start {sw.ElapsedMilliseconds}ms");
-        _precomputeCts?.Cancel();
-        _precomputeCts?.Dispose();
-        PerfLogger.Log($"[LoadFolder] A-cts-dispose done {sw.ElapsedMilliseconds}ms");
-        _precomputeCts = new CancellationTokenSource();
-        var captureCt2 = _precomputeCts.Token;
-        _ = Task.Run(async () =>
-        {
-            try { await Task.Delay(3000, captureCt2); }
-            catch { return; }
-            await PrecomputeHashesAsync(captureCt2, folderId);
-        });
-        PerfLogger.Log($"[LoadFolder] A-precompute launched {sw.ElapsedMilliseconds}ms");
-
-        if (!folderId.HasValue && FolderTree.Any(f =>
-                string.Equals(f.Path, folder, StringComparison.OrdinalIgnoreCase)))
-        {
-            PerfLogger.Log($"[LoadFolder] A-add-folder start {sw.ElapsedMilliseconds}ms");
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await _folderRepo.AddAsync(folder);
-                    var fi = await _folderRepo.GetByPathAsync(folder);
-                    if (fi != null && string.Equals(CurrentFolder, folder, StringComparison.OrdinalIgnoreCase))
-                        _ = Task.Run(async () =>
-                        {
-                            await Task.Delay(2000);
-                            await SyncFolderAsync(folder, fi.Id, exts, isCurrent);
-                        });
-                }
-                catch { }
-            });
-        }
-
-        // 立即显示第一页 — 所有 DB 查询在后台执行
+        // 立即显示第一页 — 无后台 Task.Run，和 ShowAll 路径一致
         PerfLogger.Log($"[LoadFolder] A-before-getstart {sw.ElapsedMilliseconds}ms tid={Environment.CurrentManagedThreadId}");
         int startPage = GetStartPageForLoadedFolder(preferredFilePath, null);
         PerfLogger.Log($"[LoadFolder] A-before-showpage page={startPage} {sw.ElapsedMilliseconds}ms");
