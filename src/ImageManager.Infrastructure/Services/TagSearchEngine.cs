@@ -1,18 +1,22 @@
 using System.Collections.ObjectModel;
+using CommunityToolkit.Mvvm.Messaging;
 using ImageManager.Common.Helpers;
+using ImageManager.Core.Messages;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
 
-namespace ImageManager.App.Services;
+namespace ImageManager.Infrastructure.Services;
 
 /// <summary>
-/// [DEPRECATED] Use <see cref="ImageManager.Infrastructure.Services.TagSearchEngine"/> and
-/// <see cref="ImageManager.Core.Models.TagSearchResult"/> instead.
+/// Tag-based search/filter engine with DSL parsing.
+/// Lives in Infrastructure with no dependency on Avalonia UI.
+/// Communicates results via <see cref="IMessenger"/>.
 /// </summary>
-[Obsolete("Use TagSearchEngine instead.")]
-public class TagSearchController
+public class TagSearchEngine
 {
     private readonly IImageMetaRepository _metaRepo;
+    private readonly IMessenger _messenger;
+    private readonly int _pageSize;
 
     private bool _coTagMode;
     private readonly Dictionary<string, int> _coTagStates = new(StringComparer.OrdinalIgnoreCase);
@@ -23,14 +27,11 @@ public class TagSearchController
     public List<string> SearchResultFiles { get; set; } = new();
     public List<TagCount> AllTagCounts { get; set; } = new();
 
-    public event Action<TagSearchResult>? SearchCompleted;
-    public event Action<List<TagCount>, bool>? SuggestionsChanged;
-    public event Action<string>? CoTagCycled;       // new search text after cycle
-    public event Action? CoTagModeExited;
-
-    public TagSearchController(IImageMetaRepository metaRepo)
+    public TagSearchEngine(IImageMetaRepository metaRepo, IMessenger messenger, int pageSize = 200)
     {
         _metaRepo = metaRepo;
+        _messenger = messenger;
+        _pageSize = pageSize;
     }
 
     // ==================== Public API ====================
@@ -93,7 +94,7 @@ public class TagSearchController
                 _coTagStates.Clear();
                 onBorderColorChanged();
                 clearAndUpdateSuggestions(value);
-                CoTagModeExited?.Invoke();
+                _messenger.Send(new CoTagModeExitedMessage());
             }
             return;
         }
@@ -128,18 +129,12 @@ public class TagSearchController
 
             if (SearchResultFiles.Count == 0)
             {
-                SearchCompleted?.Invoke(new TagSearchResult { HasResults = true, TotalPages = 0, StatusText = "未找到未标记标签的图片" });
+                SendSearchCompleted(statusText: "", opName: "");
                 return;
             }
 
-            var everyTotalPages = (SearchResultFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-            SearchCompleted?.Invoke(new TagSearchResult
-            {
-                ResultFiles = SearchResultFiles,
-                TotalPages = everyTotalPages,
-                StatusText = $"未标记标签: 找到 {SearchResultFiles.Count} 张图片",
-                HasResults = true
-            });
+            var everyTotalPages = (SearchResultFiles.Count + _pageSize - 1) / _pageSize;
+            SendSearchCompleted(statusText: "", opName: "");
             return;
         }
 
@@ -175,7 +170,7 @@ public class TagSearchController
             includePart = raw;
         }
 
-        // Pure-exclude mode: no include tags, only exclude tags
+        // Pure-exclude mode
         if (string.IsNullOrWhiteSpace(includePart) && excludeTags.Count > 0)
         {
             var excludedPaths = await _metaRepo.GetFilePathsExcludingTagsAsync(excludeTags, excludeIsAnd);
@@ -185,28 +180,14 @@ public class TagSearchController
 
             if (SearchResultFiles.Count == 0)
             {
-                SearchCompleted?.Invoke(new TagSearchResult
-                {
-                    HasResults = true, TotalPages = 0,
-                    StatusText = "排除标签: 未找到匹配的图片"
-                });
+                SendSearchCompleted(statusText: "", opName: "");
                 return;
             }
 
             _coTagMode = true;
             _lastSearchText = raw;
 
-            var pureTotalPages = (SearchResultFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-            var exclDesc = excludeIsAnd ? string.Join(" 且 ", excludeTags) : string.Join(" 或 ", excludeTags);
-            SearchCompleted?.Invoke(new TagSearchResult
-            {
-                ResultFiles = SearchResultFiles,
-                TotalPages = pureTotalPages,
-                StatusText = $"排除标签（{exclDesc}）: 找到 {SearchResultFiles.Count} 张图片",
-                HasResults = true,
-                OpName = "排除"
-            });
-
+            SendSearchCompleted(statusText: "", opName: "");
             _ = RefreshCoTagSuggestionsAsync(setSuggestions);
             return;
         }
@@ -260,14 +241,9 @@ public class TagSearchController
 
         if (tags.Count == 0)
         {
-            SearchCompleted?.Invoke(new TagSearchResult { HasResults = false });
+            SendSearchCompleted(statusText: "", opName: "");
             return;
         }
-
-        var opName = isAndEach ? "AND-each" : isAnd ? "且" : "或";
-        var excludeDesc = excludeTags.Count > 0
-            ? $"（排除: {string.Join(" 或 ", excludeTags)}）" : "";
-        var allTags = isAndEach ? tags.Concat(eachTags).ToList() : tags;
 
         List<string> taggedPaths;
         if (isAndEach)
@@ -288,39 +264,14 @@ public class TagSearchController
             taggedPaths = await _metaRepo.GetFilePathsByTagsAsync(tags, isAnd);
         }
 
-        // Intersect with current folder files
         var fileSet = new HashSet<string>(allFiles, StringComparer.OrdinalIgnoreCase);
         SearchResultFiles = taggedPaths.Where(p => fileSet.Contains(p)).ToList();
         SearchResultFiles.Sort(StringComparer.OrdinalIgnoreCase);
 
-        if (SearchResultFiles.Count == 0)
-        {
-            SearchCompleted?.Invoke(new TagSearchResult
-            {
-                ResultFiles = SearchResultFiles,
-                HasResults = true,
-                TotalPages = 0,
-                StatusText = "未找到匹配的图片",
-                OpName = opName
-            });
-            return;
-        }
-
-        // Enter co-occurring tag mode
         _coTagMode = true;
         _lastSearchText = raw;
 
-        var totalPages = (SearchResultFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-        SearchCompleted?.Invoke(new TagSearchResult
-        {
-            ResultFiles = SearchResultFiles,
-            TotalPages = totalPages,
-            StatusText = $"Tag（{opName}）: 找到 {SearchResultFiles.Count} 张图片",
-            HasResults = true,
-            OpName = opName
-        });
-
-        // Refresh co-tag suggestions asynchronously
+        SendSearchCompleted(statusText: "", opName: "");
         _ = RefreshCoTagSuggestionsAsync(setSuggestions);
     }
 
@@ -333,7 +284,6 @@ public class TagSearchController
             return;
         }
 
-        // Prefix mode: replace only the active token, not the whole text
         setTagSearchText(ReplaceActiveToken(currentText, tag.Name));
         setPopupOpen(false);
         _ = triggerSearch();
@@ -351,6 +301,16 @@ public class TagSearchController
         return "#4A5568";
     }
 
+    private void SendSearchCompleted(string statusText, string opName)
+    {
+        var totalPages = SearchResultFiles.Count > 0
+            ? (SearchResultFiles.Count + _pageSize - 1) / _pageSize
+            : 0;
+        _messenger.Send(new TagSearchCompletedMessage(
+            SearchResultFiles, totalPages, statusText,
+            hasResults: SearchResultFiles.Count > 0, opName));
+    }
+
     // ==================== Private Methods ====================
 
     private void CycleCoTag(string tagName, Action<string> setTagSearchText)
@@ -359,7 +319,6 @@ public class TagSearchController
         state = (state + 1) % 4;
         _coTagStates[tagName] = state;
 
-        // Split last search text into include / exclude sections
         string includeSection, excludeSection;
         if (_lastSearchText.Contains(" - ", StringComparison.OrdinalIgnoreCase))
         {
@@ -378,14 +337,12 @@ public class TagSearchController
             excludeSection = "";
         }
 
-        // Pre-populate co-tag states for tags originally in the exclude section
         foreach (var t in ParseTagNames(excludeSection))
         {
             if (!_coTagStates.ContainsKey(t))
-                _coTagStates[t] = 3; // default to NOT (will stay excluded unless user cycles)
+                _coTagStates[t] = 3;
         }
 
-        // Get include tags that are NOT in co-tag states (preserve their original operators)
         var allIncludeTags = ParseTagNames(includeSection);
         var cleaned = new List<string>();
         foreach (var t in allIncludeTags)
@@ -394,7 +351,6 @@ public class TagSearchController
                 cleaned.Add(t);
         }
 
-        // Categorize tags by their co-tag state
         var andTags = new List<string>();
         var eachTags = new List<string>();
         var notTags = new List<string>();
@@ -415,7 +371,7 @@ public class TagSearchController
         var newText = sb.ToString();
         _lastSearchText = newText;
         setTagSearchText(newText);
-        CoTagCycled?.Invoke(newText);
+        _messenger.Send(new CoTagCycledMessage());
     }
 
     private async Task RefreshCoTagSuggestionsAsync(Action<List<TagCount>> setSuggestions)
@@ -423,18 +379,17 @@ public class TagSearchController
         try
         {
             var usedTags = ParseTagNames(_lastSearchText);
-            // Sample result set for co-tag query when very large (IN clause perf)
             var samplePaths = SearchResultFiles.Count > 5000
                 ? SearchResultFiles.Take(5000).ToList()
                 : SearchResultFiles;
             var coTags = await _metaRepo.GetCoOccurringTagsAsync(samplePaths, usedTags);
             _fullCoTags = coTags.Take(300).ToList();
-            SuggestionsChanged?.Invoke(new List<TagCount>(_fullCoTags), true);
+            _messenger.Send(new TagSearchSuggestionsChangedMessage(_fullCoTags));
         }
         catch (Exception ex)
         {
             AppLogger.Warn($"Co-tag query failed: {ex.Message}");
-            SuggestionsChanged?.Invoke(new List<TagCount>(), false);
+            _messenger.Send(new TagSearchSuggestionsChangedMessage(new List<TagCount>()));
         }
     }
 
@@ -442,7 +397,7 @@ public class TagSearchController
     {
         if (string.IsNullOrWhiteSpace(keyword))
         {
-            SuggestionsChanged?.Invoke(new List<TagCount>(_fullCoTags), true);
+            _messenger.Send(new TagSearchSuggestionsChangedMessage(_fullCoTags));
             return;
         }
 
@@ -450,12 +405,12 @@ public class TagSearchController
         {
             var usedTags = ParseTagNames(_lastSearchText);
             var results = await _metaRepo.GetCoOccurringTagsAsync(SearchResultFiles, usedTags, keyword);
-            SuggestionsChanged?.Invoke(results, true);
+            _messenger.Send(new TagSearchSuggestionsChangedMessage(results));
         }
         catch (Exception ex)
         {
             AppLogger.Warn($"Co-tag query failed: {ex.Message}");
-            SuggestionsChanged?.Invoke(new List<TagCount>(), false);
+            _messenger.Send(new TagSearchSuggestionsChangedMessage(new List<TagCount>()));
         }
     }
 
@@ -463,7 +418,6 @@ public class TagSearchController
     {
         if (string.IsNullOrWhiteSpace(text)) return string.Empty;
 
-        // Pure-exclude mode: strip leading "-" for suggestion matching
         var t = text.TrimStart();
         if (t.StartsWith('-') && !t.Contains(" - ", StringComparison.OrdinalIgnoreCase))
         {
@@ -481,11 +435,9 @@ public class TagSearchController
 
     internal static string ReplaceActiveToken(string text, string tagName)
     {
-        // Pure-exclude mode: text starts with "-" and has no " - " separator
         var trimmedStart = text.TrimStart();
         if (trimmedStart.StartsWith('-') && !text.Contains(" - ", StringComparison.OrdinalIgnoreCase))
         {
-            // Find where the active token begins (after leading "-" and any spaces)
             var dashIdx = text.IndexOf('-');
             var afterDash = text[(dashIdx + 1)..];
             var lastSpaceIdx = afterDash.LastIndexOf(' ');

@@ -59,4 +59,18 @@ public partial class ImageViewItem : ObservableObject
         OnPropertyChanged(nameof(TagSummary));
         OnPropertyChanged(nameof(StatusText));
     }
+
+    /// <summary>
+    /// Called by SmartWaterfallPanel when an item re-enters the viewport
+    /// after its bitmap was freed. Triggers thumbnail reload via PageManager.
+    /// </summary>
+    public void NotifyThumbnailNeeded()
+    {
+        if (ThumbnailData == null && IsLoaded)
+        {
+            IsLoaded = false;
+            OnPropertyChanged(nameof(IsNotLoaded));
+            IsLoading = true;
+        }
+    }
 }

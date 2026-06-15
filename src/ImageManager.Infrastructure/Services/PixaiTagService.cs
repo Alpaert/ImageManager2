@@ -45,24 +45,29 @@ public class PixaiTagService : OnnxTagServiceBase
     {
         if (_session == null) return null;
 
-        var result = await Task.Run(() =>
+        await _inferenceLock.WaitAsync();
+        try
         {
-            var tensor = Preprocess(imagePath);
-            if (tensor == null) return null;
-
-            var inputs = new List<Microsoft.ML.OnnxRuntime.NamedOnnxValue>
+            var result = await Task.Run(() =>
             {
-                Microsoft.ML.OnnxRuntime.NamedOnnxValue.CreateFromTensor(_inputName, tensor)
-            };
+                var tensor = Preprocess(imagePath);
+                if (tensor == null) return null;
 
-            using var results = _session.Run(inputs);
-            var embOut = results.FirstOrDefault(r => r.Name == "embedding");
-            if (embOut == null) return null;
-            return embOut.AsTensor<float>().ToArray();
-        });
+                var inputs = new List<Microsoft.ML.OnnxRuntime.NamedOnnxValue>
+                {
+                    Microsoft.ML.OnnxRuntime.NamedOnnxValue.CreateFromTensor(_inputName, tensor)
+                };
 
-        ResetIdleTimer();
-        return result;
+                using var results = _session.Run(inputs);
+                var embOut = results.FirstOrDefault(r => r.Name == "embedding");
+                if (embOut == null) return null;
+                return embOut.AsTensor<float>().ToArray();
+            });
+
+            ResetIdleTimer();
+            return result;
+        }
+        finally { _inferenceLock.Release(); }
     }
 
     /// <summary>合并推理：一次 session.Run 同时获取 prediction + embedding，省一次 Preprocess+Run</summary>
@@ -71,31 +76,36 @@ public class PixaiTagService : OnnxTagServiceBase
         if (_session == null)
             throw new InvalidOperationException("Pixai: Model not loaded");
 
-        var result = await Task.Run(() =>
+        await _inferenceLock.WaitAsync();
+        try
         {
-            var tensor = Preprocess(imagePath);
-            if (tensor == null)
-                return (new List<TagPrediction>(), null);
-
-            var inputs = new List<Microsoft.ML.OnnxRuntime.NamedOnnxValue>
+            var result = await Task.Run(() =>
             {
-                Microsoft.ML.OnnxRuntime.NamedOnnxValue.CreateFromTensor(_inputName, tensor)
-            };
+                var tensor = Preprocess(imagePath);
+                if (tensor == null)
+                    return (new List<TagPrediction>(), null);
 
-            using var results = _session.Run(inputs);
+                var inputs = new List<Microsoft.ML.OnnxRuntime.NamedOnnxValue>
+                {
+                    Microsoft.ML.OnnxRuntime.NamedOnnxValue.CreateFromTensor(_inputName, tensor)
+                };
 
-            var predOut = results.FirstOrDefault(r => r.Name == _outputName);
-            var probs = predOut?.AsTensor<float>().ToArray() ?? Array.Empty<float>();
+                using var results = _session.Run(inputs);
 
-            var embOut = results.FirstOrDefault(r => r.Name == "embedding");
-            var embedding = embOut?.AsTensor<float>().ToArray();
+                var predOut = results.FirstOrDefault(r => r.Name == _outputName);
+                var probs = predOut?.AsTensor<float>().ToArray() ?? Array.Empty<float>();
 
-            var tags = Postprocess(probs, DefaultThreshold);
-            return (tags, embedding);
-        });
+                var embOut = results.FirstOrDefault(r => r.Name == "embedding");
+                var embedding = embOut?.AsTensor<float>().ToArray();
 
-        ResetIdleTimer();
-        return result;
+                var tags = Postprocess(probs, DefaultThreshold);
+                return (tags, embedding);
+            });
+
+            ResetIdleTimer();
+            return result;
+        }
+        finally { _inferenceLock.Release(); }
     }
 
     private const int MaxBatchSize = 16;
@@ -109,52 +119,57 @@ public class PixaiTagService : OnnxTagServiceBase
             ? imagePaths.Take(MaxBatchSize).ToList()
             : imagePaths;
 
-        var result = await Task.Run(() =>
+        await _inferenceLock.WaitAsync();
+        try
         {
-            // 逐张预处理
-            var tensors = new List<DenseTensor<float>>();
-            foreach (var path in paths)
+            var result = await Task.Run(() =>
             {
-                var t = Preprocess(path);
-                if (t != null) tensors.Add(t);
-            }
-            if (tensors.Count == 0) return null;
+                // 逐张预处理
+                var tensors = new List<DenseTensor<float>>();
+                foreach (var path in paths)
+                {
+                    var t = Preprocess(path);
+                    if (t != null) tensors.Add(t);
+                }
+                if (tensors.Count == 0) return null;
 
-            // 堆叠为 [N, 3, 448, 448]
-            int n = tensors.Count;
-            var batch = new DenseTensor<float>(new[] { n, 3, InputSize, InputSize });
-            for (int b = 0; b < n; b++)
-            {
-                var src = tensors[b];
-                for (int c = 0; c < 3; c++)
-                    for (int y = 0; y < InputSize; y++)
-                        for (int x = 0; x < InputSize; x++)
-                            batch[b, c, y, x] = src[0, c, y, x];
-            }
+                // 堆叠为 [N, 3, 448, 448]
+                int n = tensors.Count;
+                var batch = new DenseTensor<float>(new[] { n, 3, InputSize, InputSize });
+                for (int b = 0; b < n; b++)
+                {
+                    var src = tensors[b];
+                    for (int c = 0; c < 3; c++)
+                        for (int y = 0; y < InputSize; y++)
+                            for (int x = 0; x < InputSize; x++)
+                                batch[b, c, y, x] = src[0, c, y, x];
+                }
 
-            var inputs = new List<Microsoft.ML.OnnxRuntime.NamedOnnxValue>
-            {
-                Microsoft.ML.OnnxRuntime.NamedOnnxValue.CreateFromTensor(_inputName, batch)
-            };
+                var inputs = new List<Microsoft.ML.OnnxRuntime.NamedOnnxValue>
+                {
+                    Microsoft.ML.OnnxRuntime.NamedOnnxValue.CreateFromTensor(_inputName, batch)
+                };
 
-            using var results = _session.Run(inputs);
-            var embOut = results.FirstOrDefault(r => r.Name == "embedding");
-            if (embOut == null) return null;
+                using var results = _session.Run(inputs);
+                var embOut = results.FirstOrDefault(r => r.Name == "embedding");
+                if (embOut == null) return null;
 
-            var embTensor = embOut.AsTensor<float>();
-            int embDim = embTensor.Dimensions[1]; // 1024
-            var embeddings = new List<float[]>(n);
-            for (int b = 0; b < n; b++)
-            {
-                var emb = new float[embDim];
-                for (int d = 0; d < embDim; d++)
-                    emb[d] = embTensor[b, d];
-                embeddings.Add(emb);
-            }
-            return embeddings;
-        });
+                var embTensor = embOut.AsTensor<float>();
+                int embDim = embTensor.Dimensions[1]; // 1024
+                var embeddings = new List<float[]>(n);
+                for (int b = 0; b < n; b++)
+                {
+                    var emb = new float[embDim];
+                    for (int d = 0; d < embDim; d++)
+                        emb[d] = embTensor[b, d];
+                    embeddings.Add(emb);
+                }
+                return embeddings;
+            });
 
-        ResetIdleTimer();
-        return result;
+            ResetIdleTimer();
+            return result;
+        }
+        finally { _inferenceLock.Release(); }
     }
 }

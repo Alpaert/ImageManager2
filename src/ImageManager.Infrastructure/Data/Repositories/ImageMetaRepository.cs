@@ -7,13 +7,13 @@ namespace ImageManager.Infrastructure.Data.Repositories;
 
 public class ImageMetaRepository : IImageMetaRepository
 {
-    private readonly AppDbContext _db;
+    private readonly IDbContextFactory _dbFactory;
 
-    public ImageMetaRepository(AppDbContext db) => _db = db;
+    public ImageMetaRepository(IDbContextFactory dbFactory) => _dbFactory = dbFactory;
 
     public async Task<ImageMeta?> GetByIdAsync(long id)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var meta = await conn.QuerySingleOrDefaultAsync<ImageMeta>(
             "SELECT * FROM ImageMeta WHERE Id = @Id", new { Id = id });
         if (meta != null)
@@ -23,7 +23,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<ImageMeta?> GetByPathAsync(string filePath)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var meta = await conn.QuerySingleOrDefaultAsync<ImageMeta>(
             "SELECT * FROM ImageMeta WHERE FilePath = @FilePath COLLATE NOCASE",
             new { FilePath = filePath });
@@ -34,7 +34,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<List<ImageMeta>> GetByFolderAsync(string folderPath)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var normalized = Common.Helpers.PathHelper.NormalizeFolderPath(folderPath);
         var metas = (await conn.QueryAsync<ImageMeta>(
             "SELECT * FROM ImageMeta WHERE FilePath LIKE @Prefix",
@@ -55,7 +55,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<List<ImageMeta>> GetByFolderIdAsync(long folderId)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var metas = (await conn.QueryAsync<ImageMeta>(
             "SELECT * FROM ImageMeta WHERE FolderId = @FolderId",
             new { FolderId = folderId })).ToList();
@@ -75,7 +75,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<int> CountByFolderIdAsync(long folderId)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         return await conn.ExecuteScalarAsync<int>(
             "SELECT COUNT(*) FROM ImageMeta WHERE FolderId = @FolderId",
             new { FolderId = folderId });
@@ -83,7 +83,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task SetFolderIdAsync(string filePath, long folderId)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "UPDATE ImageMeta SET FolderId = @FolderId WHERE FilePath = @FilePath COLLATE NOCASE",
             new { FolderId = folderId, FilePath = filePath });
@@ -91,7 +91,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<List<ImageMeta>> GetAllAsync()
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var metas = (await conn.QueryAsync<ImageMeta>("SELECT * FROM ImageMeta")).ToList();
 
         // Load tags for all metas (could be optimized but fine for typical usage)
@@ -109,7 +109,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<long> UpsertAsync(ImageMeta meta)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         using var txn = conn.BeginTransaction();
 
         var existing = await conn.QuerySingleOrDefaultAsync<(long Id, long? FolderId)>(
@@ -151,7 +151,7 @@ public class ImageMetaRepository : IImageMetaRepository
     {
         if (metas.Count == 0) return;
 
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         using var txn = conn.BeginTransaction();
 
         // Single query to find existing paths
@@ -197,13 +197,13 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<int> DeleteAsync(long id)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         return await conn.ExecuteAsync("DELETE FROM ImageMeta WHERE Id = @Id", new { Id = id });
     }
 
     public async Task<int> DeleteByPathAsync(string filePath)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         return await conn.ExecuteAsync(
             "DELETE FROM ImageMeta WHERE FilePath = @FilePath COLLATE NOCASE",
             new { FilePath = filePath });
@@ -211,7 +211,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<int> DeleteByFolderAsync(string folderPath)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var normalized = Common.Helpers.PathHelper.NormalizeFolderPath(folderPath);
         return await conn.ExecuteAsync(
             "DELETE FROM ImageMeta WHERE FilePath LIKE @Prefix",
@@ -220,7 +220,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task SetTagsAsync(long imageId, List<string> tags)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         using var txn = conn.BeginTransaction();
 
         // Clear existing tags
@@ -251,7 +251,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task AddAutoTagsAsync(long imageId, List<string> tagNames)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         using var txn = conn.BeginTransaction();
 
         foreach (var tagName in tagNames)
@@ -278,7 +278,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task ReplaceAutoTagAsync(long imageId, string englishTagName, long chineseTagId)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         // Step 1: Upsert Chinese tag — UPDATE handles same-name, INSERT handles different-name
         await conn.ExecuteAsync(@"
             UPDATE ImageTag SET Source = 'AutoTagConfirmed'
@@ -303,7 +303,7 @@ public class ImageMetaRepository : IImageMetaRepository
     public async Task ReplaceAutoTagsBatchAsync(List<(long ImageId, string EnglishName, long ChineseId)> replacements)
     {
         if (replacements.Count == 0) return;
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         using var txn = conn.BeginTransaction();
         foreach (var (imageId, englishName, chineseId) in replacements)
         {
@@ -331,7 +331,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task DeleteAutoTagFromImageAsync(long imageId, string tagName)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(@"
             DELETE FROM ImageTag
             WHERE ImageMetaId = @ImageId
@@ -343,7 +343,7 @@ public class ImageMetaRepository : IImageMetaRepository
     /// <summary>删除文件夹下所有自动标签（Source IN ('AutoTag','AutoTagConfirmed')），一条 SQL，批量高效</summary>
     public async Task<int> DeleteAllAutoTagsByFolderAsync(string folderPath)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var normalized = Common.Helpers.PathHelper.NormalizeFolderPath(folderPath);
         return await conn.ExecuteAsync(@"
             DELETE FROM ImageTag
@@ -354,7 +354,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<List<TagCount>> GetTagCountsAsync()
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var results = await conn.QueryAsync<TagCount>(@"
             SELECT t.Name, COUNT(it.ImageMetaId) as Count
             FROM Tag t
@@ -366,7 +366,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<Dictionary<string, List<string>>> GetTagMapByFolderAsync(string folderPath)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var normalized = Common.Helpers.PathHelper.NormalizeFolderPath(folderPath);
         var rows = await conn.QueryAsync<(string FilePath, string TagName)>(@"
             SELECT im.FilePath, t.Name
@@ -395,7 +395,7 @@ public class ImageMetaRepository : IImageMetaRepository
         var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         if (filePaths.Count == 0) return result;
 
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         // Process in chunks to avoid overly large IN clauses
         foreach (var chunk in filePaths.Chunk(500))
         {
@@ -423,7 +423,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<List<string>> GetFilePathsByTagAsync(string tagName)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var results = await conn.QueryAsync<string>(@"
             SELECT DISTINCT im.FilePath
             FROM ImageMeta im
@@ -436,7 +436,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<List<string>> GetFilePathsByTagsAsync(List<string> tagNames, bool requireAll)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         if (requireAll)
         {
             // AND: files that have ALL specified tags
@@ -468,7 +468,7 @@ public class ImageMetaRepository : IImageMetaRepository
     public async Task<List<string>> GetFilePathsByTagsExcludingAsync(
         List<string> includeTags, bool requireAll, List<string> excludeTags)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         // NOT IN subquery to exclude files with any of the exclude tags
         if (requireAll)
         {
@@ -512,7 +512,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<List<string>> GetFilePathsByTagAndEachAsync(List<string> baseTags, bool requireAllBase, List<string> eachTags, List<string>? excludeTags = null)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         // baseTags: match files via AND or OR. eachTags: at least one required.
         // AND: GROUP BY + HAVING COUNT = baseCount. OR: just DISTINCT.
         var sql = @"
@@ -551,7 +551,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<List<string>> GetFilePathsExcludingTagsAsync(List<string> excludeTags, bool requireAll)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         if (requireAll)
         {
             // Exclude files that have ALL specified tags
@@ -592,7 +592,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<List<string>> GetFilePathsWithNoTagsAsync()
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var sql = @"
             SELECT im.FilePath
             FROM ImageMeta im
@@ -605,7 +605,7 @@ public class ImageMetaRepository : IImageMetaRepository
     public async Task<List<TagCount>> GetCoOccurringTagsAsync(List<string> filePaths, List<string>? excludeNames = null, string? nameFilter = null)
     {
         if (filePaths.Count == 0) return new List<TagCount>();
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var sql = @"
             SELECT t.Name, COUNT(DISTINCT it.ImageMetaId) as Count
             FROM Tag t
@@ -628,7 +628,7 @@ public class ImageMetaRepository : IImageMetaRepository
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         if (filePaths.Count == 0) return result;
 
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         foreach (var chunk in filePaths.Chunk(900))
         {
             var rows = await conn.QueryAsync<(string FilePath, string PerceptualHash)>(@"
@@ -647,7 +647,7 @@ public class ImageMetaRepository : IImageMetaRepository
         var result = new Dictionary<string, (int Width, int Height)>(StringComparer.OrdinalIgnoreCase);
         if (filePaths.Count == 0) return result;
 
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         foreach (var chunk in filePaths.Chunk(900))
         {
             var rows = await conn.QueryAsync<(string FilePath, int Width, int Height)>(@"
@@ -663,7 +663,7 @@ public class ImageMetaRepository : IImageMetaRepository
     public async Task<Dictionary<string, string>> GetFileHashesByPathsAsync(List<string> filePaths)
     {
         if (filePaths.Count == 0) return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var rows = await conn.QueryAsync<(string FilePath, string FileHash)>(@"
             SELECT FilePath, FileHash FROM ImageMeta WHERE FilePath IN @Paths AND FileHash IS NOT NULL",
             new { Paths = filePaths });
@@ -674,7 +674,7 @@ public class ImageMetaRepository : IImageMetaRepository
     public async Task<ImageMeta?> GetByFileHashAsync(string fileHash)
     {
         if (string.IsNullOrEmpty(fileHash)) return null;
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var meta = await conn.QueryFirstOrDefaultAsync<ImageMeta>(@"
             SELECT * FROM ImageMeta WHERE FileHash = @Hash LIMIT 1",
             new { Hash = fileHash });
@@ -685,7 +685,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task UpdateFilePathAsync(long id, string newPath, long newFolderId)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(@"
             UPDATE ImageMeta SET FilePath = @Path, FolderId = @FolderId, UpdatedAt = @Now
             WHERE Id = @Id",
@@ -696,7 +696,7 @@ public class ImageMetaRepository : IImageMetaRepository
     {
         var result = new Dictionary<string, (long, int)>(StringComparer.OrdinalIgnoreCase);
         if (filePaths.Count == 0) return result;
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var rows = await conn.QueryAsync<(long Id, string FilePath, int Status)>(
             "SELECT Id, FilePath, AutoTagStatus AS Status FROM ImageMeta WHERE FilePath IN @Paths",
             new { Paths = filePaths });
@@ -707,7 +707,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task SetAutoTagStatusByPathAsync(string filePath, int status)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "UPDATE ImageMeta SET AutoTagStatus = @Status WHERE FilePath = @Path COLLATE NOCASE",
             new { Status = status, Path = filePath });
@@ -716,7 +716,7 @@ public class ImageMetaRepository : IImageMetaRepository
     public async Task SetAutoTagStatusBatchAsync(List<string> filePaths, int status)
     {
         if (filePaths.Count == 0) return;
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "UPDATE ImageMeta SET AutoTagStatus = @Status WHERE FilePath IN @Paths",
             new { Status = status, Paths = filePaths });
@@ -724,7 +724,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<List<ImageMeta>> GetAllUnlinkedAsync()
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         return (await conn.QueryAsync<ImageMeta>(
             "SELECT * FROM ImageMeta WHERE FolderId IS NULL OR FolderId = 0")).ToList();
     }
@@ -776,7 +776,7 @@ public class ImageMetaRepository : IImageMetaRepository
     public async Task<Dictionary<string, long>> GetIdsByPathsAsync(List<string> filePaths)
     {
         if (filePaths.Count == 0) return new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var rows = await conn.QueryAsync<(string FilePath, long Id)>(
             "SELECT FilePath, Id FROM ImageMeta WHERE FilePath IN @Paths",
             new { Paths = filePaths });
@@ -787,7 +787,7 @@ public class ImageMetaRepository : IImageMetaRepository
     {
         if (imageIds.Count == 0 || string.IsNullOrWhiteSpace(tag)) return;
         var trimmed = tag.Trim();
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         using var txn = conn.BeginTransaction();
 
         var tagId = await conn.ExecuteScalarAsync<long>(@"
@@ -810,7 +810,7 @@ public class ImageMetaRepository : IImageMetaRepository
     public async Task RemoveTagFromImagesAsync(List<long> imageIds, string tag)
     {
         if (imageIds.Count == 0 || string.IsNullOrWhiteSpace(tag)) return;
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(@"
             DELETE FROM ImageTag
             WHERE ImageMetaId IN @Ids
@@ -821,7 +821,7 @@ public class ImageMetaRepository : IImageMetaRepository
     public async Task ClearTagsAndStatusBatchAsync(List<string> filePaths)
     {
         if (filePaths.Count == 0) return;
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         using var txn = conn.BeginTransaction();
         await conn.ExecuteAsync(
             "DELETE FROM ImageTag WHERE ImageMetaId IN (SELECT Id FROM ImageMeta WHERE FilePath IN @Paths)",
@@ -835,7 +835,7 @@ public class ImageMetaRepository : IImageMetaRepository
     public async Task ClearTagsFromImagesAsync(List<long> imageIds)
     {
         if (imageIds.Count == 0) return;
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "DELETE FROM ImageTag WHERE ImageMetaId IN @Ids",
             new { Ids = imageIds });

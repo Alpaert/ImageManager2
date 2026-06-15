@@ -9,21 +9,25 @@ namespace ImageManager.Infrastructure.Caching;
 
 public class ThumbnailCacheService : IThumbnailCacheService
 {
-    private class CacheEntry
+    private sealed class LruNode
     {
+        public string Key { get; }
         public byte[] Data { get; set; } = Array.Empty<byte>();
         public long SizeBytes { get; set; }
-        public DateTime LastAccessUtc { get; set; }
         public int DecodeWidth { get; set; }
         public int Width { get; set; }
         public int Height { get; set; }
+        public LruNode(string key) => Key = key;
     }
 
-    private readonly ConcurrentDictionary<string, CacheEntry> _cache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, LinkedListNode<LruNode>> _index = new(StringComparer.OrdinalIgnoreCase);
+    private readonly LinkedList<LruNode> _lruList = new();
+    private readonly object _lruLock = new();
     private readonly DiskThumbnailCache _diskCache;
     private readonly IMediaProcessorFactory _factory;
     private long _totalBytes;
-    private const long MaxMemoryBytes = 50 * 1024 * 1024; // 50 MB
+    private const int MaxCachedItems = 500;
+    private const long MaxMemoryBytes = 80 * 1024 * 1024; // 80 MB hard cap
 
     public long EstimatedMemoryBytes => Interlocked.Read(ref _totalBytes);
     private string _cacheDirectory = @"C:\ImageManagerCache";
@@ -83,7 +87,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
         });
     }
 
-    public async Task<(byte[]? Data, int Width, int Height)> GetOrCreateThumbnailAsync(string filePath, int decodeWidth)
+    public async Task<(byte[]? Data, int Width, int Height)> GetOrCreateThumbnailAsync(string filePath, int decodeWidth, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
             return (null, 0, 0);
@@ -97,11 +101,11 @@ public class ThumbnailCacheService : IThumbnailCacheService
         }
 
         // 1. Memory cache (must match decode width)
-        if (_cache.TryGetValue(filePath, out var entry) && entry.Data != null
-            && entry.DecodeWidth == decodeWidth)
+        if (_index.TryGetValue(filePath, out var node) && node.Value.Data != null
+            && node.Value.DecodeWidth == decodeWidth)
         {
-            entry.LastAccessUtc = DateTime.UtcNow;
-            return (entry.Data, entry.Width, entry.Height);
+            PromoteToFront(node);
+            return (node.Value.Data, node.Value.Width, node.Value.Height);
         }
 
         // 2. Disk cache
@@ -137,7 +141,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
         // 3. Generate thumbnail
         if (isVideo) PerfLogger.Log($"[Cache] GENERATE start {Path.GetFileName(filePath)}");
         var processorGen = _factory.GetProcessor(filePath);
-        var result = await processorGen.ExtractThumbnailAsync(filePath, decodeWidth, CancellationToken.None);
+        var result = await processorGen.ExtractThumbnailAsync(filePath, decodeWidth, ct);
 
         if (result != null && result.Data.Length > 0)
         {
@@ -152,40 +156,37 @@ public class ThumbnailCacheService : IThumbnailCacheService
 
     public Task ClearAsync()
     {
-        _cache.Clear();
+        lock (_lruLock)
+        {
+            _lruList.Clear();
+            _index.Clear();
+        }
         Interlocked.Exchange(ref _totalBytes, 0);
         return Task.CompletedTask;
     }
 
     public void Trim(long maxBytes, string? protectedKey = null)
     {
-        if (Interlocked.Read(ref _totalBytes) <= maxBytes)
-            return;
-
-        var sorted = _cache
-            .Where(kv => kv.Value != null)
-            .OrderBy(kv => kv.Value!.LastAccessUtc)
-            .ToList();
-
-        foreach (var kv in sorted)
+        lock (_lruLock)
         {
-            if (!string.IsNullOrEmpty(protectedKey) &&
-                string.Equals(kv.Key, protectedKey, StringComparison.OrdinalIgnoreCase))
-                continue;
-
-            if (_cache.TryRemove(kv.Key, out var entry))
+            // Evict from tail (least recently used) until under byte limit
+            var node = _lruList.Last;
+            while (node != null && Interlocked.Read(ref _totalBytes) > maxBytes)
             {
-                if (entry != null)
-                    Interlocked.Add(ref _totalBytes, -entry.SizeBytes);
-            }
-            else
-            {
-                // Value was null �?force remove
-                _cache.TryRemove(kv.Key, out _);
-            }
+                var next = node.Previous;
+                if (!string.IsNullOrEmpty(protectedKey) &&
+                    string.Equals(node.Value.Key, protectedKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    node = next;
+                    continue;
+                }
 
-            if (Interlocked.Read(ref _totalBytes) <= maxBytes)
-                break;
+                _lruList.Remove(node);
+                _index.TryRemove(node.Value.Key, out _);
+                Interlocked.Add(ref _totalBytes, -node.Value.SizeBytes);
+                node.Value.Data = Array.Empty<byte>();
+                node = next;
+            }
         }
 
         if (Interlocked.Read(ref _totalBytes) < 0)
@@ -194,24 +195,55 @@ public class ThumbnailCacheService : IThumbnailCacheService
 
     private void AddToMemory(string filePath, byte[] data, int decodeWidth, int width, int height)
     {
-        var entry = new CacheEntry
+        var newNode = new LruNode(filePath)
         {
             Data = data,
             SizeBytes = data.Length,
-            LastAccessUtc = DateTime.UtcNow,
             DecodeWidth = decodeWidth,
             Width = width,
             Height = height
         };
 
-        if (_cache.TryGetValue(filePath, out var oldEntry))
-            Interlocked.Add(ref _totalBytes, -oldEntry.SizeBytes);
+        lock (_lruLock)
+        {
+            // Remove old entry if exists
+            if (_index.TryGetValue(filePath, out var oldNode))
+            {
+                _lruList.Remove(oldNode);
+                Interlocked.Add(ref _totalBytes, -oldNode.Value.SizeBytes);
+            }
 
-        _cache[filePath] = entry;
-        Interlocked.Add(ref _totalBytes, data.Length);
+            // Add to front (most recently used)
+            var listNode = _lruList.AddFirst(newNode);
+            _index[filePath] = listNode;
+            Interlocked.Add(ref _totalBytes, data.Length);
 
-        if (Interlocked.Read(ref _totalBytes) > MaxMemoryBytes)
-            Trim(MaxMemoryBytes, filePath);
+            // Evict if over item count OR byte limit
+            while (_lruList.Count > MaxCachedItems || Interlocked.Read(ref _totalBytes) > MaxMemoryBytes)
+            {
+                var tail = _lruList.Last;
+                if (tail == null || string.Equals(tail.Value.Key, filePath, StringComparison.OrdinalIgnoreCase))
+                    break; // Don't evict the item we just added
+
+                _lruList.Remove(tail);
+                _index.TryRemove(tail.Value.Key, out _);
+                Interlocked.Add(ref _totalBytes, -tail.Value.SizeBytes);
+                // Clear reference to help GC
+                tail.Value.Data = Array.Empty<byte>();
+            }
+        }
+    }
+
+    private void PromoteToFront(LinkedListNode<LruNode> node)
+    {
+        lock (_lruLock)
+        {
+            if (node.List != null) // still in the list
+            {
+                _lruList.Remove(node);
+                _lruList.AddFirst(node);
+            }
+        }
     }
 
     public void DeleteFromDiskCache(string filePath) => _diskCache.DeleteAllWidths(filePath);

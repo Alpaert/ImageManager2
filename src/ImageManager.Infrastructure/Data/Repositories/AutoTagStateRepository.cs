@@ -6,13 +6,13 @@ namespace ImageManager.Infrastructure.Data.Repositories;
 
 public class AutoTagStateRepository : IAutoTagStateRepository
 {
-    private readonly AppDbContext _db;
+    private readonly IDbContextFactory _dbFactory;
 
-    public AutoTagStateRepository(AppDbContext db) => _db = db;
+    public AutoTagStateRepository(IDbContextFactory dbFactory) => _dbFactory = dbFactory;
 
     public async Task<AutoTagState?> GetStateAsync(long folderId)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         return await conn.QuerySingleOrDefaultAsync<AutoTagState>(
             "SELECT * FROM AutoTagState WHERE FolderId = @FolderId",
             new { FolderId = folderId });
@@ -20,7 +20,7 @@ public class AutoTagStateRepository : IAutoTagStateRepository
 
     public async Task UpsertStateAsync(AutoTagState state)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(@"
             INSERT INTO AutoTagState (FolderId, Status, TotalFiles, Processed, LastFileCount,
                 StartedAt, CompletedAt, ErrorMsg)
@@ -35,7 +35,7 @@ public class AutoTagStateRepository : IAutoTagStateRepository
 
     public async Task DeleteStateAsync(long folderId)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "DELETE FROM AutoTagState WHERE FolderId = @FolderId",
             new { FolderId = folderId });
@@ -44,7 +44,7 @@ public class AutoTagStateRepository : IAutoTagStateRepository
     public async Task<List<(string EnglishTag, string? ChineseTranslation, string? UserEditedText,
         bool IsConfirmed, bool IsExistingMapping)>> GetTranslationsAsync(long folderId)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var rows = await conn.QueryAsync<dynamic>(
             "SELECT EnglishTag, ChineseTranslation, UserEditedText, IsConfirmed, IsExistingMapping " +
             "FROM AutoTagTranslation WHERE FolderId = @FolderId ORDER BY EnglishTag",
@@ -63,7 +63,7 @@ public class AutoTagStateRepository : IAutoTagStateRepository
         string? chineseTranslation, string? userEditedText,
         bool isConfirmed, bool isExistingMapping)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(@"
             INSERT INTO AutoTagTranslation (FolderId, EnglishTag, ChineseTranslation,
                 UserEditedText, IsConfirmed, IsExistingMapping)
@@ -81,7 +81,7 @@ public class AutoTagStateRepository : IAutoTagStateRepository
 
     public async Task DeleteTranslationsAsync(long folderId)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "DELETE FROM AutoTagTranslation WHERE FolderId = @FolderId",
             new { FolderId = folderId });
@@ -89,7 +89,7 @@ public class AutoTagStateRepository : IAutoTagStateRepository
 
     public async Task DeleteTranslationAsync(long folderId, string englishTag)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "DELETE FROM AutoTagTranslation WHERE FolderId = @FolderId AND EnglishTag = @Tag COLLATE NOCASE",
             new { FolderId = folderId, Tag = englishTag });

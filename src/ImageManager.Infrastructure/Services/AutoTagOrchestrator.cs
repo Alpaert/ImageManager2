@@ -1,20 +1,20 @@
 using System.Security.Cryptography;
-using ImageManager.App.ViewModels;
+using CommunityToolkit.Mvvm.Messaging;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
+using ImageManager.Core.Messages;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
-using ImageManager.Infrastructure.Caching;
-using ImageManager.Infrastructure.Services;
 
-namespace ImageManager.App.Services;
+namespace ImageManager.Infrastructure.Services;
 
 /// <summary>
-/// [DEPRECATED] Use <see cref="ImageManager.Infrastructure.Services.AutoTagOrchestrator"/> instead.
-/// This class will be removed when all callers are migrated.
+/// Orchestrates the auto-tag pipeline: model loading, inference, translation, review, and artist registration.
+/// Lives in Infrastructure with no dependency on Avalonia UI.
+/// Communicates progress and results via <see cref="IMessenger"/>.
+/// All UI-thread marshalling is handled by injected <see cref="IDispatcher"/>.
 /// </summary>
-[Obsolete("Use AutoTagOrchestrator instead.")]
-public class AutoTagController : IDisposable
+public class AutoTagOrchestrator : IDisposable
 {
     private readonly AutoTagPipelineService _pipeline;
     private readonly IFolderRepository _folderRepo;
@@ -23,12 +23,14 @@ public class AutoTagController : IDisposable
     private readonly IEnsembleTagService _tagService;
     private readonly ITagRepository _tagRepo;
     private readonly IAutoTagStateRepository _stateRepo;
-    private readonly ThumbnailCacheService _thumbCache;
+    private readonly IThumbnailCacheService _thumbCache;
     private readonly ChineseTagLibrary _chineseLib;
     private readonly TagServiceFactory _factory;
     private readonly DeepSeekRecommendService _recommendService;
     private readonly ArtistEmbeddingStore _artistStore;
     private readonly PixaiTagService _pixaiService;
+    private readonly IMessenger _messenger;
+    private readonly IDispatcher _dispatcher;
     private string _currentFolderPath = string.Empty;
     private long _currentFolderId;
     private TagMode _currentMode = TagMode.Ensemble;
@@ -37,10 +39,7 @@ public class AutoTagController : IDisposable
     /// <summary>Paths actually processed in the last pipeline run (excluding skipped).</summary>
     public List<string> LastProcessedPaths { get; private set; } = new();
 
-    public event Action<AutoTagPipelineProgress>? ProgressChanged;
-    public event Action? TranslationReady;
-
-    public AutoTagController(
+    public AutoTagOrchestrator(
         AutoTagPipelineService pipeline,
         IFolderRepository folderRepo,
         IImageMetaRepository metaRepo,
@@ -48,12 +47,14 @@ public class AutoTagController : IDisposable
         IEnsembleTagService tagService,
         ITagRepository tagRepo,
         IAutoTagStateRepository stateRepo,
-        ThumbnailCacheService thumbCache,
+        IThumbnailCacheService thumbCache,
         ChineseTagLibrary chineseLib,
         TagServiceFactory factory,
         DeepSeekRecommendService recommendService,
         ArtistEmbeddingStore artistStore,
-        PixaiTagService pixaiService)
+        PixaiTagService pixaiService,
+        IMessenger messenger,
+        IDispatcher dispatcher)
     {
         _pipeline = pipeline;
         _folderRepo = folderRepo;
@@ -68,10 +69,14 @@ public class AutoTagController : IDisposable
         _recommendService = recommendService;
         _artistStore = artistStore;
         _pixaiService = pixaiService;
+        _messenger = messenger;
+        _dispatcher = dispatcher;
 
-        _pipeline.ProgressChanged += p => ProgressChanged?.Invoke(p);
-        _tagService.ProgressChanged += p => ProgressChanged?.Invoke(
-            new AutoTagPipelineProgress("Model", p.Processed, p.Total, p.StatusText));
+        // Wire pipeline progress → messenger
+        _pipeline.ProgressChanged += p =>
+            _messenger.Send(new AutoTagProgressMessage(p.Phase, p.Processed, p.Total, p.StatusText));
+        _tagService.ProgressChanged += p =>
+            _messenger.Send(new AutoTagProgressMessage("Model", p.Processed, p.Total, p.StatusText));
     }
 
     public void Configure(TagMode mode, double confidenceThreshold, int maxTagsPerImage,
@@ -104,7 +109,7 @@ public class AutoTagController : IDisposable
     }
 
     public string ModelPath =>
-        System.IO.Path.Combine(_thumbCache.CacheDirectory, "models");
+        Path.Combine(_thumbCache.CacheDirectory, "models");
 
     public bool IsModelLoaded => _tagService.IsModelLoaded;
 
@@ -120,7 +125,7 @@ public class AutoTagController : IDisposable
 
     public async Task<FolderTagActionResult> DetermineActionAsync(long folderId)
     {
-        var metas = folderId > 0 ? await _metaRepo.GetByFolderIdAsync(folderId) : new List<Core.Models.ImageMeta>();
+        var metas = folderId > 0 ? await _metaRepo.GetByFolderIdAsync(folderId) : new List<ImageMeta>();
         return await _pipeline.DetermineActionAsync(folderId, metas.Count);
     }
 
@@ -128,22 +133,18 @@ public class AutoTagController : IDisposable
     {
         _currentFolderPath = folderPath;
         _currentFolderId = folderId;
-        bool hasState = folderId > 0;
 
-        // Filter out video files - only process images
         filePaths = filePaths.Where(f => FileTypeConstants.IsImageFile(f)).ToList();
         if (filePaths.Count == 0)
         {
             LastProcessedPaths = new List<string>();
-            ProgressChanged?.Invoke(new AutoTagPipelineProgress("Done", 0, 0, "没有图片文件需要处理"));
-            TranslationReady?.Invoke();
+            _messenger.Send(new AutoTagProgressMessage("Done", 0, 0, "没有图片文件需要处理"));
+            _messenger.Send(new TranslationReadyMessage());
             return;
         }
 
-        // Batch-load AutoTagStatus for all file paths (single DB query)
         var statusMap = await _metaRepo.GetStatusMapByPathsAsync(filePaths);
 
-        // Resolve ImageMeta IDs; skip already AI-tagged; ensure DB record + MD5 for new files
         var metas = new List<(long Id, string FilePath)>();
         foreach (var path in filePaths)
         {
@@ -154,13 +155,12 @@ public class AutoTagController : IDisposable
             }
             else
             {
-                // New file: compute MD5, check for match, otherwise create record
                 long newId = 0;
                 try
                 {
                     string md5;
                     using (var fs = File.OpenRead(path))
-                        md5 = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(fs)).ToLowerInvariant();
+                        md5 = Convert.ToHexString(MD5.HashData(fs)).ToLowerInvariant();
                     var match = await _metaRepo.GetByFileHashAsync(md5);
                     if (match != null && !File.Exists(match.FilePath))
                     {
@@ -170,7 +170,7 @@ public class AutoTagController : IDisposable
                     else
                     {
                         var fi = new FileInfo(path);
-                        var newMeta = new Core.Models.ImageMeta
+                        var newMeta = new ImageMeta
                         {
                             FilePath = path, FileHash = md5, FolderId = folderId,
                             FileSize = fi.Length, LastWriteTicks = fi.LastWriteTimeUtc.Ticks
@@ -189,15 +189,13 @@ public class AutoTagController : IDisposable
         if (metas.Count == 0)
         {
             LastProcessedPaths = new List<string>();
-            ProgressChanged?.Invoke(new AutoTagPipelineProgress("Done", 0, 0, "全部图片已打标，跳过"));
-            TranslationReady?.Invoke();
+            _messenger.Send(new AutoTagProgressMessage("Done", 0, 0, "全部图片已打标，跳过"));
+            _messenger.Send(new TranslationReadyMessage());
             return;
         }
 
-        // Track paths for post-pipeline refresh
         LastProcessedPaths = metas.Select(m => m.FilePath).ToList();
 
-        // Phase 1: Inference
         ResetCts();
         try
         {
@@ -208,40 +206,32 @@ public class AutoTagController : IDisposable
             AppLogger.Info("AutoTag pipeline cancelled by user");
         }
 
-        TranslationReady?.Invoke();
+        _messenger.Send(new TranslationReadyMessage());
     }
 
-    public async Task<List<TagTranslationItem>> GetReviewDataAsync()
+    public async Task<List<TagTranslationDto>> GetReviewDataAsync()
     {
         var data = await _pipeline.GetReviewDataAsync(_currentFolderId, _currentFolderPath);
-        return data.Select(d => new TagTranslationItem
+        return data.Select(d => new TagTranslationDto
         {
             EnglishTag = d.EnglishTag,
             ChineseTranslation = d.UserEditedText ?? d.ChineseTranslation,
             ImageCount = d.ImageCount,
             IsConfirmed = d.IsConfirmed,
-            IsExistingMapping = d.IsExistingMapping,
-            IsEditing = false
+            IsExistingMapping = d.IsExistingMapping
         }).ToList();
     }
 
-    public async Task ConfirmTagAsync(TagTranslationItem item)
+    public async Task ConfirmTagAsync(string englishTag, string chineseName)
     {
-        var chineseName = item.UserEditedText;
-        if (string.IsNullOrWhiteSpace(chineseName))
-            chineseName = item.ChineseTranslation;
         if (string.IsNullOrWhiteSpace(chineseName)) return;
-
-        await _pipeline.ConfirmTagAsync(_currentFolderId, _currentFolderPath, item.EnglishTag, chineseName);
-        item.IsConfirmed = true;
+        await _pipeline.ConfirmTagAsync(_currentFolderId, _currentFolderPath, englishTag, chineseName);
     }
 
-    /// <summary>自动确认所有标签：查中文库替换 English→Chinese，跳过审核窗口</summary>
     public async Task AutoConfirmAllAsync()
     {
         var metas = await _metaRepo.GetByFolderAsync(_currentFolderPath);
 
-        // Build tag→imageIds reverse index (avoid O(N*M) nested loop)
         var tagToImageIds = new Dictionary<string, List<long>>(StringComparer.OrdinalIgnoreCase);
         foreach (var meta in metas)
         {
@@ -258,7 +248,6 @@ public class AutoTagController : IDisposable
 
         AppLogger.Tag("AutoConfirm", $"folder={_currentFolderPath} images={metas.Count} uniqueTags={tagToImageIds.Count}");
 
-        // Collect all tag mappings
         int confirmed = 0;
         foreach (var (enTag, _) in tagToImageIds)
         {
@@ -268,7 +257,6 @@ public class AutoTagController : IDisposable
             confirmed++;
         }
 
-        // Batch replace: collect all (imageId, englishName, chineseId) into one list
         var batch = new List<(long ImageId, string EnglishName, long ChineseId)>();
         foreach (var (enTag, imageIds) in tagToImageIds)
         {
@@ -285,18 +273,21 @@ public class AutoTagController : IDisposable
         AppLogger.Tag("AutoConfirm", $"完成 confirmed={confirmed} batchSize={batch.Count}");
     }
 
-    public async Task ConfirmAllAsync(List<TagTranslationItem> items)
+    public async Task ConfirmAllAsync(List<TagTranslationDto> items)
     {
         try
         {
             await _pipeline.PreloadMetasAsync(_currentFolderPath);
             foreach (var item in items.Where(i => !i.IsConfirmed))
-                await ConfirmTagAsync(item);
+            {
+                var chineseName = item.UserEditedText ?? item.ChineseTranslation;
+                await ConfirmTagAsync(item.EnglishTag, chineseName);
+            }
         }
         finally { _pipeline.ClearMetaCache(); }
     }
 
-    public async Task SaveDraftAsync(List<TagTranslationItem> items)
+    public async Task SaveDraftAsync(List<TagTranslationDto> items)
     {
         foreach (var item in items.Where(i => !i.IsConfirmed && !i.IsExistingMapping))
         {
@@ -314,28 +305,27 @@ public class AutoTagController : IDisposable
         return await _pipeline.GetImagesWithTagAsync(_currentFolderId, _currentFolderPath, englishTag);
     }
 
-    public async Task<List<TagTranslationItem>> RunSingleImageAsync(string filePath)
+    public async Task<List<TagTranslationDto>> RunSingleImageAsync(string filePath)
     {
         var predictions = await _tagService.PredictAsync(filePath);
         var filtered = predictions
-            .Where(p => p.Confidence >= 0.1) // low floor for manual review
+            .Where(p => p.Confidence >= 0.1)
             .Take(300)
             .ToList();
 
         var existingMappings = await _mappingRepo.GetAllAsync();
-        var items = new List<TagTranslationItem>();
+        var items = new List<TagTranslationDto>();
         foreach (var pred in filtered)
         {
             var existing = existingMappings.FirstOrDefault(m =>
                 string.Equals(m.EnglishName, pred.TagName, StringComparison.OrdinalIgnoreCase));
-            // Chinese: prefer pred.ChineseName → TagMapping → ChineseTagLibrary → English fallback
             var chinese = pred.ChineseName ?? existing?.ChineseName ?? _chineseLib.Lookup(pred.TagName) ?? pred.TagName;
-            items.Add(new TagTranslationItem
+            items.Add(new TagTranslationDto
             {
                 EnglishTag = pred.TagName,
                 ChineseTranslation = chinese,
                 ImageCount = 1,
-                IsConfirmed = true,      // auto-confirmed — no review needed
+                IsConfirmed = true,
                 IsExistingMapping = existing != null
             });
         }
@@ -343,32 +333,28 @@ public class AutoTagController : IDisposable
         return items;
     }
 
-    public async Task SaveMappingsOnlyAsync(List<TagTranslationItem> items)
+    public async Task SaveMappingsOnlyAsync(List<TagTranslationDto> items)
     {
         foreach (var item in items)
         {
-            var chinese = item.UserEditedText;
-            if (string.IsNullOrWhiteSpace(chinese)) chinese = item.ChineseTranslation;
+            var chinese = item.UserEditedText ?? item.ChineseTranslation;
             if (string.IsNullOrWhiteSpace(chinese)) continue;
             await _mappingRepo.UpsertAsync(item.EnglishTag, chinese);
         }
     }
 
-    public async Task SaveMappingsAndTagsAsync(string filePath, List<TagTranslationItem> items)
+    public async Task SaveMappingsAndTagsAsync(string filePath, List<TagTranslationDto> items)
     {
         var meta = await _metaRepo.GetByPathAsync(filePath);
         if (meta == null) return;
 
         foreach (var item in items)
         {
-            var chinese = item.UserEditedText;
-            if (string.IsNullOrWhiteSpace(chinese)) chinese = item.ChineseTranslation;
+            var chinese = item.UserEditedText ?? item.ChineseTranslation;
             if (string.IsNullOrWhiteSpace(chinese)) continue;
 
-            // Save mapping for future reuse
             await _mappingRepo.UpsertAsync(item.EnglishTag, chinese);
 
-            // If confirmed, write to image
             if (item.IsConfirmed)
             {
                 var chineseTagId = await _tagRepo.GetOrCreateTagIdAsync(chinese);
@@ -382,21 +368,19 @@ public class AutoTagController : IDisposable
         }
     }
 
-    public async Task WriteConfirmedTagsAsync(string filePath, List<TagTranslationItem> items)
+    public async Task WriteConfirmedTagsAsync(string filePath, List<TagTranslationDto> items)
     {
         var meta = await _metaRepo.GetByPathAsync(filePath);
         if (meta == null) return;
 
         foreach (var item in items.Where(i => i.IsConfirmed))
         {
-            var chineseName = item.UserEditedText;
-            if (string.IsNullOrWhiteSpace(chineseName)) chineseName = item.ChineseTranslation;
+            var chineseName = item.UserEditedText ?? item.ChineseTranslation;
             if (string.IsNullOrWhiteSpace(chineseName)) continue;
 
             await _mappingRepo.UpsertAsync(item.EnglishTag, chineseName);
 
             var chineseTagId = await _tagRepo.GetOrCreateTagIdAsync(chineseName);
-            // Add as confirmed auto-tag
             try { await _metaRepo.ReplaceAutoTagAsync(meta.Id, item.EnglishTag, chineseTagId); }
             catch (Exception ex)
             {
@@ -406,12 +390,11 @@ public class AutoTagController : IDisposable
         }
     }
 
-    public async Task DeleteTagAsync(TagTranslationItem item)
+    public async Task DeleteTagAsync(string englishTag)
     {
-        await _pipeline.DeleteAutoTagAsync(_currentFolderId, _currentFolderPath, item.EnglishTag);
+        await _pipeline.DeleteAutoTagAsync(_currentFolderId, _currentFolderPath, englishTag);
     }
 
-    /// <summary>删除文件夹下所有自动标签（高效批量 SQL）</summary>
     public async Task<int> DeleteAllAutoTagsAsync(string folderPath)
     {
         var count = await _metaRepo.DeleteAllAutoTagsByFolderAsync(folderPath);
@@ -440,8 +423,6 @@ public class AutoTagController : IDisposable
         _cts?.Cancel();
         _cts?.Dispose();
         _cts = null;
-        ProgressChanged = null;
-        TranslationReady = null;
     }
 
     public async Task MarkFolderDoneAsync(long folderId)
@@ -456,7 +437,6 @@ public class AutoTagController : IDisposable
 
     // ==================== 画师嵌入库管理 ====================
 
-    /// <summary>注册画师：从参考图提取嵌入，加入画师库</summary>
     public async Task<bool> RegisterArtistAsync(string artistName, string imagePath)
     {
         if (!_pixaiService.IsModelLoaded)
@@ -480,7 +460,6 @@ public class AutoTagController : IDisposable
         return true;
     }
 
-    /// <summary>注册画师：使用已计算的嵌入（多图均值）直接加入</summary>
     public void RegisterArtistWithEmbeddingAsync(string artistName, float[] embedding, int imageCount)
     {
         _artistStore.Add(artistName, embedding, imageCount);
@@ -493,6 +472,5 @@ public class AutoTagController : IDisposable
         AppLogger.Tag("Artist", $"注册画师 artist={artistName} imgs={imageCount} storeCount={_artistStore.Count}");
     }
 
-    /// <summary>获取画师库中的画师数量</summary>
     public int GetArtistStoreCount() => _artistStore.Count;
 }

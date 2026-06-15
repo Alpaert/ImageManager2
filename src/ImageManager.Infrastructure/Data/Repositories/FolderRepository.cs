@@ -6,13 +6,13 @@ namespace ImageManager.Infrastructure.Data.Repositories;
 
 public class FolderRepository : IFolderRepository
 {
-    private readonly AppDbContext _db;
+    private readonly IDbContextFactory _dbFactory;
 
-    public FolderRepository(AppDbContext db) => _db = db;
+    public FolderRepository(IDbContextFactory dbFactory) => _dbFactory = dbFactory;
 
     public async Task<List<FolderInfo>> GetAllAsync()
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var results = await conn.QueryAsync<FolderInfo>(
             "SELECT * FROM Folder ORDER BY SortOrder, Id");
         return results.ToList();
@@ -20,21 +20,21 @@ public class FolderRepository : IFolderRepository
 
     public async Task<FolderInfo?> GetByPathAsync(string path)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         return await conn.QuerySingleOrDefaultAsync<FolderInfo>(
             "SELECT * FROM Folder WHERE Path = @Path COLLATE NOCASE", new { Path = path });
     }
 
     public async Task AddAsync(string path)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "INSERT OR IGNORE INTO Folder (Path) VALUES (@Path)", new { Path = path });
     }
 
     public async Task UpdateAliasAsync(string path, string? alias)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "UPDATE Folder SET Alias = @Alias WHERE Path = @Path COLLATE NOCASE",
             new { Path = path, Alias = alias });
@@ -42,14 +42,14 @@ public class FolderRepository : IFolderRepository
 
     public async Task RemoveAsync(string path)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "DELETE FROM Folder WHERE Path = @Path COLLATE NOCASE", new { Path = path });
     }
 
     public async Task SetLastPageIndexAsync(string path, int pageIndex)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "UPDATE Folder SET LastPageIndex = @PageIndex WHERE Path = @Path COLLATE NOCASE",
             new { Path = path, PageIndex = pageIndex });
@@ -57,7 +57,7 @@ public class FolderRepository : IFolderRepository
 
     public async Task<int?> GetLastPageIndexAsync(string path)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         return await conn.QuerySingleOrDefaultAsync<int?>(
             "SELECT LastPageIndex FROM Folder WHERE Path = @Path COLLATE NOCASE",
             new { Path = path });
@@ -65,7 +65,7 @@ public class FolderRepository : IFolderRepository
 
     public async Task RelocateFolderAsync(long folderId, string newFolderPath)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         using var txn = conn.BeginTransaction();
 
         // Get old path

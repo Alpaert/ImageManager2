@@ -20,6 +20,7 @@ public class OnnxTagService : IAutoTagService, IDisposable
     private int _predictCount;
     private static readonly HttpClient _http = new();
     private readonly SemaphoreSlim _initLock = new(1, 1);
+    private readonly SemaphoreSlim _inferenceLock = new(1, 1);
     private string _modelDir = string.Empty;
 
     public event Action<AutoTagProgress>? ProgressChanged;
@@ -61,50 +62,55 @@ public class OnnxTagService : IAutoTagService, IDisposable
         if (_session == null)
             throw new InvalidOperationException("Model not loaded");
 
-        return await Task.Run(() =>
+        await _inferenceLock.WaitAsync(ct);
+        try
         {
-            var tensor = Preprocess(imagePath);
-            if (tensor == null)
+            return await Task.Run(() =>
             {
-                if (Interlocked.Increment(ref _predictCount) == 1)
-                    ProgressChanged?.Invoke(new AutoTagProgress(0, 0, "预处理失败: 图片无法解码"));
-                return new List<TagPrediction>();
-            }
-
-            var inputs = new List<NamedOnnxValue>
-            {
-                NamedOnnxValue.CreateFromTensor(_inputName, tensor)
-            };
-
-            using var results = _session.Run(inputs);
-            var output = results[0].AsTensor<float>();
-            var probs = output.ToArray(); // model already has sigmoid built-in
-
-            int aboveThreshold = 0;
-            float maxProb = 0;
-            var predictions = new List<TagPrediction>(probs.Length);
-            for (int i = 0; i < probs.Length && i < _tagNames.Length; i++)
-            {
-                if (probs[i] > maxProb) maxProb = probs[i];
-                if (probs[i] >= 0.01f)
+                var tensor = Preprocess(imagePath);
+                if (tensor == null)
                 {
-                    predictions.Add(new TagPrediction(_tagNames[i], probs[i]));
-                    aboveThreshold++;
+                    if (Interlocked.Increment(ref _predictCount) == 1)
+                        ProgressChanged?.Invoke(new AutoTagProgress(0, 0, "预处理失败: 图片无法解码"));
+                    return new List<TagPrediction>();
                 }
-            }
 
-            // Report diagnostic for first image
-            if (Interlocked.Increment(ref _predictCount) == 1)
-            {
-                var sample = predictions.Take(3).Select(p => $"{p.TagName}({p.Confidence:F2})");
-                ProgressChanged?.Invoke(new AutoTagProgress(0, 0,
-                    $"首图推理: maxProb={maxProb:F4} aboveThreshold={aboveThreshold} " +
-                    $"top3=[{string.Join(", ", sample)}] shape={_modelShapeInfo}"));
-            }
+                var inputs = new List<NamedOnnxValue>
+                {
+                    NamedOnnxValue.CreateFromTensor(_inputName, tensor)
+                };
 
-            predictions.Sort((a, b) => b.Confidence.CompareTo(a.Confidence));
-            return predictions;
-        });
+                using var results = _session.Run(inputs);
+                var output = results[0].AsTensor<float>();
+                var probs = output.ToArray(); // model already has sigmoid built-in
+
+                int aboveThreshold = 0;
+                float maxProb = 0;
+                var predictions = new List<TagPrediction>(probs.Length);
+                for (int i = 0; i < probs.Length && i < _tagNames.Length; i++)
+                {
+                    if (probs[i] > maxProb) maxProb = probs[i];
+                    if (probs[i] >= 0.01f)
+                    {
+                        predictions.Add(new TagPrediction(_tagNames[i], probs[i]));
+                        aboveThreshold++;
+                    }
+                }
+
+                // Report diagnostic for first image
+                if (Interlocked.Increment(ref _predictCount) == 1)
+                {
+                    var sample = predictions.Take(3).Select(p => $"{p.TagName}({p.Confidence:F2})");
+                    ProgressChanged?.Invoke(new AutoTagProgress(0, 0,
+                        $"首图推理: maxProb={maxProb:F4} aboveThreshold={aboveThreshold} " +
+                        $"top3=[{string.Join(", ", sample)}] shape={_modelShapeInfo}"));
+                }
+
+                predictions.Sort((a, b) => b.Confidence.CompareTo(a.Confidence));
+                return predictions;
+            });
+        }
+        finally { _inferenceLock.Release(); }
     }
 
     // Preprocessing: square white-pad → 448 resize → float32 0-255 → BGR → NHWC [1,448,448,3]
@@ -217,8 +223,16 @@ public class OnnxTagService : IAutoTagService, IDisposable
 
     public void Dispose()
     {
-        _session?.Dispose();
-        _session = null;
+        // Wait for any in-flight inference to finish before disposing _session
+        _inferenceLock.Wait();
+        try
+        {
+            _session?.Dispose();
+            _session = null;
+        }
+        finally { _inferenceLock.Release(); }
+
+        _inferenceLock.Dispose();
         _initLock.Dispose();
     }
 }

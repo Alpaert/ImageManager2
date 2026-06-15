@@ -7,6 +7,7 @@ using Avalonia.Media;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using CommunityToolkit.Mvvm.Messaging;
 using ImageManager.App.Services;
 using ImageManager.Common.Constants;
 using ImageManager.Core.Models;
@@ -229,7 +230,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private async Task StopAutoTag()
     {
         IsAutoTagRunning = false;
-        var controller = App.Services.GetRequiredService<ImageManager.App.Services.AutoTagController>();
+        var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
         await controller.CancelAsync();
     }
     [ObservableProperty] private bool _isShowingSearchResult;
@@ -242,7 +243,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     // ==================== Page Manager ====================
     private readonly PageManager _pageManager;
-    private readonly TagSearchController _tagSearch;
+    private readonly ImageManager.Infrastructure.Services.TagSearchEngine _tagSearch;
 
     // ==================== Cache ====================
     private readonly ConcurrentDictionary<string, string> _phashCache = new(StringComparer.OrdinalIgnoreCase);
@@ -275,9 +276,10 @@ public partial class MainWindowViewModel : ViewModelBase
         IDuplicateService duplicateService,
         ThumbnailCacheService thumbCache,
         PageManager pageManager,
-        TagSearchController tagSearch,
+        ImageManager.Infrastructure.Services.TagSearchEngine tagSearch,
         ImageManager.Infrastructure.Services.ArtistEmbeddingStore artistStore,
-        ImageManager.Infrastructure.Services.ChineseTagLibrary chineseLib)
+        ImageManager.Infrastructure.Services.ChineseTagLibrary chineseLib,
+        CommunityToolkit.Mvvm.Messaging.IMessenger messenger)
     {
         _settingsRepo = settingsRepo;
         _folderRepo = folderRepo;
@@ -303,19 +305,20 @@ public partial class MainWindowViewModel : ViewModelBase
             _imagesUpdatedTcs?.TrySetResult(true);
         };
 
-        _tagSearch.SearchCompleted += result =>
+        // Tag search completed
+        messenger.Register<MainWindowViewModel, ImageManager.Core.Messages.TagSearchCompletedMessage>(this, (r, msg) =>
         {
             CoTagFilterText = string.Empty;
             OnPropertyChanged(nameof(IsSuggestionCoTagMode));
 
-            if (!result.HasResults)
+            if (!msg.HasResults || msg.ResultFiles.Count == 0)
             {
                 CurrentTagFilter = string.Empty;
                 return;
             }
 
             IsShowingSearchResult = true;
-            if (result.TotalPages == 0)
+            if (msg.TotalPages == 0)
             {
                 Images = new ObservableCollection<ImageViewItem>();
                 TotalPages = 0;
@@ -323,31 +326,34 @@ public partial class MainWindowViewModel : ViewModelBase
             }
             else
             {
-                TotalPages = result.TotalPages;
-                PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, result.TotalPages));
+                TotalPages = msg.TotalPages;
+                PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, msg.TotalPages));
                 _pageManager.InvalidateCache();
                 _ = ShowPageAsync(0);
             }
-            StatusText = result.StatusText;
-        };
+            StatusText = msg.StatusText;
+        });
 
-        _tagSearch.SuggestionsChanged += (suggestions, isOpen) =>
+        // Suggestions changed
+        messenger.Register<MainWindowViewModel, ImageManager.Core.Messages.TagSearchSuggestionsChangedMessage>(this, (r, msg) =>
         {
-            TagSearchSuggestions = new ObservableCollection<TagCount>(suggestions);
-            IsTagSearchPopupOpen = isOpen;
-        };
+            TagSearchSuggestions = new ObservableCollection<TagCount>(msg.Suggestions);
+            IsTagSearchPopupOpen = msg.Suggestions.Count > 0;
+        });
 
-        _tagSearch.CoTagCycled += _ =>
+        // Co-tag cycled
+        messenger.Register<MainWindowViewModel, ImageManager.Core.Messages.CoTagCycledMessage>(this, (r, msg) =>
         {
             OnPropertyChanged(nameof(SearchBoxBorderColor));
-        };
+        });
 
-        _tagSearch.CoTagModeExited += () =>
+        // Co-tag mode exited
+        messenger.Register<MainWindowViewModel, ImageManager.Core.Messages.CoTagModeExitedMessage>(this, (r, msg) =>
         {
             CoTagFilterText = string.Empty;
             OnPropertyChanged(nameof(SearchBoxBorderColor));
             OnPropertyChanged(nameof(IsSuggestionCoTagMode));
-        };
+        });
     }
 
     public async Task InitializeAsync()

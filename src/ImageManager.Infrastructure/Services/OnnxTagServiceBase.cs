@@ -54,7 +54,7 @@ public abstract class OnnxTagServiceBase : IDisposable
 
     private static readonly HttpClient _http = new();
     private readonly SemaphoreSlim _initLock = new(1, 1);
-    private readonly SemaphoreSlim _inferenceLock = new(1, 1);
+    protected readonly SemaphoreSlim _inferenceLock = new(1, 1);
     private string _modelDir = string.Empty;
     private DenseTensor<float>? _cachedTensor;
     private CancellationTokenSource? _idleCts;
@@ -452,7 +452,7 @@ public abstract class OnnxTagServiceBase : IDisposable
     {
         AppLogger.Info($"Dispose {ModelSubDir}");
 
-        // Cancel and dispose idle timer first
+        // 1. Cancel idle timer to prevent DisposeSession() from racing
         lock (_idleLock)
         {
             _idleCts?.Cancel();
@@ -460,12 +460,20 @@ public abstract class OnnxTagServiceBase : IDisposable
             _idleCts = null;
         }
 
-        // Acquire idle lock before touching _session to avoid race with DisposeSession()
-        lock (_idleLock)
+        // 2. Wait for any in-flight inference to finish before touching _session
+        _inferenceLock.Wait();
+        try
         {
-            _session?.Dispose();
-            _session = null;
-            _cachedTensor = null;
+            lock (_idleLock)
+            {
+                _session?.Dispose();
+                _session = null;
+                _cachedTensor = null;
+            }
+        }
+        finally
+        {
+            _inferenceLock.Release();
         }
 
         _inferenceLock.Dispose();

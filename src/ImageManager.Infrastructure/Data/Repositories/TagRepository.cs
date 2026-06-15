@@ -6,13 +6,13 @@ namespace ImageManager.Infrastructure.Data.Repositories;
 
 public class TagRepository : ITagRepository
 {
-    private readonly AppDbContext _db;
+    private readonly IDbContextFactory _dbFactory;
 
-    public TagRepository(AppDbContext db) => _db = db;
+    public TagRepository(IDbContextFactory dbFactory) => _dbFactory = dbFactory;
 
     public async Task<long> GetOrCreateTagIdAsync(string name)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var id = await conn.ExecuteScalarAsync<long?>(@"
             INSERT OR IGNORE INTO Tag (Name) VALUES (@Name);
             SELECT Id FROM Tag WHERE Name = @Name;",
@@ -22,7 +22,7 @@ public class TagRepository : ITagRepository
 
     public async Task<List<TagCount>> GetAllTagCountsAsync()
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var results = await conn.QueryAsync<TagCount>(@"
             SELECT t.Name, COUNT(it.ImageMetaId) as Count
             FROM Tag t
@@ -34,7 +34,7 @@ public class TagRepository : ITagRepository
 
     public async Task AddFavoriteAsync(string name)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "INSERT OR IGNORE INTO FavoriteTag (Name) VALUES (@Name)",
             new { Name = name.Trim() });
@@ -42,7 +42,7 @@ public class TagRepository : ITagRepository
 
     public async Task RemoveFavoriteAsync(string name)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "DELETE FROM FavoriteTag WHERE Name = @Name",
             new { Name = name.Trim() });
@@ -50,7 +50,7 @@ public class TagRepository : ITagRepository
 
     public async Task<RenameResult> RenameTagAsync(string oldName, string newName)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         try
         {
             var affected = await conn.ExecuteAsync(
@@ -73,7 +73,7 @@ public class TagRepository : ITagRepository
 
     public async Task MergeTagsAsync(string oldName, string newName)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         using var txn = conn.BeginTransaction();
         var oldId = await conn.ExecuteScalarAsync<long?>(
             "SELECT Id FROM Tag WHERE Name = @Name", new { Name = oldName.Trim() }, txn);
@@ -98,7 +98,7 @@ public class TagRepository : ITagRepository
 
     public async Task<List<string>> GetFavoritesAsync()
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var results = await conn.QueryAsync<string>(
             "SELECT Name FROM FavoriteTag ORDER BY Name");
         return results.ToList();
@@ -106,7 +106,7 @@ public class TagRepository : ITagRepository
 
     public async Task DeleteTagAsync(string tagName)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         using var txn = conn.BeginTransaction();
         var tagId = await conn.ExecuteScalarAsync<long?>(
             "SELECT Id FROM Tag WHERE Name = @Name COLLATE NOCASE",
@@ -122,7 +122,7 @@ public class TagRepository : ITagRepository
 
     public async Task<List<string>> SearchTagsAsync(string keyword, int limit = 50)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var results = await conn.QueryAsync<string>(@"
             SELECT Name FROM Tag
             WHERE Name LIKE @Keyword

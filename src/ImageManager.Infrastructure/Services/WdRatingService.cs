@@ -21,7 +21,11 @@ public class WdRatingService : IDisposable
         _wdService = wdService;
     }
 
-    public void Dispose() => _wdService.Dispose();
+    public void Dispose()
+    {
+        // Do NOT dispose _wdService — it is a DI singleton shared with IAutoTagService.
+        // Its lifecycle is managed by the DI container.
+    }
 
     public async Task LoadAsync(string modelPath, CancellationToken ct = default)
     {

@@ -6,6 +6,8 @@ using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
 using Avalonia.Platform.Storage;
 using Avalonia.Styling;
+using CommunityToolkit.Mvvm.Messaging;
+using ImageManager.Core.Messages;
 using Avalonia.Threading;
 using Avalonia.VisualTree;
 using System.Runtime.InteropServices;
@@ -1099,7 +1101,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var controller = App.Services.GetRequiredService<Services.AutoTagController>();
+        var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
         if (!controller.IsModelLoaded)
         {
             Vm.StatusText = "正在加载打标模型...";
@@ -1695,7 +1697,7 @@ public partial class MainWindow : Window
 
     private async Task RunAutoTagAsync(ViewModels.FolderTreeNode folder, List<string> filePaths)
     {
-        var controller = App.Services.GetRequiredService<Services.AutoTagController>();
+        var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
 
         if (!controller.IsModelLoaded)
         {
@@ -1712,12 +1714,12 @@ public partial class MainWindow : Window
             settings.ArtistMatchThreshold,
             settings.DeepSeekApiKey);
 
-        void OnProgress(AutoTagPipelineProgress progress)
+        var messenger = App.Services.GetRequiredService<IMessenger>();
+        messenger.Register<AutoTagProgressMessage>(this, (r, m) =>
         {
             Avalonia.Threading.Dispatcher.UIThread.Post(() =>
-                Vm.StatusText = $"[{progress.Phase}] {progress.StatusText}");
-        }
-        controller.ProgressChanged += OnProgress;
+                Vm.StatusText = $"[{m.Phase}] {m.StatusText}");
+        });
 
         Vm.IsAutoTagRunning = true;
         Vm.StatusText = $"正在推理 {filePaths.Count} 张图片...";
@@ -1741,7 +1743,7 @@ public partial class MainWindow : Window
             }
             finally
             {
-                controller.ProgressChanged -= OnProgress;
+                messenger.Unregister<AutoTagProgressMessage>(this);
                 await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
                     Vm.IsAutoTagRunning = false);
             }
@@ -2044,7 +2046,7 @@ public partial class MainWindow : Window
 
     private async void MenuArtistDbBuilder_Click(object? sender, RoutedEventArgs e)
     {
-        var controller = App.Services.GetRequiredService<Services.AutoTagController>();
+        var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
 
         if (!controller.IsModelLoaded)
         {

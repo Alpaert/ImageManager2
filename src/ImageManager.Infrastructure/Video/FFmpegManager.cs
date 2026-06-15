@@ -35,8 +35,14 @@ public static class FFmpegManager
     }
 
     /// <summary>
-    /// Execute ffmpeg command with timeout support
+    /// Execute ffmpeg command with timeout support.
     /// </summary>
+    /// <param name="arguments">ffmpeg arguments</param>
+    /// <param name="timeoutSeconds">Hard timeout after which the process is killed.</param>
+    /// <param name="ct">External cancellation token. Triggers process kill + <see cref="OperationCanceledException"/>.</param>
+    /// <returns>Exit code, stdout, and stderr.</returns>
+    /// <exception cref="TimeoutException">Process exceeded <paramref name="timeoutSeconds"/>.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
     public static async Task<(int ExitCode, string Output, string Error)> RunAsync(
         string arguments,
         int timeoutSeconds = 30,
@@ -55,26 +61,66 @@ public static class FFmpegManager
         using var process = new Process { StartInfo = psi };
         var outputBuilder = new StringBuilder();
         var errorBuilder = new StringBuilder();
+        const int maxOutputChars = 100_000; // prevent runaway memory if ffmpeg spews
 
-        process.OutputDataReceived += (s, e) => { if (e.Data != null) outputBuilder.AppendLine(e.Data); };
-        process.ErrorDataReceived += (s, e) => { if (e.Data != null) errorBuilder.AppendLine(e.Data); };
+        process.OutputDataReceived += (s, e) =>
+        {
+            if (e.Data != null && outputBuilder.Length < maxOutputChars)
+                outputBuilder.AppendLine(e.Data);
+        };
+        process.ErrorDataReceived += (s, e) =>
+        {
+            if (e.Data != null && errorBuilder.Length < maxOutputChars)
+                errorBuilder.AppendLine(e.Data);
+        };
 
         process.Start();
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
 
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
+        // Combine external token + hard timeout
+        using var timeoutCts = new CancellationTokenSource();
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
 
         try
         {
-            await process.WaitForExitAsync(cts.Token);
+            await process.WaitForExitAsync(linkedCts.Token);
             return (process.ExitCode, outputBuilder.ToString(), errorBuilder.ToString());
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
         {
-            try { process.Kill(true); } catch { }
-            throw new TimeoutException($"FFmpeg timeout after {timeoutSeconds}s");
+            // Hard timeout — force kill
+            KillProcessTree(process);
+            throw new TimeoutException($"FFmpeg timed out after {timeoutSeconds}s. Args: {arguments}");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // External cancellation — kill and rethrow original
+            KillProcessTree(process);
+            ct.ThrowIfCancellationRequested(); // unreachable, satisfies compiler
+            throw; // never reached — ThrowIfCancellationRequested always throws
+        }
+    }
+
+    /// <summary>
+    /// Force-kill the process tree with a 3-second safety window.
+    /// </summary>
+    private static void KillProcessTree(Process process)
+    {
+        try
+        {
+            process.Kill(entireProcessTree: true);
+            // Give the OS a moment to reap; if still alive, nuke harder
+            if (!process.WaitForExit(3000))
+            {
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit(2000);
+            }
+        }
+        catch
+        {
+            // Process may have already exited — swallow
         }
     }
 }

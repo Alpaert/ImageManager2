@@ -6,13 +6,13 @@ namespace ImageManager.Infrastructure.Data.Repositories;
 
 public class TagMappingRepository : ITagMappingRepository
 {
-    private readonly AppDbContext _db;
+    private readonly IDbContextFactory _dbFactory;
 
-    public TagMappingRepository(AppDbContext db) => _db = db;
+    public TagMappingRepository(IDbContextFactory dbFactory) => _dbFactory = dbFactory;
 
     public async Task<TagMapping?> GetByEnglishNameAsync(string englishName)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         return await conn.QuerySingleOrDefaultAsync<TagMapping>(
             "SELECT * FROM TagMapping WHERE EnglishName = @Name COLLATE NOCASE",
             new { Name = englishName.Trim() });
@@ -20,7 +20,7 @@ public class TagMappingRepository : ITagMappingRepository
 
     public async Task<List<TagMapping>> GetAllAsync()
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var results = await conn.QueryAsync<TagMapping>(
             "SELECT * FROM TagMapping ORDER BY EnglishName");
         return results.ToList();
@@ -28,7 +28,7 @@ public class TagMappingRepository : ITagMappingRepository
 
     public async Task UpsertAsync(string englishName, string chineseName)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(@"
             INSERT INTO TagMapping (EnglishName, ChineseName)
             VALUES (@English, @Chinese)
@@ -39,7 +39,7 @@ public class TagMappingRepository : ITagMappingRepository
 
     public async Task DeleteAsync(string englishName)
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(
             "DELETE FROM TagMapping WHERE EnglishName = @Name COLLATE NOCASE",
             new { Name = englishName.Trim() });

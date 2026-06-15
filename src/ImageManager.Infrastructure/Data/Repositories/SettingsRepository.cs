@@ -9,16 +9,16 @@ namespace ImageManager.Infrastructure.Data.Repositories;
 
 public class SettingsRepository : ISettingsRepository, IDisposable
 {
-    private readonly AppDbContext _db;
+    private readonly IDbContextFactory _dbFactory;
     private readonly SemaphoreSlim _saveLock = new(1, 1);
     private static readonly PropertyInfo[] AppSettingProperties =
         typeof(AppSettings).GetProperties(BindingFlags.Public | BindingFlags.Instance);
 
-    public SettingsRepository(AppDbContext db) => _db = db;
+    public SettingsRepository(IDbContextFactory dbFactory) => _dbFactory = dbFactory;
 
     public async Task<AppSettings> LoadAsync()
     {
-        using var conn = _db.CreateConnection();
+        using var conn = _dbFactory.CreateConnection();
         var rows = await conn.QueryAsync<(string Key, string Value)>(
             "SELECT Key, Value FROM AppSetting");
         var dict = rows.ToDictionary(r => r.Key, r => r.Value, StringComparer.OrdinalIgnoreCase);
@@ -47,7 +47,7 @@ public class SettingsRepository : ISettingsRepository, IDisposable
         await _saveLock.WaitAsync();
         try
         {
-            using var conn = _db.CreateConnection();
+            using var conn = _dbFactory.CreateConnection();
             using var txn = conn.BeginTransaction();
 
             await conn.ExecuteAsync("DELETE FROM AppSetting", transaction: txn);

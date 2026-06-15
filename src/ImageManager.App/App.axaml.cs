@@ -3,6 +3,8 @@ using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Media;
 using Avalonia.Styling;
 using Avalonia.Markup.Xaml;
+using CommunityToolkit.Mvvm.Messaging;
+using ImageManager.App.Helpers;
 using ImageManager.App.Services;
 using ImageManager.App.ViewModels;
 using ImageManager.App.Views;
@@ -100,13 +102,23 @@ public partial class App : Application
             }
         }
 
+        // Create connection factory
+        var dbFactory = new DbContextFactory(dbPath);
+
+        // Initialize schema + migrations (one-shot, no retry)
+        using (var initConn = dbFactory.CreateConnection())
+        {
+            DatabaseInitializer.Initialize(initConn);
+        }
+
         // Open DB with recovery: if corrupt, delete files and start fresh
-        AppDbContext? dbContext = null;
+        bool dbReady = false;
         for (int attempt = 0; attempt < 5; attempt++)
         {
             try
             {
-                dbContext = new AppDbContext(dbPath);
+                using var testConn = dbFactory.CreateConnection();
+                dbReady = true;
                 break;
             }
             catch
@@ -126,13 +138,23 @@ public partial class App : Application
                         catch { System.Threading.Thread.Sleep(50); }
                     }
                 }
+                // Re-initialize after wiping
+                using var freshConn = dbFactory.CreateConnection();
+                DatabaseInitializer.Initialize(freshConn);
             }
         }
 
-        if (dbContext == null)
+        if (!dbReady)
             throw new InvalidOperationException("Unable to open or create database at " + dbPath);
 
-        services.AddSingleton(dbContext);
+        services.AddSingleton<IDbContextFactory>(dbFactory);
+
+        // UI dispatcher abstraction (allows Infrastructure services to marshal to UI thread)
+        services.AddSingleton<IDispatcher, Helpers.AvaloniaDispatcher>();
+
+        // Event aggregator for cross-component communication
+        services.AddSingleton<CommunityToolkit.Mvvm.Messaging.IMessenger>(
+            CommunityToolkit.Mvvm.Messaging.WeakReferenceMessenger.Default);
 
         services.AddSingleton<IImageMetaRepository, ImageMetaRepository>();
         services.AddSingleton<ITagRepository, TagRepository>();
@@ -176,13 +198,13 @@ public partial class App : Application
 
         services.AddSingleton<IAutoTagStateRepository, AutoTagStateRepository>();
         services.AddSingleton<AutoTagPipelineService>();
-        services.AddSingleton<AutoTagController>();
+        services.AddSingleton<AutoTagOrchestrator>();
         services.AddSingleton<DeepSeekRecommendService>();
         services.AddSingleton<IAiRecommendService>(sp => sp.GetRequiredService<DeepSeekRecommendService>());
 
 
         services.AddSingleton<PageManager>();
-        services.AddSingleton<TagSearchController>();
+        services.AddSingleton<TagSearchEngine>();
         services.AddSingleton<MainWindowViewModel>();
 
         return services.BuildServiceProvider();

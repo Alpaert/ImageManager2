@@ -3,8 +3,10 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Threading;
 using Avalonia.VisualTree;
+using ImageManager.App.Services;
 using ImageManager.App.ViewModels;
 using ImageManager.Common.Helpers;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace ImageManager.App.Controls;
 
@@ -50,6 +52,11 @@ public class SmartWaterfallPanel : Panel
 
     private readonly Dictionary<Control, double> _childWidths = new();
     private readonly List<RowInfo> _rows = new();
+
+    // Bitmap lifecycle: track which controls had their bitmaps released
+    private readonly HashSet<Control> _bitmapFreed = new();
+    private int _lastVisibleStartRow = -1;
+    private int _lastVisibleEndRow = -1;
 
     private sealed class RowInfo
     {
@@ -101,8 +108,61 @@ public class SmartWaterfallPanel : Panel
     private bool IsRowVisible(double y, double h)
     {
         if (_scrollViewer == null || _viewportHeight <= 0) return true;
-        double buf = h;
+        double buf = h * 2; // 2-row buffer zone
         return y + h >= _scrollOffsetY - buf && y <= _scrollOffsetY + _viewportHeight + buf;
+    }
+
+    /// <summary>
+    /// Release bitmap data for controls in off-screen rows.
+    /// When a row re-enters the viewport, trigger bitmap reload.
+    /// </summary>
+    private void ManageBitmapLifecycle(List<RowInfo> rows)
+    {
+        // Find visible row range
+        int visibleStart = -1, visibleEnd = -1;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            if (IsRowVisible(rows[i].Y, rows[i].Height))
+            {
+                if (visibleStart < 0) visibleStart = i;
+                visibleEnd = i;
+            }
+        }
+
+        // Extend by 1 row on each side for smooth scrolling
+        visibleStart = Math.Max(0, visibleStart - 1);
+        visibleEnd = Math.Min(rows.Count - 1, visibleEnd + 1);
+
+        // Only process if visible range changed
+        if (visibleStart == _lastVisibleStartRow && visibleEnd == _lastVisibleEndRow)
+            return;
+        _lastVisibleStartRow = visibleStart;
+        _lastVisibleEndRow = visibleEnd;
+
+        // Release bitmaps for rows outside visible range
+        for (int i = 0; i < rows.Count; i++)
+        {
+            bool isVisible = i >= visibleStart && i <= visibleEnd;
+            foreach (var child in rows[i].Children)
+            {
+                if (child.DataContext is ImageViewItem item)
+                {
+                    if (!isVisible && item.ThumbnailData != null)
+                    {
+                        item.ThumbnailData = null; // release byte[], GC reclaims Bitmap
+                        _bitmapFreed.Add(child);
+                    }
+                    else if (isVisible && _bitmapFreed.Contains(child))
+                    {
+                        item.NotifyThumbnailNeeded();
+                        _bitmapFreed.Remove(child);
+                        // Trigger PageManager to reload this thumbnail
+                        var pm = App.Services.GetRequiredService<PageManager>();
+                        pm.LoadThumbnailsForItems(new List<ImageViewItem> { item });
+                    }
+                }
+            }
+        }
     }
 
     // ==================== Measure / Arrange ====================
@@ -178,9 +238,17 @@ public class SmartWaterfallPanel : Panel
 
     private Size ArrangeVertical(Size finalSize)
     {
+        // Build row list for bitmap lifecycle management
+        var rows = new List<RowInfo>();
+        foreach (var group in _verticalLayout.GroupBy(l => l.Y))
+        {
+            var row = new RowInfo { Y = group.Key, Height = group.Max(l => l.H), Children = group.Select(l => l.Child).ToList() };
+            rows.Add(row);
+        }
+        ManageBitmapLifecycle(rows);
+
         foreach (var (child, x, y, w, h) in _verticalLayout)
         {
-            // 视口裁剪：不可见行跳过 arrange，减少 GPU/布局开销
             if (!IsRowVisible(y, h))
                 child.Arrange(new Rect(0, 0, 0, 0));
             else
@@ -243,6 +311,8 @@ public class SmartWaterfallPanel : Panel
 
     private Size ArrangeHorizontal(Size finalSize)
     {
+        ManageBitmapLifecycle(_rows);
+
         for (int rowIdx = 0; rowIdx < _rows.Count; rowIdx++)
         {
             var row = _rows[rowIdx];
