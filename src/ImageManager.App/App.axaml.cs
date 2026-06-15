@@ -213,18 +213,31 @@ public partial class App : Application
 
     public override void Initialize()
     {
-        // 显式加载 onnxruntime.dll，绕过 Windows LoadLibrary 搜索顺序问题
-        // (System32 下有旧版 onnxruntime.dll 没有 OrtGetApiBase 导出)
-        var onnxPath = System.IO.Path.Combine(AppContext.BaseDirectory, "runtimes", "win-x64", "native", "onnxruntime.dll");
-        if (System.IO.File.Exists(onnxPath))
-            System.Runtime.InteropServices.NativeLibrary.Load(onnxPath);
-
         Services = ConfigureServices();
         AvaloniaXamlLoader.Load(this);
     }
 
     public override async void OnFrameworkInitializationCompleted()
     {
+        // 显式加载 onnxruntime.dll，绕过 LoadLibrary → System32 优先级问题
+        var exeDir = AppContext.BaseDirectory;
+        var runtimesPath = System.IO.Path.Combine(exeDir, "runtimes", "win-x64", "native", "onnxruntime.dll");
+        var rootPath = System.IO.Path.Combine(exeDir, "onnxruntime.dll");
+        var targetPath = System.IO.File.Exists(runtimesPath) ? runtimesPath
+                       : System.IO.File.Exists(rootPath) ? rootPath
+                       : null;
+        if (targetPath != null)
+        {
+            try
+            {
+                var fi = new System.IO.FileInfo(targetPath);
+                System.Runtime.InteropServices.NativeLibrary.Load(targetPath);
+                Common.Helpers.AppLogger.Info($"NativeLibrary.Load OK: {targetPath} size={fi.Length}");
+            }
+            catch (Exception ex) { Common.Helpers.AppLogger.Error($"NativeLibrary.Load FAIL: {targetPath}\n{ex}"); }
+        }
+        else { Common.Helpers.AppLogger.Error($"onnxruntime.dll NOT FOUND in exeDir={exeDir}"); }
+
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
             await ApplySavedThemeAsync();
