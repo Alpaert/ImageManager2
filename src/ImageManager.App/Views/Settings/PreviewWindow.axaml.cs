@@ -11,7 +11,6 @@ using ImageManager.App.ViewModels;
 using ImageManager.Common.Helpers;
 using ImageManager.Infrastructure.Imaging;
 using Avalonia.Threading;
-using SkiaSharp;
 
 namespace ImageManager.App.Views.Settings;
 
@@ -26,11 +25,12 @@ public partial class PreviewWindow : Window
     private int _loadVersion;
     private CancellationTokenSource? _loadCts;
     private CancellationTokenSource? _settleCts;
+    private int _settleVersion;
     private readonly ImagePreloader _preloader;
 
     // Throttle: during rapid key-repeat, skip intermediate loads
     private const int SettleDelayMs = 120;
-    private long _lastLoadStartTicks;
+    private long _lastKeyPressTicks;
 
     // === 3-slot WriteableBitmap pool (cyclic reuse, fixed memory) ===
     private sealed class BitmapSlot
@@ -168,60 +168,6 @@ public partial class PreviewWindow : Window
         return s.Bitmap;
     }
 
-    /// <summary>
-    /// Prepare a WriteableBitmap from an SKBitmap (decoded from JPEG by SkiaSharp).
-    /// Handles RGBA→BGRA swap if needed. Row-by-row copy with stride safety.
-    /// </summary>
-    private WriteableBitmap PrepareSlot(int slot, int imageIndex, SKBitmap skBitmap)
-    {
-        ref var s = ref _pool[slot];
-        int w = skBitmap.Width, h = skBitmap.Height;
-        bool swapRB = skBitmap.ColorType == SKColorType.Rgba8888;
-
-        if (s.Bitmap != null && (s.PixelWidth != w || s.PixelHeight != h))
-        {
-            s.Bitmap.Dispose();
-            s.Bitmap = null;
-        }
-
-        if (s.Bitmap == null)
-        {
-            s.Bitmap = new WriteableBitmap(new PixelSize(w, h), Dpi, PixelFormat.Bgra8888, AlphaFormat.Premul);
-            s.PixelWidth = w;
-            s.PixelHeight = h;
-        }
-
-        using (var fb = s.Bitmap.Lock())
-        {
-            IntPtr src = skBitmap.GetPixels();
-            int srcRowBytes = skBitmap.RowBytes;
-            int destRowBytes = fb.RowBytes;
-            int copyBytes = Math.Min(destRowBytes, w * 4);
-            byte[] rowBuf = new byte[w * 4];
-
-            for (int y = 0; y < h; y++)
-            {
-                IntPtr srcRow = IntPtr.Add(src, y * srcRowBytes);
-                IntPtr destRow = IntPtr.Add(fb.Address, y * destRowBytes);
-
-                Marshal.Copy(srcRow, rowBuf, 0, copyBytes);
-                if (swapRB)
-                {
-                    for (int x = 0; x < w; x++)
-                    {
-                        byte tmp = rowBuf[x * 4];
-                        rowBuf[x * 4] = rowBuf[x * 4 + 2];
-                        rowBuf[x * 4 + 2] = tmp;
-                    }
-                }
-                Marshal.Copy(rowBuf, 0, destRow, copyBytes);
-            }
-        }
-
-        s.ImageIndex = imageIndex;
-        return s.Bitmap;
-    }
-
     /// <summary>Dispose all pooled WriteableBitmaps.</summary>
     private void ClearPool()
     {
@@ -255,37 +201,32 @@ public partial class PreviewWindow : Window
         var cts = RenewLoadCts();
         var token = cts.Token;
 
-        _lastLoadStartTicks = Stopwatch.GetTimestamp();
-
         Vm.IsLoading = true;
         Vm.LoadingText = "解码中...";
         _imageReady = false;
 
         try
         {
-            // Get JPEG bytes from preloader (cache-hit: ~0ms, miss: Generate on thread pool)
+            // Get raw BGRA pixels from preloader (cache-hit: ~0ms, miss: DecodeRawPixels on thread pool)
             var index = Vm.CurrentIndex;
-            var (jpegData, pixW, pixH) = await _preloader.NavigateToAsync(index, token);
+            var (rawPixels, pixW, pixH) = await _preloader.NavigateToAsync(index, token);
 
             if (version != _loadVersion || token.IsCancellationRequested) return;
 
             var fi = new FileInfo(filePath);
 
-            if (jpegData != null)
+            if (rawPixels != null)
             {
-                // Decode JPEG → SKBitmap → pool WriteableBitmap (on thread pool to avoid UI block)
+                // Copy raw BGRA pixels directly into pool WriteableBitmap (on thread pool)
                 var wb = await Task.Run(() =>
                 {
-                    using var skBitmap = SKBitmap.Decode(jpegData);
-                    if (skBitmap == null) return null;
-
                     int slot = FindSlot(index);
-                    return PrepareSlot(slot, index, skBitmap);
+                    return PrepareSlot(slot, index, rawPixels, pixW, pixH);
                 }, token);
 
                 if (wb == null || version != _loadVersion || token.IsCancellationRequested) return;
 
-                // Pointer swap
+                // Pointer swap — replaces old Source atomically
                 ImgFull.Source = wb;
                 _activeSlotIdx = FindSlot(index);
 
@@ -412,34 +353,15 @@ public partial class PreviewWindow : Window
 
     // ==================== Navigation (Async with Throttle) ====================
 
-    private void NavigateTo(int newIndex)
-    {
-        if (newIndex < 0 || newIndex >= Vm.ImagePaths.Count) return;
-
-        Vm.UserZoomed = false;
-        StopGif();
-        CancelSettleTimer();
-        CancelLoad();
-
-        ImgFull.Source = null;
-        Vm.IsLoading = true;
-        Vm.LoadingText = "加载中...";
-        _imageReady = false;
-
-        var path = Vm.ImagePaths[newIndex];
-        Vm.Title = Path.GetFileName(path);
-        Vm.UpdateInfo();
-
-        _ = LoadImageAsync(path);
-    }
-
     /// <summary>
     /// Start a settle timer: load the image at capturedIndex after SettleDelayMs
     /// of inactivity. Used during rapid key-repeat to skip intermediate images.
+    /// Guarded by _settleVersion to prevent stale callbacks from overriding newer navigations.
     /// </summary>
     private void StartSettleTimer(int capturedIndex)
     {
         CancelSettleTimer();
+        int settleVersion = Interlocked.Increment(ref _settleVersion);
         var settleCts = new CancellationTokenSource();
         _settleCts = settleCts;
         var token = settleCts.Token;
@@ -453,6 +375,7 @@ public partial class PreviewWindow : Window
                 await Dispatcher.UIThread.InvokeAsync(() =>
                 {
                     if (token.IsCancellationRequested) return;
+                    if (settleVersion != _settleVersion) return;
                     _ = LoadImageAsync(Vm.ImagePaths[capturedIndex]);
                 });
             }
@@ -496,6 +419,7 @@ public partial class PreviewWindow : Window
     /// <summary>
     /// Smart navigation: on first press, load immediately (responsiveness).
     /// On rapid repeat (within SettleDelayMs), throttle to skip intermediate images.
+    /// Does NOT blank the image — keeps showing current image until new one is ready.
     /// </summary>
     private void HandleNavigate(int delta)
     {
@@ -503,28 +427,30 @@ public partial class PreviewWindow : Window
         if (newIndex < 0) return;
 
         CancelLoad();
+        CancelSettleTimer();
         Vm.UserZoomed = false;
         StopGif();
-        ImgFull.Source = null;
+        // Keep showing current image — only clear Source in LoadImageAsync on success
         Vm.IsLoading = true;
         Vm.LoadingText = "加载中...";
         _imageReady = false;
         Vm.Title = Path.GetFileName(Vm.ImagePaths[newIndex]);
         Vm.UpdateInfo();
 
-        // Time-based detection: if a load was started recently, we're in rapid repeat
+        // Time-based detection: use key-press timing (not load timing) to detect rapid repeat
         long now = Stopwatch.GetTimestamp();
-        double msSinceLastLoad = (now - _lastLoadStartTicks) * 1000.0 / Stopwatch.Frequency;
+        double msSinceLastKey = (now - _lastKeyPressTicks) * 1000.0 / Stopwatch.Frequency;
 
-        if (msSinceLastLoad < SettleDelayMs && _lastLoadStartTicks > 0)
+        if (msSinceLastKey < SettleDelayMs && _lastKeyPressTicks > 0)
         {
-            // Rapid repeat: skip loading, just update the settle timer
+            // Rapid repeat: skip intermediate loads, settle on last index
             StartSettleTimer(newIndex);
         }
         else
         {
             // First press or long pause: load immediately
-            _lastLoadStartTicks = now;
+            Interlocked.Increment(ref _settleVersion); // cancel any pending settle
+            _lastKeyPressTicks = now;
             _ = LoadImageAsync(Vm.ImagePaths[newIndex]);
         }
     }

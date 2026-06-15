@@ -66,7 +66,7 @@ public partial class ImageViewItem : ObservableObject
     /// </summary>
     public void NotifyThumbnailNeeded()
     {
-        if (ThumbnailData == null && IsLoaded)
+        if (ThumbnailData == null)
         {
             IsLoaded = false;
             OnPropertyChanged(nameof(IsNotLoaded));

@@ -45,6 +45,7 @@ public class PageManager : IDisposable
     private long _zoomVersion = 0;  // 版本号机制，防止防抖竞态
     private CancellationTokenSource? _zoomDebounceCts;
     private CancellationTokenSource? _pageLoadCts;
+    private CancellationTokenSource? _preloadCts;
 
     public event Action<PageChangedEventArgs>? PageChanged;
 
@@ -112,6 +113,12 @@ public class PageManager : IDisposable
             _pageLoadCts.Cancel();
             _pageLoadCts.Dispose();
             _pageLoadCts = null;
+        }
+        if (_preloadCts != null)
+        {
+            _preloadCts.Cancel();
+            _preloadCts.Dispose();
+            _preloadCts = null;
         }
     }
 
@@ -335,14 +342,15 @@ public class PageManager : IDisposable
             var loadedInBatch = batch.Where(i => i.IsLoaded).ToList();
             if (loadedInBatch.Count > 0)
             {
-                await Dispatcher.UIThread.InvokeAsync(() =>
+                // Post to UI (fire-and-forget) — ThumbnailData set already marshals PropertyChanged via Avalonia
+                Dispatcher.UIThread.Post(() =>
                 {
                     foreach (var loadedItem in loadedInBatch)
                     {
                         loadedItem.IsLoading = false;
                         loadedItem.NotifyAll();
                     }
-                });
+                }, DispatcherPriority.Normal);
             }
         }
     }
@@ -385,9 +393,16 @@ public class PageManager : IDisposable
         List<string> activeFileList,
         Func<string, List<string>> getTagsForFile)
     {
+        // Cancel previous preload
+        _preloadCts?.Cancel();
+        _preloadCts?.Dispose();
+        _preloadCts = new CancellationTokenSource();
+        var ct = _preloadCts.Token;
+
         _ = Task.Run(async () =>
         {
-            await Task.Delay(300);
+            await Task.Delay(300, ct);
+            if (ct.IsCancellationRequested) return;
 
             int? preloadPrev = null, preloadNext = null;
             lock (_pageCacheLock)
@@ -405,11 +420,12 @@ public class PageManager : IDisposable
                     preloadNext = currentPage + 1;
                 }
             }
+            if (ct.IsCancellationRequested) return;
             if (preloadPrev.HasValue)
-                _ = LoadPageThumbnailsAsync(preloadPrev.Value);
+                _ = LoadPageThumbnailsAsync(preloadPrev.Value, ct);
             if (preloadNext.HasValue)
-                _ = LoadPageThumbnailsAsync(preloadNext.Value);
-        });
+                _ = LoadPageThumbnailsAsync(preloadNext.Value, ct);
+        }, ct);
     }
 
     private static (int Width, int Height) ParseJpegDimensions(byte[] jpeg)

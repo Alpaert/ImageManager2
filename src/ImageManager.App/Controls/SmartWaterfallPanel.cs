@@ -150,6 +150,7 @@ public class SmartWaterfallPanel : Panel
                     if (!isVisible && item.ThumbnailData != null)
                     {
                         item.ThumbnailData = null; // release byte[], GC reclaims Bitmap
+                        item.IsLoaded = false;     // mark as unloaded so page-revisit path reloads it
                         _bitmapFreed.Add(child);
                     }
                     else if (isVisible && _bitmapFreed.Contains(child))
@@ -250,9 +251,14 @@ public class SmartWaterfallPanel : Panel
         foreach (var (child, x, y, w, h) in _verticalLayout)
         {
             if (!IsRowVisible(y, h))
-                child.Arrange(new Rect(0, 0, 0, 0));
+            {
+                child.IsVisible = false;
+            }
             else
+            {
+                child.IsVisible = true;
                 child.Arrange(new Rect(x, y, w, h));
+            }
         }
         return finalSize;
     }
@@ -317,13 +323,16 @@ public class SmartWaterfallPanel : Panel
         {
             var row = _rows[rowIdx];
 
-            // 视口裁剪：不可见行跳过 arrange
+            // 视口裁剪：不可见行隐藏，保留在视觉树中以确保绑定正常
             if (!IsRowVisible(row.Y, row.Height))
             {
                 foreach (var child in row.Children)
-                    child.Arrange(new Rect(0, 0, 0, 0));
+                    child.IsVisible = false;
                 continue;
             }
+
+            foreach (var child in row.Children)
+                child.IsVisible = true;
 
             bool isLast = rowIdx == _rows.Count - 1;
 

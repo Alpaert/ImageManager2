@@ -55,8 +55,8 @@ public sealed class ImagePreloader : IDisposable
 
     /// <summary>
     /// Called when the user navigates to a new image.
-    /// Returns the decoded image data (byte[] JPEG) for immediate display.
-    /// If cache miss, decodes synchronously with high priority.
+    /// Returns raw BGRA pixel data for direct WriteableBitmap fill.
+    /// If cache miss, decodes via DecodeRawPixels (single decode, no JPEG round-trip).
     /// Also triggers background preloading of the sliding window.
     /// </summary>
     public async Task<(byte[]? Data, int Width, int Height)> NavigateToAsync(int newIndex, CancellationToken externalCt = default)
@@ -206,23 +206,13 @@ public sealed class ImagePreloader : IDisposable
             if (ct.IsCancellationRequested)
                 return (null, 0, 0);
 
-            // Decode on thread pool — polling instead of Throw to avoid unhandled exceptions
+            // Decode raw BGRA pixels directly (single decode, no JPEG re-encode → re-decode waste)
             var (data, pixW, pixH) = await Task.Run(() =>
             {
                 if (ct.IsCancellationRequested)
                     return (null!, 0, 0);
 
-                var (w, h) = ThumbnailGenerator.GetDimensions(filePath);
-                int decodeWidth = Math.Min(w, MaxDecodeWidth);
-
-                var jpegData = ThumbnailGenerator.Generate(filePath, decodeWidth);
-                if (jpegData == null)
-                    return (null!, 0, 0);
-
-                if (ct.IsCancellationRequested)
-                    return (null!, 0, 0);
-
-                return (jpegData, w, h);
+                return ThumbnailGenerator.DecodeRawPixels(filePath, MaxDecodeWidth);
             });
 
             if (data != null)
