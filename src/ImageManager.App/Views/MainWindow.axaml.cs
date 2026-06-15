@@ -1703,7 +1703,14 @@ public partial class MainWindow : Window
         {
             Vm.StatusText = "正在加载打标模型...";
             try { await controller.LoadModelAsync(); }
-            catch (Exception ex) { Vm.StatusText = $"模型加载失败: {ex.Message}"; return; }
+            catch (Exception ex)
+            {
+                var fullDetail = ex.ToString();
+                while (ex.InnerException != null) { ex = ex.InnerException; }
+                AppLogger.Error($"模型加载失败: {fullDetail}");
+                Vm.StatusText = $"模型加载失败: {ex.Message}";
+                return;
+            }
         }
 
         var settings = Vm.AppSettings;
