@@ -31,6 +31,24 @@
                            Source="{Binding GifCurrentFrame, Converter={StaticResource BytesToBitmap}}"
                            Stretch="Uniform"
                            IsVisible="{Binding IsGif}"/>
+
+                    <!-- Loading overlay -->
+                    <Border x:Name="LoadingOverlay"
+                            IsVisible="{Binding IsLoading}"
+                            Background="#44000000"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            CornerRadius="8"
+                            Padding="16,12">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <ProgressBar Width="120" Height="4" IsIndeterminate="True"
+                                         Foreground="{DynamicResource AccentBrush}"/>
+                            <TextBlock Text="{Binding LoadingText}"
+                                       Foreground="{DynamicResource AppFgBrush}"
+                                       FontSize="13"
+                                       VerticalAlignment="Center"/>
+                        </StackPanel>
+                    </Border>
                 </Grid>
             </ScrollViewer>
 

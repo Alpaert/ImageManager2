@@ -1,7 +1,9 @@
-﻿using Avalonia;
+using System.Diagnostics;
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using ImageManager.App.Services;
 using ImageManager.App.ViewModels;
 using ImageManager.Common.Helpers;
 using ImageManager.Infrastructure.Imaging;
@@ -17,27 +19,48 @@ public partial class PreviewWindow : Window
     private bool _isDragging;
     private Point _dragStart;
     private double _dragStartOffX, _dragStartOffY;
-    private bool _isNavigating;
     private int _loadVersion;
+    private CancellationTokenSource? _loadCts;
+    private CancellationTokenSource? _settleCts;
+    private int _settleVersion;
+    private readonly ImagePreloader _preloader;
+
+    // Throttle: during rapid key-repeat, skip intermediate loads
+    private const int SettleDelayMs = 120;
+    private long _lastLoadStartTicks;
 
     public PreviewWindow()
     {
         InitializeComponent();
-        // Tunnel = PreviewMouseWheel in WPF �?fires before ScrollViewer's scroll handler
         Scroller.AddHandler(ScrollViewer.PointerWheelChangedEvent, OnPreviewPointerWheel, RoutingStrategies.Tunnel);
-        // Keyboard navigation
         KeyDown += OnPreviewKeyDown;
+
+        _preloader = App.Services.GetService(typeof(ImagePreloader)) as ImagePreloader
+            ?? new ImagePreloader();
     }
 
-    protected override void OnClosing(WindowClosingEventArgs e)
+    protected override void OnClosed(EventArgs e)
     {
         // Save position BEFORE native window destruction (Closed fires too late)
         Vm.SavedLeft = Position.X;
         Vm.SavedTop = Position.Y;
-        StopGif(); Vm.ReleaseImage(); base.OnClosing(e);
+        StopGif();
+        CancelAllLoads();
+        Vm.ReleaseImage();
+        base.OnClosed(e);
     }
 
-    /// <summary>Create with image list for navigation. Replace later with PNG icons via IconLeft/IconRight.</summary>
+    protected override void OnClosing(WindowClosingEventArgs e)
+    {
+        Vm.SavedLeft = Position.X;
+        Vm.SavedTop = Position.Y;
+        StopGif();
+        CancelAllLoads();
+        Vm.ReleaseImage();
+        base.OnClosing(e);
+    }
+
+    /// <summary>Create with image list for navigation.</summary>
     public static PreviewWindow Create(List<string> imagePaths, int startIndex)
     {
         var win = new PreviewWindow();
@@ -49,9 +72,15 @@ public partial class PreviewWindow : Window
             HasNext = startIndex < imagePaths.Count - 1
         };
         win.DataContext = vm;
+
+        // Initialize preloader with the full file list
+        win._preloader.SetFileList(imagePaths, startIndex);
+
         if (imagePaths.Count == 0) return win;
         if (startIndex >= imagePaths.Count) startIndex = imagePaths.Count - 1;
-        win.LoadImage(imagePaths[startIndex]);
+
+        // Load the initial image (async, fire-and-forget since window is about to show)
+        _ = win.LoadImageAsync(imagePaths[startIndex]);
         return win;
     }
 
@@ -61,130 +90,223 @@ public partial class PreviewWindow : Window
         return Create(new List<string> { filePath }, 0);
     }
 
+    // ==================== Image Loading (Async) ====================
 
-    private void LoadImage(string filePath)
+    private async Task LoadImageAsync(string filePath)
     {
         if (!File.Exists(filePath)) return;
         StopGif();
 
         if (Path.GetExtension(filePath).ToLowerInvariant() == ".gif")
         {
-            LoadGifAsync(filePath);
+            await LoadGifAsync(filePath);
             return;
         }
 
         Vm.IsGif = false;
         Vm.GifCurrentFrame = null;
         ImgFull.IsVisible = true;
-        LoadStatic(filePath);
-    }
 
-    private async void LoadGifAsync(string filePath)
-    {
-        int version = ++_loadVersion;
-        var (pixW, pixH) = await Task.Run(() => ThumbnailGenerator.GetDimensions(filePath));
-        var fi = new FileInfo(filePath);
+        int version = Interlocked.Increment(ref _loadVersion);
+        var cts = RenewLoadCts();
+        var token = cts.Token;
 
-        Vm.IsGif = true;
-        Vm.PixelWidth = pixW;
-        Vm.PixelHeight = pixH;
-        Vm.FileSizeBytes = fi.Length;
-        Vm.ImageWidthDip = pixW;
-        Vm.ImageHeightDip = pixH;
-        Vm.Title = Path.GetFileName(filePath);
+        _lastLoadStartTicks = Stopwatch.GetTimestamp();
+
+        // Show loading state immediately
+        Vm.IsLoading = true;
+        Vm.LoadingText = "解码中...";
+        _imageReady = false;
         Vm.ImageData = null;
-        Vm.GifFrames = null;
-        ImgFull.IsVisible = false;
 
-        var firstFrame = ThumbnailGenerator.DecodeFirstGifFrame(filePath, 800);
-        if (firstFrame != null)
+        try
         {
-            Vm.GifCurrentFrame = firstFrame.JpegData;
-            _imageReady = true;
-            Vm.UpdateInfo();
-            FitToViewport();
-        }
-        else
-        {
-            Vm.GifCurrentFrame = null;
-            Vm.InfoText = $"分辨率：{pixW} x {pixH}    文件大小：{FileSizeFormatter.Format(fi.Length)}    加载中...";
-        }
+            // Use preloader (which checks cache first, then decodes)
+            var index = Vm.CurrentIndex;
+            var (data, pixW, pixH) = await _preloader.NavigateToAsync(index, token);
 
-        var path = filePath;
-        var frames = await Task.Run(() => ThumbnailGenerator.DecodeGifFrames(path, 800));
+            if (version != _loadVersion || token.IsCancellationRequested) return;
 
-        if (version != _loadVersion) return;
+            var fi = new FileInfo(filePath);
 
-        if (frames != null && frames.Count > 1)
-        {
-            Vm.GifFrames = frames;
-            if (!_imageReady)
+            if (data != null)
             {
-                Vm.GifCurrentFrame = frames[0].JpegData;
+                Vm.ImageData = data;
+                Vm.PixelWidth = pixW;
+                Vm.PixelHeight = pixH;
+                Vm.FileSizeBytes = fi.Length;
+                Vm.ImageWidthDip = pixW;
+                Vm.ImageHeightDip = pixH;
+                Vm.Title = Path.GetFileName(filePath);
+                Vm.IsLoading = false;
                 _imageReady = true;
                 Vm.UpdateInfo();
                 FitToViewport();
             }
-            Vm.GifFrameIndex = 0;
-            StartGifTimer(1);
-        }
-        else if (!_imageReady)
-        {
-            Vm.IsGif = false;
-            Vm.GifCurrentFrame = null;
-            ImgFull.IsVisible = true;
-            LoadStatic(filePath);
-        }
-    }
-
-    private void LoadStatic(string filePath)
-    {
-        try
-        {
-            var (pixW, pixH) = Task.Run(() => ThumbnailGenerator.GetDimensions(filePath)).GetAwaiter().GetResult();
-            // ^ 安全：仅用于图片（非视频），SKCodec 读头 <5ms，不会阻塞 UI
-            var fi = new FileInfo(filePath);
-
-            int decodeWidth = Math.Min(pixW, 3840);
-            var data = ThumbnailGenerator.Generate(filePath, decodeWidth);
-
-            if (data == null)
+            else
             {
                 Vm.Title = Path.GetFileName(filePath);
                 Vm.InfoText = "预览失败：图片过大或格式不支持";
                 Vm.PixelWidth = pixW;
                 Vm.PixelHeight = pixH;
                 Vm.FileSizeBytes = fi.Length;
-                return;
+                Vm.IsLoading = false;
             }
+        }
+        catch (OperationCanceledException)
+        {
+            // Load was cancelled — another navigation took over, nothing to do
+        }
+        catch (Exception ex)
+        {
+            if (version != _loadVersion || token.IsCancellationRequested) return;
+            AppLogger.Warn($"Preview load failed for {filePath}: {ex.Message}");
+            Vm.Title = Path.GetFileName(filePath);
+            Vm.InfoText = "预览失败：图片过大或格式不支持";
+            Vm.IsLoading = false;
+        }
+    }
 
-            Vm.ImageData = data;
+    private async Task LoadGifAsync(string filePath)
+    {
+        int version = Interlocked.Increment(ref _loadVersion);
+        var cts = RenewLoadCts();
+        var token = cts.Token;
+
+        Vm.IsLoading = true;
+        Vm.LoadingText = "加载GIF...";
+
+        try
+        {
+            var (pixW, pixH) = await Task.Run(() => ThumbnailGenerator.GetDimensions(filePath), token);
+            var fi = new FileInfo(filePath);
+
+            Vm.IsGif = true;
             Vm.PixelWidth = pixW;
             Vm.PixelHeight = pixH;
             Vm.FileSizeBytes = fi.Length;
             Vm.ImageWidthDip = pixW;
             Vm.ImageHeightDip = pixH;
             Vm.Title = Path.GetFileName(filePath);
-            _imageReady = true;
-            Vm.UpdateInfo();
+            Vm.ImageData = null;
+            Vm.GifFrames = null;
+            ImgFull.IsVisible = false;
+            _imageReady = false;
+
+            // First frame: decode on background thread too
+            var firstFrame = await Task.Run(() => ThumbnailGenerator.DecodeFirstGifFrame(filePath, 800), token);
+            if (token.IsCancellationRequested || version != _loadVersion) return;
+
+            if (firstFrame != null)
+            {
+                Vm.GifCurrentFrame = firstFrame.JpegData;
+                _imageReady = true;
+                Vm.IsLoading = false;
+                Vm.UpdateInfo();
+                FitToViewport();
+            }
+            else
+            {
+                Vm.GifCurrentFrame = null;
+                Vm.InfoText = $"分辨率：{pixW} x {pixH}    文件大小：{FileSizeFormatter.Format(fi.Length)}    加载中...";
+            }
+
+            // Remaining frames: decode on background
+            var path = filePath;
+            var frames = await Task.Run(() => ThumbnailGenerator.DecodeGifFrames(path, 800), token);
+            if (token.IsCancellationRequested || version != _loadVersion) return;
+
+            if (frames != null && frames.Count > 1)
+            {
+                Vm.GifFrames = frames;
+                if (!_imageReady)
+                {
+                    Vm.GifCurrentFrame = frames[0].JpegData;
+                    _imageReady = true;
+                    Vm.IsLoading = false;
+                    Vm.UpdateInfo();
+                    FitToViewport();
+                }
+                Vm.GifFrameIndex = 0;
+                StartGifTimer(1);
+            }
+            else if (!_imageReady)
+            {
+                Vm.IsGif = false;
+                Vm.GifCurrentFrame = null;
+                ImgFull.IsVisible = true;
+                Vm.IsLoading = false;
+                // Fall through: treat as static image
+                if (File.Exists(filePath))
+                {
+                    Vm.IsGif = false;
+                    await LoadImageAsync(filePath);
+                    return;
+                }
+            }
         }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            AppLogger.Warn($"Preview load failed for {filePath}: {ex.Message}");
+            if (version != _loadVersion) return;
+            AppLogger.Warn($"GIF load failed for {filePath}: {ex.Message}");
             Vm.Title = Path.GetFileName(filePath);
-            Vm.InfoText = "预览失败：图片过大或格式不支持";
+            Vm.InfoText = "预览失败：GIF加载出错";
+            Vm.IsLoading = false;
         }
     }
 
-    private void NavigateTo(string filePath)
+    // ==================== Navigation (Async with Throttle) ====================
+
+    private void NavigateTo(int newIndex)
     {
-        _isNavigating = true;
+        if (newIndex < 0 || newIndex >= Vm.ImagePaths.Count) return;
+
         Vm.UserZoomed = false;
         StopGif();
-        LoadImage(filePath);
-        if (_imageReady) FitToViewport();
-        _isNavigating = false;
+        CancelSettleTimer();
+        CancelLoad();
+
+        Vm.ImageData = null;
+        Vm.IsLoading = true;
+        Vm.LoadingText = "加载中...";
+        _imageReady = false;
+
+        var path = Vm.ImagePaths[newIndex];
+        Vm.Title = Path.GetFileName(path);
+        Vm.UpdateInfo();
+
+        _ = LoadImageAsync(path);
     }
+
+    /// <summary>
+    /// Start a settle timer: load the image at capturedIndex after SettleDelayMs
+    /// of inactivity. Used during rapid key-repeat to skip intermediate images.
+    /// </summary>
+    private void StartSettleTimer(int capturedIndex)
+    {
+        CancelSettleTimer();
+        var settleCts = new CancellationTokenSource();
+        _settleCts = settleCts;
+        var token = settleCts.Token;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(SettleDelayMs, token);
+                if (token.IsCancellationRequested) return;
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    if (token.IsCancellationRequested) return;
+                    _ = LoadImageAsync(Vm.ImagePaths[capturedIndex]);
+                });
+            }
+            catch (OperationCanceledException) { }
+        }, token);
+    }
+
+    // ==================== Keyboard & Click Handlers ====================
 
     private void OnPreviewKeyDown(object? sender, KeyEventArgs e)
     {
@@ -195,39 +317,108 @@ public partial class PreviewWindow : Window
         }
         else if (e.Key == Key.Left)
         {
-            var path = Vm.Navigate(-1);
-            if (path != null) NavigateTo(path);
+            HandleNavigate(-1);
             e.Handled = true;
         }
         else if (e.Key == Key.Right)
         {
-            var path = Vm.Navigate(1);
-            if (path != null) NavigateTo(path);
+            HandleNavigate(1);
             e.Handled = true;
         }
     }
 
     private void ArrowLeft_Click(object? sender, PointerPressedEventArgs e)
     {
-        var path = Vm.Navigate(-1);
-        if (path != null) NavigateTo(path);
+        HandleNavigate(-1);
         e.Handled = true;
     }
 
     private void ArrowRight_Click(object? sender, PointerPressedEventArgs e)
     {
-        var path = Vm.Navigate(1);
-        if (path != null) NavigateTo(path);
+        HandleNavigate(1);
         e.Handled = true;
     }
+
+    /// <summary>
+    /// Smart navigation: on first press, load immediately (responsiveness).
+    /// On rapid repeat (within SettleDelayMs), throttle to skip intermediate images.
+    /// </summary>
+    private void HandleNavigate(int delta)
+    {
+        var newIndex = Vm.NavigateIndex(delta);
+        if (newIndex < 0) return;
+
+        CancelLoad();
+        Vm.UserZoomed = false;
+        StopGif();
+        Vm.ImageData = null;
+        Vm.IsLoading = true;
+        Vm.LoadingText = "加载中...";
+        _imageReady = false;
+        Vm.Title = Path.GetFileName(Vm.ImagePaths[newIndex]);
+        Vm.UpdateInfo();
+
+        // Time-based detection: if a load was started recently, we're in rapid repeat
+        long now = Stopwatch.GetTimestamp();
+        double msSinceLastLoad = (now - _lastLoadStartTicks) * 1000.0 / Stopwatch.Frequency;
+
+        if (msSinceLastLoad < SettleDelayMs && _lastLoadStartTicks > 0)
+        {
+            // Rapid repeat: skip loading, just update the settle timer
+            StartSettleTimer(newIndex);
+        }
+        else
+        {
+            // First press or long pause: load immediately
+            _lastLoadStartTicks = now;
+            _ = LoadImageAsync(Vm.ImagePaths[newIndex]);
+        }
+    }
+
+    // ==================== Cancellation Helpers ====================
+
+    private CancellationTokenSource RenewLoadCts()
+    {
+        CancelLoad();
+        var cts = new CancellationTokenSource();
+        _loadCts = cts;
+        return cts;
+    }
+
+    private void CancelLoad()
+    {
+        var cts = Interlocked.Exchange(ref _loadCts, null!);
+        if (cts != null)
+        {
+            try { cts.Cancel(); } catch { }
+            cts.Dispose();
+        }
+    }
+
+    private void CancelSettleTimer()
+    {
+        var cts = Interlocked.Exchange(ref _settleCts, null!);
+        if (cts != null)
+        {
+            try { cts.Cancel(); } catch { }
+            cts.Dispose();
+        }
+    }
+
+    private void CancelAllLoads()
+    {
+        CancelLoad();
+        CancelSettleTimer();
+        _preloader.CancelAllPending();
+    }
+
+    // ==================== Fit To Viewport ====================
 
     private void Scroller_Loaded(object? sender, RoutedEventArgs e)
     {
         if (_imageReady && !Vm.UserZoomed)
             FitToViewport();
     }
-
-    // ==================== Fit To Viewport ====================
 
     private void Scroller_SizeChanged(object? sender, SizeChangedEventArgs e)
     {
@@ -256,7 +447,6 @@ public partial class PreviewWindow : Window
         Vm.ZoomFactor = fit;
         Vm.UserZoomed = false;
 
-        // Apply zoom to image layout size
         ImgFull.Width = Vm.ImageWidthDip * fit;
         ImgFull.Height = Vm.ImageHeightDip * fit;
         ImgGif.Width = Vm.ImageWidthDip * fit;
@@ -268,9 +458,6 @@ public partial class PreviewWindow : Window
         Vm.UpdateInfo();
     }
 
-    /// <summary>
-    /// ContentGrid should be at least viewport-sized so the image can center properly.
-    /// </summary>
     private void ApplyZoomLayout()
     {
         if (!_imageReady) return;
@@ -322,17 +509,14 @@ public partial class PreviewWindow : Window
         double vh = Scroller.Viewport.Height;
         if (vw <= 0 || vh <= 0) return;
 
-        // Mouse position in viewport
         Point mouseInViewport = e.GetPosition(Scroller);
 
-        // Calculate ratio of mouse position within total extent (as original WPF)
         double oldExtentW = Math.Max(Vm.ImageWidthDip * oldZoom, vw);
         double oldExtentH = Math.Max(Vm.ImageHeightDip * oldZoom, vh);
 
         double relX = (Scroller.Offset.X + mouseInViewport.X) / oldExtentW;
         double relY = (Scroller.Offset.Y + mouseInViewport.Y) / oldExtentH;
 
-        // Apply new zoom
         Vm.ZoomFactor = newZoom;
         ImgFull.Width = Vm.ImageWidthDip * newZoom;
         ImgFull.Height = Vm.ImageHeightDip * newZoom;
@@ -342,7 +526,6 @@ public partial class PreviewWindow : Window
         ApplyZoomLayout();
         Scroller.UpdateLayout();
 
-        // Calculate new offset to keep same ratio under mouse
         double newExtentW = Math.Max(Vm.ImageWidthDip * newZoom, vw);
         double newExtentH = Math.Max(Vm.ImageHeightDip * newZoom, vh);
 
@@ -406,6 +589,8 @@ public partial class PreviewWindow : Window
         e.Handled = true;
     }
 
+    // ==================== GIF Animation ====================
+
     private void StartGifTimer(int fromIndex)
     {
         Vm.GifTimer?.Stop();
@@ -433,7 +618,6 @@ public partial class PreviewWindow : Window
         Vm.GifCurrentFrame = frames[Vm.GifFrameIndex].JpegData;
         Vm.GifFrameIndex = (Vm.GifFrameIndex + 1) % frames.Count;
 
-        // Reschedule with the next frame's duration
         var timer = (DispatcherTimer)sender!;
         timer.Interval = TimeSpan.FromMilliseconds(Math.Max(30, frames[Vm.GifFrameIndex].DurationMs));
     }
@@ -445,6 +629,6 @@ public partial class PreviewWindow : Window
         Vm.GifFrames = null;
         Vm.IsGif = false;
         Vm.GifCurrentFrame = null;
-        ++_loadVersion;
+        Interlocked.Increment(ref _loadVersion);
     }
 }

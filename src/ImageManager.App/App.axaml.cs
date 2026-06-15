@@ -205,6 +205,7 @@ public partial class App : Application
 
         services.AddSingleton<PageManager>();
         services.AddSingleton<TagSearchEngine>();
+        services.AddSingleton<Services.ImagePreloader>();
         services.AddSingleton<MainWindowViewModel>();
 
         return services.BuildServiceProvider();

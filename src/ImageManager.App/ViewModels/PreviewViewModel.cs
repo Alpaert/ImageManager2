@@ -22,6 +22,10 @@ public partial class PreviewViewModel : ViewModelBase
     [ObservableProperty] private double _fitZoom = 1.0;
     [ObservableProperty] private bool _userZoomed;
 
+    // Loading state for async decoding
+    [ObservableProperty] private bool _isLoading;
+    [ObservableProperty] private string _loadingText = "加载中...";
+
     // Navigation
     public List<string> ImagePaths { get; set; } = new();
     [ObservableProperty] private int _currentIndex;
@@ -32,10 +36,10 @@ public partial class PreviewViewModel : ViewModelBase
     public double SavedLeft { get; set; } = double.NaN;
     public double SavedTop { get; set; } = double.NaN;
 
-    /// <summary>Called by PreviewWindow to navigate. Returns new file path or null.</summary>
-    public string? Navigate(int delta)
+    /// <summary>Called by PreviewWindow to navigate. Returns new index or -1 if out of range.</summary>
+    public int NavigateIndex(int delta)
     {
-        if (ImagePaths.Count == 0) return null;
+        if (ImagePaths.Count == 0) return -1;
         int newIdx = CurrentIndex + delta;
 
         // Skip video files when navigating
@@ -46,12 +50,12 @@ public partial class PreviewViewModel : ViewModelBase
             newIdx += direction;
         }
 
-        if (newIdx < 0 || newIdx >= ImagePaths.Count) return null;
-        ImageData = null; // release previous image before loading new
+        if (newIdx < 0 || newIdx >= ImagePaths.Count) return -1;
+
         CurrentIndex = newIdx;
         HasPrev = CurrentIndex > 0;
         HasNext = CurrentIndex < ImagePaths.Count - 1;
-        return ImagePaths[CurrentIndex];
+        return newIdx;
     }
 
 
@@ -61,7 +65,11 @@ public partial class PreviewViewModel : ViewModelBase
     public List<ImageManager.Infrastructure.Imaging.GifFrame>? GifFrames;
     public int GifFrameIndex;
     public Avalonia.Threading.DispatcherTimer? GifTimer;
-    public void ReleaseImage() => ImageData = null;
+    public void ReleaseImage()
+    {
+        ImageData = null;
+        GifCurrentFrame = null;
+    }
 
     public double MinZoom => Math.Min(FitZoom * 0.05, FitZoom);
     public const double MaxZoom = 10.0;
