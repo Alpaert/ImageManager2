@@ -52,17 +52,17 @@
   </ItemGroup>
 
   <!--
-    Workaround: .NET publish (framework-dependent) doesn't flatten
-    runtimes/win-x64/native/*.dll into the output root, so native DLLs
-    from NuGet packages (ONNX Runtime, SkiaSharp, SQLite) are missing.
-    This target copies them from the build output to the publish directory.
+    Workaround: .NET framework-dependent publish doesn't include native
+    runtime DLLs from NuGet packages. This target preserves the
+    runtimes/{rid}/native/ directory structure so the .NET native resolver
+    (.deps.json + DllImport) can find them at runtime.
   -->
   <Target Name="CopyNativeRuntimeDlls" AfterTargets="Publish">
     <ItemGroup>
-      <NativeRuntimeDll Include="$(ProjectDir)$(OutDir)runtimes\win-x64\native\*.dll" />
+      <NativeRuntimeDll Include="$(ProjectDir)$(OutDir)runtimes\**\*.dll" />
     </ItemGroup>
     <Copy SourceFiles="@(NativeRuntimeDll)"
-          DestinationFolder="$(PublishDir)" />
+          DestinationFolder="$(PublishDir)%(RecursiveDir)" />
     <Message Importance="high"
              Text="Copied @(NativeRuntimeDll->Count()) native runtime DLL(s) to publish output" />
   </Target>
