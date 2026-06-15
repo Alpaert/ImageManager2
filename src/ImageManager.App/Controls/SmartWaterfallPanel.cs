@@ -260,6 +260,20 @@ public class SmartWaterfallPanel : Panel
             if (isLast)
             {
                 double rowHeight = _rows.Count > 1 ? _rows[_rows.Count - 2].Height : TargetRowHeight;
+
+                // 先算总宽度，若超出窗口则等比缩小行高
+                double totalW = 0;
+                foreach (var child in row.Children)
+                {
+                    if (child is Control ctrl && ctrl.DataContext is ImageViewItem item
+                        && item.Width > 0 && item.Height > 0)
+                        totalW += rowHeight * (double)item.Width / item.Height + 10;
+                    else
+                        totalW += rowHeight * 0.75;
+                }
+                if (totalW > finalSize.Width && totalW > 0)
+                    rowHeight *= finalSize.Width / totalW;
+
                 double x = 0;
                 foreach (var child in row.Children)
                 {
