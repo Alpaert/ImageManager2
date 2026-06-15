@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Threading.Channels;
 using Avalonia;
 using Avalonia.Media;
+using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using ImageManager.App.Services;
@@ -253,6 +254,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private int _folderViewRequestVersion;
     private CancellationTokenSource? _searchCts;
     private CancellationTokenSource? _precomputeCts;
+    private DispatcherTimer? _idleTimer;
     private FileSystemWatcher? _folderWatcher;
     private CancellationTokenSource? _folderWatchDebounceCts;
     private CancellationTokenSource? _widthDebounceCts;
@@ -567,6 +569,12 @@ public partial class MainWindowViewModel : ViewModelBase
         CurrentFolder = folder;
         StartWatchingCurrentFolder();
         PerfLogger.Log($"[LoadFolder] 1-cleanup done {sw.ElapsedMilliseconds}ms");
+
+        // 重置空闲定时器：用户停止切换 5 秒后执行维护任务
+        _idleTimer?.Stop();
+        _idleTimer = new DispatcherTimer(TimeSpan.FromSeconds(5), DispatcherPriority.Background, OnIdleTimerTick);
+        _idleTimer.Start();
+
         await Task.Yield();
         PerfLogger.Log($"[LoadFolder] 2-yield done {sw.ElapsedMilliseconds}ms");
 
@@ -997,6 +1005,39 @@ public partial class MainWindowViewModel : ViewModelBase
                 list.Add(m);
             return list;
         }
+    }
+
+    /// <summary>用户停止切换文件夹 5 秒后执行维护任务（CleanMeta、PrecomputeHashes、SyncFolder）</summary>
+    private void OnIdleTimerTick(object? sender, EventArgs e)
+    {
+        _idleTimer?.Stop();
+        var folder = CurrentFolder;
+        if (string.IsNullOrEmpty(folder)) return;
+        var exts = FileTypeConstants.AllMediaExtensions.ToArray();
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var folderInfo = await _folderRepo.GetByPathAsync(folder);
+                var folderId = folderInfo?.Id;
+                var diskFiles = new HashSet<string>(
+                    Directory.EnumerateFiles(folder, "*.*", SearchOption.TopDirectoryOnly)
+                        .Where(f => exts.Contains(Path.GetExtension(f).ToLower())),
+                    StringComparer.OrdinalIgnoreCase);
+
+                // 清理孤立 DB 记录
+                await CleanMetaForFolderAsync(folder, diskFiles);
+
+                // 预计算哈希 + 同步文件夹
+                if (folderId.HasValue)
+                {
+                    await PrecomputeHashesAsync(CancellationToken.None, folderId);
+                    await SyncFolderAsync(folder, folderId.Value, exts);
+                }
+            }
+            catch { }
+        });
     }
 
     private async Task CleanMetaForFolderAsync(string folderPath, HashSet<string> existingFiles)
