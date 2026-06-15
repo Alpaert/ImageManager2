@@ -25,7 +25,6 @@
                       HorizontalAlignment="Center"
                       VerticalAlignment="Center">
                     <Image x:Name="ImgFull"
-                           Source="{Binding ImageData, Converter={StaticResource BytesToBitmap}}"
                            Stretch="Uniform"/>
                     <Image x:Name="ImgGif"
                            Source="{Binding GifCurrentFrame, Converter={StaticResource BytesToBitmap}}"

@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using ImageManager.Common.Constants;
 using SkiaSharp;
 
@@ -140,6 +141,140 @@ public static class ThumbnailGenerator
         catch
         {
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Decode image to raw BGRA pixels for direct WriteableBitmap fill.
+    /// Uses SKCanvas.DrawBitmap for RELIABLE color space conversion (not ScalePixels).
+    /// Caller owns the returned byte array. Returns (pixels, width, height).
+    /// </summary>
+    public static (byte[]? Pixels, int Width, int Height) DecodeRawPixels(string filePath, int maxWidth)
+    {
+        try
+        {
+            using var stream = File.OpenRead(filePath);
+            using var codec = SKCodec.Create(stream);
+            if (codec == null) return (null, 0, 0);
+
+            int origW = codec.Info.Width;
+            int origH = codec.Info.Height;
+
+            int targetW = Math.Min(origW, maxWidth);
+            int targetH = Math.Max(1, (int)(origH * ((float)maxWidth / origW)));
+            if (targetH > origH) { targetH = origH; targetW = origW; }
+
+            float desiredScale = (float)targetW / origW;
+            bool useDirectDecode = false;
+            int decodeW, decodeH;
+
+            if (desiredScale >= 1f) { decodeW = origW; decodeH = origH; }
+            else
+            {
+                float js;
+                if (desiredScale <= 0.125f) js = 0.125f;
+                else if (desiredScale <= 0.25f) js = 0.25f;
+                else if (desiredScale <= 0.5f) js = 0.5f;
+                else js = 1f;
+
+                if (js >= 1f)
+                {
+                    if (origW > targetW * 2 || origH > targetH * 2)
+                    { useDirectDecode = true; decodeW = targetW; decodeH = targetH; }
+                    else { decodeW = origW; decodeH = origH; }
+                }
+                else
+                {
+                    var ds = codec.GetScaledDimensions(js);
+                    decodeW = ds.Width; decodeH = ds.Height;
+                    if (decodeW == 0 || decodeH == 0)
+                    { useDirectDecode = true; decodeW = targetW; decodeH = targetH; }
+                }
+            }
+
+            var sampling = new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear);
+
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                SKBitmap? decoded = null;
+                try
+                {
+                    // 1. Decode at native format, then resize to target
+                    SKColorType ct;
+                    SKAlphaType at;
+
+                    if (useDirectDecode)
+                    {
+                        using var s2 = File.OpenRead(filePath);
+                        using var c2 = SKCodec.Create(s2);
+                        if (c2 == null) return (null, 0, 0);
+                        var ci = c2.Info;
+                        ct = ci.ColorType != SKColorType.Unknown ? ci.ColorType : SKColorType.Rgba8888;
+                        at = ci.AlphaType != SKAlphaType.Unknown ? ci.AlphaType : SKAlphaType.Premul;
+                        var info = new SKImageInfo(targetW, targetH, ct, at);
+                        decoded = new SKBitmap(info);
+                        if (c2.GetPixels(info, decoded.GetPixels()) != SKCodecResult.Success)
+                        { decoded.Dispose(); return (null, 0, 0); }
+                    }
+                    else
+                    {
+                        var ci = codec.Info;
+                        ct = ci.ColorType != SKColorType.Unknown ? ci.ColorType : SKColorType.Rgba8888;
+                        at = ci.AlphaType != SKAlphaType.Unknown ? ci.AlphaType : SKAlphaType.Premul;
+                        var di = new SKImageInfo(decodeW, decodeH, ct, at);
+                        decoded = new SKBitmap(di);
+                        if (codec.GetPixels(di, decoded.GetPixels()) != SKCodecResult.Success)
+                        { decoded.Dispose(); return (null, 0, 0); }
+
+                        if (decodeW != targetW || decodeH != targetH)
+                        {
+                            // Resize into target-size bitmap with SAME native format
+                            var ri = new SKImageInfo(targetW, targetH, ct, at);
+                            var r = new SKBitmap(ri);
+                            if (decoded.ScalePixels(r, sampling)) { decoded.Dispose(); decoded = r; }
+                            else { r.Dispose(); decoded.Dispose(); return (null, 0, 0); }
+                        }
+                    }
+
+                    // 2. Convert to BGRA — try ReadPixels first (correct for all formats incl. CMYK),
+                    //    fall back to SKCanvas.DrawBitmap if ReadPixels fails.
+                    var bgraInfo = new SKImageInfo(targetW, targetH, SKColorType.Bgra8888, SKAlphaType.Premul);
+                    using var bgra = new SKBitmap(bgraInfo);
+                    using (var srcImage = SKImage.FromBitmap(decoded))
+                    {
+                        if (!srcImage.ReadPixels(bgraInfo, bgra.GetPixels(), bgra.RowBytes, 0, 0))
+                        {
+                            // Fallback: canvas draw
+                            using var canvas = new SKCanvas(bgra);
+                            canvas.DrawBitmap(decoded, 0, 0);
+                            canvas.Flush();
+                        }
+                    }
+                    decoded.Dispose();
+
+                    // 3. Extract pixels row-by-row (RowBytes may have alignment padding)
+                    int pixelStride = targetW * 4;
+                    byte[] pixels = new byte[targetH * pixelStride];
+                    IntPtr src = bgra.GetPixels();
+                    int srcRowBytes = bgra.RowBytes;
+                    for (int y = 0; y < targetH; y++)
+                    {
+                        Marshal.Copy(IntPtr.Add(src, y * srcRowBytes), pixels, y * pixelStride, pixelStride);
+                    }
+                    return (pixels, targetW, targetH);
+                }
+                catch
+                {
+                    decoded?.Dispose();
+                    if (attempt == 0 && !useDirectDecode) { useDirectDecode = true; continue; }
+                    return (null, 0, 0);
+                }
+            }
+            return (null, 0, 0);
+        }
+        catch
+        {
+            return (null, 0, 0);
         }
     }
 

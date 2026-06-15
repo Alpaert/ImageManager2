@@ -1,13 +1,17 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using Avalonia.Media.Imaging;
+using Avalonia.Platform;
 using ImageManager.App.Services;
 using ImageManager.App.ViewModels;
 using ImageManager.Common.Helpers;
 using ImageManager.Infrastructure.Imaging;
 using Avalonia.Threading;
+using SkiaSharp;
 
 namespace ImageManager.App.Views.Settings;
 
@@ -22,12 +26,23 @@ public partial class PreviewWindow : Window
     private int _loadVersion;
     private CancellationTokenSource? _loadCts;
     private CancellationTokenSource? _settleCts;
-    private int _settleVersion;
     private readonly ImagePreloader _preloader;
 
     // Throttle: during rapid key-repeat, skip intermediate loads
     private const int SettleDelayMs = 120;
     private long _lastLoadStartTicks;
+
+    // === 3-slot WriteableBitmap pool (cyclic reuse, fixed memory) ===
+    private sealed class BitmapSlot
+    {
+        public WriteableBitmap? Bitmap;
+        public int ImageIndex = -1;
+        public int PixelWidth;
+        public int PixelHeight;
+    }
+    private readonly BitmapSlot[] _pool = { new(), new(), new() };
+    private int _activeSlotIdx = -1;
+    private static readonly Vector Dpi = new(96, 96);
 
     public PreviewWindow()
     {
@@ -46,7 +61,7 @@ public partial class PreviewWindow : Window
         Vm.SavedTop = Position.Y;
         StopGif();
         CancelAllLoads();
-        Vm.ReleaseImage();
+        ClearPool();
         base.OnClosed(e);
     }
 
@@ -56,7 +71,7 @@ public partial class PreviewWindow : Window
         Vm.SavedTop = Position.Y;
         StopGif();
         CancelAllLoads();
-        Vm.ReleaseImage();
+        ClearPool();
         base.OnClosing(e);
     }
 
@@ -90,6 +105,135 @@ public partial class PreviewWindow : Window
         return Create(new List<string> { filePath }, 0);
     }
 
+    // ==================== Bitmap Pool (3-slot cyclic reuse) ====================
+
+    /// <summary>Find pool slot by image index, or return LRU slot (not active, lowest index).</summary>
+    private int FindSlot(int imageIndex)
+    {
+        for (int i = 0; i < 3; i++)
+            if (_pool[i].Bitmap != null && _pool[i].ImageIndex == imageIndex)
+                return i;
+
+        // Pick any idle slot (Bitmap == null), or the one farthest from active
+        for (int i = 0; i < 3; i++)
+            if (_pool[i].Bitmap == null)
+                return i;
+
+        // All occupied: replace the slot that's NOT the active one and has oldest index
+        int best = 0;
+        int bestDist = int.MinValue;
+        for (int i = 0; i < 3; i++)
+        {
+            if (i == _activeSlotIdx) continue;
+            int dist = Math.Abs(_pool[i].ImageIndex - imageIndex);
+            if (dist > bestDist) { bestDist = dist; best = i; }
+        }
+        return best;
+    }
+
+    /// <summary>
+    /// Prepare a WriteableBitmap in a pool slot with the given raw BGRA pixels.
+    /// Reuses existing WriteableBitmap if dimensions match, otherwise creates new.
+    /// Returns the prepared WriteableBitmap.
+    /// </summary>
+    private WriteableBitmap PrepareSlot(int slot, int imageIndex, byte[] pixels, int w, int h)
+    {
+        ref var s = ref _pool[slot];
+
+        // If dimensions differ, dispose old and create new
+        if (s.Bitmap != null && (s.PixelWidth != w || s.PixelHeight != h))
+        {
+            s.Bitmap.Dispose();
+            s.Bitmap = null;
+        }
+
+        if (s.Bitmap == null)
+        {
+            s.Bitmap = new WriteableBitmap(new PixelSize(w, h), Dpi, PixelFormat.Bgra8888, AlphaFormat.Premul);
+            s.PixelWidth = w;
+            s.PixelHeight = h;
+        }
+
+        // Copy raw BGRA pixels directly into WriteableBitmap's framebuffer
+        using (var fb = s.Bitmap.Lock())
+        {
+            if (fb.RowBytes == w * 4)
+                Marshal.Copy(pixels, 0, fb.Address, pixels.Length);
+            else
+                for (int y = 0; y < h; y++)
+                    Marshal.Copy(pixels, y * w * 4, IntPtr.Add(fb.Address, y * fb.RowBytes), Math.Min(fb.RowBytes, w * 4));
+        }
+
+        s.ImageIndex = imageIndex;
+        return s.Bitmap;
+    }
+
+    /// <summary>
+    /// Prepare a WriteableBitmap from an SKBitmap (decoded from JPEG by SkiaSharp).
+    /// Handles RGBA→BGRA swap if needed. Row-by-row copy with stride safety.
+    /// </summary>
+    private WriteableBitmap PrepareSlot(int slot, int imageIndex, SKBitmap skBitmap)
+    {
+        ref var s = ref _pool[slot];
+        int w = skBitmap.Width, h = skBitmap.Height;
+        bool swapRB = skBitmap.ColorType == SKColorType.Rgba8888;
+
+        if (s.Bitmap != null && (s.PixelWidth != w || s.PixelHeight != h))
+        {
+            s.Bitmap.Dispose();
+            s.Bitmap = null;
+        }
+
+        if (s.Bitmap == null)
+        {
+            s.Bitmap = new WriteableBitmap(new PixelSize(w, h), Dpi, PixelFormat.Bgra8888, AlphaFormat.Premul);
+            s.PixelWidth = w;
+            s.PixelHeight = h;
+        }
+
+        using (var fb = s.Bitmap.Lock())
+        {
+            IntPtr src = skBitmap.GetPixels();
+            int srcRowBytes = skBitmap.RowBytes;
+            int destRowBytes = fb.RowBytes;
+            int copyBytes = Math.Min(destRowBytes, w * 4);
+            byte[] rowBuf = new byte[w * 4];
+
+            for (int y = 0; y < h; y++)
+            {
+                IntPtr srcRow = IntPtr.Add(src, y * srcRowBytes);
+                IntPtr destRow = IntPtr.Add(fb.Address, y * destRowBytes);
+
+                Marshal.Copy(srcRow, rowBuf, 0, copyBytes);
+                if (swapRB)
+                {
+                    for (int x = 0; x < w; x++)
+                    {
+                        byte tmp = rowBuf[x * 4];
+                        rowBuf[x * 4] = rowBuf[x * 4 + 2];
+                        rowBuf[x * 4 + 2] = tmp;
+                    }
+                }
+                Marshal.Copy(rowBuf, 0, destRow, copyBytes);
+            }
+        }
+
+        s.ImageIndex = imageIndex;
+        return s.Bitmap;
+    }
+
+    /// <summary>Dispose all pooled WriteableBitmaps.</summary>
+    private void ClearPool()
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            _pool[i].Bitmap?.Dispose();
+            _pool[i].Bitmap = null;
+            _pool[i].ImageIndex = -1;
+        }
+        _activeSlotIdx = -1;
+    }
+
     // ==================== Image Loading (Async) ====================
 
     private async Task LoadImageAsync(string filePath)
@@ -113,25 +257,38 @@ public partial class PreviewWindow : Window
 
         _lastLoadStartTicks = Stopwatch.GetTimestamp();
 
-        // Show loading state immediately
         Vm.IsLoading = true;
         Vm.LoadingText = "解码中...";
         _imageReady = false;
-        Vm.ImageData = null;
 
         try
         {
-            // Use preloader (which checks cache first, then decodes)
+            // Get JPEG bytes from preloader (cache-hit: ~0ms, miss: Generate on thread pool)
             var index = Vm.CurrentIndex;
-            var (data, pixW, pixH) = await _preloader.NavigateToAsync(index, token);
+            var (jpegData, pixW, pixH) = await _preloader.NavigateToAsync(index, token);
 
             if (version != _loadVersion || token.IsCancellationRequested) return;
 
             var fi = new FileInfo(filePath);
 
-            if (data != null)
+            if (jpegData != null)
             {
-                Vm.ImageData = data;
+                // Decode JPEG → SKBitmap → pool WriteableBitmap (on thread pool to avoid UI block)
+                var wb = await Task.Run(() =>
+                {
+                    using var skBitmap = SKBitmap.Decode(jpegData);
+                    if (skBitmap == null) return null;
+
+                    int slot = FindSlot(index);
+                    return PrepareSlot(slot, index, skBitmap);
+                }, token);
+
+                if (wb == null || version != _loadVersion || token.IsCancellationRequested) return;
+
+                // Pointer swap
+                ImgFull.Source = wb;
+                _activeSlotIdx = FindSlot(index);
+
                 Vm.PixelWidth = pixW;
                 Vm.PixelHeight = pixH;
                 Vm.FileSizeBytes = fi.Length;
@@ -153,10 +310,7 @@ public partial class PreviewWindow : Window
                 Vm.IsLoading = false;
             }
         }
-        catch (OperationCanceledException)
-        {
-            // Load was cancelled — another navigation took over, nothing to do
-        }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
             if (version != _loadVersion || token.IsCancellationRequested) return;
@@ -188,7 +342,7 @@ public partial class PreviewWindow : Window
             Vm.ImageWidthDip = pixW;
             Vm.ImageHeightDip = pixH;
             Vm.Title = Path.GetFileName(filePath);
-            Vm.ImageData = null;
+            ImgFull.Source = null;
             Vm.GifFrames = null;
             ImgFull.IsVisible = false;
             _imageReady = false;
@@ -267,7 +421,7 @@ public partial class PreviewWindow : Window
         CancelSettleTimer();
         CancelLoad();
 
-        Vm.ImageData = null;
+        ImgFull.Source = null;
         Vm.IsLoading = true;
         Vm.LoadingText = "加载中...";
         _imageReady = false;
@@ -351,7 +505,7 @@ public partial class PreviewWindow : Window
         CancelLoad();
         Vm.UserZoomed = false;
         StopGif();
-        Vm.ImageData = null;
+        ImgFull.Source = null;
         Vm.IsLoading = true;
         Vm.LoadingText = "加载中...";
         _imageReady = false;

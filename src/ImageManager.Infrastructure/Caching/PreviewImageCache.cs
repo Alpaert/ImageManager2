@@ -36,7 +36,7 @@ public sealed class PreviewImageCache
     private const double Gamma = 0.1;    // size/resolution weight
 
     private const int MaxEntries = 20;
-    private const long MaxMemoryBytes = 400 * 1024 * 1024; // 400 MB
+    private const long MaxMemoryBytes = 400 * 1024 * 1024; // 400 MB for JPEG cache
     private long _totalBytes;
 
     // Current browsing position (set externally by preloader)
