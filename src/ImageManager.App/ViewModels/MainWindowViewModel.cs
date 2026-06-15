@@ -1021,10 +1021,9 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 var folderInfo = await _folderRepo.GetByPathAsync(folder);
                 var folderId = folderInfo?.Id;
-                var diskFiles = new HashSet<string>(
-                    Directory.EnumerateFiles(folder, "*.*", SearchOption.TopDirectoryOnly)
-                        .Where(f => exts.Contains(Path.GetExtension(f).ToLower())),
-                    StringComparer.OrdinalIgnoreCase);
+                // 使用 _allFiles 而非重新枚举磁盘：保持与 PrecomputeHashesAsync 一致，
+                // 避免 CleanMeta 在 showAll 模式下误删子文件夹文件的 DB 记录
+                var diskFiles = new HashSet<string>(_allFiles, StringComparer.OrdinalIgnoreCase);
 
                 // 清理孤立 DB 记录
                 await CleanMetaForFolderAsync(folder, diskFiles);
