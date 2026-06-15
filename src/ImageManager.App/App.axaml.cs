@@ -223,8 +223,8 @@ public partial class App : Application
         var exeDir = AppContext.BaseDirectory;
         var runtimesPath = System.IO.Path.Combine(exeDir, "runtimes", "win-x64", "native", "onnxruntime.dll");
         var rootPath = System.IO.Path.Combine(exeDir, "onnxruntime.dll");
-        var targetPath = System.IO.File.Exists(runtimesPath) ? runtimesPath
-                       : System.IO.File.Exists(rootPath) ? rootPath
+        var targetPath = System.IO.File.Exists(rootPath) ? rootPath
+                       : System.IO.File.Exists(runtimesPath) ? runtimesPath
                        : null;
         if (targetPath != null)
         {
