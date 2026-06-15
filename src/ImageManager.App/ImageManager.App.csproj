@@ -36,6 +36,10 @@
     <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.1" />
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.1" />
 
+    <!-- 直接引用 ONNX GPU Windows 包以获取 GeneratePathProperty，
+         然后在 ItemGroup 中用 Content 把原生 DLL 拷到发布输出 -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu.Windows" Version="1.26.0"
+                      GeneratePathProperty="true" PrivateAssets="all" />
   </ItemGroup>
 
   <ItemGroup>
@@ -56,11 +60,15 @@
     把 GPU 版 onnxruntime*.dll 从 build 输出拷到 EXE 根目录，
     LoadLibrary 搜 EXE 目录优先于 System32。
   -->
-  <Target Name="CopyOnnxToExeRoot" AfterTargets="CopyFilesToPublishDirectory;Publish">
-    <ItemGroup>
-      <_SrcOnnx Include="$(OutDir)runtimes\win-x64\native\onnxruntime*.dll" />
-    </ItemGroup>
-    <Copy SourceFiles="@(_SrcOnnx)" DestinationFolder="$(PublishDir)" />
-    <Message Importance="high" Text="ONNX DLLs copied to EXE root: @(_SrcOnnx->Count()) file(s)" />
-  </Target>
+  <!-- 从 NuGet 包把 ONNX 原生 DLL 发布到 EXE 根目录 -->
+  <ItemGroup>
+    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime_Gpu_Windows)\runtimes\win-x64\native\onnxruntime.dll"
+             CopyToPublishDirectory="PreserveNewest" Link="onnxruntime.dll" Visible="false" />
+    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime_Gpu_Windows)\runtimes\win-x64\native\onnxruntime_providers_cuda.dll"
+             CopyToPublishDirectory="PreserveNewest" Link="onnxruntime_providers_cuda.dll" Visible="false" />
+    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime_Gpu_Windows)\runtimes\win-x64\native\onnxruntime_providers_shared.dll"
+             CopyToPublishDirectory="PreserveNewest" Link="onnxruntime_providers_shared.dll" Visible="false" />
+    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime_Gpu_Windows)\runtimes\win-x64\native\onnxruntime_providers_tensorrt.dll"
+             CopyToPublishDirectory="PreserveNewest" Link="onnxruntime_providers_tensorrt.dll" Visible="false" />
+  </ItemGroup>
 </Project>
