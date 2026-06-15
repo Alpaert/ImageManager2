@@ -213,6 +213,12 @@ public partial class App : Application
 
     public override void Initialize()
     {
+        // 显式加载 onnxruntime.dll，绕过 Windows LoadLibrary 搜索顺序问题
+        // (System32 下有旧版 onnxruntime.dll 没有 OrtGetApiBase 导出)
+        var onnxPath = System.IO.Path.Combine(AppContext.BaseDirectory, "runtimes", "win-x64", "native", "onnxruntime.dll");
+        if (System.IO.File.Exists(onnxPath))
+            System.Runtime.InteropServices.NativeLibrary.Load(onnxPath);
+
         Services = ConfigureServices();
         AvaloniaXamlLoader.Load(this);
     }
