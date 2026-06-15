@@ -234,7 +234,17 @@ public partial class App : Application
                 System.Runtime.InteropServices.NativeLibrary.Load(targetPath);
                 Common.Helpers.AppLogger.Info($"NativeLibrary.Load OK: {targetPath} size={fi.Length}");
             }
-            catch (Exception ex) { Common.Helpers.AppLogger.Error($"NativeLibrary.Load FAIL: {targetPath}\n{ex}"); }
+            catch (Exception ex)
+            {
+                var inner = ex;
+                var chain = new System.Text.StringBuilder();
+                while (inner != null)
+                {
+                    chain.AppendLine($"[{inner.GetType().Name}] {inner.Message}");
+                    inner = inner.InnerException;
+                }
+                Common.Helpers.AppLogger.Error($"NativeLibrary.Load FAIL: path={targetPath} hResult=0x{ex.HResult:X8}\nException chain:\n{chain}\nFull:\n{ex}");
+            }
         }
         else { Common.Helpers.AppLogger.Error($"onnxruntime.dll NOT FOUND in exeDir={exeDir}"); }
 
