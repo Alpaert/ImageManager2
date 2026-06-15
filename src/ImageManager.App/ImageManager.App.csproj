@@ -53,14 +53,14 @@
 
   <!--
     C:\Windows\System32\onnxruntime.dll (2.8KB stub) 不含 OrtGetApiBase。
-    Windows LoadLibrary 搜 EXE 目录先于 System32，所以把 GPU 版
-    onnxruntime*.dll 从 runtimes/win-x64/native/ 额外拷到 EXE 根目录。
+    把 GPU 版 onnxruntime*.dll 从 build 输出拷到 EXE 根目录，
+    LoadLibrary 搜 EXE 目录优先于 System32。
   -->
-  <Target Name="CopyOnnxToExeRoot" AfterTargets="Publish">
+  <Target Name="CopyOnnxToExeRoot" AfterTargets="CopyFilesToPublishDirectory;Publish">
     <ItemGroup>
-      <_OnnxDll Include="$(PublishDir)runtimes\win-x64\native\onnxruntime*.dll" />
+      <_SrcOnnx Include="$(OutDir)runtimes\win-x64\native\onnxruntime*.dll" />
     </ItemGroup>
-    <Copy SourceFiles="@(_OnnxDll)" DestinationFolder="$(PublishDir)" />
-    <Message Importance="high" Text="ONNX DLLs copied to EXE root: @(_OnnxDll->Count()) file(s)" />
+    <Copy SourceFiles="@(_SrcOnnx)" DestinationFolder="$(PublishDir)" />
+    <Message Importance="high" Text="ONNX DLLs copied to EXE root: @(_SrcOnnx->Count()) file(s)" />
   </Target>
 </Project>
