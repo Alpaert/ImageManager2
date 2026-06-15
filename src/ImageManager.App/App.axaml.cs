@@ -214,8 +214,6 @@ public partial class App : Application
     public override void Initialize()
     {
         Services = ConfigureServices();
-        // Initialize LibVLC once at startup (must be on main thread before any usage)
-        try { LibVLCSharp.Shared.Core.Initialize(); } catch { }
         AvaloniaXamlLoader.Load(this);
     }
 
