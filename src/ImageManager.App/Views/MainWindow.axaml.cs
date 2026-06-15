@@ -1728,11 +1728,14 @@ public partial class MainWindow : Window
             try
             {
                 await controller.RunPipelineAsync(folder.DbId, folder.Path, filePaths, "Start");
+                var processed = controller.LastProcessedPaths;
                 await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
                 {
                     if (!Vm.StatusText.Contains("已停止"))
-                        Vm.StatusText = $"打标完成 ({filePaths.Count} 张)";
-                    foreach (var path in filePaths)
+                        Vm.StatusText = processed.Count > 0
+                            ? $"打标完成 ({processed.Count}/{filePaths.Count} 张)"
+                            : $"打标完成 ({filePaths.Count} 张，全部已跳过)";
+                    foreach (var path in processed)
                         await Vm.RefreshImageTagsAsync(path);
                 });
             }

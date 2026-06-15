@@ -50,4 +50,20 @@
       <Link>libffmpeg\%(RecursiveDir)%(Filename)%(Extension)</Link>
     </None>
   </ItemGroup>
+
+  <!--
+    Workaround: .NET publish (framework-dependent) doesn't flatten
+    runtimes/win-x64/native/*.dll into the output root, so native DLLs
+    from NuGet packages (ONNX Runtime, SkiaSharp, SQLite) are missing.
+    This target copies them from the build output to the publish directory.
+  -->
+  <Target Name="CopyNativeRuntimeDlls" AfterTargets="Publish">
+    <ItemGroup>
+      <NativeRuntimeDll Include="$(ProjectDir)$(OutDir)runtimes\win-x64\native\*.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(NativeRuntimeDll)"
+          DestinationFolder="$(PublishDir)" />
+    <Message Importance="high"
+             Text="Copied @(NativeRuntimeDll->Count()) native runtime DLL(s) to publish output" />
+  </Target>
 </Project>
