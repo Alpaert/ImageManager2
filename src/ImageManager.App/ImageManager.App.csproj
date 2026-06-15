@@ -53,17 +53,22 @@
 
   <!--
     Workaround: .NET framework-dependent publish doesn't include native
-    runtime DLLs from NuGet packages. This target preserves the
-    runtimes/{rid}/native/ directory structure so the .NET native resolver
-    (.deps.json + DllImport) can find them at runtime.
+    runtime DLLs from NuGet packages. This target:
+    1. Preserves runtimes/{rid}/native/ for .deps.json resolution
+    2. Also copies onnxruntime*.dll to the publish root so LoadLibrary
+       finds them before C:\Windows\System32\onnxruntime.dll
   -->
   <Target Name="CopyNativeRuntimeDlls" AfterTargets="Publish">
     <ItemGroup>
-      <NativeRuntimeDll Include="$(ProjectDir)$(OutDir)runtimes\**\*.dll" />
+      <NativeRuntimeDll Include="$(OutDir)runtimes\**\*.dll" />
+      <OnnxRuntimeDll Include="$(OutDir)runtimes\win-x64\native\onnxruntime*.dll"
+                       Exclude="$(OutDir)runtimes\win-x64\native\*.lib" />
     </ItemGroup>
     <Copy SourceFiles="@(NativeRuntimeDll)"
           DestinationFolder="$(PublishDir)%(RecursiveDir)" />
+    <Copy SourceFiles="@(OnnxRuntimeDll)"
+          DestinationFolder="$(PublishDir)" />
     <Message Importance="high"
-             Text="Copied @(NativeRuntimeDll->Count()) native runtime DLL(s) to publish output" />
+             Text="Copied @(NativeRuntimeDll->Count()) native DLLs + @(OnnxRuntimeDll->Count()) ONNX DLLs to publish" />
   </Target>
 </Project>
