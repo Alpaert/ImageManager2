@@ -1,5 +1,6 @@
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Imaging;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using SkiaSharp;
@@ -59,6 +60,11 @@ public abstract class OnnxTagServiceBase : IDisposable
     private DenseTensor<float>? _cachedTensor;
     private CancellationTokenSource? _idleCts;
     private readonly object _idleLock = new();
+
+    // === 内存诊断采样计数器 ===
+    private int _preprocessCount;
+    private int _inferenceCount;
+    private const int MemSampleInterval = 100;
 
     public event Action<AutoTagProgress>? ProgressChanged;
     public bool IsModelLoaded => _session != null && _tagNames.Length > 0;
@@ -142,7 +148,6 @@ public abstract class OnnxTagServiceBase : IDisposable
                 var tensor = Preprocess(imagePath);
                 if (tensor == null)
                 {
-                    AppLogger.Warn($"预处理失败: {Path.GetFileName(imagePath)}");
                     return new List<TagPrediction>();
                 }
 
@@ -151,12 +156,14 @@ public abstract class OnnxTagServiceBase : IDisposable
                     NamedOnnxValue.CreateFromTensor(_inputName, tensor)
                 };
 
+                // === 内存诊断：session.Run 前后（采样） ===
+                int inferId = Interlocked.Increment(ref _inferenceCount);
+                if (inferId % MemSampleInterval == 0)
+                    AppLogger.Memory($"Inference.Run #{inferId} {Path.GetFileName(imagePath)}");
+
                 using var results = _session.Run(inputs);
                 var output = results.First(r => r.Name == _outputName);
                 var probs = output.AsTensor<float>().ToArray();
-
-                AppLogger.Tag(ModelSubDir,
-                    $"推理完成 image={Path.GetFileName(imagePath)} output={_outputName} len={probs.Length} maxProb={probs.Max():F4} aboveThreshold={probs.Count(p => p >= DefaultThreshold)}");
 
                 return Postprocess(probs, DefaultThreshold);
             });
@@ -226,9 +233,13 @@ public abstract class OnnxTagServiceBase : IDisposable
 
     protected virtual DenseTensor<float>? Preprocess(string imagePath)
     {
+        int callId = Interlocked.Increment(ref _preprocessCount);
+        bool sample = callId % MemSampleInterval == 0;
+        if (sample) AppLogger.Memory($"Preprocess.Enter #{callId} {Path.GetFileName(imagePath)}");
+
         try
         {
-            using var original = SKBitmap.Decode(imagePath);
+            using var original = ThumbnailGenerator.DecodeForAnalysis(imagePath, 2048);
             if (original == null) return null;
 
             // 转换为 RGB 的 SKBitmap
@@ -282,6 +293,7 @@ public abstract class OnnxTagServiceBase : IDisposable
                 }
             }
 
+            if (sample) AppLogger.Memory($"Preprocess.Exit #{callId}");
             return tensor;
         }
         catch (Exception ex)
@@ -321,7 +333,6 @@ public abstract class OnnxTagServiceBase : IDisposable
 
         if (results.Count == 0)
         {
-            AppLogger.Warn($"Postprocess 结果为空! output={_outputName} total={probs.Length} enabled={EnabledCategories?.Count} catSkipped={catSkipped} thresSkipped={thresSkipped} threshold={threshold} sigmoid={NeedsSigmoid} categories=[{string.Join(",", (_tagCategories.Distinct().OrderBy(c=>c)))}]");
         }
         return results;
     }

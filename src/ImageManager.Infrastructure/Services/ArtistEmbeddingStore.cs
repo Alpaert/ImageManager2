@@ -89,7 +89,6 @@ public class ArtistEmbeddingStore
         if (bestSim < minSimilarity || bestArtist == null)
             return null;
 
-        AppLogger.Tag("Artist", $"搜索命中 artist={bestArtist} sim={bestSim:F4} dbCount={_artists.Count}");
         return (bestArtist, bestSim);
     }
 

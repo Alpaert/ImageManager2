@@ -128,7 +128,7 @@ public class ImageMetaRepository : IImageMetaRepository
                     FileHash = @FileHash, PerceptualHash = @PerceptualHash,
                     Width = @Width, Height = @Height,
                     FileSize = @FileSize, LastWriteTicks = @LastWriteTicks,
-                    FolderId = @FolderId, UpdatedAt = @UpdatedAt
+                    FolderId = @FolderId, UpdatedAt = @UpdatedAt, HashStatus = @HashStatus
                 WHERE Id = @Id", meta, txn);
         }
         else
@@ -137,9 +137,9 @@ public class ImageMetaRepository : IImageMetaRepository
             meta.UpdatedAt = DateTime.UtcNow;
             meta.Id = await conn.ExecuteScalarAsync<long>(@"
                 INSERT INTO ImageMeta (FilePath, FileHash, PerceptualHash, Width, Height,
-                    FileSize, LastWriteTicks, FolderId, CreatedAt, UpdatedAt)
+                    FileSize, LastWriteTicks, FolderId, CreatedAt, UpdatedAt, HashStatus)
                 VALUES (@FilePath, @FileHash, @PerceptualHash, @Width, @Height,
-                    @FileSize, @LastWriteTicks, @FolderId, @CreatedAt, @UpdatedAt);
+                    @FileSize, @LastWriteTicks, @FolderId, @CreatedAt, @UpdatedAt, @HashStatus);
                 SELECT last_insert_rowid();", meta, txn);
         }
 
@@ -157,7 +157,7 @@ public class ImageMetaRepository : IImageMetaRepository
         // Single query to find existing paths
         var paths = metas.Select(m => m.FilePath).Distinct().ToList();
         var existing = await conn.QueryAsync<(string FilePath, long Id)>(
-            "SELECT FilePath, Id FROM ImageMeta WHERE FilePath IN @Paths",
+            "SELECT FilePath, Id FROM ImageMeta WHERE FilePath COLLATE NOCASE IN @Paths",
             new { Paths = paths }, txn);
 
         var existingMap = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
@@ -176,7 +176,7 @@ public class ImageMetaRepository : IImageMetaRepository
                         FileHash = @FileHash, PerceptualHash = @PerceptualHash,
                         Width = @Width, Height = @Height,
                         FileSize = @FileSize, LastWriteTicks = @LastWriteTicks,
-                        FolderId = @FolderId, UpdatedAt = @UpdatedAt
+                        FolderId = @FolderId, UpdatedAt = @UpdatedAt, HashStatus = @HashStatus
                     WHERE Id = @Id", meta, txn);
             }
             else
@@ -185,9 +185,9 @@ public class ImageMetaRepository : IImageMetaRepository
                 meta.UpdatedAt = now;
                 meta.Id = await conn.ExecuteScalarAsync<long>(@"
                     INSERT INTO ImageMeta (FilePath, FileHash, PerceptualHash, Width, Height,
-                        FileSize, LastWriteTicks, FolderId, CreatedAt, UpdatedAt)
+                        FileSize, LastWriteTicks, FolderId, CreatedAt, UpdatedAt, HashStatus)
                     VALUES (@FilePath, @FileHash, @PerceptualHash, @Width, @Height,
-                        @FileSize, @LastWriteTicks, @FolderId, @CreatedAt, @UpdatedAt);
+                        @FileSize, @LastWriteTicks, @FolderId, @CreatedAt, @UpdatedAt, @HashStatus);
                     SELECT last_insert_rowid();", meta, txn);
             }
         }
@@ -632,7 +632,7 @@ public class ImageMetaRepository : IImageMetaRepository
         foreach (var chunk in filePaths.Chunk(900))
         {
             var rows = await conn.QueryAsync<(string FilePath, string PerceptualHash)>(@"
-                SELECT FilePath, PerceptualHash FROM ImageMeta WHERE FilePath IN @Paths",
+                SELECT FilePath, PerceptualHash FROM ImageMeta WHERE FilePath COLLATE NOCASE IN @Paths",
                 new { Paths = chunk });
 
             foreach (var (path, hash) in rows)
@@ -652,7 +652,7 @@ public class ImageMetaRepository : IImageMetaRepository
         {
             var rows = await conn.QueryAsync<(string FilePath, int Width, int Height)>(@"
                 SELECT FilePath, Width, Height FROM ImageMeta
-                WHERE FilePath IN @Paths AND Width > 0",
+                WHERE FilePath COLLATE NOCASE IN @Paths AND Width > 0",
                 new { Paths = chunk });
             foreach (var (path, w, h) in rows)
                 result[path] = (w, h);
@@ -662,13 +662,44 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<Dictionary<string, string>> GetFileHashesByPathsAsync(List<string> filePaths)
     {
-        if (filePaths.Count == 0) return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (filePaths.Count == 0) return result;
         using var conn = _dbFactory.CreateConnection();
-        var rows = await conn.QueryAsync<(string FilePath, string FileHash)>(@"
-            SELECT FilePath, FileHash FROM ImageMeta WHERE FilePath IN @Paths AND FileHash IS NOT NULL",
-            new { Paths = filePaths });
-        return rows.Where(r => !string.IsNullOrEmpty(r.FileHash))
-                   .ToDictionary(r => r.FilePath, r => r.FileHash, StringComparer.OrdinalIgnoreCase);
+        foreach (var chunk in filePaths.Chunk(900))
+        {
+            var rows = await conn.QueryAsync<(string FilePath, string FileHash)>(@"
+                SELECT FilePath, FileHash FROM ImageMeta WHERE FilePath COLLATE NOCASE IN @Paths AND FileHash IS NOT NULL",
+                new { Paths = chunk });
+            foreach (var (path, hash) in rows)
+            {
+                if (!string.IsNullOrEmpty(hash))
+                    result[path] = hash;
+            }
+        }
+        return result;
+    }
+
+    public async Task<HashSet<string>> GetHashedPathsAsync(List<string> filePaths)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (filePaths.Count == 0) return result;
+        using var conn = _dbFactory.CreateConnection();
+        foreach (var chunk in filePaths.Chunk(900))
+        {
+            var rows = await conn.QueryAsync<string>(@"
+                SELECT FilePath FROM ImageMeta
+                WHERE FilePath COLLATE NOCASE IN @Paths AND HashStatus = 1",
+                new { Paths = chunk });
+            foreach (var path in rows)
+                result.Add(path);
+        }
+        return result;
+    }
+
+    public async Task ResetHashStatusAsync()
+    {
+        using var conn = _dbFactory.CreateConnection();
+        await conn.ExecuteAsync("UPDATE ImageMeta SET HashStatus = 0");
     }
 
     public async Task<ImageMeta?> GetByFileHashAsync(string fileHash)
@@ -697,11 +728,14 @@ public class ImageMetaRepository : IImageMetaRepository
         var result = new Dictionary<string, (long, int)>(StringComparer.OrdinalIgnoreCase);
         if (filePaths.Count == 0) return result;
         using var conn = _dbFactory.CreateConnection();
-        var rows = await conn.QueryAsync<(long Id, string FilePath, int Status)>(
-            "SELECT Id, FilePath, AutoTagStatus AS Status FROM ImageMeta WHERE FilePath IN @Paths",
-            new { Paths = filePaths });
-        foreach (var row in rows)
-            result[row.FilePath] = (row.Id, row.Status);
+        foreach (var chunk in filePaths.Chunk(900))
+        {
+            var rows = await conn.QueryAsync<(long Id, string FilePath, int Status)>(
+                "SELECT Id, FilePath, AutoTagStatus AS Status FROM ImageMeta WHERE FilePath COLLATE NOCASE IN @Paths",
+                new { Paths = chunk });
+            foreach (var row in rows)
+                result[row.FilePath] = (row.Id, row.Status);
+        }
         return result;
     }
 

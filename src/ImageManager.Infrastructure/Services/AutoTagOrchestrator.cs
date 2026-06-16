@@ -125,8 +125,8 @@ public class AutoTagOrchestrator : IDisposable
 
     public async Task<FolderTagActionResult> DetermineActionAsync(long folderId)
     {
-        var metas = folderId > 0 ? await _metaRepo.GetByFolderIdAsync(folderId) : new List<ImageMeta>();
-        return await _pipeline.DetermineActionAsync(folderId, metas.Count);
+        long fileCount = folderId > 0 ? await _metaRepo.CountByFolderIdAsync(folderId) : 0;
+        return await _pipeline.DetermineActionAsync(folderId, fileCount);
     }
 
     public async Task RunPipelineAsync(long folderId, string folderPath, List<string> filePaths, string action)
@@ -139,9 +139,10 @@ public class AutoTagOrchestrator : IDisposable
         {
             LastProcessedPaths = new List<string>();
             _messenger.Send(new AutoTagProgressMessage("Done", 0, 0, "没有图片文件需要处理"));
-            _messenger.Send(new TranslationReadyMessage());
             return;
         }
+
+        AppLogger.Memory($"Orch.Start action={action} files={filePaths.Count} folder={Path.GetFileName(folderPath)}");
 
         var statusMap = await _metaRepo.GetStatusMapByPathsAsync(filePaths);
 
@@ -150,7 +151,7 @@ public class AutoTagOrchestrator : IDisposable
         {
             if (statusMap.TryGetValue(path, out var existing))
             {
-                if (existing.Status == 1) { AppLogger.Info($"AutoTag skip: {path}"); continue; }
+                if (existing.Status == 1) { continue; }
                 metas.Add((existing.Id, path));
             }
             else
@@ -173,7 +174,8 @@ public class AutoTagOrchestrator : IDisposable
                         var newMeta = new ImageMeta
                         {
                             FilePath = path, FileHash = md5, FolderId = folderId,
-                            FileSize = fi.Length, LastWriteTicks = fi.LastWriteTimeUtc.Ticks
+                            FileSize = fi.Length, LastWriteTicks = fi.LastWriteTimeUtc.Ticks,
+                            HashStatus = 0  // Hash not yet computed
                         };
                         newId = await _metaRepo.UpsertAsync(newMeta);
                     }
@@ -190,7 +192,6 @@ public class AutoTagOrchestrator : IDisposable
         {
             LastProcessedPaths = new List<string>();
             _messenger.Send(new AutoTagProgressMessage("Done", 0, 0, "全部图片已打标，跳过"));
-            _messenger.Send(new TranslationReadyMessage());
             return;
         }
 
@@ -206,103 +207,7 @@ public class AutoTagOrchestrator : IDisposable
             AppLogger.Info("AutoTag pipeline cancelled by user");
         }
 
-        _messenger.Send(new TranslationReadyMessage());
-    }
-
-    public async Task<List<TagTranslationDto>> GetReviewDataAsync()
-    {
-        var data = await _pipeline.GetReviewDataAsync(_currentFolderId, _currentFolderPath);
-        return data.Select(d => new TagTranslationDto
-        {
-            EnglishTag = d.EnglishTag,
-            ChineseTranslation = d.UserEditedText ?? d.ChineseTranslation,
-            ImageCount = d.ImageCount,
-            IsConfirmed = d.IsConfirmed,
-            IsExistingMapping = d.IsExistingMapping
-        }).ToList();
-    }
-
-    public async Task ConfirmTagAsync(string englishTag, string chineseName)
-    {
-        if (string.IsNullOrWhiteSpace(chineseName)) return;
-        await _pipeline.ConfirmTagAsync(_currentFolderId, _currentFolderPath, englishTag, chineseName);
-    }
-
-    public async Task AutoConfirmAllAsync()
-    {
-        var metas = await _metaRepo.GetByFolderAsync(_currentFolderPath);
-
-        var tagToImageIds = new Dictionary<string, List<long>>(StringComparer.OrdinalIgnoreCase);
-        foreach (var meta in metas)
-        {
-            foreach (var tag in meta.Tags)
-            {
-                if (!tagToImageIds.TryGetValue(tag.Name, out var list))
-                {
-                    list = new List<long>();
-                    tagToImageIds[tag.Name] = list;
-                }
-                list.Add(meta.Id);
-            }
-        }
-
-        AppLogger.Tag("AutoConfirm", $"folder={_currentFolderPath} images={metas.Count} uniqueTags={tagToImageIds.Count}");
-
-        int confirmed = 0;
-        foreach (var (enTag, _) in tagToImageIds)
-        {
-            var zh = _chineseLib.Lookup(enTag);
-            if (string.IsNullOrWhiteSpace(zh)) zh = enTag;
-            await _mappingRepo.UpsertAsync(enTag, zh);
-            confirmed++;
-        }
-
-        var batch = new List<(long ImageId, string EnglishName, long ChineseId)>();
-        foreach (var (enTag, imageIds) in tagToImageIds)
-        {
-            var zh = _chineseLib.Lookup(enTag);
-            if (string.IsNullOrWhiteSpace(zh)) zh = enTag;
-            var chineseTagId = await _tagRepo.GetOrCreateTagIdAsync(zh);
-            foreach (var imageId in imageIds)
-                batch.Add((imageId, enTag, chineseTagId));
-        }
-
-        await _metaRepo.ReplaceAutoTagsBatchAsync(batch);
-
-        if (_currentFolderId > 0) await MarkFolderDoneAsync(_currentFolderId);
-        AppLogger.Tag("AutoConfirm", $"完成 confirmed={confirmed} batchSize={batch.Count}");
-    }
-
-    public async Task ConfirmAllAsync(List<TagTranslationDto> items)
-    {
-        try
-        {
-            await _pipeline.PreloadMetasAsync(_currentFolderPath);
-            foreach (var item in items.Where(i => !i.IsConfirmed))
-            {
-                var chineseName = item.UserEditedText ?? item.ChineseTranslation;
-                await ConfirmTagAsync(item.EnglishTag, chineseName);
-            }
-        }
-        finally { _pipeline.ClearMetaCache(); }
-    }
-
-    public async Task SaveDraftAsync(List<TagTranslationDto> items)
-    {
-        foreach (var item in items.Where(i => !i.IsConfirmed && !i.IsExistingMapping))
-        {
-            var edited = item.UserEditedText;
-            if (string.IsNullOrWhiteSpace(edited)) edited = item.ChineseTranslation;
-            await _stateRepo.SaveTranslationAsync(_currentFolderId, item.EnglishTag,
-                string.IsNullOrWhiteSpace(item.ChineseTranslation) ? null : item.ChineseTranslation,
-                string.IsNullOrWhiteSpace(edited) ? null : edited,
-                isConfirmed: false, isExistingMapping: false);
-        }
-    }
-
-    public async Task<List<string>> GetImagesWithTagAsync(string englishTag)
-    {
-        return await _pipeline.GetImagesWithTagAsync(_currentFolderId, _currentFolderPath, englishTag);
+        AppLogger.Memory($"Orch.End processed={LastProcessedPaths.Count}");
     }
 
     public async Task<List<TagTranslationDto>> RunSingleImageAsync(string filePath)
@@ -333,16 +238,6 @@ public class AutoTagOrchestrator : IDisposable
         return items;
     }
 
-    public async Task SaveMappingsOnlyAsync(List<TagTranslationDto> items)
-    {
-        foreach (var item in items)
-        {
-            var chinese = item.UserEditedText ?? item.ChineseTranslation;
-            if (string.IsNullOrWhiteSpace(chinese)) continue;
-            await _mappingRepo.UpsertAsync(item.EnglishTag, chinese);
-        }
-    }
-
     public async Task SaveMappingsAndTagsAsync(string filePath, List<TagTranslationDto> items)
     {
         var meta = await _metaRepo.GetByPathAsync(filePath);
@@ -366,33 +261,6 @@ public class AutoTagOrchestrator : IDisposable
                 await _metaRepo.AddAutoTagsAsync(meta.Id, new List<string> { chinese });
             }
         }
-    }
-
-    public async Task WriteConfirmedTagsAsync(string filePath, List<TagTranslationDto> items)
-    {
-        var meta = await _metaRepo.GetByPathAsync(filePath);
-        if (meta == null) return;
-
-        foreach (var item in items.Where(i => i.IsConfirmed))
-        {
-            var chineseName = item.UserEditedText ?? item.ChineseTranslation;
-            if (string.IsNullOrWhiteSpace(chineseName)) continue;
-
-            await _mappingRepo.UpsertAsync(item.EnglishTag, chineseName);
-
-            var chineseTagId = await _tagRepo.GetOrCreateTagIdAsync(chineseName);
-            try { await _metaRepo.ReplaceAutoTagAsync(meta.Id, item.EnglishTag, chineseTagId); }
-            catch (Exception ex)
-            {
-                AppLogger.Warn($"WriteConfirmedTags: ReplaceAutoTagAsync failed for image={meta.Id} tag={item.EnglishTag}: {ex.Message}");
-            }
-            await _metaRepo.AddAutoTagsAsync(meta.Id, new List<string> { chineseName });
-        }
-    }
-
-    public async Task DeleteTagAsync(string englishTag)
-    {
-        await _pipeline.DeleteAutoTagAsync(_currentFolderId, _currentFolderPath, englishTag);
     }
 
     public async Task<int> DeleteAllAutoTagsAsync(string folderPath)

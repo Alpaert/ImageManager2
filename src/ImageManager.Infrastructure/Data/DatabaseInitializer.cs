@@ -89,19 +89,6 @@ public static class DatabaseInitializer
                 FOREIGN KEY (FolderId) REFERENCES Folder(Id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS AutoTagTranslation (
-                Id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-                FolderId           INTEGER NOT NULL,
-                EnglishTag         TEXT NOT NULL,
-                ChineseTranslation TEXT,
-                UserEditedText     TEXT,
-                IsConfirmed        INTEGER DEFAULT 0,
-                IsExistingMapping  INTEGER DEFAULT 0,
-                CreatedAt          TEXT NOT NULL DEFAULT (datetime('now')),
-                FOREIGN KEY (FolderId) REFERENCES Folder(Id) ON DELETE CASCADE,
-                UNIQUE(FolderId, EnglishTag COLLATE NOCASE)
-            );
-            CREATE INDEX IF NOT EXISTS idx_autotagtrans_folder ON AutoTagTranslation(FolderId);
             """;
         cmd.ExecuteNonQuery();
     }
@@ -112,6 +99,7 @@ public static class DatabaseInitializer
         TryAddColumn(conn, "ALTER TABLE ImageTag ADD COLUMN Source TEXT DEFAULT NULL;");
         TryAddColumn(conn, "ALTER TABLE ImageMeta ADD COLUMN SystemRating INTEGER DEFAULT -1;");
         TryAddColumn(conn, "ALTER TABLE ImageMeta ADD COLUMN AutoTagStatus INTEGER DEFAULT 0;");
+        TryAddColumn(conn, "ALTER TABLE ImageMeta ADD COLUMN HashStatus INTEGER DEFAULT 0;");
         TryAddColumns(conn, """
             ALTER TABLE ImageMeta ADD COLUMN Duration REAL DEFAULT NULL;
             ALTER TABLE ImageMeta ADD COLUMN ThumbnailTimestamp REAL DEFAULT NULL;

@@ -50,13 +50,11 @@ public class SingleModelTagService : IEnsembleTagService, IDisposable
 
     public Task<SystemRating> PredictRatingAsync(string imagePath, CancellationToken ct = default)
     {
-        AppLogger.Tag("Rating", $"模式 A 不支持 Rating，返回 Unknown image={Path.GetFileName(imagePath)}");
         return Task.FromResult(SystemRating.Unknown);
     }
 
     public async Task<List<TagPrediction>> PredictAsync(string imagePath, CancellationToken ct = default)
     {
-        AppLogger.Tag("Predict", $"模式 A 单模型推理 image={Path.GetFileName(imagePath)}");
         var preds = await _pixai.PredictAsync(imagePath, ct);
 
         var filtered = preds
@@ -68,7 +66,6 @@ public class SingleModelTagService : IEnsembleTagService, IDisposable
             filtered[i] = filtered[i] with { ChineseName = _chineseLib.Lookup(filtered[i].TagName) };
         }
 
-        AppLogger.Tag("Predict", $"模式 A 结果: raw={preds.Count} filtered={filtered.Count} threshold={_minConfidence}");
         return filtered;
     }
 

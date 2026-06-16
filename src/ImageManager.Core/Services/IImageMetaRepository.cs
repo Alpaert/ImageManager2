@@ -46,6 +46,12 @@ public interface IImageMetaRepository
     /// <summary>Batch-load FileHash for a set of file paths.</summary>
     Task<Dictionary<string, string>> GetFileHashesByPathsAsync(List<string> filePaths);
 
+    /// <summary>Returns the set of file paths where HashStatus=1 (both FileHash and PerceptualHash computed).</summary>
+    Task<HashSet<string>> GetHashedPathsAsync(List<string> filePaths);
+
+    /// <summary>Reset HashStatus to 0 for all records (used when hash algorithm version changes).</summary>
+    Task ResetHashStatusAsync();
+
     /// <summary>Find a record by its MD5 file hash.</summary>
     Task<ImageMeta?> GetByFileHashAsync(string fileHash);
 

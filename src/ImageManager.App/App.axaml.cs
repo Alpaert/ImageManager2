@@ -182,10 +182,6 @@ public partial class App : Application
         services.AddSingleton<OnnxTagService>();
         services.AddSingleton<IAutoTagService>(sp => sp.GetRequiredService<OnnxTagService>());
 
-        // Translation (kept for backward compat, not used in ensemble pipeline)
-        services.AddSingleton<DeepSeekTranslationService>();
-        services.AddSingleton<ITranslationService>(sp => sp.GetRequiredService<DeepSeekTranslationService>());
-
         // ==================== Ensemble Tag Services ====================
         services.AddSingleton<ChineseTagLibrary>();
         services.AddSingleton<ArtistEmbeddingStore>();
@@ -261,6 +257,7 @@ public partial class App : Application
         }
 
         base.OnFrameworkInitializationCompleted();
+        Common.Helpers.AppLogger.Memory("App.Init");
     }
 
     private async Task ApplySavedThemeAsync()

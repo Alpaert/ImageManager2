@@ -16,6 +16,7 @@ public class ImageMeta
 
     public int SystemRating { get; set; } = -1;  // -1=Unknown, 0=General, 1=Sensitive, 2=Questionable, 3=Explicit
     public int AutoTagStatus { get; set; } // 0=not AI-tagged, 1=AI-tagged
+    public int HashStatus { get; set; }   // 0=hash not computed, 1=computed (both FileHash + PerceptualHash)
 
     // Video-specific fields
     public double? Duration { get; set; }  // Video duration in seconds, NULL for images

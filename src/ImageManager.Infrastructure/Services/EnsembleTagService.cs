@@ -24,6 +24,10 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
     public TagMode Mode => TagMode.Ensemble;
     public bool IsModelLoaded => _wd.IsLoaded && _pixai.IsModelLoaded;
 
+    // === 内存诊断采样计数器 ===
+    private int _predictCount;
+    private const int MemSampleInterval = 50;
+
     public event Action<AutoTagProgress>? ProgressChanged;
 
     public EnsembleTagService(
@@ -85,13 +89,18 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
     public async Task<EnsembleResult> PredictWithSourcesAsync(string imagePath, CancellationToken ct = default)
     {
         var fileName = Path.GetFileName(imagePath);
-        AppLogger.Tag("Ensemble", $"三模型并行推理开始 image={fileName}");
+        int callId = Interlocked.Increment(ref _predictCount);
+        bool sample = callId % MemSampleInterval == 0;
+
+        if (sample) AppLogger.Memory($"Ensemble#{callId}.Start {fileName}");
 
         // 双模型并行推理（PixAI 合并 prediction+embedding 一次 Run）
         var ratingTask = _wd.PredictRatingAsync(imagePath);
         var pixaiTask = _pixai.PredictWithEmbeddingAsync(imagePath);
 
         await Task.WhenAll(ratingTask, pixaiTask);
+
+        if (sample) AppLogger.Memory($"Ensemble#{callId}.AfterParallel {fileName}");
 
         var rating = await ratingTask;
         var (pixaiPreds, embedding) = await pixaiTask;
@@ -109,8 +118,7 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
             }
         }
 
-        AppLogger.Tag("Ensemble",
-            $"推理完成 rating={rating} pixaiCount={pixaiPreds.Count} artist={artistName ?? "none"}");
+
 
         var sourceTags = new Dictionary<string, List<TagPrediction>>
         {
@@ -142,9 +150,6 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
                 SourceModels = new List<string> { "embedding" }
             });
         }
-
-        AppLogger.Tag("Ensemble",
-            $"合并完成 mergedCount={merged.Count} top3=[{string.Join(", ", merged.Take(3).Select(m => $"{m.ChineseName ?? m.TagName}({m.Confidence:F2})"))}]");
 
         return new EnsembleResult(rating, merged, sourceTags)
         {

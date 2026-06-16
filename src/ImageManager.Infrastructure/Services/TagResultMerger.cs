@@ -26,19 +26,6 @@ public class TagResultMerger
         var pixaiMerged = MergeOneModel(modelResults.GetValueOrDefault("pixai") ?? new(),
             "pixai", config.ModelThresholds.GetValueOrDefault("pixai", 0.3));
 
-        // 诊断：camie 原始标签的置信度
-        if (camieRaw.Count > 0)
-        {
-            var topCamie = camieRaw.OrderByDescending(p => p.Confidence).Take(3);
-            AppLogger.Tag("Merge", $"camieRaw={camieRaw.Count} top3=[{string.Join(", ", topCamie.Select(p => $"{p.TagName}({p.Confidence:F4})"))}] merged={camieMerged.Count}");
-        }
-        else
-        {
-            AppLogger.Warn("camie 无原始输出！");
-        }
-
-        AppLogger.Tag("Merge", $"pixai={pixaiMerged.Count} camie={camieMerged.Count} maxTags={config.MaxTags}");
-
         // camie 全部保留（数量少 1-3 个），pixai 填剩余槽位
         int camieTake = camieMerged.Count;
         int pixaiMax = Math.Max(0, config.MaxTags - camieTake);
@@ -51,7 +38,6 @@ public class TagResultMerger
         // 按置信度排序（camie 低位在前也能被看到）
         result.Sort((a, b) => b.Confidence.CompareTo(a.Confidence));
 
-        AppLogger.Tag("Merge", $"结果 camie={camieTake} pixai={pixaiTake} total={result.Count}");
         return result;
     }
 

@@ -57,9 +57,6 @@ public class WdRatingService : IDisposable
             }
 
             var rating = (SystemRating)bestIdx;
-            var cnNames = new[] { "全年龄", "敏感", "大尺度", "R18" };
-            AppLogger.Tag("Rating", $"image={Path.GetFileName(imagePath)} rating={rating}({cnNames[bestIdx]}) prob={best:F4}");
-
             return rating;
         }
         catch (Exception ex)

@@ -1,4 +1,6 @@
+using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Imaging;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using SkiaSharp;
@@ -22,6 +24,10 @@ public class OnnxTagService : IAutoTagService, IDisposable
     private readonly SemaphoreSlim _initLock = new(1, 1);
     private readonly SemaphoreSlim _inferenceLock = new(1, 1);
     private string _modelDir = string.Empty;
+
+    // === 内存诊断采样计数器 ===
+    private int _preprocessCount;
+    private const int MemSampleInterval = 100;
 
     public event Action<AutoTagProgress>? ProgressChanged;
     public bool IsModelLoaded => _session != null;
@@ -114,11 +120,12 @@ public class OnnxTagService : IAutoTagService, IDisposable
     }
 
     // Preprocessing: square white-pad → 448 resize → float32 0-255 → BGR → NHWC [1,448,448,3]
-    private static DenseTensor<float>? Preprocess(string imagePath)
+    private DenseTensor<float>? Preprocess(string imagePath)
     {
+        int callId = Interlocked.Increment(ref _preprocessCount);
         try
         {
-            using var original = SKBitmap.Decode(imagePath);
+            using var original = ThumbnailGenerator.DecodeForAnalysis(imagePath, 2048);
             if (original == null) return null;
 
             int w = original.Width;
@@ -139,6 +146,9 @@ public class OnnxTagService : IAutoTagService, IDisposable
             if (resized == null) return null;
 
             // NHWC tensor: [1, 448, 448, 3], float32, 0-255 range, BGR order
+            // NOTE: new tensor allocated EVERY call — not cached (unlike OnnxTagServiceBase)
+            if (callId % MemSampleInterval == 0)
+                AppLogger.Memory($"Preprocess.WD.NewTensor #{callId}");
             var tensor = new DenseTensor<float>(new[] { 1, InputSize, InputSize, 3 });
 
             unsafe

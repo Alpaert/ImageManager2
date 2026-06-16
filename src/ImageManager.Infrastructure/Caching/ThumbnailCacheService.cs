@@ -148,6 +148,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
             AddToMemory(filePath, result.Data, decodeWidth, result.Width, result.Height);
             _diskCache.Save(filePath, result.Data);
             _diskCache.SaveMeta(filePath, result.Width, result.Height);
+            AppLogger.Memory($"ThumbCache.Gen {Path.GetFileName(filePath)}");
             return (result.Data, result.Width, result.Height);
         }
 
@@ -232,6 +233,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
                 tail.Value.Data = Array.Empty<byte>();
             }
         }
+        AppLogger.Memory("ThumbCache.LRU");
     }
 
     private void PromoteToFront(LinkedListNode<LruNode> node)

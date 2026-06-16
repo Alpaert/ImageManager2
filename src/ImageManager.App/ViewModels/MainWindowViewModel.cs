@@ -580,6 +580,7 @@ public partial class MainWindowViewModel : ViewModelBase
         CurrentFolder = folder;
         StartWatchingCurrentFolder();
         PerfLogger.Log($"[LoadFolder] 1-cleanup done {sw.ElapsedMilliseconds}ms");
+        AppLogger.Memory($"LoadFolder.Cleanup {Path.GetFileName(folder)}");
 
         // 重置空闲定时器：用户停止切换 5 秒后执行维护任务
         _idleTimer?.Stop();
@@ -629,6 +630,7 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
         PerfLogger.Log($"[LoadFolder] disk-enum done count={_allFiles.Count} {sw.ElapsedMilliseconds}ms");
+        AppLogger.Memory($"LoadFolder.DiskEnum count={_allFiles.Count}");
 
         if (_allFiles.Count == 0)
         {
@@ -648,6 +650,7 @@ public partial class MainWindowViewModel : ViewModelBase
         await ShowPageAsync(startPage);
 
         PerfLogger.Log($"[LoadFolder] END total={_allFiles.Count} elapsed={sw.ElapsedMilliseconds}ms");
+        AppLogger.Memory($"LoadFolder.End total={_allFiles.Count}");
     }
 
     /// <summary>Public wrapper for code-behind: sync current folder and refresh UI, then compute missing hashes</summary>
@@ -871,6 +874,7 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         var files = _allFiles.ToArray();
         if (files.Length == 0) return;
+        AppLogger.Memory($"HashPrecompute.Start total={files.Length}");
 
         // Force re-hash if algorithm was upgraded (or old data has corrupt FolderId)
         HashSet<string> existingSet;
@@ -879,20 +883,28 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             AppSettings.HashVersion = CurrentHashVersion;
             await _settingsRepo.SaveAsync(AppSettings);
+            // Reset HashStatus for all records so they get re-hashed with new algorithm
+            try { await _metaRepo.ResetHashStatusAsync(); }
+            catch { }
             existingSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         }
         else
         {
-            // Lightweight pre-check: only query FilePath + PerceptualHash (no tag joins)
+            // Lightweight pre-check: query HashStatus=1 for already-computed files
             try
             {
-                var hashDict = await _metaRepo.GetPerceptualHashesByPathsAsync(files.ToList());
-                existingSet = new HashSet<string>(
-                    hashDict.Where(kv => kv.Value.Split('|').Length >= 4)
-                            .Select(kv => kv.Key),
-                    StringComparer.OrdinalIgnoreCase);
-                foreach (var kv in hashDict)
-                    _phashCache[kv.Key] = kv.Value;
+                existingSet = await _metaRepo.GetHashedPathsAsync(files.ToList());
+                // Also warm the in-memory phash cache for similarity search
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var hashDict = await _metaRepo.GetPerceptualHashesByPathsAsync(files.ToList());
+                        foreach (var kv in hashDict)
+                            _phashCache[kv.Key] = kv.Value;
+                    }
+                    catch { }
+                });
             }
             catch
             {
@@ -941,7 +953,7 @@ public partial class MainWindowViewModel : ViewModelBase
         });
 
         // === Consumer: CPU-bound hash computation ===
-        int cpuConcurrency = Math.Max(1, Environment.ProcessorCount - 1);
+        int cpuConcurrency = Math.Max(1, Math.Min(4, Environment.ProcessorCount - 1));
         using var cpuSlots = new SemaphoreSlim(cpuConcurrency);
         var upsertBatch = new ConcurrentQueue<ImageMeta>();
         int processed = 0;
@@ -968,7 +980,8 @@ public partial class MainWindowViewModel : ViewModelBase
                                 FileSize = item.FileSize,
                                 LastWriteTicks = item.LastWriteTicks,
                                 FolderId = folderId, // may be null — BulkUpsert will preserve existing non-null
-                                PerceptualHash = HashService.ComputeCombinedPerceptualHashFromBytes(item.Data)
+                                PerceptualHash = HashService.ComputeCombinedPerceptualHashFromBytes(item.Data),
+                                HashStatus = 1  // Mark as computed
                             };
                             try
                             {
@@ -989,6 +1002,9 @@ public partial class MainWindowViewModel : ViewModelBase
                                 int snap = Interlocked.CompareExchange(ref processed, 0, 0);
                                 _dispatcher.InvokeAsync(() =>
                                     BackgroundStatusText = $"正在计算图片指纹... {snap}/{totalNeed}");
+                                // Compact LOH to prevent commit exhaustion (0xc000012d)
+                                GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
+                                AppLogger.Memory("HashPrecompute.PostGC");
                             }
                         }
                         finally { cpuSlots.Release(); }
@@ -1014,7 +1030,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
         _dispatcher.InvokeAsync(() =>
             BackgroundStatusText = "");
-
+        AppLogger.Memory($"HashPrecompute.End processed={processed}");
         return;
 
         List<ImageMeta> DrainBatch()
@@ -1094,6 +1110,7 @@ public partial class MainWindowViewModel : ViewModelBase
         await _pageManager.ShowPageAsync(pageIndex, TotalPages,
             ActiveFileList, GetTagsForFile, IsShowingSearchResult, CurrentFolder);
         PerfLogger.Log($"[ShowPage] END elapsed={sw.ElapsedMilliseconds}ms");
+        AppLogger.Memory($"ShowPage.End page={pageIndex}");
     }
 
     // ==================== Thumbnail Zoom ====================
@@ -1407,6 +1424,7 @@ partial void OnCornerRadiusDipChanged(double value)
             return;
 
         _allFiles = rebuiltFiles;
+        AppLogger.Memory($"RebuildList count={rebuiltFiles.Count}");
         _tagSearch.SearchResultFiles.Sort(CreateSortComparison(CurrentSortOrder));
         _orientationFilteredFiles.Clear();
 
