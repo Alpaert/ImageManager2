@@ -4,6 +4,7 @@ using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Caching;
+using ImageManager.Infrastructure.Helpers;
 using ImageManager.Infrastructure.Imaging;
 using ImageManager.Infrastructure.Video;
 using Avalonia.Threading;
@@ -104,6 +105,11 @@ public class PageManager : IDisposable
             _ = Task.Run(() => _folderRepo.SetLastPageIndexAsync(currentFolder!, pageIndex));
         PreloadAdjacentPages(pageIndex, totalPages, activeFileList, getTagsForFile);
         _ = Task.Run(() => TrimPageCache(pageIndex, totalPages));
+
+        // LOH compaction check after page render (lightweight — Compaction runs on thread pool)
+        var pressure = MemoryPressureMonitor.Current;
+        if (pressure >= MemoryPressureMonitor.PressureLevel.High)
+            MemoryPressureMonitor.CompactLoh();
     }
 
     private void CancelPageLoad()

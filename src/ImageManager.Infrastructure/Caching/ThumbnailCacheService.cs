@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Helpers;
 using ImageManager.Infrastructure.Imaging;
 using ImageManager.Infrastructure.Video;
 
@@ -148,7 +149,6 @@ public class ThumbnailCacheService : IThumbnailCacheService
             AddToMemory(filePath, result.Data, decodeWidth, result.Width, result.Height);
             _diskCache.Save(filePath, result.Data);
             _diskCache.SaveMeta(filePath, result.Width, result.Height);
-            AppLogger.Memory($"ThumbCache.Gen {Path.GetFileName(filePath)}");
             return (result.Data, result.Width, result.Height);
         }
 
@@ -233,7 +233,11 @@ public class ThumbnailCacheService : IThumbnailCacheService
                 tail.Value.Data = Array.Empty<byte>();
             }
         }
-        AppLogger.Memory("ThumbCache.LRU");
+
+        // LOH compaction after large evictions or accumulated allocations
+        MemoryPressureMonitor.RecordAllocation();
+        if (MemoryPressureMonitor.ShouldCompactNow())
+            MemoryPressureMonitor.CompactLoh();
     }
 
     private void PromoteToFront(LinkedListNode<LruNode> node)

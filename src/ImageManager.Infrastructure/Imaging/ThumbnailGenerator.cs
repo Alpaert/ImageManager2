@@ -1,6 +1,5 @@
 using System.Runtime.InteropServices;
 using ImageManager.Common.Constants;
-using ImageManager.Common.Helpers;
 using SkiaSharp;
 
 namespace ImageManager.Infrastructure.Imaging;
@@ -137,9 +136,7 @@ public static class ThumbnailGenerator
 
             using var skImage = SKImage.FromBitmap(final);
             using var jpeg = skImage.Encode(SKEncodedImageFormat.Jpeg, 85);
-            var result = jpeg?.ToArray();
-            AppLogger.Memory("ThumbGen");
-            return result;
+            return jpeg?.ToArray();
         }
         catch
         {

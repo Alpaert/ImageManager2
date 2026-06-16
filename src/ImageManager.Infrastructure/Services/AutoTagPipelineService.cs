@@ -3,6 +3,7 @@ using System.Threading.Channels;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Helpers;
 
 namespace ImageManager.Infrastructure.Services;
 
@@ -166,14 +167,8 @@ public class AutoTagPipelineService : IDisposable
                     // === 内存诊断：推理后、GC 前 ===
                     AppLogger.Memory($"Batch{batchNum}/{totalBatches}.PostInfer");
 
-                    // Force Gen2 + LOH compaction after each batch.
-                    // Without this, 64-bit GC sees infinite address space and never
-                    // compacts LOH, letting SKBitmap fragments exhaust system commit.
-                    for (int gcRetry = 0; gcRetry < 2; gcRetry++)
-                    {
-                        GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
-                        GC.WaitForPendingFinalizers();
-                    }
+                    // Adaptive Gen2 + LOH compaction via shared monitor
+                    MemoryPressureMonitor.CompactLoh();
 
                     // === 内存诊断：GC 压缩后 ===
                     AppLogger.Memory($"Batch{batchNum}/{totalBatches}.PostGC");

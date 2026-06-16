@@ -24,6 +24,7 @@ public class OnnxTagService : IAutoTagService, IDisposable
     private readonly SemaphoreSlim _initLock = new(1, 1);
     private readonly SemaphoreSlim _inferenceLock = new(1, 1);
     private string _modelDir = string.Empty;
+    private DenseTensor<float>? _cachedTensor;
 
     // === 内存诊断采样计数器 ===
     private int _preprocessCount;
@@ -146,10 +147,10 @@ public class OnnxTagService : IAutoTagService, IDisposable
             if (resized == null) return null;
 
             // NHWC tensor: [1, 448, 448, 3], float32, 0-255 range, BGR order
-            // NOTE: new tensor allocated EVERY call — not cached (unlike OnnxTagServiceBase)
-            if (callId % MemSampleInterval == 0)
-                AppLogger.Memory($"Preprocess.WD.NewTensor #{callId}");
-            var tensor = new DenseTensor<float>(new[] { 1, InputSize, InputSize, 3 });
+            // Cached across inferences — same pattern as OnnxTagServiceBase._cachedTensor
+            if (_cachedTensor == null)
+                _cachedTensor = new DenseTensor<float>(new[] { 1, InputSize, InputSize, 3 });
+            var tensor = _cachedTensor;
 
             unsafe
             {

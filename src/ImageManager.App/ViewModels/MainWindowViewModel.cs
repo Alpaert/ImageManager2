@@ -15,6 +15,7 @@ using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Caching;
 using ImageManager.Common.Helpers;
 using ImageManager.Infrastructure.Hashing;
+using ImageManager.Infrastructure.Helpers;
 using ImageManager.Infrastructure.Imaging;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -1002,8 +1003,8 @@ public partial class MainWindowViewModel : ViewModelBase
                                 int snap = Interlocked.CompareExchange(ref processed, 0, 0);
                                 _dispatcher.InvokeAsync(() =>
                                     BackgroundStatusText = $"正在计算图片指纹... {snap}/{totalNeed}");
-                                // Compact LOH to prevent commit exhaustion (0xc000012d)
-                                GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
+                                // Adaptive LOH compaction via shared monitor
+                                MemoryPressureMonitor.CompactLoh();
                                 AppLogger.Memory("HashPrecompute.PostGC");
                             }
                         }
@@ -1110,7 +1111,6 @@ public partial class MainWindowViewModel : ViewModelBase
         await _pageManager.ShowPageAsync(pageIndex, TotalPages,
             ActiveFileList, GetTagsForFile, IsShowingSearchResult, CurrentFolder);
         PerfLogger.Log($"[ShowPage] END elapsed={sw.ElapsedMilliseconds}ms");
-        AppLogger.Memory($"ShowPage.End page={pageIndex}");
     }
 
     // ==================== Thumbnail Zoom ====================

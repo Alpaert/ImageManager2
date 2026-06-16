@@ -257,17 +257,21 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Ctrl+Shift+G — force GC and show memory stats (debug)
+        // Ctrl+Shift+G — force GC + LOH compaction + show memory stats (debug)
         if (e.Key == Key.G && e.KeyModifiers == (KeyModifiers.Control | KeyModifiers.Shift))
         {
             e.Handled = true;
             var memBefore = GC.GetTotalMemory(false);
-            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
-            GC.WaitForPendingFinalizers();
-            GC.Collect();
+            var privBefore = System.Diagnostics.Process.GetCurrentProcess().PrivateMemorySize64 / 1048576.0;
+            Infrastructure.Helpers.MemoryPressureMonitor.CompactLoh();
             var memAfter = GC.GetTotalMemory(false);
+            var privAfter = System.Diagnostics.Process.GetCurrentProcess().PrivateMemorySize64 / 1048576.0;
             var freedMB = (memBefore - memAfter) / 1024.0 / 1024.0;
-            Vm.StatusText = $"GC: {memBefore / 1024 / 1024}MB → {memAfter / 1024 / 1024}MB (释放 {freedMB:F1}MB)";
+            var privFreed = privBefore - privAfter;
+            Vm.StatusText = $"GC: Heap {memBefore/1048576:F0}→{memAfter/1048576:F0}MB | " +
+                $"Private {privBefore:F0}→{privAfter:F0}MB | " +
+                $"FragScore {Infrastructure.Helpers.MemoryPressureMonitor.FragmentationScore:F1} " +
+                $"({Infrastructure.Helpers.MemoryPressureMonitor.Current})";
             return;
         }
 
