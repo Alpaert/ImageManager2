@@ -55,20 +55,20 @@
     </None>
   </ItemGroup>
 
-  <!--
-    C:\Windows\System32\onnxruntime.dll (2.8KB stub) 不含 OrtGetApiBase。
-    把 GPU 版 onnxruntime*.dll 从 build 输出拷到 EXE 根目录，
-    LoadLibrary 搜 EXE 目录优先于 System32。
-  -->
-  <!-- 从 NuGet 包把 ONNX 原生 DLL 发布到 EXE 根目录 -->
+  <!-- 发布时把 ONNX Runtime GPU 原生 DLL 放到 EXE 根目录，
+       防止 LoadLibrary 误加载 C:\Windows\System32\onnxruntime.dll (2.8KB 桩) -->
+  <PropertyGroup>
+    <_OnnxRid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</_OnnxRid>
+    <_OnnxRid Condition="'$(_OnnxRid)' == ''">win-x64</_OnnxRid>
+  </PropertyGroup>
   <ItemGroup>
-    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime_Gpu_Windows)\runtimes\win-x64\native\onnxruntime.dll"
+    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime_Gpu_Windows)\runtimes\$(_OnnxRid)\native\onnxruntime.dll"
              CopyToPublishDirectory="PreserveNewest" Link="onnxruntime.dll" Visible="false" />
-    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime_Gpu_Windows)\runtimes\win-x64\native\onnxruntime_providers_cuda.dll"
+    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime_Gpu_Windows)\runtimes\$(_OnnxRid)\native\onnxruntime_providers_cuda.dll"
              CopyToPublishDirectory="PreserveNewest" Link="onnxruntime_providers_cuda.dll" Visible="false" />
-    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime_Gpu_Windows)\runtimes\win-x64\native\onnxruntime_providers_shared.dll"
+    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime_Gpu_Windows)\runtimes\$(_OnnxRid)\native\onnxruntime_providers_shared.dll"
              CopyToPublishDirectory="PreserveNewest" Link="onnxruntime_providers_shared.dll" Visible="false" />
-    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime_Gpu_Windows)\runtimes\win-x64\native\onnxruntime_providers_tensorrt.dll"
+    <Content Include="$(PkgMicrosoft_ML_OnnxRuntime_Gpu_Windows)\runtimes\$(_OnnxRid)\native\onnxruntime_providers_tensorrt.dll"
              CopyToPublishDirectory="PreserveNewest" Link="onnxruntime_providers_tensorrt.dll" Visible="false" />
   </ItemGroup>
 </Project>
