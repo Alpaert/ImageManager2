@@ -201,7 +201,7 @@ public class AutoTagController : IDisposable
         ResetCts();
         try
         {
-            await _pipeline.RunInferenceAsync(folderId, metas, action, _cts!.Token);
+            LastProcessedPaths = await _pipeline.RunInferenceAsync(folderId, metas, action, _cts!.Token);
         }
         catch (OperationCanceledException)
         {

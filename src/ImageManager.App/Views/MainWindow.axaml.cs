@@ -1118,26 +1118,34 @@ public partial class MainWindow : Window
             settings.DeepSeekApiKey);
 
         var filePaths = selected.Select(i => i.FilePath).Distinct().ToList();
-        var repo = App.Services.GetRequiredService<Core.Services.IImageMetaRepository>();
-        var actualPaths = new List<string>();
-        foreach (var p in filePaths)
-        {
-            var m = await repo.GetByPathAsync(p);
-            if (m?.AutoTagStatus == 1) continue;
-            actualPaths.Add(p);
-        }
-        if (actualPaths.Count == 0) { Vm.StatusText = "所选图片均已打标，跳过"; return; }
-
-        Vm.StatusText = $"正在推理 {actualPaths.Count} 张图片...";
+        Vm.StatusText = "正在准备...";
 
         _ = Task.Run(async () =>
         {
+            var repo = App.Services.GetRequiredService<Core.Services.IImageMetaRepository>();
+            var actualPaths = new List<string>();
+            foreach (var p in filePaths)
+            {
+                var m = await repo.GetByPathAsync(p);
+                if (m?.AutoTagStatus == 1) continue;
+                actualPaths.Add(p);
+            }
+            if (actualPaths.Count == 0)
+            {
+                await App.UI.InvokeAsync(() =>
+                    Vm.StatusText = "所选图片均已打标，跳过");
+                return;
+            }
+
+            await App.UI.InvokeAsync(() =>
+                Vm.StatusText = $"正在推理 {actualPaths.Count} 张图片...");
+
             try
             {
                 for (int idx = 0; idx < actualPaths.Count; idx++)
                 {
                     var path = actualPaths[idx];
-                    await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                    await App.UI.InvokeAsync(() =>
                         Vm.StatusText = $"推理中 ({idx + 1}/{actualPaths.Count}): {System.IO.Path.GetFileName(path)}");
 
                     var items = await controller.RunSingleImageAsync(path);
@@ -1146,7 +1154,7 @@ public partial class MainWindow : Window
                     await repo.SetAutoTagStatusByPathAsync(path, 1);
                 }
 
-                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
+                await App.UI.InvokeAsync(async () =>
                 {
                     foreach (var path in actualPaths)
                         await Vm.RefreshImageTagsAsync(path);
@@ -1155,7 +1163,7 @@ public partial class MainWindow : Window
             }
             catch (Exception ex)
             {
-                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                await App.UI.InvokeAsync(() =>
                     Vm.StatusText = $"打标失败: {ex.Message}");
             }
         });
@@ -1560,7 +1568,7 @@ public partial class MainWindow : Window
     {
         var folder = GetContextMenuFolder(sender);
         if (folder == null) return;
-        var files = GetImageFilesInFolder(folder.Path);
+        var files = await GetImageFilesInFolderAsync(folder.Path);
         if (files.Count == 0) { Vm.StatusText = "文件夹无图片"; return; }
         await RunAutoTagAsync(folder, files);
     }
@@ -1576,7 +1584,9 @@ public partial class MainWindow : Window
 
         bool recursive = result.Value;
         AppLogger.Info($"ClearTags: recursive={recursive}");
-        var files = recursive ? GetImageFilesRecursive(folder.Path) : GetImageFilesInFolder(folder.Path);
+        var files = recursive
+            ? await GetImageFilesRecursiveAsync(folder.Path)
+            : await GetImageFilesInFolderAsync(folder.Path);
         AppLogger.Info($"ClearTags: found {files.Count} files");
         if (files.Count == 0) { Vm.StatusText = "文件夹无图片"; return; }
 
@@ -1654,45 +1664,49 @@ public partial class MainWindow : Window
     {
         var folder = GetContextMenuFolder(sender);
         if (folder == null) return;
-        var files = GetImageFilesRecursive(folder.Path);
+        var files = await GetImageFilesRecursiveAsync(folder.Path);
         if (files.Count == 0) { Vm.StatusText = "文件夹及子文件夹无图片"; return; }
         await RunAutoTagAsync(folder, files);
     }
 
-    private static List<string> GetImageFilesInFolder(string path)
+    private static async Task<List<string>> GetImageFilesInFolderAsync(string path)
     {
         try
         {
-            return Directory.EnumerateFiles(path)
-                .Where(f => FileTypeConstants.IsMediaFile(f))
-                .ToList();
+            return await Task.Run(() =>
+                Directory.EnumerateFiles(path)
+                    .Where(f => FileTypeConstants.IsMediaFile(f))
+                    .ToList());
         }
         catch { return new List<string>(); }
     }
 
-    private static List<string> GetImageFilesRecursive(string root)
+    private static async Task<List<string>> GetImageFilesRecursiveAsync(string root)
     {
-        var files = new List<string>();
         try
         {
-            var dirs = new Queue<string>();
-            dirs.Enqueue(root);
-            while (dirs.Count > 0)
+            return await Task.Run(() =>
             {
-                var dir = dirs.Dequeue();
-                try
+                var files = new List<string>();
+                var dirs = new Queue<string>();
+                dirs.Enqueue(root);
+                while (dirs.Count > 0)
                 {
-                    foreach (var f in Directory.EnumerateFiles(dir))
-                        if (FileTypeConstants.IsMediaFile(f))
-                            files.Add(f);
-                    foreach (var sub in Directory.EnumerateDirectories(dir))
-                        dirs.Enqueue(sub);
+                    var dir = dirs.Dequeue();
+                    try
+                    {
+                        foreach (var f in Directory.EnumerateFiles(dir))
+                            if (FileTypeConstants.IsMediaFile(f))
+                                files.Add(f);
+                        foreach (var sub in Directory.EnumerateDirectories(dir))
+                            dirs.Enqueue(sub);
+                    }
+                    catch { }
                 }
-                catch { }
-            }
+                return files;
+            });
         }
-        catch { }
-        return files;
+        catch { return new List<string>(); }
     }
 
     private async Task RunAutoTagAsync(ViewModels.FolderTreeNode folder, List<string> filePaths)
@@ -1724,7 +1738,7 @@ public partial class MainWindow : Window
         var messenger = App.Services.GetRequiredService<IMessenger>();
         messenger.Register<AutoTagProgressMessage>(this, (r, m) =>
         {
-            Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            App.UI.Post(() =>
                 Vm.StatusText = $"[{m.Phase}] {m.StatusText}");
         });
 
@@ -1736,7 +1750,7 @@ public partial class MainWindow : Window
             {
                 await controller.RunPipelineAsync(folder.DbId, folder.Path, filePaths, "Start");
                 var processed = controller.LastProcessedPaths;
-                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
+                await App.UI.InvokeAsync(async () =>
                 {
                     if (!Vm.StatusText.Contains("已停止"))
                         Vm.StatusText = processed.Count > 0
@@ -1748,13 +1762,13 @@ public partial class MainWindow : Window
             }
             catch (Exception ex)
             {
-                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                await App.UI.InvokeAsync(() =>
                     Vm.StatusText = $"打标失败: {ex.Message}");
             }
             finally
             {
                 messenger.Unregister<AutoTagProgressMessage>(this);
-                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                await App.UI.InvokeAsync(() =>
                     Vm.IsAutoTagRunning = false);
             }
         });
@@ -1801,7 +1815,7 @@ public partial class MainWindow : Window
         dialog.Content = panel;
 
         await dialog.ShowDialog(this);
-        return tcs.Task.Result;
+        return await tcs.Task;
     }
 
     private async Task<string?> ShowFolderAliasDialogAsync(string currentText)
@@ -1894,7 +1908,7 @@ public partial class MainWindow : Window
 
         for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
-            var scrolled = await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+            var scrolled = await App.UI.InvokeAsync(() =>
             {
                 ItemsImages.UpdateLayout();
                 var selected = Vm.Images.FirstOrDefault(i => i.IsSelected);
@@ -1905,7 +1919,7 @@ public partial class MainWindow : Window
 
                 container.BringIntoView();
                 return true;
-            }, Avalonia.Threading.DispatcherPriority.Loaded);  // 统一使用 Loaded
+            });  // 统一使用 Loaded
 
             if (scrolled) return;
             await Task.Delay(delayMs);
@@ -1922,7 +1936,7 @@ public partial class MainWindow : Window
 
         for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
-            var scrolled = await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+            var scrolled = await App.UI.InvokeAsync(() =>
             {
                 LstFolders.UpdateLayout();
                 var container = LstFolders.TreeContainerFromItem(node);
@@ -1960,7 +1974,7 @@ public partial class MainWindow : Window
                 sv.Offset = new Vector(0, targetOffset);
                 return true;
 
-            }, Avalonia.Threading.DispatcherPriority.Loaded);
+            });
 
             if (scrolled) return;
 
@@ -2089,7 +2103,7 @@ public partial class MainWindow : Window
                 var artistDirs = Directory.GetDirectories(dir);
                 if (artistDirs.Length == 0)
                 {
-                    await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() => vm.StatusText = "未找到子文件夹");
+                    await App.UI.InvokeAsync(() => vm.StatusText = "未找到子文件夹");
                     return;
                 }
 
@@ -2114,7 +2128,7 @@ public partial class MainWindow : Window
 
                 if (toBuild.Count == 0)
                 {
-                    await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                    await App.UI.InvokeAsync(() =>
                         vm.StatusText = $"全部 {skipped} 位画师无需更新");
                     return;
                 }
@@ -2127,7 +2141,7 @@ public partial class MainWindow : Window
                     built++;
                     var label = store.GetImageCount(artistName) > 0 ? $"重建 {artistName}" : $"新增 {artistName}";
                     var hint = $"跳过{skipped} / 处理{built}/{toBuild.Count}: {label}";
-                    await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                    await App.UI.InvokeAsync(() =>
                     {
                         vm.ReportProgress(built, toBuild.Count, $"{hint} ({imgCount}张)");
                     });
@@ -2165,7 +2179,7 @@ public partial class MainWindow : Window
                     }
                 }
 
-                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                await App.UI.InvokeAsync(() =>
                     vm.ReportProgress(toBuild.Count, toBuild.Count,
                         $"完成！跳过 {skipped} / 重建+新增 {toBuild.Count}，共 {controller.GetArtistStoreCount()} 位画师"));
             });

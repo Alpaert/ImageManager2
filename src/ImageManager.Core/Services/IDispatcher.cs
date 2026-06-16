@@ -14,4 +14,10 @@ public interface IDispatcher
 
     /// <summary>Invoke an async operation on the UI thread.</summary>
     Task InvokeAsync(Func<Task> callback);
+
+    /// <summary>Invoke a function on the UI thread and return its result.</summary>
+    Task<T> InvokeAsync<T>(Func<T> callback);
+
+    /// <summary>Invoke an async function on the UI thread and return its result.</summary>
+    Task<T> InvokeAsync<T>(Func<Task<T>> callback);
 }

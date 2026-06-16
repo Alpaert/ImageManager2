@@ -23,6 +23,8 @@ namespace ImageManager.App;
 public partial class App : Application
 {
     public static ServiceProvider Services { get; private set; } = null!;
+    /// <summary>UI-thread dispatcher for safe cross-thread UI access. Set after DI container is built.</summary>
+    public static IDispatcher UI { get; private set; } = null!;
     public static string CacheDirectoryPath { get; private set; } =
         System.IO.Path.Combine(AppContext.BaseDirectory, "Cache");
 
@@ -219,6 +221,8 @@ public partial class App : Application
 
     public override async void OnFrameworkInitializationCompleted()
     {
+        UI = Services.GetRequiredService<IDispatcher>();
+
         // 显式加载 onnxruntime.dll，绕过 LoadLibrary → System32 优先级问题
         var exeDir = AppContext.BaseDirectory;
         var runtimesPath = System.IO.Path.Combine(exeDir, "runtimes", "win-x64", "native", "onnxruntime.dll");

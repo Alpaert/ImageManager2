@@ -15,4 +15,10 @@ public class AvaloniaDispatcher : IDispatcher
 
     public Task InvokeAsync(Func<Task> callback)
         => Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(callback);
+
+    public Task<T> InvokeAsync<T>(Func<T> callback)
+        => Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(callback).GetTask();
+
+    public Task<T> InvokeAsync<T>(Func<Task<T>> callback)
+        => Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(callback);
 }

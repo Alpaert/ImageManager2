@@ -26,23 +26,31 @@ public partial class FolderTreeNode : ObservableObject
 
     public FolderTreeNode()
     {
-        // Defer — caller should call EnsureExpanderVisible after setting Path
+        // Defer — caller should call EnsureExpanderVisibleAsync after setting Path
     }
 
-    public void EnsureExpanderVisible()
+    /// <summary>
+    /// Checks if this folder has subdirectories (offloaded to background thread on first call).
+    /// Safe to call from UI thread.
+    /// </summary>
+    public async Task EnsureExpanderVisibleAsync()
     {
-        if (!_childrenLoaded && HasRealChildren && Children.Count == 0)
+        if (_childrenLoaded) return;
+        if (!_hasRealChildrenChecked)
+        {
+            await Task.Run(() =>
+            {
+                _hasRealChildrenChecked = true;
+                try { _hasRealChildren = Directory.Exists(Path) && Directory.EnumerateDirectories(Path).Any(); }
+                catch { _hasRealChildren = false; }
+            });
+        }
+        if (_hasRealChildren && Children.Count == 0)
             Children.Add(Placeholder);
     }
 
-    private bool HasRealChildren
-    {
-        get
-        {
-            try { return Directory.Exists(Path) && Directory.EnumerateDirectories(Path).Any(); }
-            catch { return false; }
-        }
-    }
+    private bool _hasRealChildren;
+    private bool _hasRealChildrenChecked;
 
     partial void OnIsExpandedChanged(bool value)
     {
@@ -54,7 +62,7 @@ public partial class FolderTreeNode : ObservableObject
     {
         var dir = Path;
         var buffer = new List<FolderTreeNode>();
-        await Task.Run(() =>
+        await Task.Run(async () =>
         {
             try
             {
@@ -63,7 +71,7 @@ public partial class FolderTreeNode : ObservableObject
                 {
                     var name = System.IO.Path.GetFileName(sub);
                     var node = new FolderTreeNode { Path = sub, DisplayName = name };
-                    node.EnsureExpanderVisible();
+                    await node.EnsureExpanderVisibleAsync();
                     buffer.Add(node);
                 }
             }

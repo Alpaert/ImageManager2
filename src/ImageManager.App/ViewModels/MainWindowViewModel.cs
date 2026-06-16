@@ -129,21 +129,22 @@ public partial class MainWindowViewModel : ViewModelBase
     public event Action? ScrollToSelectedRequested;
     public event Action<FolderTreeNode>? TreeScrollToNodeRequested;
 
-    private List<string> GetSearchScopeFiles()
+    private async Task<List<string>> GetSearchScopeFilesAsync()
     {
         if (SearchScope == 0 || string.IsNullOrEmpty(CurrentFolder))
             return _allFiles;
-        return GetImageFilesRecursive(CurrentFolder);
+        return await GetImageFilesRecursiveAsync(CurrentFolder);
     }
 
-    private static List<string> GetImageFilesRecursive(string root)
+    private static async Task<List<string>> GetImageFilesRecursiveAsync(string root)
     {
         var exts = FileTypeConstants.AllMediaExtensions;
         try
         {
-            return Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirectories)
-                .Where(f => exts.Contains(Path.GetExtension(f)))
-                .ToList();
+            return await Task.Run(() =>
+                Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirectories)
+                    .Where(f => exts.Contains(Path.GetExtension(f)))
+                    .ToList());
         }
         catch { return new List<string>(); }
     }
@@ -245,6 +246,8 @@ public partial class MainWindowViewModel : ViewModelBase
     private readonly PageManager _pageManager;
     private readonly ImageManager.Infrastructure.Services.TagSearchEngine _tagSearch;
 
+    private readonly ImageManager.Core.Services.IDispatcher _dispatcher;
+
     // ==================== Cache ====================
     private readonly ConcurrentDictionary<string, string> _phashCache = new(StringComparer.OrdinalIgnoreCase);
 
@@ -279,7 +282,8 @@ public partial class MainWindowViewModel : ViewModelBase
         ImageManager.Infrastructure.Services.TagSearchEngine tagSearch,
         ImageManager.Infrastructure.Services.ArtistEmbeddingStore artistStore,
         ImageManager.Infrastructure.Services.ChineseTagLibrary chineseLib,
-        CommunityToolkit.Mvvm.Messaging.IMessenger messenger)
+        CommunityToolkit.Mvvm.Messaging.IMessenger messenger,
+        ImageManager.Core.Services.IDispatcher dispatcher)
     {
         _settingsRepo = settingsRepo;
         _folderRepo = folderRepo;
@@ -292,6 +296,7 @@ public partial class MainWindowViewModel : ViewModelBase
         _tagSearch = tagSearch;
         _artistStore = artistStore;
         _chineseLib = chineseLib;
+        _dispatcher = dispatcher;
 
         _pageManager.PageChanged += args =>
         {
@@ -375,7 +380,7 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             Path = f.Path, DisplayName = f.DisplayName, DbId = f.Id
         }).ToList();
-        foreach (var n in nodes) n.EnsureExpanderVisible();
+        await Task.WhenAll(nodes.Select(n => n.EnsureExpanderVisibleAsync()));
         FolderTree = new ObservableCollection<FolderTreeNode>(nodes);
 
         SyncUISettingsFromAppData();
@@ -422,7 +427,7 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 Path = info.Path, DisplayName = info.DisplayName, DbId = info.Id
             };
-            node.EnsureExpanderVisible();
+            await node.EnsureExpanderVisibleAsync();
             FolderTree.Add(node);
         }
 
@@ -550,7 +555,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (!Directory.Exists(folder))
         {
             // Try to relocate if this was a previously imported folder
-            var existingFolder = await _folderRepo.GetByPathAsync(folder);
+            var existingFolder = await Task.Run(() => _folderRepo.GetByPathAsync(folder));
             if (existingFolder != null)
             {
                 StatusText = "文件夹路径已变更，请在侧边栏重新点击该文件夹以重定位";
@@ -601,7 +606,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
         // Check if this folder already has FolderId markers in DB
         PerfLogger.Log($"[LoadFolder] 3-db-query-folder start {sw.ElapsedMilliseconds}ms");
-        var folderInfo = await _folderRepo.GetByPathAsync(folder);
+        var folderInfo = await Task.Run(() => _folderRepo.GetByPathAsync(folder));
         PerfLogger.Log($"[LoadFolder] 3-db-query-folder done {sw.ElapsedMilliseconds}ms");
         if (isCurrent?.Invoke() == false)
             return;
@@ -759,12 +764,14 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         try
         {
-            var diskFiles = new HashSet<string>(
-                Directory.EnumerateFiles(folder, "*.*", SearchOption.TopDirectoryOnly)
-                    .Where(f => FileTypeConstants.IsMediaFile(f)),
-                StringComparer.OrdinalIgnoreCase);
+            // Disk enum + DB query on background thread to avoid blocking UI
+            var diskFiles = await Task.Run(() =>
+                new HashSet<string>(
+                    Directory.EnumerateFiles(folder, "*.*", SearchOption.TopDirectoryOnly)
+                        .Where(f => FileTypeConstants.IsMediaFile(f)),
+                    StringComparer.OrdinalIgnoreCase));
 
-            var dbFiles = await _metaRepo.GetByFolderIdAsync(folderId);
+            var dbFiles = await Task.Run(() => _metaRepo.GetByFolderIdAsync(folderId));
             var dbSet = new HashSet<string>(dbFiles.Select(m => m.FilePath), StringComparer.OrdinalIgnoreCase);
 
             // MD5 + DB on background thread to avoid blocking UI
@@ -837,15 +844,21 @@ public partial class MainWindowViewModel : ViewModelBase
                     if (isCurrent?.Invoke() == false)
                         return false;
 
-                    _allFiles = diskFiles.ToList();
-                    TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-                    PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-                    _pageManager.InvalidateCache();
-                    _phashCache.Clear();
+                    await _dispatcher.InvokeAsync(() =>
+                    {
+                        _allFiles = diskFiles.ToList();
+                        TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
+                        PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
+                        _pageManager.InvalidateCache();
+                        _phashCache.Clear();
+                    });
                     int targetPage = CurrentPage;
                     if (targetPage >= TotalPages) targetPage = Math.Max(0, TotalPages - 1);
-                    await ShowPageAsync(targetPage);
-                    StatusText = $"总文件数: {_allFiles.Count}";
+                    await _dispatcher.InvokeAsync(async () =>
+                    {
+                        await ShowPageAsync(targetPage);
+                        StatusText = $"总文件数: {_allFiles.Count}";
+                    });
                 }
                 return true;
             }
@@ -934,7 +947,7 @@ public partial class MainWindowViewModel : ViewModelBase
         int processed = 0;
         int totalNeed = needsHashing.Count;
 
-        Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+        _dispatcher.InvokeAsync(() =>
             BackgroundStatusText = $"正在计算图片指纹... 0/{totalNeed}");
 
         var consumeTasks = Enumerable.Range(0, cpuConcurrency).Select(async _ =>
@@ -974,7 +987,7 @@ public partial class MainWindowViewModel : ViewModelBase
                                     await _metaRepo.BulkUpsertAsync(batch);
                                 Interlocked.Add(ref processed, batch.Count);
                                 int snap = Interlocked.CompareExchange(ref processed, 0, 0);
-                                Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                                _dispatcher.InvokeAsync(() =>
                                     BackgroundStatusText = $"正在计算图片指纹... {snap}/{totalNeed}");
                             }
                         }
@@ -999,7 +1012,7 @@ public partial class MainWindowViewModel : ViewModelBase
             await _metaRepo.BulkUpsertAsync(final);
         Interlocked.Add(ref processed, final.Count);
 
-        Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+        _dispatcher.InvokeAsync(() =>
             BackgroundStatusText = "");
 
         return;
@@ -1132,7 +1145,7 @@ partial void OnCornerRadiusDipChanged(double value)
                 try { await Task.Delay(50, token); }
                 catch { return; }
                 if (token.IsCancellationRequested) return;
-                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                await _dispatcher.InvokeAsync(() =>
                 {
                     if (!token.IsCancellationRequested)
                         ThumbnailBaseWidth = capturedWidth;
@@ -1359,9 +1372,8 @@ partial void OnCornerRadiusDipChanged(double value)
 
                     await Task.Delay(50 * (retry + 1));  // 50ms, 100ms, 150ms
 
-                    await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(
-                        () => TreeScrollToNodeRequested?.Invoke(currentNode),
-                        Avalonia.Threading.DispatcherPriority.Loaded);
+                    await _dispatcher.InvokeAsync(
+                        () => TreeScrollToNodeRequested?.Invoke(currentNode));
                 }
             }
         }
@@ -1381,7 +1393,7 @@ partial void OnCornerRadiusDipChanged(double value)
             return;
 
         var rebuiltFiles = showAllSubfolders
-            ? GetImageFilesRecursive(folderPath)
+            ? await GetImageFilesRecursiveAsync(folderPath)
             : await Task.Run(() =>
                 Directory.EnumerateFiles(folderPath, "*.*", SearchOption.TopDirectoryOnly)
                     .Where(f => FileTypeConstants.IsMediaFile(f))
@@ -1439,7 +1451,7 @@ partial void OnCornerRadiusDipChanged(double value)
                     if (loadedCount > 0)
                     {
                         // Refresh current page to show newly loaded tags
-                        _ = Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                        _ = _dispatcher.InvokeAsync(() =>
                         {
                             _pageManager.InvalidateCache();
                             _ = ShowPageAsync(CurrentPage);
@@ -1534,7 +1546,7 @@ partial void OnCornerRadiusDipChanged(double value)
 
         try
         {
-            await _tagSearch.SearchByTagAsync(raw, GetSearchScopeFiles(), IsShowingSearchResult,
+            await _tagSearch.SearchByTagAsync(raw, await GetSearchScopeFilesAsync(), IsShowingSearchResult,
                 list => { foreach (var t in list) TagSearchSuggestions.Add(t); });
         }
         catch (Exception ex)
@@ -1858,7 +1870,7 @@ partial void OnCornerRadiusDipChanged(double value)
         try
         {
             var results = await _similarService.FindSimilarAsync(
-                filePath, GetSearchScopeFiles(), 5, _searchCts.Token);
+                filePath, await GetSearchScopeFilesAsync(), 5, _searchCts.Token);
 
             _tagSearch.SearchResultFiles = results.ToList();
 
@@ -2022,9 +2034,8 @@ partial void OnCornerRadiusDipChanged(double value)
 
             item.IsSelected = true;
 
-            Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(
-                () => ScrollToSelectedRequested?.Invoke(),
-                Avalonia.Threading.DispatcherPriority.Background);
+            _dispatcher.InvokeAsync(
+                () => ScrollToSelectedRequested?.Invoke());
         }
     }
 
@@ -2040,13 +2051,13 @@ partial void OnCornerRadiusDipChanged(double value)
         {
             if (isCurrent?.Invoke() == false) return false;
 
-            var ready = await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+            var ready = await _dispatcher.InvokeAsync(() =>
             {
                 // 改进检测：节点已展开且子节点已加载
                 return TreeScrollToNodeRequested?.GetInvocationList().Length > 0
                        && node.IsExpanded
                        && node.ChildrenLoaded;
-            }, Avalonia.Threading.DispatcherPriority.Loaded);
+            });
 
             if (ready)
             {
@@ -2115,9 +2126,8 @@ partial void OnCornerRadiusDipChanged(double value)
         await Task.Delay(20);
         if (isCurrent?.Invoke() == false) return;
 
-        await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(
-            () => ScrollToSelectedRequested?.Invoke(),
-            Avalonia.Threading.DispatcherPriority.Loaded);
+        await _dispatcher.InvokeAsync(
+            () => { ScrollToSelectedRequested?.Invoke(); });
 
         await Task.Delay(100);
     }
@@ -2312,7 +2322,7 @@ partial void OnCornerRadiusDipChanged(double value)
 
     public async Task RefreshImageTagsAsync(string filePath)
     {
-        var meta = await _metaRepo.GetByPathAsync(filePath);
+        var meta = await Task.Run(() => _metaRepo.GetByPathAsync(filePath));
         if (meta == null) return;
 
         var tags = meta.Tags.Select(t => t.Name).ToList();
@@ -2484,7 +2494,7 @@ partial void OnCornerRadiusDipChanged(double value)
 
     public async Task<List<string>> GetTagsForFileAsync(string filePath)
     {
-        var meta = await _metaRepo.GetByPathAsync(filePath);
+        var meta = await Task.Run(() => _metaRepo.GetByPathAsync(filePath));
         return meta?.Tags.Select(t => t.Name).ToList() ?? new List<string>();
     }
 

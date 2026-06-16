@@ -86,7 +86,8 @@ public class AutoTagPipelineService : IDisposable
 
     // ==================== Phase 1: Inference ====================
 
-    public async Task RunInferenceAsync(long folderId, List<(long Id, string FilePath)> metas, string action,
+    /// <returns>List of file paths that were actually processed (for post-pipeline refresh).</returns>
+    public async Task<List<string>> RunInferenceAsync(long folderId, List<(long Id, string FilePath)> metas, string action,
         CancellationToken ct = default)
     {
         bool hasState = folderId > 0;
@@ -169,6 +170,8 @@ public class AutoTagPipelineService : IDisposable
         });
 
         // Consumer: save tags + batch-stamp AutoTagStatus every 100 to survive mid-run exit
+        // Track actually processed paths for accurate post-pipeline refresh
+        var processedPaths = new List<string>();
         var consumerTask = Task.Run(async () =>
         {
             var completed = 0;
@@ -187,6 +190,7 @@ public class AutoTagPipelineService : IDisposable
                         Interlocked.Increment(ref processed);
                         completed++;
                         stampBuffer.Add(item.FilePath);
+                        processedPaths.Add(item.FilePath);
 
                         if (stampBuffer.Count >= 100)
                         {
@@ -252,6 +256,7 @@ public class AutoTagPipelineService : IDisposable
         }
 
         ClearMetaCache();
+        return processedPaths;
     }
 
     // ==================== Phase 2: Translation ====================

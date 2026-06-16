@@ -57,6 +57,7 @@ public class SmartWaterfallPanel : Panel
     private readonly HashSet<Control> _bitmapFreed = new();
     private int _lastVisibleStartRow = -1;
     private int _lastVisibleEndRow = -1;
+    private PageManager? _cachedPageManager;
 
     private sealed class RowInfo
     {
@@ -157,9 +158,9 @@ public class SmartWaterfallPanel : Panel
                     {
                         item.NotifyThumbnailNeeded();
                         _bitmapFreed.Remove(child);
-                        // Trigger PageManager to reload this thumbnail
-                        var pm = App.Services.GetRequiredService<PageManager>();
-                        pm.LoadThumbnailsForItems(new List<ImageViewItem> { item });
+                        // Trigger PageManager to reload this thumbnail (cached to avoid service locator in hot path)
+                        _cachedPageManager ??= App.Services.GetRequiredService<PageManager>();
+                        _cachedPageManager.LoadThumbnailsForItems(new List<ImageViewItem> { item });
                     }
                 }
             }
