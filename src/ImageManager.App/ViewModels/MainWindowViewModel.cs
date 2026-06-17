@@ -2193,7 +2193,10 @@ partial void OnCornerRadiusDipChanged(double value)
 
         item.IsSelected = true;
 
-        await Task.Delay(20);
+        // 跨文件夹首次跳转时 Images 集合刚被 PageChanged 替换为新实例，
+        // Avalonia 的 ItemsControl 需要至少一次 layout pass 才能创建 child 容器。
+        // 等待一段时间，再由 View 端的 OnScrollToSelected 自带重试循环兜底。
+        await Task.Delay(80);
         if (isCurrent?.Invoke() == false) return;
 
         await _dispatcher.InvokeAsync(

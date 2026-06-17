@@ -1910,35 +1910,47 @@ public partial class MainWindow : Window
     {
         // SmartWaterfallPanel 对视口外 child 跳过 Arrange，Bounds 为空，BringIntoView 失效。
         // 改为先从 Panel 查询目标行 Y、直接驱动 ScrollViewer.Offset，再用 BringIntoView 微调。
-        const int maxAttempts = 15;
+        // 跨文件夹首次跳转时 Images 集合刚被替换为新 ObservableCollection，ItemsControl 需要
+        // 至少一次 layout pass 才能生成 child 容器。重试覆盖 ~2 秒，含缩略图异步解码窗口。
+        const int maxAttempts = 40;
         const int delayMs = 50;
 
+        string? failReason = null;
         for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
             var scrolled = await App.UI.InvokeAsync(() =>
             {
-                ItemsImages.UpdateLayout();
-
                 var selected = Vm.Images.FirstOrDefault(i => i.IsSelected);
-                if (selected == null) return true;
+                if (selected == null) { failReason = "no-selected"; return true; }
 
-                if (ItemsImages.ContainerFromItem(selected) is not Control container) return false;
-                if (ItemsImages.ItemsPanelRoot is not SmartWaterfallPanel panel) return false;
-                if (!panel.TryGetItemY(container, out var y, out var h)) return false;
+                // 强制 ItemsControl 与 Panel 完整跑一次 Measure
+                ItemsImages.InvalidateMeasure();
+                if (ItemsImages.ItemsPanelRoot is SmartWaterfallPanel p0)
+                    p0.InvalidateMeasure();
+                ItemsImages.UpdateLayout();
+                Dispatcher.UIThread.RunJobs(DispatcherPriority.Render);
+
+                if (ItemsImages.ContainerFromItem(selected) is not Control container)
+                { failReason = "no-container"; return false; }
+                if (ItemsImages.ItemsPanelRoot is not SmartWaterfallPanel panel)
+                { failReason = "no-panel"; return false; }
+                if (!panel.TryGetItemY(container, out var y, out var h))
+                { failReason = "no-layout"; return false; }
 
                 var viewportH = ThumbnailScrollViewer.Viewport.Height;
                 var extentH = ThumbnailScrollViewer.Extent.Height;
-                if (viewportH <= 0 || extentH <= 0) return false;
+                if (viewportH <= 0) { failReason = "no-viewport"; return false; }
 
                 var maxOffset = Math.Max(0, extentH - viewportH);
                 var target = Math.Max(0, Math.Min(maxOffset, y - (viewportH - h) / 2));
                 ThumbnailScrollViewer.Offset = new Vector(0, target);
+                System.Diagnostics.Debug.WriteLine(
+                    $"[ImageScroll] OK attempt={attempt} y={y:F1} h={h:F1} target={target:F1} ext={extentH:F1} vp={viewportH:F1}");
                 return true;
             });
 
             if (scrolled)
             {
-                // 等一帧让目标行进入视口、被 SmartWaterfallPanel Arrange 后，再做一次微调
                 await Task.Delay(delayMs);
                 await App.UI.InvokeAsync(() =>
                 {
@@ -1952,7 +1964,7 @@ public partial class MainWindow : Window
             await Task.Delay(delayMs);
         }
 
-        System.Diagnostics.Debug.WriteLine("[ImageScroll] Failed to scroll to selected image");
+        System.Diagnostics.Debug.WriteLine($"[ImageScroll] FAILED reason={failReason ?? "unknown"}");
     }
 
     private async void OnTreeScrollToNode(ViewModels.FolderTreeNode node)
