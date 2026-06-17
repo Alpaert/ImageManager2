@@ -79,6 +79,65 @@ public static class VideoThumbnailGenerator
     }
 
     /// <summary>
+    /// 提取视频原分辨率帧（不缩放），用于缓存后续 SkiaSharp 缩放
+    /// </summary>
+    public static async Task<byte[]?> ExtractOriginalFrameAsync(string filePath, CancellationToken ct = default)
+    {
+        try
+        {
+            var metadata = await VideoMetadataExtractor.ExtractMetadataAsync(filePath, ct);
+            if (metadata == null) return null;
+
+            double startTimestamp = metadata.Value.Duration * 0.25;
+            string tsStr = startTimestamp.ToString("F2", CultureInfo.InvariantCulture);
+
+            // 策略 1: thumbnail 智能选帧，不带 scale
+            string? tempFile = null;
+            try
+            {
+                tempFile = Path.Combine(Path.GetTempPath(), $"thumb_{Guid.NewGuid():N}.jpg");
+                string args = $"-ss {tsStr} -i \"{filePath}\" -t 5 -vf \"thumbnail\" -frames:v 1 -update 1 -q:v 2 \"{tempFile}\"";
+                var (exitCode, _, _) = await FFmpegManager.RunAsync(args, 30, ct);
+                if (exitCode == 0 && File.Exists(tempFile))
+                {
+                    var data = await File.ReadAllBytesAsync(tempFile, ct);
+                    if (data.Length > 0) return data;
+                }
+            }
+            catch { }
+            finally
+            {
+                try { if (tempFile != null && File.Exists(tempFile)) File.Delete(tempFile); } catch { }
+            }
+
+            // 策略 2: 简单提取，不带 scale
+            tempFile = null;
+            try
+            {
+                tempFile = Path.Combine(Path.GetTempPath(), $"thumb_{Guid.NewGuid():N}.jpg");
+                string args = $"-ss {tsStr} -i \"{filePath}\" -vframes 1 -update 1 -q:v 2 \"{tempFile}\"";
+                var (exitCode, _, _) = await FFmpegManager.RunAsync(args, 30, ct);
+                if (exitCode == 0 && File.Exists(tempFile))
+                {
+                    var data = await File.ReadAllBytesAsync(tempFile, ct);
+                    if (data.Length > 0) return data;
+                }
+            }
+            catch { }
+            finally
+            {
+                try { if (tempFile != null && File.Exists(tempFile)) File.Delete(tempFile); } catch { }
+            }
+
+            return null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// 提取最佳帧：先尝试 thumbnail 滤镜，失败则回退到简单提取
     /// </summary>
     private static async Task<byte[]?> ExtractBestFrameAsync(

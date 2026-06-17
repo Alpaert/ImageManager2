@@ -9,12 +9,12 @@ public class MediaProcessorFactory : IMediaProcessorFactory
 {
     private readonly IMediaProcessor[] _processors;
 
-    public MediaProcessorFactory()
+    public MediaProcessorFactory(string cacheDirectory)
     {
         _processors = new IMediaProcessor[]
         {
             new ImageMediaProcessor(),
-            new VideoMediaProcessor()
+            new VideoMediaProcessor(cacheDirectory)
         };
     }
 

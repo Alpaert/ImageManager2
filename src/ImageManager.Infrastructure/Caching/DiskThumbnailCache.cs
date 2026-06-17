@@ -183,6 +183,11 @@ public class DiskThumbnailCache
                 if (File.Exists(oldPath))
                     File.Delete(oldPath);
             }
+
+            // Also delete video original frame
+            var originalPath = Path.Combine(_cacheRoot, "video_originals", folderHash, hashName);
+            if (File.Exists(originalPath))
+                File.Delete(originalPath);
         }
         catch { }
     }

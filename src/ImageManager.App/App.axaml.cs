@@ -169,7 +169,7 @@ public partial class App : Application
         services.AddSingleton<IDuplicateService, DuplicateService>();
 
         // ==================== Media Processor Factory ====================
-        services.AddSingleton<IMediaProcessorFactory, MediaProcessorFactory>();
+        services.AddSingleton<IMediaProcessorFactory>(new MediaProcessorFactory(cacheDir));
 
         services.AddSingleton<ThumbnailCacheService>(sp =>
             new ThumbnailCacheService(
