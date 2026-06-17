@@ -891,50 +891,24 @@ public partial class MainWindowViewModel : ViewModelBase
         if (files.Length == 0) return;
         AppLogger.Memory($"HashPrecompute.Start total={files.Length}");
 
-        // Force re-hash if algorithm was upgraded (or old data has corrupt FolderId)
-        HashSet<string> existingSet;
-        const string CurrentHashVersion = "3";
-        if (AppSettings.HashVersion != CurrentHashVersion)
-        {
-            AppSettings.HashVersion = CurrentHashVersion;
-            await _settingsRepo.SaveAsync(AppSettings);
-            // Reset HashStatus for all records so they get re-hashed with new algorithm
-            try { await _metaRepo.ResetHashStatusAsync(); }
-            catch { }
-            existingSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        }
-        else
-        {
-            // Lightweight pre-check: query HashStatus=1 for already-computed files
-            try
-            {
-                existingSet = await _metaRepo.GetHashedPathsAsync(files.ToList());
-                // Also warm the in-memory phash cache for similarity search
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        var hashDict = await _metaRepo.GetPerceptualHashesByPathsAsync(files.ToList());
-                        foreach (var kv in hashDict)
-                        {
-                            if (!string.IsNullOrEmpty(kv.Value))
-                                _phashCache[kv.Key] = kv.Value;
-                        }
-                    }
-                    catch { }
-                });
-            }
-            catch
-            {
-                existingSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            }
-        }
+        HashSet<string> existingSet = await GetHashedPathsWithRetryAsync(files);
 
         var needsHashing = files
             .Where(f => !existingSet.Contains(f))
             .Where(f => FileTypeConstants.IsImageFile(f))  // Skip video files
             .ToList();
         if (needsHashing.Count == 0) return;
+
+        // Pre-query existing FileHash to avoid recomputing MD5 for files already
+        // indexed by SyncFolderAsync (which stores FileHash with HashStatus=0)
+        var fileHashCache = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var dbHashes = await _metaRepo.GetFileHashesByPathsAsync(needsHashing);
+            foreach (var kv in dbHashes)
+                fileHashCache[kv.Key] = kv.Value;
+        }
+        catch (Exception ex) { AppLogger.Warn($"预加载 FileHash 失败: {ex.Message}"); }
 
         // === Producer: I/O-bound file reading ===
         var channel = Channel.CreateBounded<(string Path, byte[] Data, long FileSize, long LastWriteTicks, string FileHash)>(
@@ -967,6 +941,7 @@ public partial class MainWindowViewModel : ViewModelBase
                         await cpuSlots.WaitAsync(ct);
                         try
                         {
+                            var phash = HashService.ComputeCombinedPerceptualHashFromBytes(item.Data);
                             var meta = new ImageMeta
                             {
                                 FilePath = item.Path,
@@ -974,8 +949,8 @@ public partial class MainWindowViewModel : ViewModelBase
                                 FileSize = item.FileSize,
                                 LastWriteTicks = item.LastWriteTicks,
                                 FolderId = folderId, // may be null — BulkUpsert will preserve existing non-null
-                                PerceptualHash = HashService.ComputeCombinedPerceptualHashFromBytes(item.Data),
-                                HashStatus = 1  // Mark as computed
+                                PerceptualHash = phash,
+                                HashStatus = string.IsNullOrEmpty(phash) ? 0 : 1
                             };
                             try
                             {
@@ -984,7 +959,8 @@ public partial class MainWindowViewModel : ViewModelBase
                             }
                             catch { }
 
-                            _phashCache[item.Path] = meta.PerceptualHash;
+                            if (!string.IsNullOrEmpty(meta.PerceptualHash))
+                                _phashCache[item.Path] = meta.PerceptualHash;
                             upsertBatch.Enqueue(meta);
 
                             if (upsertBatch.Count >= 100)
@@ -1008,7 +984,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 }
             }
             catch (OperationCanceledException) { }
-            catch { }
+            catch (Exception ex) { AppLogger.Error($"Hash consumer 异常: {ex.Message}"); }
         });
 
         // Start consumers first, then produce with bounded parallelism
@@ -1023,15 +999,22 @@ public partial class MainWindowViewModel : ViewModelBase
                 {
                     var fi = new FileInfo(path);
                     string fileHash;
-                    using (var fs = File.OpenRead(path))
+                    if (fileHashCache.TryGetValue(path, out var cachedHash))
+                    {
+                        fileHash = cachedHash;
+                    }
+                    else
+                    {
+                        using var fs = File.OpenRead(path);
                         fileHash = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(fs)).ToLowerInvariant();
+                    }
                     var hashInput = ThumbnailGenerator.DecodeForHashInput(path, 256);
                     if (hashInput == null) return;
                     await channel.Writer.WriteAsync(
                         (path, hashInput, fi.Length, fi.LastWriteTimeUtc.Ticks, fileHash), token);
                 }
                 catch (OperationCanceledException) { }
-                catch { }
+                catch (Exception ex) { AppLogger.Warn($"Hash producer 文件失败: {ex.Message}"); }
             });
         channel.Writer.Complete();
         await Task.WhenAll(consumerTaskList);
@@ -1053,6 +1036,41 @@ public partial class MainWindowViewModel : ViewModelBase
                 list.Add(m);
             return list;
         }
+    }
+
+    /// <summary>Query HashStatus=1 paths with retry. On total failure, returns all files
+    /// as "already hashed" to skip this cycle safely (idle timer will retrigger).</summary>
+    private async Task<HashSet<string>> GetHashedPathsWithRetryAsync(string[] files)
+    {
+        const int maxRetries = 3;
+        for (int attempt = 1; attempt <= maxRetries; attempt++)
+        {
+            try
+            {
+                var result = await _metaRepo.GetHashedPathsAsync(files.ToList());
+                // Warm the in-memory phash cache for similarity search
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var hashDict = await _metaRepo.GetPerceptualHashesByPathsAsync(files.ToList());
+                        foreach (var kv in hashDict)
+                            if (!string.IsNullOrEmpty(kv.Value))
+                                _phashCache[kv.Key] = kv.Value;
+                    }
+                    catch { }
+                });
+                return result;
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Warn($"GetHashedPathsAsync 失败 ({attempt}/{maxRetries}): {ex.Message}");
+                if (attempt < maxRetries)
+                    await Task.Delay(TimeSpan.FromMilliseconds(200 * Math.Pow(2, attempt - 1)));
+            }
+        }
+        AppLogger.Error("GetHashedPathsAsync 全部重试失败，跳过本轮哈希预计算");
+        return new HashSet<string>(files, StringComparer.OrdinalIgnoreCase);
     }
 
     /// <summary>用户停止切换文件夹 5 秒后执行维护任务（CleanMeta、PrecomputeHashes、SyncFolder）</summary>

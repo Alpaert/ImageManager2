@@ -1,4 +1,5 @@
 using Dapper;
+using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
 using Microsoft.Data.Sqlite;
@@ -151,48 +152,61 @@ public class ImageMetaRepository : IImageMetaRepository
     {
         if (metas.Count == 0) return;
 
-        using var conn = _dbFactory.CreateConnection();
-        using var txn = conn.BeginTransaction();
-
-        // Single query to find existing paths
-        var paths = metas.Select(m => m.FilePath).Distinct().ToList();
-        var existing = await conn.QueryAsync<(string FilePath, long Id)>(
-            "SELECT FilePath, Id FROM ImageMeta WHERE FilePath COLLATE NOCASE IN @Paths",
-            new { Paths = paths }, txn);
-
-        var existingMap = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-        foreach (var (fp, id) in existing)
-            existingMap[fp] = id;
-
-        var now = DateTime.UtcNow;
-        foreach (var meta in metas)
+        for (int attempt = 1; ; attempt++)
         {
-            if (existingMap.TryGetValue(meta.FilePath, out var id))
+            try
             {
-                meta.Id = id;
-                meta.UpdatedAt = now;
-                await conn.ExecuteAsync(@"
-                    UPDATE ImageMeta SET
-                        FileHash = @FileHash, PerceptualHash = @PerceptualHash,
-                        Width = @Width, Height = @Height,
-                        FileSize = @FileSize, LastWriteTicks = @LastWriteTicks,
-                        FolderId = @FolderId, UpdatedAt = @UpdatedAt, HashStatus = @HashStatus
-                    WHERE Id = @Id", meta, txn);
+                using var conn = _dbFactory.CreateConnection();
+                using var txn = conn.BeginTransaction();
+
+                // Single query to find existing paths
+                var paths = metas.Select(m => m.FilePath).Distinct().ToList();
+                var existing = await conn.QueryAsync<(string FilePath, long Id)>(
+                    "SELECT FilePath, Id FROM ImageMeta WHERE FilePath COLLATE NOCASE IN @Paths",
+                    new { Paths = paths }, txn);
+
+                var existingMap = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+                foreach (var (fp, id) in existing)
+                    existingMap[fp] = id;
+
+                var now = DateTime.UtcNow;
+                foreach (var meta in metas)
+                {
+                    if (existingMap.TryGetValue(meta.FilePath, out var id))
+                    {
+                        meta.Id = id;
+                        meta.UpdatedAt = now;
+                        await conn.ExecuteAsync(@"
+                            UPDATE ImageMeta SET
+                                FileHash = @FileHash, PerceptualHash = @PerceptualHash,
+                                Width = @Width, Height = @Height,
+                                FileSize = @FileSize, LastWriteTicks = @LastWriteTicks,
+                                FolderId = @FolderId, UpdatedAt = @UpdatedAt, HashStatus = @HashStatus
+                            WHERE Id = @Id", meta, txn);
+                    }
+                    else
+                    {
+                        meta.CreatedAt = now;
+                        meta.UpdatedAt = now;
+                        meta.Id = await conn.ExecuteScalarAsync<long>(@"
+                            INSERT INTO ImageMeta (FilePath, FileHash, PerceptualHash, Width, Height,
+                                FileSize, LastWriteTicks, FolderId, CreatedAt, UpdatedAt, HashStatus)
+                            VALUES (@FilePath, @FileHash, @PerceptualHash, @Width, @Height,
+                                @FileSize, @LastWriteTicks, @FolderId, @CreatedAt, @UpdatedAt, @HashStatus);
+                            SELECT last_insert_rowid();", meta, txn);
+                    }
+                }
+
+                txn.Commit();
+                return; // success
             }
-            else
+            catch (SqliteException ex) when (ex.Message.Contains("busy") || ex.Message.Contains("locked"))
             {
-                meta.CreatedAt = now;
-                meta.UpdatedAt = now;
-                meta.Id = await conn.ExecuteScalarAsync<long>(@"
-                    INSERT INTO ImageMeta (FilePath, FileHash, PerceptualHash, Width, Height,
-                        FileSize, LastWriteTicks, FolderId, CreatedAt, UpdatedAt, HashStatus)
-                    VALUES (@FilePath, @FileHash, @PerceptualHash, @Width, @Height,
-                        @FileSize, @LastWriteTicks, @FolderId, @CreatedAt, @UpdatedAt, @HashStatus);
-                    SELECT last_insert_rowid();", meta, txn);
+                if (attempt >= 3) throw;
+                AppLogger.Warn($"BulkUpsert 失败 ({attempt}/3): {ex.Message}");
+                await Task.Delay(TimeSpan.FromMilliseconds(100 * Math.Pow(2, attempt - 1)));
             }
         }
-
-        txn.Commit();
     }
 
     public async Task<int> DeleteAsync(long id)
