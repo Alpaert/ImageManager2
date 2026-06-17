@@ -28,7 +28,7 @@ public class DbContextFactory : IDbContextFactory
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             PRAGMA journal_mode=WAL;
-            PRAGMA busy_timeout=2000;
+            PRAGMA busy_timeout=30000;
             PRAGMA foreign_keys=ON;
             PRAGMA cache_size=-8192;
             PRAGMA synchronous=NORMAL;
