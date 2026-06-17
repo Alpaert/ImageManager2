@@ -1427,16 +1427,19 @@ partial void OnCornerRadiusDipChanged(double value)
             // 2. syncSelection=true: 需要选中节点，滚动确保可见
             if (forceScroll || syncSelection)
             {
-                // 多次重试滚动，递增延迟以应对大型树渲染
-                for (int retry = 0; retry < 3; retry++)
+                // Allow time for the TreeView to expand and render, especially when
+                // loading large sub-trees from DB for the first time.
+                await Task.Delay(200);
+                for (int retry = 0; retry < 5; retry++)
                 {
                     if (isCurrent?.Invoke() == false)
                         return currentNode;
 
-                    await Task.Delay(50 * (retry + 1));  // 50ms, 100ms, 150ms
-
                     await _dispatcher.InvokeAsync(
                         () => TreeScrollToNodeRequested?.Invoke(currentNode));
+
+                    if (retry < 4)
+                        await Task.Delay(200 * (retry + 1));  // 200, 400, 600, 800ms
                 }
             }
         }

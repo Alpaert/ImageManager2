@@ -378,3 +378,8 @@ FodyWeavers.xsd
 
 # 文档目录 - 不推送
 /docs/
+
+# cc-connect 运行时文件
+.cc-connect-data/
+config.toml
+.config.toml.lock

@@ -1934,59 +1934,24 @@ public partial class MainWindow : Window
 
     private async void OnTreeScrollToNode(ViewModels.FolderTreeNode node)
     {
-        // 递增延迟重试：50ms, 100ms, 150ms, 200ms, 250ms, 300ms = 共 1050ms 总等待
-        // 首次展开子节点时 TreeViewItem 容器需要更多时间渲染
-        const int maxAttempts = 6;
-
+        // Retry with increasing delays. After ExpandAndHighlightFolderAsync expands
+        // the path, TreeViewItem containers take time to materialize (especially for
+        // large trees where virtualization may defer container creation).
+        const int maxAttempts = 10;
         for (var attempt = 0; attempt < maxAttempts; attempt++)
         {
             var scrolled = await App.UI.InvokeAsync(() =>
             {
                 LstFolders.UpdateLayout();
                 var container = LstFolders.TreeContainerFromItem(node);
-
-                if (container == null)
-                {
-                    // 容器未就绪，继续重试
-                    return false;
-                }
-
-                var sv = LstFolders.FindDescendantOfType<ScrollViewer>();
-                if (sv == null)
-                {
-                    container.BringIntoView();
-                    return true;
-                }
-
-                // === 检测节点是否已在视野内 ===
-                var bounds = container.Bounds;
-                var containerY = container.TranslatePoint(new Avalonia.Point(0, 0), sv)?.Y ?? 0;
-
-                // 如果节点完全可见，无需滚动
-                if (containerY >= 0 && containerY + bounds.Height <= sv.Viewport.Height)
-                {
-                    return true;
-                }
-
-                // 计算目标偏移（居中显示）
-                double targetOffset = containerY - sv.Viewport.Height / 2 + bounds.Height / 2;
-                if (targetOffset < 0) targetOffset = 0;
-
-                double maxY = Math.Max(0, sv.Extent.Height - sv.Viewport.Height);
-                if (targetOffset > maxY) targetOffset = maxY;
-
-                sv.Offset = new Vector(0, targetOffset);
+                if (container == null) return false;
+                container.BringIntoView();
                 return true;
-
             });
-
             if (scrolled) return;
-
-            await Task.Delay(50 * (attempt + 1));  // 递增延迟
+            await Task.Delay(Math.Min(100 * (attempt + 1), 400));
         }
-
-        // === 滚动失败时的调试信息 ===
-        System.Diagnostics.Debug.WriteLine($"[TreeScroll] Failed to scroll to node: {node.Path}");
+        AppLogger.Warn($"[TreeScroll] 滚动失败: {node.Path}");
     }
 
     // ==================== Window Closing ====================
