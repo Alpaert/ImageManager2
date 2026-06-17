@@ -168,6 +168,33 @@ public class SmartWaterfallPanel : Panel
         }
     }
 
+    // 查询 child 在 Panel 内部坐标系下的 Y 坐标与行高。视口外的 child 不会被 Arrange，
+    // 其 Bounds 不可用；调用方据此直接驱动 ScrollViewer.Offset。
+    public bool TryGetItemY(Control child, out double y, out double height)
+    {
+        foreach (var entry in _verticalLayout)
+        {
+            if (ReferenceEquals(entry.Child, child))
+            {
+                y = entry.Y;
+                height = entry.H;
+                return true;
+            }
+        }
+        foreach (var row in _rows)
+        {
+            if (row.Children.Contains(child))
+            {
+                y = row.Y;
+                height = row.Height;
+                return true;
+            }
+        }
+        y = 0;
+        height = 0;
+        return false;
+    }
+
     // ==================== Measure / Arrange ====================
 
     private void ResetLifecycleState()

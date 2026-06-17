@@ -11,6 +11,7 @@ using ImageManager.Core.Messages;
 using Avalonia.Threading;
 using Avalonia.VisualTree;
 using System.Runtime.InteropServices;
+using ImageManager.App.Controls;
 using ImageManager.App.Helpers;
 using ImageManager.App.ViewModels;
 using ImageManager.Common.Constants;
@@ -1907,7 +1908,9 @@ public partial class MainWindow : Window
 
     private async void OnScrollToSelected()
     {
-        const int maxAttempts = 12;  // 增加到12次
+        // SmartWaterfallPanel 对视口外 child 跳过 Arrange，Bounds 为空，BringIntoView 失效。
+        // 改为先从 Panel 查询目标行 Y、直接驱动 ScrollViewer.Offset，再用 BringIntoView 微调。
+        const int maxAttempts = 15;
         const int delayMs = 50;
 
         for (var attempt = 0; attempt < maxAttempts; attempt++)
@@ -1915,17 +1918,37 @@ public partial class MainWindow : Window
             var scrolled = await App.UI.InvokeAsync(() =>
             {
                 ItemsImages.UpdateLayout();
+
                 var selected = Vm.Images.FirstOrDefault(i => i.IsSelected);
                 if (selected == null) return true;
 
-                var container = ItemsImages.ContainerFromItem(selected) as Control;
-                if (container == null) return false;
+                if (ItemsImages.ContainerFromItem(selected) is not Control container) return false;
+                if (ItemsImages.ItemsPanelRoot is not SmartWaterfallPanel panel) return false;
+                if (!panel.TryGetItemY(container, out var y, out var h)) return false;
 
-                container.BringIntoView();
+                var viewportH = ThumbnailScrollViewer.Viewport.Height;
+                var extentH = ThumbnailScrollViewer.Extent.Height;
+                if (viewportH <= 0 || extentH <= 0) return false;
+
+                var maxOffset = Math.Max(0, extentH - viewportH);
+                var target = Math.Max(0, Math.Min(maxOffset, y - (viewportH - h) / 2));
+                ThumbnailScrollViewer.Offset = new Vector(0, target);
                 return true;
-            });  // 统一使用 Loaded
+            });
 
-            if (scrolled) return;
+            if (scrolled)
+            {
+                // 等一帧让目标行进入视口、被 SmartWaterfallPanel Arrange 后，再做一次微调
+                await Task.Delay(delayMs);
+                await App.UI.InvokeAsync(() =>
+                {
+                    var selected = Vm.Images.FirstOrDefault(i => i.IsSelected);
+                    if (selected != null && ItemsImages.ContainerFromItem(selected) is Control c)
+                        c.BringIntoView();
+                });
+                return;
+            }
+
             await Task.Delay(delayMs);
         }
 
