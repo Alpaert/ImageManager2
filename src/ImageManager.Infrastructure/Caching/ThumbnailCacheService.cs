@@ -2,7 +2,6 @@ using System.Collections.Concurrent;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
-using ImageManager.Infrastructure.Helpers;
 using ImageManager.Infrastructure.Imaging;
 using ImageManager.Infrastructure.Video;
 
@@ -233,11 +232,6 @@ public class ThumbnailCacheService : IThumbnailCacheService
                 tail.Value.Data = Array.Empty<byte>();
             }
         }
-
-        // LOH compaction after large evictions or accumulated allocations
-        MemoryPressureMonitor.RecordAllocation();
-        if (MemoryPressureMonitor.ShouldCompactNow())
-            MemoryPressureMonitor.CompactLoh();
     }
 
     private void PromoteToFront(LinkedListNode<LruNode> node)

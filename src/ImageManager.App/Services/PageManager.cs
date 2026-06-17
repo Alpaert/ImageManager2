@@ -131,8 +131,10 @@ public class PageManager : IDisposable
     public void LoadThumbnailsForItems(List<ImageViewItem> items)
     {
         var toLoad = items.Where(i => !i.IsLoaded).ToList();
+        // Use current page's CancellationToken so page flip instantly cancels scroll-triggered loads
+        var ct = _pageLoadCts?.Token ?? default;
         foreach (var item in toLoad)
-            _ = LoadSingleThumbnailAsync(item);
+            _ = LoadSingleThumbnailAsync(item, ct);
     }
 
     public async Task LoadThumbnailsForItemsAsync(List<ImageViewItem> items)

@@ -187,7 +187,7 @@ public abstract class OnnxTagServiceBase : IDisposable
             var ct = _idleCts.Token;
             _ = Task.Run(async () =>
             {
-                try { await Task.Delay(TimeSpan.FromMinutes(3), ct); }
+                try { await Task.Delay(TimeSpan.FromMinutes(1), ct); }
                 catch { return; }
                 if (!ct.IsCancellationRequested)
                     DisposeSession();
@@ -200,7 +200,7 @@ public abstract class OnnxTagServiceBase : IDisposable
         lock (_idleLock)
         {
             if (_session == null) return;
-            AppLogger.Info($"[{ModelSubDir}] 3 分钟未使用，释放 GPU 显存");
+            AppLogger.Info($"[{ModelSubDir}] 1 分钟未使用，释放 GPU 显存");
             _session.Dispose();
             _session = null;
             _cachedTensor = null;

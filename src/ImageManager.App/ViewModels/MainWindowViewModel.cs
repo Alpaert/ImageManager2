@@ -258,7 +258,8 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private ImageSortOrder _currentSortOrder = ImageSortOrder.FileNameAsc;
     private int _folderViewRequestVersion;
     private CancellationTokenSource? _searchCts;
-    private CancellationTokenSource? _precomputeCts;
+    private readonly SemaphoreSlim _hashGate = new(1, 1);
+    private CancellationTokenSource? _hashCts;
     private DispatcherTimer? _idleTimer;
     private FileSystemWatcher? _folderWatcher;
     private CancellationTokenSource? _folderWatchDebounceCts;
@@ -663,15 +664,11 @@ public partial class MainWindowViewModel : ViewModelBase
         var exts = FileTypeConstants.AllMediaExtensions.ToArray();
         await SyncFolderAsync(CurrentFolder, fi.Id, exts);
 
-        _precomputeCts?.Cancel();
-        _precomputeCts?.Dispose();
-        _precomputeCts = new CancellationTokenSource();
-        var captureCt3 = _precomputeCts.Token;
         _ = Task.Run(async () =>
         {
-            try { await Task.Delay(3000, captureCt3); }
+            try { await Task.Delay(3000); }
             catch { return; }
-            await PrecomputeHashesAsync(captureCt3, fi.Id);
+            await PrecomputeHashesAsync(CancellationToken.None, fi.Id);
         });
     }
 
@@ -803,6 +800,10 @@ public partial class MainWindowViewModel : ViewModelBase
                                 {
                                     await _metaRepo.UpdateFilePathAsync(match.Id, file, folderId);
                                 }
+                                else if (string.Equals(match.FilePath, file, StringComparison.OrdinalIgnoreCase))
+                                {
+                                    await _metaRepo.SetFolderIdAsync(file, folderId);
+                                }
                                 else
                                 {
                                     var fi = new FileInfo(file);
@@ -831,7 +832,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 bool deleted = false;
                 foreach (var meta in dbFiles)
                 {
-                    if (!diskFiles.Contains(meta.FilePath))
+                    if (!diskFiles.Contains(meta.FilePath) && !File.Exists(meta.FilePath))
                     {
                         await _metaRepo.SetFolderIdAsync(meta.FilePath, 0L);
                         _thumbCache.DeleteFromDiskCache(meta.FilePath);
@@ -848,20 +849,12 @@ public partial class MainWindowViewModel : ViewModelBase
                     if (isCurrent?.Invoke() == false)
                         return false;
 
-                    await _dispatcher.InvokeAsync(() =>
-                    {
-                        _allFiles = diskFiles.ToList();
-                        TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-                        PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-                        _pageManager.InvalidateCache();
-                        _phashCache.Clear();
-                    });
-                    int targetPage = CurrentPage;
-                    if (targetPage >= TotalPages) targetPage = Math.Max(0, TotalPages - 1);
+                    // Reuse RebuildFileListAsync to correctly handle ShowAllSubfolders,
+                    // sorting, and page state — instead of overwriting _allFiles with
+                    // top-level-only diskFiles which destroys sub-folder view.
                     await _dispatcher.InvokeAsync(async () =>
                     {
-                        await ShowPageAsync(targetPage);
-                        StatusText = $"总文件数: {_allFiles.Count}";
+                        await RebuildFileListAsync();
                     });
                 }
                 return true;
@@ -872,6 +865,27 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     private async Task PrecomputeHashesAsync(CancellationToken ct, long? folderId = null)
+    {
+        // Unified cancellation: cancel any previous run, link with caller's token
+        var oldCts = Interlocked.Exchange(ref _hashCts, CancellationTokenSource.CreateLinkedTokenSource(ct));
+        oldCts?.Cancel();
+        oldCts?.Dispose();
+        var token = _hashCts!.Token;
+
+        if (!await _hashGate.WaitAsync(0, token).ConfigureAwait(false))
+        {
+            try { await _hashGate.WaitAsync(token).ConfigureAwait(false); }
+            catch (OperationCanceledException) { return; }
+        }
+        try
+        {
+            if (token.IsCancellationRequested) return;
+            await PrecomputeHashesCoreAsync(token, folderId);
+        }
+        finally { _hashGate.Release(); }
+    }
+
+    private async Task PrecomputeHashesCoreAsync(CancellationToken ct, long? folderId)
     {
         var files = _allFiles.ToArray();
         if (files.Length == 0) return;
@@ -902,7 +916,10 @@ public partial class MainWindowViewModel : ViewModelBase
                     {
                         var hashDict = await _metaRepo.GetPerceptualHashesByPathsAsync(files.ToList());
                         foreach (var kv in hashDict)
-                            _phashCache[kv.Key] = kv.Value;
+                        {
+                            if (!string.IsNullOrEmpty(kv.Value))
+                                _phashCache[kv.Key] = kv.Value;
+                        }
                     }
                     catch { }
                 });
@@ -928,30 +945,6 @@ public partial class MainWindowViewModel : ViewModelBase
             });
 
         int ioConcurrency = 2;
-        using var ioSlots = new SemaphoreSlim(ioConcurrency);
-
-        var produceTasks = needsHashing.Select(async path =>
-        {
-            try
-            {
-                if (ct.IsCancellationRequested) return;
-                await ioSlots.WaitAsync(ct);
-                try
-                {
-                    var fi = new FileInfo(path);
-                    string fileHash;
-                    using (var fs = File.OpenRead(path))
-                        fileHash = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(fs)).ToLowerInvariant();
-                    var hashInput = await Task.Run(() => ThumbnailGenerator.DecodeForHashInput(path, 256), ct);
-                    if (hashInput == null) return;
-                    await channel.Writer.WriteAsync(
-                        (path, hashInput, fi.Length, fi.LastWriteTimeUtc.Ticks, fileHash), ct);
-                }
-                finally { ioSlots.Release(); }
-            }
-            catch (OperationCanceledException) { }
-            catch { }
-        });
 
         // === Consumer: CPU-bound hash computation ===
         int cpuConcurrency = Math.Max(1, Math.Min(4, Environment.ProcessorCount - 1));
@@ -1003,9 +996,11 @@ public partial class MainWindowViewModel : ViewModelBase
                                 int snap = Interlocked.CompareExchange(ref processed, 0, 0);
                                 _dispatcher.InvokeAsync(() =>
                                     BackgroundStatusText = $"正在计算图片指纹... {snap}/{totalNeed}");
-                                // Adaptive LOH compaction via shared monitor
-                                MemoryPressureMonitor.CompactLoh();
-                                AppLogger.Memory("HashPrecompute.PostGC");
+                                if (MemoryPressureMonitor.Current >= MemoryPressureMonitor.PressureLevel.High)
+                                {
+                                    MemoryPressureMonitor.CompactLoh();
+                                    AppLogger.Memory("HashPrecompute.PostGC");
+                                }
                             }
                         }
                         finally { cpuSlots.Release(); }
@@ -1016,11 +1011,28 @@ public partial class MainWindowViewModel : ViewModelBase
             catch { }
         });
 
-        // Start consumers first to avoid channel-full deadlock
+        // Start consumers first, then produce with bounded parallelism
         var consumerTaskList = consumeTasks.ToList();
-        var producerTaskList = produceTasks.ToList();
 
-        await Task.WhenAll(producerTaskList);
+        await Parallel.ForEachAsync(
+            needsHashing,
+            new ParallelOptions { MaxDegreeOfParallelism = ioConcurrency, CancellationToken = ct },
+            async (path, token) =>
+            {
+                try
+                {
+                    var fi = new FileInfo(path);
+                    string fileHash;
+                    using (var fs = File.OpenRead(path))
+                        fileHash = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(fs)).ToLowerInvariant();
+                    var hashInput = ThumbnailGenerator.DecodeForHashInput(path, 256);
+                    if (hashInput == null) return;
+                    await channel.Writer.WriteAsync(
+                        (path, hashInput, fi.Length, fi.LastWriteTimeUtc.Ticks, fileHash), token);
+                }
+                catch (OperationCanceledException) { }
+                catch { }
+            });
         channel.Writer.Complete();
         await Task.WhenAll(consumerTaskList);
 
@@ -1439,7 +1451,10 @@ partial void OnCornerRadiusDipChanged(double value)
         }
         else
         {
-            await ShowPageAsync(0);
+            // Keep current page — don't jump to 0 on background refresh
+            int targetPage = CurrentPage;
+            if (targetPage >= TotalPages) targetPage = Math.Max(0, TotalPages - 1);
+            await ShowPageAsync(targetPage);
         }
 
         StatusText = $"总文件数: {_allFiles.Count}";

@@ -58,6 +58,7 @@ public class SmartWaterfallPanel : Panel
     private int _lastVisibleStartRow = -1;
     private int _lastVisibleEndRow = -1;
     private PageManager? _cachedPageManager;
+    private Control? _firstTrackedChild; // detect ItemsSource reset (page flip)
 
     private sealed class RowInfo
     {
@@ -169,9 +170,29 @@ public class SmartWaterfallPanel : Panel
 
     // ==================== Measure / Arrange ====================
 
+    private void ResetLifecycleState()
+    {
+        _bitmapFreed.Clear();
+        _lastVisibleStartRow = -1;
+        _lastVisibleEndRow = -1;
+    }
+
     protected override Size MeasureOverride(Size availableSize)
     {
-        if (Children.Count == 0) return new Size(0, 0);
+        // Detect page flip: ItemsSource reset replaces all children
+        if (Children.Count == 0)
+        {
+            ResetLifecycleState();
+            _firstTrackedChild = null;
+            return new Size(0, 0);
+        }
+        if (_firstTrackedChild != null && _firstTrackedChild != Children[0])
+        {
+            ResetLifecycleState();
+        }
+        if (Children.Count > 0)
+            _firstTrackedChild = Children[0];
+
         var sw = Stopwatch.StartNew();
         var result = Mode switch
         {

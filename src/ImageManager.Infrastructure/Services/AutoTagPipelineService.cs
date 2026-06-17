@@ -93,9 +93,7 @@ public class AutoTagPipelineService : IDisposable
         bool hasState = folderId > 0;
         int runId = Interlocked.Increment(ref _pipelineRunCount);
         int total = metas.Count;
-        int totalBatches = (total + 199) / 200;  // ceil division by batchSize
 
-        // === 内存诊断：Pipeline 入口 ===
         AppLogger.Memory($"Pipeline#{runId}.Start total={total} action={action}");
 
         if (hasState)
@@ -110,71 +108,37 @@ public class AutoTagPipelineService : IDisposable
         }
 
         var channel = Channel.CreateBounded<(long ImageId, string FilePath, List<TagPrediction> Predictions)>(
-            new BoundedChannelOptions(200) { SingleWriter = false, SingleReader = true,
+            new BoundedChannelOptions(32) { SingleWriter = true, SingleReader = true,
                 FullMode = BoundedChannelFullMode.Wait });
 
-        var ioSemaphore = new SemaphoreSlim(_maxConcurrency);
         int processed = 0;
         var errors = new ConcurrentQueue<string>();
-        const int batchSize = 200;
 
-        // Producer: launch in batches to avoid N concurrent Task objects.
-        // GC + LOH compaction between batches prevents commit exhaustion (0xc000012d)
-        // caused by SKBitmap.Decode LOH fragmentation under 64-bit GC heuristics.
         var producerTask = Task.Run(async () =>
         {
-            int batchIdx = 0;
             try
             {
-                for (int batchStart = 0; batchStart < metas.Count; batchStart += batchSize)
+                for (int i = 0; i < metas.Count; i++)
                 {
                     if (ct.IsCancellationRequested) break;
-                    batchIdx++;
-                    int batchEnd = Math.Min(batchStart + batchSize, metas.Count);
-                    var batch = metas.GetRange(batchStart, batchEnd - batchStart);
-                    int batchNum = batchIdx;
-
-                    // === 内存诊断：每 batch 推理前 ===
-                    AppLogger.Memory($"Batch{batchNum}/{totalBatches}.PreInfer size={batch.Count}");
-
-                    var batchTasks = batch.Select(async meta =>
+                    var meta = metas[i];
+                    try
                     {
-                        if (ct.IsCancellationRequested) return;
-                        var acquired = false;
-                        try
-                        {
-                            await ioSemaphore.WaitAsync(ct);
-                            acquired = true;
-                            var predictions = await _tagService.PredictAsync(meta.FilePath);
-                            var filtered = predictions
-                                .Where(p => p.Confidence >= _confidenceThreshold)
-                                .Take(_maxTagsPerImage)
-                                .ToList();
-                            await channel.Writer.WriteAsync((meta.Id, meta.FilePath, filtered), ct);
-                        }
-                        catch (OperationCanceledException) { }
-                        catch (Exception ex)
-                        {
-                            errors.Enqueue($"{Path.GetFileName(meta.FilePath)}: {ex.Message}");
-                        }
-                        finally
-                        {
-                            if (acquired) ioSemaphore.Release();
-                        }
-                    });
-                    await Task.WhenAll(batchTasks);
-
-                    // === 内存诊断：推理后、GC 前 ===
-                    AppLogger.Memory($"Batch{batchNum}/{totalBatches}.PostInfer");
-
-                    // Adaptive Gen2 + LOH compaction via shared monitor
-                    MemoryPressureMonitor.CompactLoh();
-
-                    // === 内存诊断：GC 压缩后 ===
-                    AppLogger.Memory($"Batch{batchNum}/{totalBatches}.PostGC");
+                        var predictions = await _tagService.PredictAsync(meta.FilePath);
+                        var filtered = predictions
+                            .Where(p => p.Confidence >= _confidenceThreshold)
+                            .Take(_maxTagsPerImage)
+                            .ToList();
+                        await channel.Writer.WriteAsync((meta.Id, meta.FilePath, filtered), ct);
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (Exception ex)
+                    {
+                        errors.Enqueue($"{Path.GetFileName(meta.FilePath)}: {ex.Message}");
+                    }
                 }
             }
-            catch (Exception ex) { AppLogger.Error($"Producer tasks failed: {ex.Message}"); }
+            catch (Exception ex) { AppLogger.Error($"Producer failed: {ex.Message}"); }
             finally { channel.Writer.Complete(); }
         });
 
