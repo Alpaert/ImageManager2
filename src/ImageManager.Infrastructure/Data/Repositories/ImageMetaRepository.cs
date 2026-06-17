@@ -159,23 +159,26 @@ public class ImageMetaRepository : IImageMetaRepository
                 using var conn = _dbFactory.CreateConnection();
                 using var txn = conn.BeginTransaction();
 
-                // Single query to find existing paths
+                // Single query to find existing paths (also fetch FolderId to preserve it)
                 var paths = metas.Select(m => m.FilePath).Distinct().ToList();
-                var existing = await conn.QueryAsync<(string FilePath, long Id)>(
-                    "SELECT FilePath, Id FROM ImageMeta WHERE FilePath COLLATE NOCASE IN @Paths",
+                var existing = await conn.QueryAsync<(string FilePath, long Id, long? FolderId)>(
+                    "SELECT FilePath, Id, FolderId FROM ImageMeta WHERE FilePath COLLATE NOCASE IN @Paths",
                     new { Paths = paths }, txn);
 
-                var existingMap = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-                foreach (var (fp, id) in existing)
-                    existingMap[fp] = id;
+                var existingMap = new Dictionary<string, (long Id, long? FolderId)>(StringComparer.OrdinalIgnoreCase);
+                foreach (var (fp, id, folderId) in existing)
+                    existingMap[fp] = (id, folderId);
 
                 var now = DateTime.UtcNow;
                 foreach (var meta in metas)
                 {
-                    if (existingMap.TryGetValue(meta.FilePath, out var id))
+                    if (existingMap.TryGetValue(meta.FilePath, out var existingData))
                     {
-                        meta.Id = id;
+                        meta.Id = existingData.Id;
                         meta.UpdatedAt = now;
+                        // Preserve existing non-null FolderId (for subfolder files in "全展示" mode)
+                        if (existingData.FolderId.HasValue && existingData.FolderId.Value != 0)
+                            meta.FolderId = existingData.FolderId.Value;
                         await conn.ExecuteAsync(@"
                             UPDATE ImageMeta SET
                                 FileHash = @FileHash, PerceptualHash = @PerceptualHash,

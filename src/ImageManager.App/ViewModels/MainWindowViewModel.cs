@@ -1078,6 +1078,7 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         _idleTimer?.Stop();
         var folder = CurrentFolder;
+        var showAll = ShowAllSubfolders; // capture before Task.Run
         if (string.IsNullOrEmpty(folder)) return;
         var exts = FileTypeConstants.AllMediaExtensions.ToArray();
 
@@ -1092,7 +1093,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 var diskFiles = new HashSet<string>(_allFiles, StringComparer.OrdinalIgnoreCase);
 
                 // 清理孤立 DB 记录
-                await CleanMetaForFolderAsync(folder, diskFiles);
+                await CleanMetaForFolderAsync(folder, diskFiles, showAll);
 
                 // 预计算哈希 + 同步文件夹
                 if (folderId.HasValue)
@@ -1105,13 +1106,28 @@ public partial class MainWindowViewModel : ViewModelBase
         });
     }
 
-    private async Task CleanMetaForFolderAsync(string folderPath, HashSet<string> existingFiles)
+    private async Task CleanMetaForFolderAsync(string folderPath, HashSet<string> existingFiles, bool showAll)
     {
         try
         {
             var metas = await _metaRepo.GetByFolderAsync(folderPath);
+            var normalizedPath = PathHelper.NormalizeFolderPath(folderPath);
+
             foreach (var meta in metas)
             {
+                if (!showAll)
+                {
+                    // Non-showAll: only clean records for files directly in this folder,
+                    // not subfolder files (which are not in _allFiles / existingFiles).
+                    var metaDir = Path.GetDirectoryName(meta.FilePath);
+                    if (metaDir == null ||
+                        !string.Equals(
+                            PathHelper.NormalizeFolderPath(metaDir),
+                            normalizedPath,
+                            StringComparison.OrdinalIgnoreCase))
+                        continue;
+                }
+
                 if (!existingFiles.Contains(meta.FilePath))
                     _ = _metaRepo.DeleteByPathAsync(meta.FilePath);
             }
