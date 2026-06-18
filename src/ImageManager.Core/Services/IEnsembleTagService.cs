@@ -7,7 +7,7 @@ namespace ImageManager.Core.Services;
 public enum TagMode
 {
     SingleModel = 0,  // PixAI 单模型全量打标
-    Ensemble = 1       // 三模型专家流水线（WD Rating + PixAI general/character + Camie artist/copyright）
+    Ensemble = 1       // 双模型打标（WD Rating + PixAI general/character + embedding 画师识别）
 }
 
 public enum SystemRating
@@ -43,7 +43,7 @@ public readonly record struct ModelStatus(
 public class MergeConfig
 {
     public int MaxTags { get; set; } = 75;
-    public Dictionary<string, double> ModelThresholds { get; set; } = new()
+    public Dictionary<string, double> TagThresholds { get; set; } = new()
     {
         ["pixai"] = 0.30
     };

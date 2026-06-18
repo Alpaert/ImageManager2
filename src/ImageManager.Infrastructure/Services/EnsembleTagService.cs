@@ -5,11 +5,9 @@ using ImageManager.Core.Services;
 namespace ImageManager.Infrastructure.Services;
 
 /// <summary>
-/// 模式 B：三模型专家流水线服务。
-/// WD (裁判官) → Rating 分级
-/// PixAI (视觉总监) → Category 0(general) + 4(character)
-/// Camie (档案管理员) → Category 1(artist) + 3(copyright)
-/// 三模型并行推理 → TagResultMerger 中文层去重合并。
+/// 模式 B：双模型打标服务。
+/// WD → Rating 分级；PixAI → general/character 标签和 embedding。
+/// 画师识别使用 PixAI embedding 与本地画师库匹配。
 /// </summary>
 public class EnsembleTagService : IEnsembleTagService, IDisposable
 {
@@ -19,8 +17,6 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
     private readonly ChineseTagLibrary _chineseLib;
     private readonly ArtistEmbeddingStore _artistStore;
     private MergeConfig _mergeConfig = new();
-    private string _modelsRootDir = string.Empty;
-
     public TagMode Mode => TagMode.Ensemble;
     public bool IsModelLoaded => _wd.IsLoaded && _pixai.IsModelLoaded;
 
@@ -49,13 +45,12 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
     public void Configure(MergeConfig config)
     {
         _mergeConfig = config;
-        AppLogger.Info($"Ensemble 配置: maxTags={config.MaxTags} thresholds={string.Join(",", config.ModelThresholds.Select(kv => $"{kv.Key}={kv.Value}"))}");
+        AppLogger.Info($"Ensemble 配置: maxTags={config.MaxTags} thresholds={string.Join(",", config.TagThresholds.Select(kv => $"{kv.Key}={kv.Value}"))}");
     }
 
     public async Task LoadModelAsync(string modelsRootDir, CancellationToken ct = default)
     {
-        _modelsRootDir = modelsRootDir;
-        AppLogger.Info("=== 模式 B: 三模型专家流水线 加载开始 ===");
+        AppLogger.Info("=== 模式 B: 双模型打标 加载开始 ===");
 
         _pixai.SetEnsembleMode();
 
@@ -94,16 +89,13 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
 
         if (sample) AppLogger.Memory($"Ensemble#{callId}.Start {fileName}");
 
-        // 双模型并行推理（PixAI 合并 prediction+embedding 一次 Run）
-        var ratingTask = _wd.PredictRatingAsync(imagePath);
-        var pixaiTask = _pixai.PredictWithEmbeddingAsync(imagePath);
+        // Keep model inference sequential during batch auto-tagging. Running WD and
+        // PixAI at the same time doubles Skia/ONNX transient allocations per image.
+        var rating = await _wd.PredictRatingAsync(imagePath, ct);
+        if (sample) AppLogger.Memory($"Ensemble#{callId}.AfterRating {fileName}");
 
-        await Task.WhenAll(ratingTask, pixaiTask);
-
-        if (sample) AppLogger.Memory($"Ensemble#{callId}.AfterParallel {fileName}");
-
-        var rating = await ratingTask;
-        var (pixaiPreds, embedding) = await pixaiTask;
+        var (pixaiPreds, embedding) = await _pixai.PredictWithEmbeddingAsync(imagePath, ct);
+        if (sample) AppLogger.Memory($"Ensemble#{callId}.AfterPixai {fileName}");
 
         // 画师识别
         string? artistName = null;

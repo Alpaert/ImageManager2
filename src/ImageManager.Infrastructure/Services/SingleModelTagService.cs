@@ -6,15 +6,13 @@ namespace ImageManager.Infrastructure.Services;
 /// <summary>
 /// 模式 A：单模型打标服务。
 /// 使用 PixAI Tagger 全类别输出（EnabledCategories=null），
-/// 直接查 cnname 得中文，无 Rating 分级，无 camie 参与。
+/// 直接查 cnname 得中文，无 Rating 分级。
 /// </summary>
 public class SingleModelTagService : IEnsembleTagService, IDisposable
 {
     private readonly PixaiTagService _pixai;
     private readonly ChineseTagLibrary _chineseLib;
     private double _minConfidence = 0.15;
-    private string _modelsRootDir = string.Empty;
-
     public TagMode Mode => TagMode.SingleModel;
     public bool IsModelLoaded => _pixai.IsModelLoaded;
 
@@ -35,7 +33,6 @@ public class SingleModelTagService : IEnsembleTagService, IDisposable
 
     public async Task LoadModelAsync(string modelsRootDir, CancellationToken ct = default)
     {
-        _modelsRootDir = modelsRootDir;
         AppLogger.Info("=== 模式 A: 单模型打标 加载开始 ===");
 
         _pixai.SetAllCategoriesMode();

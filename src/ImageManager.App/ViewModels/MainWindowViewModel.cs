@@ -231,7 +231,7 @@ public partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     private async Task StopAutoTag()
     {
-        IsAutoTagRunning = false;
+        StatusText = "正在停止推理...";
         var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
         await controller.CancelAsync();
     }
@@ -259,6 +259,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private int _folderViewRequestVersion;
     private CancellationTokenSource? _searchCts;
     private readonly SemaphoreSlim _hashGate = new(1, 1);
+    private readonly SemaphoreSlim _maintenanceGate = new(1, 1);
     private CancellationTokenSource? _hashCts;
     private DispatcherTimer? _idleTimer;
     private FileSystemWatcher? _folderWatcher;
@@ -1084,18 +1085,16 @@ public partial class MainWindowViewModel : ViewModelBase
 
         _ = Task.Run(async () =>
         {
+            // 非阻塞获取：如果 AutoTag 正在运行则跳过本次维护
+            if (!await _maintenanceGate.WaitAsync(0)) return;
             try
             {
                 var folderInfo = await _folderRepo.GetByPathAsync(folder);
                 var folderId = folderInfo?.Id;
-                // 使用 _allFiles 而非重新枚举磁盘：保持与 PrecomputeHashesAsync 一致，
-                // 避免 CleanMeta 在 showAll 模式下误删子文件夹文件的 DB 记录
                 var diskFiles = new HashSet<string>(_allFiles, StringComparer.OrdinalIgnoreCase);
 
-                // 清理孤立 DB 记录
                 await CleanMetaForFolderAsync(folder, diskFiles, showAll);
 
-                // 预计算哈希 + 同步文件夹
                 if (folderId.HasValue)
                 {
                     await PrecomputeHashesAsync(CancellationToken.None, folderId);
@@ -1103,6 +1102,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 }
             }
             catch { }
+            finally { _maintenanceGate.Release(); }
         });
     }
 
@@ -1129,7 +1129,10 @@ public partial class MainWindowViewModel : ViewModelBase
                 }
 
                 if (!existingFiles.Contains(meta.FilePath))
-                    _ = _metaRepo.DeleteByPathAsync(meta.FilePath);
+                {
+                    try { await _metaRepo.DeleteByPathAsync(meta.FilePath); }
+                    catch (Exception ex) { AppLogger.Warn($"CleanMeta delete failed: {meta.FilePath} — {ex.Message}"); }
+                }
             }
         }
         catch { }

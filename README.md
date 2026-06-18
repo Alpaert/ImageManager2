@@ -69,7 +69,7 @@ models\
 
 **两种打标模式：**
 - **SingleModel** — 仅 PixAI，轻量快速
-- **Ensemble** — PixAI + WD14 双模型并行，带内容分级和画师识别
+- **Ensemble** — PixAI + WD14 双模型串行推理，带内容分级和画师识别
 
 ## 项目结构
 
@@ -85,7 +85,7 @@ src/
 
 **Ensemble 模式：**
 ```
-图片文件 → PixAI（标签推理 + 嵌入提取） + WD14（内容分级）并行推理
+图片文件 → WD14（内容分级）→ PixAI（标签推理 + 嵌入提取）
     → 合并去重 → ChineseTagLibrary 本地 CSV 查表替换中文
     → 画师识别（嵌入向量匹配）→ 直接写入数据库，标记 Done
 ```

@@ -18,13 +18,10 @@ public readonly record struct FolderTagActionResult(
 public class AutoTagPipelineService : IDisposable
 {
     private readonly IImageMetaRepository _metaRepo;
-    private readonly ITagRepository _tagRepo;
-    private readonly ITagMappingRepository _mappingRepo;
     private readonly IEnsembleTagService _tagService;
     private readonly IAutoTagStateRepository _stateRepo;
     private double _confidenceThreshold = 0.35;
     private int _maxTagsPerImage = 20;
-    private int _maxConcurrency = 1;  // GPU 推理时 1，避免显存争抢
     public event Action<AutoTagPipelineProgress>? ProgressChanged;
 
     // ==================== 内存诊断计数器 ====================
@@ -32,23 +29,18 @@ public class AutoTagPipelineService : IDisposable
 
     public AutoTagPipelineService(
         IImageMetaRepository metaRepo,
-        ITagRepository tagRepo,
-        ITagMappingRepository mappingRepo,
         IEnsembleTagService tagService,
         IAutoTagStateRepository stateRepo)
     {
         _metaRepo = metaRepo;
-        _tagRepo = tagRepo;
-        _mappingRepo = mappingRepo;
         _tagService = tagService;
         _stateRepo = stateRepo;
     }
 
-    public void Configure(double confidenceThreshold, int maxTagsPerImage, int maxConcurrency = 1)
+    public void Configure(double confidenceThreshold, int maxTagsPerImage)
     {
         _confidenceThreshold = confidenceThreshold;
         _maxTagsPerImage = maxTagsPerImage;
-        _maxConcurrency = maxConcurrency;
     }
 
     // ==================== Situation Assessment ====================
@@ -88,8 +80,9 @@ public class AutoTagPipelineService : IDisposable
 
     /// <returns>List of file paths that were actually processed (for post-pipeline refresh).</returns>
     public async Task<List<string>> RunInferenceAsync(long folderId, List<(long Id, string FilePath)> metas, string action,
-        CancellationToken ct = default)
+        CancellationToken ct = default, IEnsembleTagService? tagService = null)
     {
+        var activeTagService = tagService ?? _tagService;
         bool hasState = folderId > 0;
         int runId = Interlocked.Increment(ref _pipelineRunCount);
         int total = metas.Count;
@@ -158,7 +151,7 @@ public class AutoTagPipelineService : IDisposable
                     var meta = metas[i];
                     try
                     {
-                        var predictions = await _tagService.PredictAsync(meta.FilePath);
+                        var predictions = await activeTagService.PredictAsync(meta.FilePath, ct);
                         var filtered = predictions
                             .Where(p => p.Confidence >= _confidenceThreshold)
                             .Take(_maxTagsPerImage)

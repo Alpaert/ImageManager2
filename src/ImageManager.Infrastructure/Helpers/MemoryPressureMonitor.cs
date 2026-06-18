@@ -167,14 +167,16 @@ public static class MemoryPressureMonitor
                 return;
             _lastLevelRefresh = DateTime.UtcNow;
 
+            double heapMB = GC.GetTotalMemory(false) / 1048576.0;
             double score = ComputeScore();
             double commitMB = CommitChargeMB;
+            bool scoreIsMeaningful = heapMB >= 256;
 
-            if (score > 50 || commitMB > 8000)
+            if (commitMB > 8000 || (scoreIsMeaningful && score > 50))
                 _cachedLevel = PressureLevel.Critical;
-            else if (score > 20 || commitMB > 4000)
+            else if (commitMB > 6500 || (scoreIsMeaningful && score > 20))
                 _cachedLevel = PressureLevel.High;
-            else if (score > 5 || commitMB > 2000)
+            else if (commitMB > 4000 || (scoreIsMeaningful && score > 5))
                 _cachedLevel = PressureLevel.Medium;
             else
                 _cachedLevel = PressureLevel.Low;

@@ -17,7 +17,6 @@ namespace ImageManager.Infrastructure.Services;
 public class AutoTagOrchestrator : IDisposable
 {
     private readonly AutoTagPipelineService _pipeline;
-    private readonly IFolderRepository _folderRepo;
     private readonly IImageMetaRepository _metaRepo;
     private readonly ITagMappingRepository _mappingRepo;
     private readonly IEnsembleTagService _tagService;
@@ -30,9 +29,6 @@ public class AutoTagOrchestrator : IDisposable
     private readonly ArtistEmbeddingStore _artistStore;
     private readonly PixaiTagService _pixaiService;
     private readonly IMessenger _messenger;
-    private readonly IDispatcher _dispatcher;
-    private string _currentFolderPath = string.Empty;
-    private long _currentFolderId;
     private TagMode _currentMode = TagMode.Ensemble;
     private CancellationTokenSource? _cts;
 
@@ -41,7 +37,6 @@ public class AutoTagOrchestrator : IDisposable
 
     public AutoTagOrchestrator(
         AutoTagPipelineService pipeline,
-        IFolderRepository folderRepo,
         IImageMetaRepository metaRepo,
         ITagMappingRepository mappingRepo,
         IEnsembleTagService tagService,
@@ -53,11 +48,9 @@ public class AutoTagOrchestrator : IDisposable
         DeepSeekRecommendService recommendService,
         ArtistEmbeddingStore artistStore,
         PixaiTagService pixaiService,
-        IMessenger messenger,
-        IDispatcher dispatcher)
+        IMessenger messenger)
     {
         _pipeline = pipeline;
-        _folderRepo = folderRepo;
         _metaRepo = metaRepo;
         _mappingRepo = mappingRepo;
         _tagService = tagService;
@@ -70,7 +63,6 @@ public class AutoTagOrchestrator : IDisposable
         _artistStore = artistStore;
         _pixaiService = pixaiService;
         _messenger = messenger;
-        _dispatcher = dispatcher;
 
         // Wire pipeline progress → messenger
         _pipeline.ProgressChanged += p =>
@@ -95,7 +87,7 @@ public class AutoTagOrchestrator : IDisposable
             ensSvc?.Configure(new MergeConfig
             {
                 MaxTags = maxTagsPerImage,
-                ModelThresholds = new Dictionary<string, double>
+                TagThresholds = new Dictionary<string, double>
                 {
                     ["pixai"] = pixaiThreshold
                 },
@@ -131,9 +123,6 @@ public class AutoTagOrchestrator : IDisposable
 
     public async Task RunPipelineAsync(long folderId, string folderPath, List<string> filePaths, string action)
     {
-        _currentFolderPath = folderPath;
-        _currentFolderId = folderId;
-
         filePaths = filePaths.Where(f => FileTypeConstants.IsImageFile(f)).ToList();
         if (filePaths.Count == 0)
         {
@@ -200,7 +189,8 @@ public class AutoTagOrchestrator : IDisposable
         ResetCts();
         try
         {
-            LastProcessedPaths = await _pipeline.RunInferenceAsync(folderId, metas, action, _cts!.Token);
+            var activeTagService = _factory.Create(_currentMode);
+            LastProcessedPaths = await _pipeline.RunInferenceAsync(folderId, metas, action, _cts!.Token, activeTagService);
         }
         catch (OperationCanceledException)
         {

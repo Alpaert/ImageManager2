@@ -51,7 +51,11 @@ public class OnnxTagService : IAutoTagService, IDisposable
             if (!File.Exists(tagsPath))
                 await DownloadFileAsync($"{ModelRepo}/resolve/main/{TagsFile}", tagsPath, "标签");
 
-            _session = await Task.Run(() => new InferenceSession(onnxPath));
+            _session = await Task.Run(() =>
+            {
+                using var opts = new SessionOptions { EnableMemoryPattern = false };
+                return new InferenceSession(onnxPath, opts);
+            });
             _inputName = _session.InputNames[0];
             _outputName = _session.OutputNames[0];
             var inMeta = _session.InputMetadata[_inputName];

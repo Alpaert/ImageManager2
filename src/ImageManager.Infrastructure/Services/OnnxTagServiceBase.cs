@@ -31,13 +31,13 @@ public abstract class OnnxTagServiceBase : IDisposable
     /// <summary>默认最低置信度（可在 Postprocess 中覆盖）</summary>
     protected virtual double DefaultThreshold => 0.15;
 
-    /// <summary>CSV 中 tag_id 列索引（WD 为 0，pixai/camie 为 1）</summary>
+    /// <summary>CSV 中 tag_id 列索引（WD 为 0，pixai 为 1）</summary>
     protected virtual int CsvTagIdIndex => 0;
 
-    /// <summary>CSV 中 category 列索引（WD 为 2，pixai/camie 为 3）</summary>
+    /// <summary>CSV 中 category 列索引（WD 为 2，pixai 为 3）</summary>
     protected virtual int CsvCategoryIndex => 2;
 
-    /// <summary>模型输出是否需要手动 sigmoid（WD 内置 sigmoid→false，pixai/camie→false）</summary>
+    /// <summary>模型输出是否需要手动 sigmoid（WD 内置 sigmoid→false，pixai→false）</summary>
     protected virtual bool NeedsSigmoid => false;
 
     /// <summary>期望的输出名称（子类可覆盖），null=自动查找</summary>
@@ -231,7 +231,7 @@ public abstract class OnnxTagServiceBase : IDisposable
         {
             var opts = new SessionOptions();
             opts.AppendExecutionProvider_CUDA(0);
-            opts.EnableMemoryPattern = true;
+            opts.EnableMemoryPattern = false;
             session = new InferenceSession(onnxPath, opts);
             AppLogger.Info($"[{ModelSubDir}] CUDA GPU 加速已启用");
             return session;
@@ -240,7 +240,8 @@ public abstract class OnnxTagServiceBase : IDisposable
         {
             session?.Dispose();
             AppLogger.Warn($"[{ModelSubDir}] CUDA 不可用，回退 CPU: {ex.Message}");
-            return new InferenceSession(onnxPath);
+            using var opts = new SessionOptions { EnableMemoryPattern = false };
+            return new InferenceSession(onnxPath, opts);
         }
     }
 

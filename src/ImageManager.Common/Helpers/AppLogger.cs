@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
+using System.Text;
 
 namespace ImageManager.Common.Helpers;
 
@@ -53,7 +54,7 @@ public static class AppLogger
     /// </summary>
     public static void Memory(string phase, [CallerMemberName] string caller = "")
     {
-        var key = $"{caller}|{phase}";
+        var key = $"{caller}|{NormalizeMemoryPhase(phase)}";
         bool always = false;
         lock (_memThrottle)
         {
@@ -105,6 +106,53 @@ public static class AppLogger
             Write("MEM", $"{phase} | GC:{g0}/{g1}/{g2} | Heap={heapMB:F1}MB | WS={wsMB:F1}MB | Priv={privMB:F1}MB{availStr}", caller);
         }
         catch { /* 内存日志失败不应影响主流程 */ }
+    }
+
+    private static string NormalizeMemoryPhase(string phase)
+    {
+        if (string.IsNullOrEmpty(phase)) return phase;
+
+        var sb = new StringBuilder(phase.Length);
+        var previousWasToken = false;
+        foreach (var ch in phase)
+        {
+            if (char.IsDigit(ch))
+            {
+                if (!previousWasToken)
+                {
+                    sb.Append('#');
+                    previousWasToken = true;
+                }
+                continue;
+            }
+
+            previousWasToken = false;
+            sb.Append(ch);
+        }
+
+        var normalized = sb.ToString();
+        var lastSpace = normalized.LastIndexOf(' ');
+        var lastTokenStart = lastSpace >= 0 ? lastSpace + 1 : 0;
+        var fileExtIndex = normalized.LastIndexOf('.');
+        if (fileExtIndex > lastTokenStart && LooksLikeFileExtension(normalized, fileExtIndex))
+        {
+            if (lastSpace >= 0)
+                normalized = normalized[..(lastSpace + 1)] + "<file>";
+        }
+
+        return normalized;
+    }
+
+    private static bool LooksLikeFileExtension(string value, int dotIndex)
+    {
+        int extLength = value.Length - dotIndex - 1;
+        if (extLength is < 2 or > 5) return false;
+
+        for (int i = dotIndex + 1; i < value.Length; i++)
+        {
+            if (!char.IsLetterOrDigit(value[i])) return false;
+        }
+        return true;
     }
 
     private static void Write(string level, string message, string caller)

@@ -33,6 +33,7 @@ public partial class MainWindow : Window
     private MainWindowViewModel Vm => (MainWindowViewModel)DataContext!;
 
     private CancellationTokenSource? _scrollAnimCts;
+    private int _autoTagRunVersion;
 
     public MainWindow()
     {
@@ -1597,25 +1598,9 @@ public partial class MainWindow : Window
 
         Vm.StatusText = $"正在清空 {files.Count} 张图片的标签...";
         var clearRepo = App.Services.GetRequiredService<Core.Services.IImageMetaRepository>();
-        int cleared = 0;
-        await Task.Run(async () =>
-        {
-            foreach (var path in files)
-            {
-                try
-                {
-                    var meta = await clearRepo.GetByPathAsync(path);
-                    if (meta != null)
-                    {
-                        await clearRepo.SetTagsAsync(meta.Id, new List<string>());
-                        await clearRepo.SetAutoTagStatusByPathAsync(path, 0);
-                        Interlocked.Increment(ref cleared);
-                    }
-                }
-                catch (Exception ex) { AppLogger.Warn($"ClearTags fail: {path} {ex.Message}"); }
-            }
-        });
-        AppLogger.Info($"ClearTags: done cleared={cleared}/{files.Count}");
+        await Task.Run(() =>
+            clearRepo.ClearTagsAndStatusBatchAsync(files));
+        AppLogger.Info($"ClearTags: done cleared={files.Count}");
         foreach (var path in files)
             Vm.ClearTagCacheForPath(path);
         if (string.Equals(Vm.CurrentFolder, folder.Path, StringComparison.OrdinalIgnoreCase))
@@ -1623,7 +1608,7 @@ public partial class MainWindow : Window
             Vm.InvalidatePageCache();
             await Vm.ShowPageAsync(Vm.CurrentPage);
         }
-        Vm.StatusText = $"已清空 {cleared}/{files.Count} 张图片的标签";
+        Vm.StatusText = $"已清空 {files.Count} 张图片的标签";
     }
 
     private Task<bool?> ShowClearTagsDialogAsync()
@@ -1716,6 +1701,12 @@ public partial class MainWindow : Window
 
     private async Task RunAutoTagAsync(ViewModels.FolderTreeNode folder, List<string> filePaths)
     {
+        if (Vm.IsAutoTagRunning)
+        {
+            Vm.StatusText = "自动打标正在进行中";
+            return;
+        }
+
         var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
 
         if (!controller.IsModelLoaded)
@@ -1741,12 +1732,15 @@ public partial class MainWindow : Window
             settings.DeepSeekApiKey);
 
         var messenger = App.Services.GetRequiredService<IMessenger>();
-        messenger.Register<AutoTagProgressMessage>(this, (r, m) =>
+        // 用唯一 token 替代 this，避免旧 Task.Run 的 finally 误删新 handler
+        var msgToken = new object();
+        messenger.Register<AutoTagProgressMessage>(msgToken, (r, m) =>
         {
             App.UI.Post(() =>
                 Vm.StatusText = $"[{m.Phase}] {m.StatusText}");
         });
 
+        var runVersion = Interlocked.Increment(ref _autoTagRunVersion);
         Vm.IsAutoTagRunning = true;
         Vm.StatusText = $"正在推理 {filePaths.Count} 张图片...";
         _ = Task.Run(async () =>
@@ -1772,9 +1766,18 @@ public partial class MainWindow : Window
             }
             finally
             {
-                messenger.Unregister<AutoTagProgressMessage>(this);
-                await App.UI.InvokeAsync(() =>
-                    Vm.IsAutoTagRunning = false);
+                try { messenger.Unregister<AutoTagProgressMessage>(msgToken); }
+                catch (Exception ex) { AppLogger.Warn($"AutoTag unregister failed: {ex.Message}"); }
+
+                try
+                {
+                    await App.UI.InvokeAsync(() =>
+                    {
+                        if (runVersion == Volatile.Read(ref _autoTagRunVersion))
+                            Vm.IsAutoTagRunning = false;
+                    });
+                }
+                catch (Exception ex) { AppLogger.Warn($"AutoTag reset IsRunning failed: {ex.Message}"); }
             }
         });
     }

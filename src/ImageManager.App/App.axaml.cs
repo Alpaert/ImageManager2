@@ -1,3 +1,4 @@
+using System.Text;
 using Avalonia;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Media;
@@ -255,6 +256,28 @@ public partial class App : Application
             var vm = Services.GetRequiredService<MainWindowViewModel>();
             desktop.MainWindow = new MainWindow { DataContext = vm };
         }
+
+        // ========== 全局未处理异常捕获 ==========
+        // 捕获 fire-and-forget Task.Run 中被遗弃的异常（如 _ = Task.Run(...) 无 await）
+        TaskScheduler.UnobservedTaskException += (_, args) =>
+        {
+            var ex = args.Exception; // AggregateException，展开所有 inner
+            var sb = new StringBuilder();
+            sb.AppendLine("===== UnobservedTaskException =====");
+            foreach (var inner in ex.InnerExceptions)
+                sb.AppendLine(inner.ToString()); // 含完整类型、消息、堆栈
+            AppLogger.Error(sb.ToString());
+            args.SetObserved(); // 标记已处理，防止进程崩溃
+        };
+
+        // 捕获 async void / UI 线程 / 线程池等未处理异常
+        AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+        {
+            if (args.ExceptionObject is Exception ex)
+                AppLogger.Error($"===== UnhandledException =====\n{ex}");
+            else
+                AppLogger.Error($"===== UnhandledException (non-Exception) =====\n{args.ExceptionObject}");
+        };
 
         base.OnFrameworkInitializationCompleted();
         Common.Helpers.AppLogger.Memory("App.Init");

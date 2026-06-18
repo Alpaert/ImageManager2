@@ -71,12 +71,13 @@ public class PixaiTagService : OnnxTagServiceBase
     }
 
     /// <summary>合并推理：一次 session.Run 同时获取 prediction + embedding，省一次 Preprocess+Run</summary>
-    public async Task<(List<TagPrediction> tags, float[]? embedding)> PredictWithEmbeddingAsync(string imagePath)
+    public async Task<(List<TagPrediction> tags, float[]? embedding)> PredictWithEmbeddingAsync(string imagePath,
+        CancellationToken ct = default)
     {
         if (_session == null)
             throw new InvalidOperationException("Pixai: Model not loaded");
 
-        await _inferenceLock.WaitAsync();
+        await _inferenceLock.WaitAsync(ct);
         try
         {
             var result = await Task.Run(() =>
@@ -124,17 +125,18 @@ public class PixaiTagService : OnnxTagServiceBase
         {
             var result = await Task.Run(() =>
             {
-                // 逐张预处理
-                var tensors = new List<DenseTensor<float>>();
+                // 逐张预处理。Preprocess reuses a cached tensor, so copy each
+                // image immediately before the next preprocess overwrites it.
+                var tensorBuffers = new List<float[]>();
                 foreach (var path in paths)
                 {
                     var t = Preprocess(path);
-                    if (t != null) tensors.Add(t);
+                    if (t != null) tensorBuffers.Add(t.ToArray());
                 }
-                if (tensors.Count == 0) return null;
+                if (tensorBuffers.Count == 0) return null;
 
                 // 堆叠为 [N, 3, 448, 448]
-                int n = tensors.Count;
+                int n = tensorBuffers.Count;
                 var batch = new DenseTensor<float>(new[] { n, 3, InputSize, InputSize });
 
                 // 估算批处理 Tensor 的内存大小并通知 GC
@@ -145,11 +147,11 @@ public class PixaiTagService : OnnxTagServiceBase
                 {
                     for (int b = 0; b < n; b++)
                     {
-                        var src = tensors[b];
+                        var src = tensorBuffers[b];
                         for (int c = 0; c < 3; c++)
                             for (int y = 0; y < InputSize; y++)
                                 for (int x = 0; x < InputSize; x++)
-                                    batch[b, c, y, x] = src[0, c, y, x];
+                                    batch[b, c, y, x] = src[(c * InputSize + y) * InputSize + x];
                     }
 
                     var inputs = new List<Microsoft.ML.OnnxRuntime.NamedOnnxValue>

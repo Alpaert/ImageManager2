@@ -23,7 +23,7 @@ public class ChineseTagLibrary
             return;
         }
 
-        // pixai/camie CSV: id,tag_id,name,category,... → name at index 2
+        // pixai CSV: id,tag_id,name,category,... → name at index 2
         // WD CSV: tag_id,name,category,... → name at index 1
         int nameIdx = modelName == "wd14" ? 1 : 2;
 
@@ -49,7 +49,8 @@ public class ChineseTagLibrary
                 list = new List<string>();
                 _zhToEns[zh] = list;
             }
-            list.Add(en);
+            if (!list.Contains(en, StringComparer.OrdinalIgnoreCase))
+                list.Add(en);
             loaded++;
         }
 
