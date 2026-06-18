@@ -94,7 +94,11 @@ public class AutoTagPipelineService : IDisposable
         int runId = Interlocked.Increment(ref _pipelineRunCount);
         int total = metas.Count;
 
-        AppLogger.Memory($"Pipeline#{runId}.Start total={total} action={action}");
+        // 内存诊断：Pipeline 开始
+        double commitStart = MemoryPressureMonitor.CommitChargeMB;
+        double fragStart = MemoryPressureMonitor.FragmentationScore;
+        AppLogger.Memory($"Pipeline#{runId}.Start total={total} action={action} " +
+            $"commit={commitStart:F0}MB frag={fragStart:F1}");
 
         if (hasState)
         {
@@ -108,7 +112,7 @@ public class AutoTagPipelineService : IDisposable
         }
 
         var channel = Channel.CreateBounded<(long ImageId, string FilePath, List<TagPrediction> Predictions)>(
-            new BoundedChannelOptions(32) { SingleWriter = true, SingleReader = true,
+            new BoundedChannelOptions(16) { SingleWriter = true, SingleReader = true,
                 FullMode = BoundedChannelFullMode.Wait });
 
         int processed = 0;
@@ -121,6 +125,36 @@ public class AutoTagPipelineService : IDisposable
                 for (int i = 0; i < metas.Count; i++)
                 {
                     if (ct.IsCancellationRequested) break;
+
+                    // 内存压力检测 - 每 10 张图片检查一次
+                    if (i > 0 && i % 10 == 0)
+                    {
+                        var level = MemoryPressureMonitor.Current;
+
+                        if (level == MemoryPressureMonitor.PressureLevel.Critical)
+                        {
+                            AppLogger.Memory($"Pipeline#{runId} Critical pressure at {i}/{total}, emergency cleanup");
+                            MemoryPressureMonitor.EmergencyCleanup();
+                            // Critical 时等待 Consumer 处理积压
+                            await Task.Delay(200, ct);
+                        }
+                        else if (level == MemoryPressureMonitor.PressureLevel.High)
+                        {
+                            AppLogger.Memory($"Pipeline#{runId} High pressure at {i}/{total}, triggering LOH compact");
+                            MemoryPressureMonitor.CompactLoh();
+                            // High 时短暂暂停让 Consumer 追上
+                            await Task.Delay(100, ct);
+                        }
+
+                        // 每 50 张输出内存统计
+                        if (i % 50 == 0)
+                        {
+                            AppLogger.Memory($"Pipeline#{runId} progress {i}/{total} " +
+                                $"level={level} commit={MemoryPressureMonitor.CommitChargeMB:F0}MB " +
+                                $"frag={MemoryPressureMonitor.FragmentationScore:F1}");
+                        }
+                    }
+
                     var meta = metas[i];
                     try
                     {
@@ -132,6 +166,13 @@ public class AutoTagPipelineService : IDisposable
                         await channel.Writer.WriteAsync((meta.Id, meta.FilePath, filtered), ct);
                     }
                     catch (OperationCanceledException) { break; }
+                    catch (OutOfMemoryException ex)
+                    {
+                        AppLogger.Error($"Pipeline#{runId} OOM at {i}/{total}: {ex.Message}");
+                        MemoryPressureMonitor.EmergencyCleanup();
+                        errors.Enqueue($"{Path.GetFileName(meta.FilePath)}: 内存不足");
+                        continue;
+                    }
                     catch (Exception ex)
                     {
                         errors.Enqueue($"{Path.GetFileName(meta.FilePath)}: {ex.Message}");
@@ -219,7 +260,12 @@ public class AutoTagPipelineService : IDisposable
 
         int finished = Volatile.Read(ref processed);
         // === 内存诊断：Pipeline 结束 ===
-        AppLogger.Memory($"Pipeline#{runId}.End processed={finished}/{total} errors={errors.Count}");
+        double commitEnd = MemoryPressureMonitor.CommitChargeMB;
+        double fragEnd = MemoryPressureMonitor.FragmentationScore;
+        double memDelta = commitEnd - commitStart;
+        AppLogger.Memory($"Pipeline#{runId}.End processed={finished}/{total} errors={errors.Count} " +
+            $"commit={commitStart:F0}→{commitEnd:F0}MB (Δ{memDelta:+0;-0}MB) " +
+            $"frag={fragStart:F1}→{fragEnd:F1}");
 
         if (hasState)
         {

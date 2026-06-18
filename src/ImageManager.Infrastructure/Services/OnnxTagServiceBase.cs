@@ -1,5 +1,6 @@
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Helpers;
 using ImageManager.Infrastructure.Imaging;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -78,7 +79,11 @@ public abstract class OnnxTagServiceBase : IDisposable
         await _initLock.WaitAsync();
         try
         {
+            // 取消旧空闲定时器，防止它在加载期间或之后误释放新 session
+            lock (_idleLock) { _idleCts?.Cancel(); }
+
             if (_session != null) return;
+
             _modelDir = modelDir;
             Directory.CreateDirectory(_modelDir);
 
@@ -190,21 +195,33 @@ public abstract class OnnxTagServiceBase : IDisposable
                 try { await Task.Delay(TimeSpan.FromMinutes(1), ct); }
                 catch { return; }
                 if (!ct.IsCancellationRequested)
-                    DisposeSession();
+                {
+                    try { DisposeSession(); }
+                    catch (Exception ex) { AppLogger.Warn($"[{ModelSubDir}] DisposeSession 失败: {ex.Message}"); }
+                }
             });
         }
     }
 
     private void DisposeSession()
     {
-        lock (_idleLock)
+        // 先获取推理锁，确保没有正在进行的推理使用 _session
+        _inferenceLock.Wait();
+        try
         {
-            if (_session == null) return;
-            AppLogger.Info($"[{ModelSubDir}] 1 分钟未使用，释放 GPU 显存");
-            _session.Dispose();
-            _session = null;
-            _cachedTensor = null;
+            lock (_idleLock)
+            {
+                if (_session == null) return;
+                AppLogger.Info($"[{ModelSubDir}] 1 分钟未使用，释放 GPU 显存");
+                _session.Dispose();
+                _session = null;
+                // 显式清空 Tensor 缓存，释放托管内存
+                _cachedTensor = null;
+                // 触发 GC 回收大对象
+                GC.Collect(2, GCCollectionMode.Optimized, false);
+            }
         }
+        finally { _inferenceLock.Release(); }
     }
 
     private InferenceSession CreateSession(string onnxPath)
@@ -237,21 +254,26 @@ public abstract class OnnxTagServiceBase : IDisposable
         bool sample = callId % MemSampleInterval == 0;
         if (sample) AppLogger.Memory($"Preprocess.Enter #{callId} {Path.GetFileName(imagePath)}");
 
+        SKBitmap? original = null;
+        SKBitmap? rgb = null;
+        SKBitmap? squared = null;
+        SKBitmap? resized = null;
+
         try
         {
-            using var original = ThumbnailGenerator.DecodeForAnalysis(imagePath, 2048);
+            original = ThumbnailGenerator.DecodeForAnalysis(imagePath, 2048);
             if (original == null) return null;
 
             // 转换为 RGB 的 SKBitmap
-            using var rgb = ConvertToRgbBitmap(original);
+            rgb = ConvertToRgbBitmap(original);
 
             // 填充到正方形
-            using var squared = PreserveAspectRatio
+            squared = PreserveAspectRatio
                 ? ResizeKeepAspect(rgb, InputSize)
                 : WhitePadToSquare(rgb);
 
             // 缩放到目标尺寸
-            using var resized = squared.Resize(new SKSizeI(InputSize, InputSize),
+            resized = squared.Resize(new SKSizeI(InputSize, InputSize),
                 new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
             if (resized == null) return null;
 
@@ -293,6 +315,9 @@ public abstract class OnnxTagServiceBase : IDisposable
                 }
             }
 
+            // 记录大对象分配，用于内存压力监控
+            MemoryPressureMonitor.RecordAllocation();
+
             if (sample) AppLogger.Memory($"Preprocess.Exit #{callId}");
             return tensor;
         }
@@ -300,6 +325,14 @@ public abstract class OnnxTagServiceBase : IDisposable
         {
             AppLogger.Error($"Preprocess exception: {ex.Message}");
             return null;
+        }
+        finally
+        {
+            // 确保所有临时 SKBitmap 对象被释放，避免非托管内存泄漏
+            resized?.Dispose();
+            squared?.Dispose();
+            rgb?.Dispose();
+            original?.Dispose();
         }
     }
 
@@ -479,6 +512,7 @@ public abstract class OnnxTagServiceBase : IDisposable
             {
                 _session?.Dispose();
                 _session = null;
+                // 显式清空 Tensor 缓存，释放托管内存
                 _cachedTensor = null;
             }
         }
@@ -489,5 +523,8 @@ public abstract class OnnxTagServiceBase : IDisposable
 
         _inferenceLock.Dispose();
         _initLock.Dispose();
+
+        // 触发 GC 回收释放的资源
+        GC.Collect(2, GCCollectionMode.Optimized, false);
     }
 }

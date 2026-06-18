@@ -136,35 +136,48 @@ public class PixaiTagService : OnnxTagServiceBase
                 // 堆叠为 [N, 3, 448, 448]
                 int n = tensors.Count;
                 var batch = new DenseTensor<float>(new[] { n, 3, InputSize, InputSize });
-                for (int b = 0; b < n; b++)
+
+                // 估算批处理 Tensor 的内存大小并通知 GC
+                long batchMemoryBytes = (long)n * 3 * InputSize * InputSize * sizeof(float);
+                GC.AddMemoryPressure(batchMemoryBytes);
+
+                try
                 {
-                    var src = tensors[b];
-                    for (int c = 0; c < 3; c++)
-                        for (int y = 0; y < InputSize; y++)
-                            for (int x = 0; x < InputSize; x++)
-                                batch[b, c, y, x] = src[0, c, y, x];
+                    for (int b = 0; b < n; b++)
+                    {
+                        var src = tensors[b];
+                        for (int c = 0; c < 3; c++)
+                            for (int y = 0; y < InputSize; y++)
+                                for (int x = 0; x < InputSize; x++)
+                                    batch[b, c, y, x] = src[0, c, y, x];
+                    }
+
+                    var inputs = new List<Microsoft.ML.OnnxRuntime.NamedOnnxValue>
+                    {
+                        Microsoft.ML.OnnxRuntime.NamedOnnxValue.CreateFromTensor(_inputName, batch)
+                    };
+
+                    using var results = _session.Run(inputs);
+                    var embOut = results.FirstOrDefault(r => r.Name == "embedding");
+                    if (embOut == null) return null;
+
+                    var embTensor = embOut.AsTensor<float>();
+                    int embDim = embTensor.Dimensions[1]; // 1024
+                    var embeddings = new List<float[]>(n);
+                    for (int b = 0; b < n; b++)
+                    {
+                        var emb = new float[embDim];
+                        for (int d = 0; d < embDim; d++)
+                            emb[d] = embTensor[b, d];
+                        embeddings.Add(emb);
+                    }
+                    return embeddings;
                 }
-
-                var inputs = new List<Microsoft.ML.OnnxRuntime.NamedOnnxValue>
+                finally
                 {
-                    Microsoft.ML.OnnxRuntime.NamedOnnxValue.CreateFromTensor(_inputName, batch)
-                };
-
-                using var results = _session.Run(inputs);
-                var embOut = results.FirstOrDefault(r => r.Name == "embedding");
-                if (embOut == null) return null;
-
-                var embTensor = embOut.AsTensor<float>();
-                int embDim = embTensor.Dimensions[1]; // 1024
-                var embeddings = new List<float[]>(n);
-                for (int b = 0; b < n; b++)
-                {
-                    var emb = new float[embDim];
-                    for (int d = 0; d < embDim; d++)
-                        emb[d] = embTensor[b, d];
-                    embeddings.Add(emb);
+                    // 移除内存压力通知
+                    GC.RemoveMemoryPressure(batchMemoryBytes);
                 }
-                return embeddings;
             });
 
             ResetIdleTimer();
