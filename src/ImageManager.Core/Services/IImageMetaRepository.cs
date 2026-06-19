@@ -10,6 +10,8 @@ public interface IImageMetaRepository
     Task<List<ImageMeta>> GetByFolderIdAsync(long folderId);
     Task<int> CountByFolderIdAsync(long folderId);
     Task SetFolderIdAsync(string filePath, long folderId);
+    Task<int> UnlinkFolderIdAsync(long folderId);
+    Task<int> UnlinkOrphanFolderIdsAsync();
     Task<List<ImageMeta>> GetAllAsync();
     Task<long> UpsertAsync(ImageMeta meta);
     Task BulkUpsertAsync(List<ImageMeta> metas);

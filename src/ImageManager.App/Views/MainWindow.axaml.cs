@@ -129,8 +129,6 @@ public partial class MainWindow : Window
             try
             {
                 File.Delete(item.FilePath);
-                var repo = App.Services.GetRequiredService<Core.Services.IImageMetaRepository>();
-                await repo.DeleteByPathAsync(item.FilePath);
                 thumbCache.DeleteFromDiskCache(item.FilePath);
                 deletedPaths.Add(item.FilePath);
                 successCount++;
@@ -1065,6 +1063,7 @@ public partial class MainWindow : Window
 
         var ok = await ShowConfirmDialogAsync($"确定要清空 {selected.Count} 张选中图片的所有标签？");
         if (!ok) return;
+        AppLogger.Warn($"ClearSelectedTags confirmed count={selected.Count}");
 
         var repo = App.Services.GetRequiredService<Core.Services.IImageMetaRepository>();
         await Task.Run(async () =>
@@ -1090,6 +1089,8 @@ public partial class MainWindow : Window
             item.Tags.Clear();
             item.NotifyAll();
         }
+        await Vm.RefreshTagCountsAsync(forceRefresh: true);
+        AppLogger.Info($"ClearSelectedTags tag counts refreshed count={selected.Count}");
         Vm.StatusText = $"已清空 {selected.Count} 张图片的标签";
     }
 
@@ -1164,6 +1165,8 @@ public partial class MainWindow : Window
                 {
                     foreach (var path in actualPaths)
                         await Vm.RefreshImageTagsAsync(path);
+                    await Vm.RefreshTagCountsAsync(forceRefresh: true);
+                    AppLogger.Info($"SelectedAutoTag tag counts refreshed count={actualPaths.Count}");
                     Vm.StatusText = $"打标完成 ({actualPaths.Count} 张)";
                 });
             }
@@ -1608,6 +1611,8 @@ public partial class MainWindow : Window
             Vm.InvalidatePageCache();
             await Vm.ShowPageAsync(Vm.CurrentPage);
         }
+        await Vm.RefreshTagCountsAsync(forceRefresh: true);
+        AppLogger.Info($"ClearFolderTags tag counts refreshed count={files.Count} recursive={recursive}");
         Vm.StatusText = $"已清空 {files.Count} 张图片的标签";
     }
 
@@ -1757,6 +1762,11 @@ public partial class MainWindow : Window
                             : $"打标完成 ({filePaths.Count} 张，全部已跳过)";
                     foreach (var path in processed)
                         await Vm.RefreshImageTagsAsync(path);
+                    if (processed.Count > 0)
+                    {
+                        await Vm.RefreshTagCountsAsync(forceRefresh: true);
+                        AppLogger.Info($"AutoTag tag counts refreshed processed={processed.Count}");
+                    }
                 });
             }
             catch (Exception ex)

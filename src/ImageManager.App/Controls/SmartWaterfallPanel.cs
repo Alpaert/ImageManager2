@@ -441,6 +441,7 @@ public class SmartWaterfallPanel : Panel
     private Size MeasureDefault(Size availableSize)
     {
         double itemWidth = ColumnWidth;
+        double cellWidth = itemWidth + 10; // Matches thumbnail template Margin=5 on both sides.
         SetValue(ItemWidthProperty, itemWidth);
         _childWidths.Clear();
         _rows.Clear();
@@ -450,16 +451,16 @@ public class SmartWaterfallPanel : Panel
 
         foreach (Control child in Children)
         {
-            child.Measure(new Size(itemWidth, double.PositiveInfinity));
-            _childWidths[child] = child.DesiredSize.Width;
+            child.Measure(new Size(cellWidth, double.PositiveInfinity));
+            _childWidths[child] = cellWidth;
 
-            if (curX + child.DesiredSize.Width > availableSize.Width && curX > 0)
+            if (curX + cellWidth > availableSize.Width && curX > 0)
             {
                 _rows.Add(new RowInfo { Y = curY, Height = maxRowH, Children = new List<Control>(currentRow) });
                 curX = 0; curY += maxRowH; maxRowH = 0;
                 currentRow.Clear();
             }
-            curX += child.DesiredSize.Width;
+            curX += cellWidth;
             maxRowH = Math.Max(maxRowH, child.DesiredSize.Height);
             currentRow.Add(child);
         }

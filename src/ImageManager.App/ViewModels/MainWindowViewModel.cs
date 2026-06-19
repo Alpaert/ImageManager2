@@ -394,6 +394,10 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             try
             {
+                var orphanFolders = await _metaRepo.UnlinkOrphanFolderIdsAsync();
+                if (orphanFolders > 0)
+                    AppLogger.Info($"ImageMeta orphan FolderId unlinked count={orphanFolders}");
+
                 var unlinked = await _metaRepo.GetAllUnlinkedAsync();
                 foreach (var m in unlinked)
                     _thumbCache.DeleteFromDiskCache(m.FilePath);
@@ -447,6 +451,12 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             try
             {
+                if (SelectedFolderNode.DbId > 0)
+                {
+                    var unlinked = await _metaRepo.UnlinkFolderIdAsync(SelectedFolderNode.DbId);
+                    AppLogger.Info($"RemoveFolder unlink folderId={SelectedFolderNode.DbId} path={SelectedFolderNode.Path} count={unlinked}");
+                }
+
                 var metas = await _metaRepo.GetByFolderAsync(SelectedFolderNode.Path);
                 foreach (var meta in metas)
                     _thumbCache.DeleteFromDiskCache(meta.FilePath);
@@ -899,7 +909,6 @@ public partial class MainWindowViewModel : ViewModelBase
 
         var files = _allFiles.ToArray();
         if (files.Length == 0) return;
-        AppLogger.Memory($"HashPrecompute.Start total={files.Length}");
 
         HashSet<string> existingSet = await GetHashedPathsWithRetryAsync(files);
 
@@ -907,7 +916,12 @@ public partial class MainWindowViewModel : ViewModelBase
             .Where(f => !existingSet.Contains(f))
             .Where(f => FileTypeConstants.IsImageFile(f))  // Skip video files
             .ToList();
-        if (needsHashing.Count == 0) return;
+        AppLogger.Memory($"HashPrecompute.Start totalFiles={files.Length} hashed={existingSet.Count} needsHashing={needsHashing.Count}");
+        if (needsHashing.Count == 0)
+        {
+            AppLogger.Memory($"HashPrecompute.End processed=0 totalFiles={files.Length} hashed={existingSet.Count} needsHashing=0");
+            return;
+        }
 
         // Pre-query existing FileHash to avoid recomputing MD5 for files already
         // indexed by SyncFolderAsync (which stores FileHash with HashStatus=0)
@@ -1156,10 +1170,10 @@ public partial class MainWindowViewModel : ViewModelBase
                         continue;
                 }
 
-                if (!existingFiles.Contains(meta.FilePath))
+                if (!existingFiles.Contains(meta.FilePath) && !File.Exists(meta.FilePath))
                 {
-                    try { await _metaRepo.DeleteByPathAsync(meta.FilePath); }
-                    catch (Exception ex) { AppLogger.Warn($"CleanMeta delete failed: {meta.FilePath} — {ex.Message}"); }
+                    try { await _metaRepo.SetFolderIdAsync(meta.FilePath, 0L); }
+                    catch (Exception ex) { AppLogger.Warn($"CleanMeta unlink failed: {meta.FilePath} — {ex.Message}"); }
                 }
             }
         }
@@ -1959,7 +1973,11 @@ partial void OnCornerRadiusDipChanged(double value)
             TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
             PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
 
-            if (_pageManager.TryRestorePreSearchState(out _, out var pageIndex))
+            if (ShowAllSubfolders && !string.IsNullOrEmpty(CurrentFolder))
+            {
+                await RebuildFileListAsync();
+            }
+            else if (_pageManager.TryRestorePreSearchState(out _, out var pageIndex))
             {
                 await ShowPageAsync(pageIndex);
                 StatusText = $"总文件数: {_allFiles.Count}";
@@ -2271,7 +2289,11 @@ partial void OnCornerRadiusDipChanged(double value)
         TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
 
-        if (_pageManager.TryRestorePreSearchState(out _, out var pageIndex))
+        if (ShowAllSubfolders && !string.IsNullOrEmpty(CurrentFolder))
+        {
+            _ = RebuildFileListAsync();
+        }
+        else if (_pageManager.TryRestorePreSearchState(out _, out var pageIndex))
         {
             _ = ShowPageAsync(pageIndex);
             StatusText = $"总文件数: {_allFiles.Count}";
@@ -2401,6 +2423,10 @@ partial void OnCornerRadiusDipChanged(double value)
         }
 
         _tagSearch.AllTagCounts = counts;
+        if (!string.IsNullOrWhiteSpace(TagSearchText))
+        {
+            await _dispatcher.InvokeAsync(() => UpdateTagSuggestions(TagSearchText));
+        }
     }
 
     public List<TagCount> GetAllTagCounts()
@@ -2595,6 +2621,7 @@ partial void OnCornerRadiusDipChanged(double value)
             missing = paths.Where(p => !_tagCacheByPath.ContainsKey(p)).ToList();
         }
         if (missing.Count == 0) return;
+        Dictionary<string, List<string>> loadedTags = new(StringComparer.OrdinalIgnoreCase);
         await Task.Run(async () =>
         {
             var tagMap = await _metaRepo.GetTagMapByPathsAsync(missing);
@@ -2602,8 +2629,23 @@ partial void OnCornerRadiusDipChanged(double value)
             {
                 foreach (var path in missing)
                 {
-                    _tagCacheByPath[path] = tagMap.TryGetValue(path, out var tags)
-                        ? tags : new List<string>();
+                    var tags = tagMap.TryGetValue(path, out var found)
+                        ? found : new List<string>();
+                    _tagCacheByPath[path] = tags;
+                    loadedTags[path] = tags;
+                }
+            }
+        });
+        if (loadedTags.Count == 0) return;
+
+        await _dispatcher.InvokeAsync(() =>
+        {
+            foreach (var item in Images)
+            {
+                if (loadedTags.TryGetValue(item.FilePath, out var tags))
+                {
+                    item.Tags = new List<string>(tags);
+                    item.NotifyAll();
                 }
             }
         });

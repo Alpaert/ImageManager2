@@ -90,6 +90,27 @@ public class ImageMetaRepository : IImageMetaRepository
             new { FolderId = folderId, FilePath = filePath });
     }
 
+    public async Task<int> UnlinkFolderIdAsync(long folderId)
+    {
+        using var conn = _dbFactory.CreateConnection();
+        return await conn.ExecuteAsync(
+            "UPDATE ImageMeta SET FolderId = 0 WHERE FolderId = @FolderId",
+            new { FolderId = folderId });
+    }
+
+    public async Task<int> UnlinkOrphanFolderIdsAsync()
+    {
+        using var conn = _dbFactory.CreateConnection();
+        return await conn.ExecuteAsync(@"
+            UPDATE ImageMeta
+            SET FolderId = 0
+            WHERE FolderId IS NOT NULL
+              AND FolderId != 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM Folder f WHERE f.Id = ImageMeta.FolderId
+              )");
+    }
+
     public async Task<List<ImageMeta>> GetAllAsync()
     {
         using var conn = _dbFactory.CreateConnection();
@@ -113,8 +134,11 @@ public class ImageMetaRepository : IImageMetaRepository
         using var conn = _dbFactory.CreateConnection();
         using var txn = conn.BeginTransaction();
 
-        var existing = await conn.QuerySingleOrDefaultAsync<(long Id, long? FolderId)>(
-            "SELECT Id, FolderId FROM ImageMeta WHERE FilePath = @FilePath COLLATE NOCASE",
+        var existing = await conn.QuerySingleOrDefaultAsync<(long Id, long? FolderId, long? ExistingFolderId)>(@"
+            SELECT im.Id, im.FolderId, f.Id AS ExistingFolderId
+            FROM ImageMeta im
+            LEFT JOIN Folder f ON f.Id = im.FolderId
+            WHERE im.FilePath = @FilePath COLLATE NOCASE",
             new { meta.FilePath }, txn);
 
         if (existing != default)
@@ -122,7 +146,7 @@ public class ImageMetaRepository : IImageMetaRepository
             meta.Id = existing.Id;
             meta.UpdatedAt = DateTime.UtcNow;
             // Preserve existing non-null FolderId (for subfolder files in "全展示" mode)
-            if (existing.FolderId.HasValue && existing.FolderId.Value != 0)
+            if (existing.FolderId.HasValue && existing.FolderId.Value != 0 && existing.ExistingFolderId.HasValue)
                 meta.FolderId = existing.FolderId.Value;
             await conn.ExecuteAsync(@"
                 UPDATE ImageMeta SET
@@ -159,15 +183,18 @@ public class ImageMetaRepository : IImageMetaRepository
                 using var conn = _dbFactory.CreateConnection();
                 using var txn = conn.BeginTransaction();
 
-                // Single query to find existing paths (also fetch FolderId to preserve it)
+                // Single query to find existing paths. Preserve FolderId only if it still points at a Folder row.
                 var paths = metas.Select(m => m.FilePath).Distinct().ToList();
-                var existing = await conn.QueryAsync<(string FilePath, long Id, long? FolderId)>(
-                    "SELECT FilePath, Id, FolderId FROM ImageMeta WHERE FilePath COLLATE NOCASE IN @Paths",
+                var existing = await conn.QueryAsync<(string FilePath, long Id, long? FolderId, long? ExistingFolderId)>(@"
+                    SELECT im.FilePath, im.Id, im.FolderId, f.Id AS ExistingFolderId
+                    FROM ImageMeta im
+                    LEFT JOIN Folder f ON f.Id = im.FolderId
+                    WHERE im.FilePath COLLATE NOCASE IN @Paths",
                     new { Paths = paths }, txn);
 
-                var existingMap = new Dictionary<string, (long Id, long? FolderId)>(StringComparer.OrdinalIgnoreCase);
-                foreach (var (fp, id, folderId) in existing)
-                    existingMap[fp] = (id, folderId);
+                var existingMap = new Dictionary<string, (long Id, long? FolderId, bool FolderExists)>(StringComparer.OrdinalIgnoreCase);
+                foreach (var (fp, id, folderId, existingFolderId) in existing)
+                    existingMap[fp] = (id, folderId, existingFolderId.HasValue);
 
                 var now = DateTime.UtcNow;
                 foreach (var meta in metas)
@@ -177,7 +204,7 @@ public class ImageMetaRepository : IImageMetaRepository
                         meta.Id = existingData.Id;
                         meta.UpdatedAt = now;
                         // Preserve existing non-null FolderId (for subfolder files in "全展示" mode)
-                        if (existingData.FolderId.HasValue && existingData.FolderId.Value != 0)
+                        if (existingData.FolderId.HasValue && existingData.FolderId.Value != 0 && existingData.FolderExists)
                             meta.FolderId = existingData.FolderId.Value;
                         await conn.ExecuteAsync(@"
                             UPDATE ImageMeta SET
