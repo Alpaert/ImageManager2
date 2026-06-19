@@ -2020,7 +2020,6 @@ public partial class MainWindow : Window
     {
         MemorySettingViewModel? memVm = null;
         memVm = new MemorySettingViewModel(
-            Vm.AppSettings.ThumbnailCacheMaxMB,
             Vm.AppSettings.DiskCacheDirectory,
             Vm.AppSettings.DeepSeekApiKey,
             Vm.AppSettings.TagMode,
@@ -2028,11 +2027,9 @@ public partial class MainWindow : Window
             Vm.AppSettings.EnsemblePixaiMinConfidence,
             Vm.AppSettings.ArtistMatchThreshold,
             Vm.AppSettings.SingleModelMinConfidence,
-            () => App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>().EstimatedMemoryBytes,
             path => new Infrastructure.Caching.DiskThumbnailCache(path).EstimateDiskUsage(),
             pathChanged =>
             {
-                Vm.AppSettings.ThumbnailCacheMaxMB = memVm!.MaxCacheMB;
                 var oldPath = Vm.AppSettings.DiskCacheDirectory;
                 var newPath = memVm.CachePath;
                 Vm.AppSettings.DiskCacheDirectory = newPath;

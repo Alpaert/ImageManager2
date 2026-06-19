@@ -5,10 +5,8 @@ namespace ImageManager.App.ViewModels;
 
 public partial class MemorySettingViewModel : ViewModelBase
 {
-    [ObservableProperty] private int _maxCacheMB = 512;
     [ObservableProperty] private string _cachePath =
         System.IO.Path.Combine(AppContext.BaseDirectory, "Cache");
-    [ObservableProperty] private string _currentUsageHint = string.Empty;
     [ObservableProperty] private string _diskUsageHint = string.Empty;
     [ObservableProperty] private string _deepSeekApiKey = string.Empty;
 
@@ -25,21 +23,18 @@ public partial class MemorySettingViewModel : ViewModelBase
     [ObservableProperty] private double _singleModelMinConfidence = 0.15;
 
     public Action<bool>? OnSave { get; set; }
-    public Func<long>? GetCurrentCacheBytes { get; set; }
     public Func<string, long>? GetDiskUsage { get; set; }
 
     private string _originalCachePath = string.Empty;
 
-    public MemorySettingViewModel(int maxCacheMB, string cachePath,
+    public MemorySettingViewModel(string cachePath,
         string deepSeekApiKey,
         int tagMode, int ensembleMaxTags,
         double pixaiMinConfidence, double artistMatchThreshold,
         double singleModelMinConfidence,
-        Func<long>? getCurrentCacheBytes,
         Func<string, long>? getDiskUsage,
         Action<bool>? onSave)
     {
-        _maxCacheMB = maxCacheMB > 0 ? maxCacheMB : 512;
         _cachePath = cachePath;
         _deepSeekApiKey = deepSeekApiKey ?? string.Empty;
         _tagMode = tagMode;
@@ -48,7 +43,6 @@ public partial class MemorySettingViewModel : ViewModelBase
         _artistMatchThreshold = artistMatchThreshold > 0 ? artistMatchThreshold : 0.35;
         _singleModelMinConfidence = singleModelMinConfidence > 0 ? singleModelMinConfidence : 0.15;
         _originalCachePath = cachePath;
-        GetCurrentCacheBytes = getCurrentCacheBytes;
         GetDiskUsage = getDiskUsage;
         OnSave = onSave;
 
@@ -69,11 +63,6 @@ public partial class MemorySettingViewModel : ViewModelBase
 
     private void UpdateHints()
     {
-        if (GetCurrentCacheBytes != null)
-        {
-            double curMb = GetCurrentCacheBytes() / 1024.0 / 1024.0;
-            CurrentUsageHint = $"当前缩略图缓存估算占用约 {curMb:0.0} MB。（上限：{MaxCacheMB} MB）";
-        }
         if (GetDiskUsage != null)
         {
             double diskMb = GetDiskUsage(CachePath) / 1024.0 / 1024.0;
@@ -86,9 +75,6 @@ public partial class MemorySettingViewModel : ViewModelBase
     [RelayCommand]
     private void Save()
     {
-        if (MaxCacheMB < 64) MaxCacheMB = 64;
-        if (MaxCacheMB > 4096) MaxCacheMB = 4096;
-
         bool pathChanged = !string.Equals(
             (CachePath ?? "").TrimEnd('\\', '/'),
             (_originalCachePath ?? "").TrimEnd('\\', '/'),

@@ -26,6 +26,8 @@ public class OnnxTagService : IAutoTagService, IDisposable
     private string _modelDir = string.Empty;
     private DenseTensor<float>? _cachedTensor;
     private SKBitmap? _scratchBitmap;
+    private CancellationTokenSource? _idleCts;
+    private readonly object _idleLock = new();
 
     // === 鍐呭瓨璇婃柇閲囨牱璁℃暟鍣?===
     private int _preprocessCount;
@@ -39,6 +41,8 @@ public class OnnxTagService : IAutoTagService, IDisposable
         await _initLock.WaitAsync();
         try
         {
+            lock (_idleLock) { _idleCts?.Cancel(); }
+
             if (_session != null) return;
 
             _modelDir = modelPath;
@@ -70,13 +74,14 @@ public class OnnxTagService : IAutoTagService, IDisposable
 
     public async Task<List<TagPrediction>> PredictAsync(string imagePath, CancellationToken ct = default)
     {
-        if (_session == null)
-            throw new InvalidOperationException("Model not loaded");
-
         await _inferenceLock.WaitAsync(ct);
         try
         {
-            return await Task.Run(() =>
+            var session = _session;
+            if (session == null)
+                throw new InvalidOperationException("Model not loaded");
+
+            var result = await Task.Run(() =>
             {
                 var tensor = Preprocess(imagePath);
                 if (tensor == null)
@@ -91,7 +96,7 @@ public class OnnxTagService : IAutoTagService, IDisposable
                     NamedOnnxValue.CreateFromTensor(_inputName, tensor)
                 };
 
-                using var results = _session.Run(inputs);
+                using var results = session.Run(inputs);
                 var output = results[0].AsTensor<float>();
                 var probs = output.ToArray(); // model already has sigmoid built-in
 
@@ -120,6 +125,51 @@ public class OnnxTagService : IAutoTagService, IDisposable
                 predictions.Sort((a, b) => b.Confidence.CompareTo(a.Confidence));
                 return predictions;
             });
+
+            ResetIdleTimer();
+            return result;
+        }
+        finally { _inferenceLock.Release(); }
+    }
+
+    private void ResetIdleTimer()
+    {
+        lock (_idleLock)
+        {
+            _idleCts?.Cancel();
+            _idleCts?.Dispose();
+            _idleCts = new CancellationTokenSource();
+            var ct = _idleCts.Token;
+            _ = Task.Run(async () =>
+            {
+                try { await Task.Delay(TimeSpan.FromMinutes(1), ct); }
+                catch { return; }
+                if (!ct.IsCancellationRequested)
+                {
+                    try { DisposeSession(); }
+                    catch (Exception ex) { AppLogger.Warn($"[wd] DisposeSession 失败: {ex.Message}"); }
+                }
+            });
+        }
+    }
+
+    private void DisposeSession()
+    {
+        _inferenceLock.Wait();
+        try
+        {
+            lock (_idleLock)
+            {
+                if (_session == null) return;
+                AppLogger.Info("[wd] 1 分钟未使用，释放 GPU 显存");
+                _session.Dispose();
+                _session = null;
+                _cachedTensor = null;
+                _scratchBitmap?.Dispose();
+                _scratchBitmap = null;
+                GC.Collect(2, GCCollectionMode.Optimized, false);
+                AppLogger.Memory("[wd] AfterIdleDispose");
+            }
         }
         finally { _inferenceLock.Release(); }
     }
@@ -256,6 +306,13 @@ public class OnnxTagService : IAutoTagService, IDisposable
 
     public void Dispose()
     {
+        lock (_idleLock)
+        {
+            _idleCts?.Cancel();
+            _idleCts?.Dispose();
+            _idleCts = null;
+        }
+
         // Wait for any in-flight inference to finish before disposing _session
         _inferenceLock.Wait();
         try

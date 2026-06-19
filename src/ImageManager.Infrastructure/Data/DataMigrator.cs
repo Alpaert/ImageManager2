@@ -133,7 +133,6 @@ public class DataMigrator
         settings.ThumbnailBorderColor = oldData.ThumbnailBorderColor ?? "#FF808080";
         settings.ThumbnailBackgroundColor = oldData.ThumbnailBackgroundColor ?? "#CCFFFFFF";
         settings.ThumbnailOpacity = oldData.ThumbnailOpacity > 0 ? oldData.ThumbnailOpacity : 1.0;
-        settings.ThumbnailCacheMaxMB = oldData.ThumbnailCacheMaxMB > 0 ? oldData.ThumbnailCacheMaxMB : 512;
         settings.DiskCacheDirectory = oldData.DiskCacheDirectory ?? @"C:\ImageManagerCache";
         settings.MaxTagSuggestionCount = oldData.MaxTagSuggestionCount > 0 ? oldData.MaxTagSuggestionCount : 30;
         settings.LastFolder = oldData.LastFolder ?? "";
@@ -175,7 +174,6 @@ public class DataMigrator
         public string? ThumbnailBorderColor { get; set; }
         public string? ThumbnailBackgroundColor { get; set; }
         public double ThumbnailOpacity { get; set; } = 1.0;
-        public int ThumbnailCacheMaxMB { get; set; } = 512;
         public string? DiskCacheDirectory { get; set; }
     }
 

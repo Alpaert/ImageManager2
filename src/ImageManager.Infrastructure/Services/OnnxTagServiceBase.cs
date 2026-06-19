@@ -222,6 +222,7 @@ public abstract class OnnxTagServiceBase : IDisposable
                 _scratchBitmap = null;
                 // 触发 GC 回收大对象
                 GC.Collect(2, GCCollectionMode.Optimized, false);
+                AppLogger.Memory($"[{ModelSubDir}] AfterIdleDispose");
             }
         }
         finally { _inferenceLock.Release(); }
