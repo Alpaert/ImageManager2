@@ -1,4 +1,4 @@
-using ImageManager.Common.Helpers;
+﻿using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Imaging;
 using Microsoft.ML.OnnxRuntime;
@@ -25,8 +25,9 @@ public class OnnxTagService : IAutoTagService, IDisposable
     private readonly SemaphoreSlim _inferenceLock = new(1, 1);
     private string _modelDir = string.Empty;
     private DenseTensor<float>? _cachedTensor;
+    private SKBitmap? _scratchBitmap;
 
-    // === 内存诊断采样计数器 ===
+    // === 鍐呭瓨璇婃柇閲囨牱璁℃暟鍣?===
     private int _preprocessCount;
     private const int MemSampleInterval = 100;
 
@@ -47,14 +48,13 @@ public class OnnxTagService : IAutoTagService, IDisposable
             var tagsPath = Path.Combine(_modelDir, TagsFile);
 
             if (!File.Exists(onnxPath))
-                await DownloadFileAsync($"{ModelRepo}/resolve/main/{ModelFile}", onnxPath, "模型");
+                await DownloadFileAsync($"{ModelRepo}/resolve/main/{ModelFile}", onnxPath, "\u6a21\u578b");
             if (!File.Exists(tagsPath))
-                await DownloadFileAsync($"{ModelRepo}/resolve/main/{TagsFile}", tagsPath, "标签");
+                await DownloadFileAsync($"{ModelRepo}/resolve/main/{TagsFile}", tagsPath, "\u6807\u7b7e");
 
             _session = await Task.Run(() =>
             {
-                using var opts = new SessionOptions { EnableMemoryPattern = false };
-                return new InferenceSession(onnxPath, opts);
+                return OnnxSessionFactory.Create(onnxPath, "wd");
             });
             _inputName = _session.InputNames[0];
             _outputName = _session.OutputNames[0];
@@ -63,7 +63,7 @@ public class OnnxTagService : IAutoTagService, IDisposable
             _tagNames = await Task.Run(() => ParseTagsCsv(tagsPath));
 
             ProgressChanged?.Invoke(new AutoTagProgress(0, 0,
-                $"模型已加载 输入:{_inputName} 形状:{_modelShapeInfo} 标签:{_tagNames.Length}个"));
+                $"\u6a21\u578b\u5df2\u52a0\u8f7d \u8f93\u5165:{_inputName} \u5f62\u72b6:{_modelShapeInfo} \u6807\u7b7e:{_tagNames.Length}\u4e2a"));
         }
         finally { _initLock.Release(); }
     }
@@ -82,7 +82,7 @@ public class OnnxTagService : IAutoTagService, IDisposable
                 if (tensor == null)
                 {
                     if (Interlocked.Increment(ref _predictCount) == 1)
-                        ProgressChanged?.Invoke(new AutoTagProgress(0, 0, "预处理失败: 图片无法解码"));
+                        ProgressChanged?.Invoke(new AutoTagProgress(0, 0, "\u9884\u5904\u7406\u5931\u8d25: \u56fe\u7247\u65e0\u6cd5\u89e3\u7801"));
                     return new List<TagPrediction>();
                 }
 
@@ -113,7 +113,7 @@ public class OnnxTagService : IAutoTagService, IDisposable
                 {
                     var sample = predictions.Take(3).Select(p => $"{p.TagName}({p.Confidence:F2})");
                     ProgressChanged?.Invoke(new AutoTagProgress(0, 0,
-                        $"首图推理: maxProb={maxProb:F4} aboveThreshold={aboveThreshold} " +
+                        $"\u9996\u56fe\u63a8\u7406: maxProb={maxProb:F4} aboveThreshold={aboveThreshold} " +
                         $"top3=[{string.Join(", ", sample)}] shape={_modelShapeInfo}"));
                 }
 
@@ -124,34 +124,20 @@ public class OnnxTagService : IAutoTagService, IDisposable
         finally { _inferenceLock.Release(); }
     }
 
-    // Preprocessing: square white-pad → 448 resize → float32 0-255 → BGR → NHWC [1,448,448,3]
+    // Preprocessing: square white-pad 鈫?448 resize 鈫?float32 0-255 鈫?BGR 鈫?NHWC [1,448,448,3]
     private DenseTensor<float>? Preprocess(string imagePath)
     {
         int callId = Interlocked.Increment(ref _preprocessCount);
         try
         {
-            using var original = ThumbnailGenerator.DecodeForAnalysis(imagePath, 2048);
+            using var original = ThumbnailGenerator.DecodeForAnalysis(imagePath, InputSize * 2);
             if (original == null) return null;
 
-            int w = original.Width;
-            int h = original.Height;
-            int maxDim = Math.Max(w, h);
 
-            // Pad to square with white (255,255,255), centered
-            using var padded = new SKBitmap(maxDim, maxDim, original.ColorType, SKAlphaType.Opaque);
-            padded.Erase(SKColors.White);
-            using var canvas = new SKCanvas(padded);
-            int offX = (maxDim - w) / 2;
-            int offY = (maxDim - h) / 2;
-            canvas.DrawBitmap(original, offX, offY);
-
-            // Resize to 448×448 (BICUBIC)
-            using var resized = padded.Resize(new SKSizeI(InputSize, InputSize),
-                new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
-            if (resized == null) return null;
+            var resized = DrawToModelBitmap(original);
 
             // NHWC tensor: [1, 448, 448, 3], float32, 0-255 range, BGR order
-            // Cached across inferences — same pattern as OnnxTagServiceBase._cachedTensor
+            // Cached across inferences 鈥?same pattern as OnnxTagServiceBase._cachedTensor
             if (_cachedTensor == null)
                 _cachedTensor = new DenseTensor<float>(new[] { 1, InputSize, InputSize, 3 });
             var tensor = _cachedTensor;
@@ -196,6 +182,38 @@ public class OnnxTagService : IAutoTagService, IDisposable
         }
     }
 
+    private SKBitmap DrawToModelBitmap(SKBitmap src)
+    {
+        var target = GetScratchBitmap();
+        target.Erase(SKColors.White);
+
+        int maxDim = Math.Max(src.Width, src.Height);
+        float scale = (float)InputSize / maxDim;
+        float drawW = src.Width * scale;
+        float drawH = src.Height * scale;
+        var dest = new SKRect((InputSize - drawW) / 2f, (InputSize - drawH) / 2f,
+            (InputSize + drawW) / 2f, (InputSize + drawH) / 2f);
+
+        using var canvas = new SKCanvas(target);
+        using var paint = new SKPaint { IsAntialias = false };
+        canvas.DrawBitmap(src, dest, paint);
+        return target;
+    }
+
+    private SKBitmap GetScratchBitmap()
+    {
+        if (_scratchBitmap == null ||
+            _scratchBitmap.Width != InputSize ||
+            _scratchBitmap.Height != InputSize ||
+            _scratchBitmap.ColorType != SKColorType.Rgba8888)
+        {
+            _scratchBitmap?.Dispose();
+            _scratchBitmap = new SKBitmap(InputSize, InputSize, SKColorType.Rgba8888, SKAlphaType.Opaque);
+        }
+
+        return _scratchBitmap;
+    }
+
     private static string[] ParseTagsCsv(string csvPath)
     {
         var tags = new List<string>();
@@ -231,7 +249,7 @@ public class OnnxTagService : IAutoTagService, IDisposable
             {
                 ProgressChanged?.Invoke(new AutoTagProgress(
                     (int)(totalRead / 1024 / 1024), (int)(totalBytes / 1024 / 1024),
-                    $"下载{label}... {totalRead / 1024 / 1024}/{totalBytes / 1024 / 1024} MB"));
+                    $"\u4e0b\u8f7d{label}... {totalRead / 1024 / 1024}/{totalBytes / 1024 / 1024} MB"));
             }
         }
     }
@@ -244,6 +262,9 @@ public class OnnxTagService : IAutoTagService, IDisposable
         {
             _session?.Dispose();
             _session = null;
+            _cachedTensor = null;
+            _scratchBitmap?.Dispose();
+            _scratchBitmap = null;
         }
         finally { _inferenceLock.Release(); }
 

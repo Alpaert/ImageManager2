@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using ImageManager.Common.Helpers;
 using ImageManager.Infrastructure.Caching;
+using ImageManager.Infrastructure.Helpers;
 using ImageManager.Infrastructure.Imaging;
 
 namespace ImageManager.App.Services;
@@ -30,7 +31,7 @@ public sealed class ImagePreloader : IDisposable
     // Window sizes (asymmetric: forward bias)
     private const int ForwardWindow = 4;
     private const int BackwardWindow = 2;
-    private const int MaxConcurrentDecodes = 4;
+    private const int MaxConcurrentDecodes = 2;
 
     // Decode width cap for preview (4K-equivalent)
     private const int MaxDecodeWidth = 3840;
@@ -67,18 +68,20 @@ public sealed class ImagePreloader : IDisposable
         int oldIndex = _currentIndex;
         _currentIndex = newIndex;
         _cache.SetCurrentIndex(newIndex);
+        _cache.TrimForPressure();
 
         // Cancel all pending preloads from the previous position
         CancelAllPending();
 
         var filePath = _filePaths[newIndex];
+        AppLogger.Memory($"Preview.Navigate.Start index={newIndex} cacheCount={_cache.Count} cacheMB={_cache.EstimatedMemoryBytes / 1048576.0:F1}");
 
         // 1. Check cache first
         var cached = _cache.TryGet(filePath, out int w, out int h);
         if (cached != null)
         {
             // Cache hit — trigger window update and return immediately
-            _ = Task.Run(() => UpdateSlidingWindow(newIndex));
+            AppLogger.Memory($"Preview.Navigate.Hit index={newIndex} cacheCount={_cache.Count} cacheMB={_cache.EstimatedMemoryBytes / 1048576.0:F1}");
             return (cached, w, h);
         }
 
@@ -87,10 +90,7 @@ public sealed class ImagePreloader : IDisposable
         var result = await DecodeImageAsync(filePath, newIndex, cts.Token);
 
         // 3. Trigger sliding window update in background
-        if (result.Data != null)
-        {
-            _ = Task.Run(() => UpdateSlidingWindow(newIndex));
-        }
+        AppLogger.Memory($"Preview.Navigate.End index={newIndex} hasData={result.Data != null} cacheCount={_cache.Count} cacheMB={_cache.EstimatedMemoryBytes / 1048576.0:F1}");
 
         return result;
     }
@@ -113,7 +113,19 @@ public sealed class ImagePreloader : IDisposable
     /// </summary>
     public void OnNavigationSettled(int index)
     {
+        if (AutoTagRuntimeState.IsRunning) return;
         _ = Task.Run(() => UpdateSlidingWindow(index));
+    }
+
+    public void ShutdownPreviewSession()
+    {
+        AppLogger.Memory($"Preview.Shutdown.Start cacheCount={_cache.Count} cacheMB={_cache.EstimatedMemoryBytes / 1048576.0:F1}");
+        CancelAllPending();
+        _filePaths = new List<string>();
+        _currentIndex = -1;
+        _cache.Clear();
+        MemoryPressureMonitor.CompactLoh();
+        AppLogger.Memory($"Preview.Shutdown.End cacheCount={_cache.Count} cacheMB={_cache.EstimatedMemoryBytes / 1048576.0:F1}");
     }
 
     /// <summary>
@@ -137,6 +149,9 @@ public sealed class ImagePreloader : IDisposable
 
     private async Task UpdateSlidingWindow(int centerIndex)
     {
+        if (AutoTagRuntimeState.IsRunning) return;
+        if (centerIndex < 0 || centerIndex >= _filePaths.Count) return;
+
         // Compute the full window of indices to ensure are decoded
         var desired = new HashSet<int>();
 
@@ -163,27 +178,40 @@ public sealed class ImagePreloader : IDisposable
             .ToList();
 
         if (sorted.Count == 0) return;
+        AppLogger.Memory($"Preview.Preload.Start center={centerIndex} count={sorted.Count} cacheCount={_cache.Count} cacheMB={_cache.EstimatedMemoryBytes / 1048576.0:F1}");
 
         // Use a fresh linked CTS for this window update
         using var windowCts = CancellationTokenSource.CreateLinkedTokenSource(_globalCts.Token);
 
-        // Decode in parallel with semaphore limiting
-        var tasks = sorted.Select(async idx =>
+        int parallelism = RecommendedPreviewParallelism();
+        for (int i = 0; i < sorted.Count; i += parallelism)
         {
-            try
+            if (windowCts.Token.IsCancellationRequested) return;
+            var slice = sorted.Skip(i).Take(parallelism).ToList();
+            var tasks = slice.Select(async idx =>
             {
-                if (windowCts.Token.IsCancellationRequested) return;
-                var path = _filePaths[idx];
-                await DecodeImageAsync(path, idx, windowCts.Token);
-            }
-            catch (OperationCanceledException) { }
-            catch (Exception ex)
-            {
-                AppLogger.Warn($"[Preloader] Failed to preload {_filePaths[idx]}: {ex.Message}");
-            }
-        });
+                try
+                {
+                    if (windowCts.Token.IsCancellationRequested) return;
+                    var path = _filePaths[idx];
+                    await DecodeImageAsync(path, idx, windowCts.Token);
+                }
+                catch (OperationCanceledException) { }
+                catch (Exception ex)
+                {
+                    AppLogger.Warn($"[Preloader] Failed to preload {_filePaths[idx]}: {ex.Message}");
+                }
+            });
 
-        await Task.WhenAll(tasks);
+            await Task.WhenAll(tasks);
+        }
+
+        AppLogger.Memory($"Preview.Preload.End center={centerIndex} cacheCount={_cache.Count} cacheMB={_cache.EstimatedMemoryBytes / 1048576.0:F1}");
+    }
+
+    private static int RecommendedPreviewParallelism()
+    {
+        return MemoryPressureMonitor.Current >= MemoryPressureMonitor.PressureLevel.Medium ? 1 : 2;
     }
 
     private async Task<(byte[]? Data, int Width, int Height)> DecodeImageAsync(
@@ -217,7 +245,10 @@ public sealed class ImagePreloader : IDisposable
 
             if (data != null)
             {
+                if (ct.IsCancellationRequested)
+                    return (null, 0, 0);
                 _cache.Store(filePath, data, pixW, pixH, fileIndex);
+                _cache.TrimForPressure();
             }
 
             return (data, pixW, pixH);

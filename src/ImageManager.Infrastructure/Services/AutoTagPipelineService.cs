@@ -1,4 +1,5 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Threading.Channels;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
@@ -24,7 +25,7 @@ public class AutoTagPipelineService : IDisposable
     private int _maxTagsPerImage = 20;
     public event Action<AutoTagPipelineProgress>? ProgressChanged;
 
-    // ==================== 内存诊断计数器 ====================
+    // ==================== 鍐呭瓨璇婃柇璁℃暟鍣?====================
     private static int _pipelineRunCount;
 
     public AutoTagPipelineService(
@@ -50,29 +51,29 @@ public class AutoTagPipelineService : IDisposable
         var state = await _stateRepo.GetStateAsync(folderId);
 
         if (state == null)
-            return new FolderTagActionResult("Start", "开始对文件夹进行自动打标？", true);
+            return new FolderTagActionResult("Start", "\u5f00\u59cb\u5bf9\u6587\u4ef6\u5939\u8fdb\u884c\u81ea\u52a8\u6253\u6807\uff1f", true);
 
         return state.Status switch
         {
             "Processing" => new FolderTagActionResult("Recover",
-                $"检测到上次打标中断（已完成 {state.Processed}/{state.TotalFiles}）。\n是否清理并重新打标？", true),
+                $"\u68c0\u6d4b\u5230\u4e0a\u6b21\u6253\u6807\u4e2d\u65ad\uff08\u5df2\u5b8c\u6210 {state.Processed}/{state.TotalFiles}\uff09\u3002\n\u662f\u5426\u6e05\u7406\u5e76\u91cd\u65b0\u6253\u6807\uff1f", true),
 
             "Done" when state.LastFileCount == folderFileCount => new FolderTagActionResult("ReTag",
-                "此文件夹已完成打标。\n是否删除所有自动标签并重新打标？\n（手动标签不受影响）", true),
+                "\u6b64\u6587\u4ef6\u5939\u5df2\u5b8c\u6210\u6253\u6807\u3002\n\u662f\u5426\u5220\u9664\u6240\u6709\u81ea\u52a8\u6807\u7b7e\u5e76\u91cd\u65b0\u6253\u6807\uff1f\n\uff08\u624b\u52a8\u6807\u7b7e\u4e0d\u53d7\u5f71\u54cd\uff09", true),
 
             "Done" when state.LastFileCount < folderFileCount => new FolderTagActionResult("NewFiles",
-                $"此文件夹已打标，但检测到 {folderFileCount - state.LastFileCount} 张新图片。是否仅对新图片打标？", true),
+                $"\u6b64\u6587\u4ef6\u5939\u5df2\u6253\u6807\uff0c\u4f46\u68c0\u6d4b\u5230 {folderFileCount - state.LastFileCount} \u5f20\u65b0\u56fe\u7247\u3002\u662f\u5426\u4ec5\u5bf9\u65b0\u56fe\u7247\u6253\u6807\uff1f", true),
 
             "Done" => new FolderTagActionResult("Blocked",
-                "此文件夹已完成打标，无需重复。", false),
+                "\u6b64\u6587\u4ef6\u5939\u5df2\u5b8c\u6210\u6253\u6807\uff0c\u65e0\u9700\u91cd\u590d\u3002", false),
 
             "AwaitingReview" => new FolderTagActionResult("Resume",
-                "此文件夹推理已完成，是否直接确认标签？（不会重新推理）\n选择\"否\"可重新打标", true),
+                "\u6b64\u6587\u4ef6\u5939\u63a8\u7406\u5df2\u5b8c\u6210\uff0c\u662f\u5426\u76f4\u63a5\u786e\u8ba4\u6807\u7b7e\uff1f\uff08\u4e0d\u4f1a\u91cd\u65b0\u63a8\u7406\uff09\n\u9009\u62e9\"\u5426\"\u53ef\u91cd\u65b0\u6253\u6807", true),
 
             "Failed" => new FolderTagActionResult("Retry",
-                $"上次打标失败。错误：{state.ErrorMsg ?? "未知"}\n是否重新打标？", true),
+                $"\u4e0a\u6b21\u6253\u6807\u5931\u8d25\u3002\u9519\u8bef\uff1a{state.ErrorMsg ?? "\u672a\u77e5"}\n\u662f\u5426\u91cd\u65b0\u6253\u6807\uff1f", true),
 
-            _ => new FolderTagActionResult("Start", "开始对文件夹进行自动打标？", true)
+            _ => new FolderTagActionResult("Start", "\u5f00\u59cb\u5bf9\u6587\u4ef6\u5939\u8fdb\u884c\u81ea\u52a8\u6253\u6807\uff1f", true)
         };
     }
 
@@ -82,12 +83,14 @@ public class AutoTagPipelineService : IDisposable
     public async Task<List<string>> RunInferenceAsync(long folderId, List<(long Id, string FilePath)> metas, string action,
         CancellationToken ct = default, IEnsembleTagService? tagService = null)
     {
+        using var autoTagRun = AutoTagRuntimeState.Enter();
         var activeTagService = tagService ?? _tagService;
         bool hasState = folderId > 0;
         int runId = Interlocked.Increment(ref _pipelineRunCount);
         int total = metas.Count;
+        var runWatch = Stopwatch.StartNew();
 
-        // 内存诊断：Pipeline 开始
+        // Memory diagnostics: pipeline start.
         double commitStart = MemoryPressureMonitor.CommitChargeMB;
         double fragStart = MemoryPressureMonitor.FragmentationScore;
         AppLogger.Memory($"Pipeline#{runId}.Start total={total} action={action} " +
@@ -119,7 +122,7 @@ public class AutoTagPipelineService : IDisposable
                 {
                     if (ct.IsCancellationRequested) break;
 
-                    // 内存压力检测 - 每 10 张图片检查一次
+                    // Check memory pressure every 10 images.
                     if (i > 0 && i % 10 == 0)
                     {
                         var level = MemoryPressureMonitor.Current;
@@ -128,23 +131,22 @@ public class AutoTagPipelineService : IDisposable
                         {
                             AppLogger.Memory($"Pipeline#{runId} Critical pressure at {i}/{total}, emergency cleanup");
                             MemoryPressureMonitor.EmergencyCleanup();
-                            // Critical 时等待 Consumer 处理积压
                             await Task.Delay(200, ct);
                         }
                         else if (level == MemoryPressureMonitor.PressureLevel.High)
                         {
                             AppLogger.Memory($"Pipeline#{runId} High pressure at {i}/{total}, triggering LOH compact");
                             MemoryPressureMonitor.CompactLoh();
-                            // High 时短暂暂停让 Consumer 追上
-                            await Task.Delay(100, ct);
                         }
 
-                        // 每 50 张输出内存统计
+                        // Log memory and throughput every 50 images
                         if (i % 50 == 0)
                         {
+                            var secondsPer10 = i > 0 ? runWatch.Elapsed.TotalSeconds / i * 10.0 : 0;
                             AppLogger.Memory($"Pipeline#{runId} progress {i}/{total} " +
                                 $"level={level} commit={MemoryPressureMonitor.CommitChargeMB:F0}MB " +
-                                $"frag={MemoryPressureMonitor.FragmentationScore:F1}");
+                                $"frag={MemoryPressureMonitor.FragmentationScore:F1} " +
+                                $"secPer10={secondsPer10:F1}");
                         }
                     }
 
@@ -163,7 +165,7 @@ public class AutoTagPipelineService : IDisposable
                     {
                         AppLogger.Error($"Pipeline#{runId} OOM at {i}/{total}: {ex.Message}");
                         MemoryPressureMonitor.EmergencyCleanup();
-                        errors.Enqueue($"{Path.GetFileName(meta.FilePath)}: 内存不足");
+                        errors.Enqueue($"{Path.GetFileName(meta.FilePath)}: \u5185\u5b58\u4e0d\u8db3");
                         continue;
                     }
                     catch (Exception ex)
@@ -218,7 +220,7 @@ public class AutoTagPipelineService : IDisposable
                             }
                             ProgressChanged?.Invoke(new AutoTagPipelineProgress(
                                 "Inference", processed, metas.Count,
-                                $"正在推理图片标签... {processed}/{metas.Count}"));
+                                $"\u6b63\u5728\u63a8\u7406\u56fe\u7247\u6807\u7b7e... {processed}/{metas.Count}"));
                         }
                     }
                     catch (Exception ex)
@@ -232,7 +234,7 @@ public class AutoTagPipelineService : IDisposable
             {
                 ProgressChanged?.Invoke(new AutoTagPipelineProgress(
                     "Stopped", processed, metas.Count,
-                    $"推理已停止 ({processed}/{metas.Count})"));
+                    $"\u63a8\u7406\u5df2\u505c\u6b62 ({processed}/{metas.Count})"));
             }
 
             // Flush remaining stamps
@@ -242,7 +244,7 @@ public class AutoTagPipelineService : IDisposable
             if (!errors.IsEmpty)
             {
                 var msg = string.Join("\n", errors.Take(5));
-                if (errors.Count > 5) msg += $"\n... 及其他 {errors.Count - 5} 个错误";
+                if (errors.Count > 5) msg += $"\n... \u53ca\u5176\u4ed6 {errors.Count - 5} \u4e2a\u9519\u8bef";
                 AppLogger.Error($"Pipeline#{runId} errors={errors.Count}: {msg.Replace('\n', '|')}");
                 ProgressChanged?.Invoke(new AutoTagPipelineProgress(
                     "Error", errors.Count, metas.Count, msg));
@@ -252,13 +254,14 @@ public class AutoTagPipelineService : IDisposable
         await Task.WhenAll(producerTask, consumerTask);
 
         int finished = Volatile.Read(ref processed);
-        // === 内存诊断：Pipeline 结束 ===
+        // Memory diagnostics: pipeline end.
         double commitEnd = MemoryPressureMonitor.CommitChargeMB;
         double fragEnd = MemoryPressureMonitor.FragmentationScore;
         double memDelta = commitEnd - commitStart;
+        var secondsPer10End = finished > 0 ? runWatch.Elapsed.TotalSeconds / finished * 10.0 : 0;
         AppLogger.Memory($"Pipeline#{runId}.End processed={finished}/{total} errors={errors.Count} " +
-            $"commit={commitStart:F0}→{commitEnd:F0}MB (Δ{memDelta:+0;-0}MB) " +
-            $"frag={fragStart:F1}→{fragEnd:F1}");
+            $"commit={commitStart:F0}->{commitEnd:F0}MB (delta={memDelta:+0;-0}MB) " +
+            $"frag={fragStart:F1}->{fragEnd:F1} secPer10={secondsPer10End:F1}");
 
         if (hasState)
         {

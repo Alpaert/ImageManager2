@@ -61,6 +61,7 @@ public abstract class OnnxTagServiceBase : IDisposable
     private DenseTensor<float>? _cachedTensor;
     private CancellationTokenSource? _idleCts;
     private readonly object _idleLock = new();
+    private SKBitmap? _scratchBitmap;
 
     // === 内存诊断采样计数器 ===
     private int _preprocessCount;
@@ -105,7 +106,7 @@ public abstract class OnnxTagServiceBase : IDisposable
             }
 
             AppLogger.Info($"创建 InferenceSession (CUDA): {onnxPath}");
-            _session = await Task.Run(() => CreateSession(onnxPath));
+            _session = await Task.Run(() => OnnxSessionFactory.Create(onnxPath, ModelSubDir));
             _inputName = _session.InputNames[0];
             var inMeta = _session.InputMetadata[_inputName];
             var shape = $"[{string.Join(",", inMeta.Dimensions)}]";
@@ -217,32 +218,13 @@ public abstract class OnnxTagServiceBase : IDisposable
                 _session = null;
                 // 显式清空 Tensor 缓存，释放托管内存
                 _cachedTensor = null;
+                _scratchBitmap?.Dispose();
+                _scratchBitmap = null;
                 // 触发 GC 回收大对象
                 GC.Collect(2, GCCollectionMode.Optimized, false);
             }
         }
         finally { _inferenceLock.Release(); }
-    }
-
-    private InferenceSession CreateSession(string onnxPath)
-    {
-        InferenceSession? session = null;
-        try
-        {
-            var opts = new SessionOptions();
-            opts.AppendExecutionProvider_CUDA(0);
-            opts.EnableMemoryPattern = false;
-            session = new InferenceSession(onnxPath, opts);
-            AppLogger.Info($"[{ModelSubDir}] CUDA GPU 加速已启用");
-            return session;
-        }
-        catch (Exception ex)
-        {
-            session?.Dispose();
-            AppLogger.Warn($"[{ModelSubDir}] CUDA 不可用，回退 CPU: {ex.Message}");
-            using var opts = new SessionOptions { EnableMemoryPattern = false };
-            return new InferenceSession(onnxPath, opts);
-        }
     }
 
     // ==================== 预处理（NCHW + RGB + 归一化） ====================
@@ -256,27 +238,12 @@ public abstract class OnnxTagServiceBase : IDisposable
         if (sample) AppLogger.Memory($"Preprocess.Enter #{callId} {Path.GetFileName(imagePath)}");
 
         SKBitmap? original = null;
-        SKBitmap? rgb = null;
-        SKBitmap? squared = null;
-        SKBitmap? resized = null;
-
         try
         {
-            original = ThumbnailGenerator.DecodeForAnalysis(imagePath, 2048);
+            original = ThumbnailGenerator.DecodeForAnalysis(imagePath, InputSize * 2);
             if (original == null) return null;
 
-            // 转换为 RGB 的 SKBitmap
-            rgb = ConvertToRgbBitmap(original);
-
-            // 填充到正方形
-            squared = PreserveAspectRatio
-                ? ResizeKeepAspect(rgb, InputSize)
-                : WhitePadToSquare(rgb);
-
-            // 缩放到目标尺寸
-            resized = squared.Resize(new SKSizeI(InputSize, InputSize),
-                new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
-            if (resized == null) return null;
+            var resized = DrawToModelBitmap(original, InputSize, PreserveAspectRatio);
 
             // NCHW tensor: [1, 3, InputSize, InputSize] — reused across inferences
             if (_cachedTensor == null)
@@ -329,10 +296,6 @@ public abstract class OnnxTagServiceBase : IDisposable
         }
         finally
         {
-            // 确保所有临时 SKBitmap 对象被释放，避免非托管内存泄漏
-            resized?.Dispose();
-            squared?.Dispose();
-            rgb?.Dispose();
             original?.Dispose();
         }
     }
@@ -413,42 +376,40 @@ public abstract class OnnxTagServiceBase : IDisposable
 
     // ==================== 图像预处理辅助 ====================
 
-    private static SKBitmap ConvertToRgbBitmap(SKBitmap original)
+    private SKBitmap DrawToModelBitmap(SKBitmap src, int targetSize, bool preserveAspectRatio)
     {
-        var rgb = new SKBitmap(original.Width, original.Height, SKColorType.Rgba8888, SKAlphaType.Opaque);
-        using var canvas = new SKCanvas(rgb);
-        canvas.DrawBitmap(original, 0, 0);
-        return rgb;
+        var target = GetScratchBitmap(targetSize);
+        target.Erase(preserveAspectRatio ? SKColors.Black : SKColors.White);
+
+        var dest = GetDestinationRect(src.Width, src.Height, targetSize);
+        using var canvas = new SKCanvas(target);
+        using var paint = new SKPaint { IsAntialias = false };
+        canvas.DrawBitmap(src, dest, paint);
+        return target;
     }
 
-    private static SKBitmap WhitePadToSquare(SKBitmap src)
+    private SKBitmap GetScratchBitmap(int targetSize)
     {
-        int w = src.Width, h = src.Height;
-        int maxDim = Math.Max(w, h);
-        var padded = new SKBitmap(maxDim, maxDim, src.ColorType, SKAlphaType.Opaque);
-        padded.Erase(SKColors.White);
-        using var canvas = new SKCanvas(padded);
-        int offX = (maxDim - w) / 2, offY = (maxDim - h) / 2;
-        canvas.DrawBitmap(src, offX, offY);
-        return padded;
+        if (_scratchBitmap == null ||
+            _scratchBitmap.Width != targetSize ||
+            _scratchBitmap.Height != targetSize ||
+            _scratchBitmap.ColorType != SKColorType.Rgba8888)
+        {
+            _scratchBitmap?.Dispose();
+            _scratchBitmap = new SKBitmap(targetSize, targetSize, SKColorType.Rgba8888, SKAlphaType.Opaque);
+        }
+
+        return _scratchBitmap;
     }
 
-    private static SKBitmap ResizeKeepAspect(SKBitmap src, int targetSize)
+    private static SKRect GetDestinationRect(int width, int height, int targetSize)
     {
-        int w = src.Width, h = src.Height;
-        float scale = (float)targetSize / Math.Max(w, h);
-        int newW = (int)(w * scale), newH = (int)(h * scale);
-
-        using var resized = src.Resize(new SKSizeI(newW, newH),
-            new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
-        if (resized == null) return src;
-
-        var padded = new SKBitmap(targetSize, targetSize, src.ColorType, SKAlphaType.Opaque);
-        padded.Erase(new SKColor(0, 0, 0));  // 黑色填充（ImageNet 惯例）
-        using var canvas = new SKCanvas(padded);
-        int offX = (targetSize - newW) / 2, offY = (targetSize - newH) / 2;
-        canvas.DrawBitmap(resized, offX, offY);
-        return padded;
+        int maxDim = Math.Max(width, height);
+        float scale = (float)targetSize / maxDim;
+        float drawW = width * scale;
+        float drawH = height * scale;
+        return new SKRect((targetSize - drawW) / 2f, (targetSize - drawH) / 2f,
+            (targetSize + drawW) / 2f, (targetSize + drawH) / 2f);
     }
 
     // ==================== 下载 ====================
@@ -515,6 +476,8 @@ public abstract class OnnxTagServiceBase : IDisposable
                 _session = null;
                 // 显式清空 Tensor 缓存，释放托管内存
                 _cachedTensor = null;
+                _scratchBitmap?.Dispose();
+                _scratchBitmap = null;
             }
         }
         finally

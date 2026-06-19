@@ -38,7 +38,7 @@ public class PageManager : IDisposable
     private List<ImageViewItem>? _preSearchPageItems;
     private int _preSearchPageIndex;
 
-    private readonly SemaphoreSlim _thumbnailLoadSemaphore = new(8);
+    private readonly SemaphoreSlim _thumbnailLoadSemaphore = new(6);
     private readonly SemaphoreSlim _videoLoadSemaphore = new(4);
     private int _thumbnailDecodeWidth = 200;
     private int _currentZoomLevel;
@@ -69,6 +69,8 @@ public class PageManager : IDisposable
 
         var sw = Stopwatch.StartNew();
         PerfLogger.Log($"[PageMgr] ShowPage START page={pageIndex}/{totalPages}");
+        AppLogger.Memory($"Page.Show.Start page={pageIndex} cached={CachedPageCount} thumbCacheMB={_thumbCache.EstimatedMemoryBytes / 1048576.0:F1}");
+        _thumbCache.TrimForPressure();
 
         // Cancel any in-flight thumbnail loads from previous page
         CancelPageLoad();
@@ -93,23 +95,38 @@ public class PageManager : IDisposable
         if (needsLoad)
         {
             PerfLogger.Log($"[PageMgr] LoadThumbnails START unloaded={pageItems.Count(i => !i.IsLoaded)}");
-            _ = LoadPageThumbnailsAsync(pageIndex, loadCt);
+            _ = LoadPageThumbnailsAsync(pageIndex, loadCt)
+                .ContinueWith(_ => PreloadAdjacentPages(pageIndex, totalPages, activeFileList, getTagsForFile, loadCt),
+                    CancellationToken.None,
+                    TaskContinuationOptions.OnlyOnRanToCompletion,
+                    TaskScheduler.Default);
+        }
+        else
+        {
+            PreloadAdjacentPages(pageIndex, totalPages, activeFileList, getTagsForFile, loadCt);
         }
 
         PageChanged?.Invoke(new PageChangedEventArgs(
             pageItems, pageIndex, totalPages,
             $"当前页: {pageIndex + 1}/{totalPages}  每页 {PageSize} 张"));
         PerfLogger.Log($"[PageMgr] ShowPage END elapsed={sw.ElapsedMilliseconds}ms");
+        AppLogger.Memory($"Page.Show.End page={pageIndex} cached={CachedPageCount} thumbCacheMB={_thumbCache.EstimatedMemoryBytes / 1048576.0:F1} elapsedMs={sw.ElapsedMilliseconds}");
 
         if (!isSearchResult && !string.IsNullOrEmpty(currentFolder))
             _ = Task.Run(() => _folderRepo.SetLastPageIndexAsync(currentFolder!, pageIndex));
-        PreloadAdjacentPages(pageIndex, totalPages, activeFileList, getTagsForFile);
         _ = Task.Run(() => TrimPageCache(pageIndex, totalPages));
 
         // LOH compaction check after page render (lightweight — Compaction runs on thread pool)
         var pressure = MemoryPressureMonitor.Current;
         if (pressure >= MemoryPressureMonitor.PressureLevel.High)
             MemoryPressureMonitor.CompactLoh();
+
+        await Task.CompletedTask;
+    }
+
+    private int CachedPageCount
+    {
+        get { lock (_pageCacheLock) return _pageCache.Count; }
     }
 
     private void CancelPageLoad()
@@ -254,7 +271,13 @@ public class PageManager : IDisposable
     public void InvalidateCache()
     {
         _currentUiState = default;
-        lock (_pageCacheLock) { _pageCache.Clear(); }
+        lock (_pageCacheLock)
+        {
+            foreach (var page in _pageCache.Values)
+                foreach (var item in page)
+                    item.ThumbnailData = null;
+            _pageCache.Clear();
+        }
     }
 
     public void UpdateUiState(PageUiState state) => _currentUiState = state;
@@ -334,7 +357,10 @@ public class PageManager : IDisposable
 
         ThreadPool.GetAvailableThreads(out var w, out var io);
         ThreadPool.GetMaxThreads(out var mw, out var mio);
+        var sw = Stopwatch.StartNew();
+        var pressure = MemoryPressureMonitor.Current;
         PerfLogger.Log($"[PageMgr] LoadThumbnails unloaded={unloaded.Count} ThreadPool={mw-w}/{mw}");
+        AppLogger.Memory($"Page.Thumb.Start page={pageIndex} unloaded={unloaded.Count} pressure={pressure} thumbCacheMB={_thumbCache.EstimatedMemoryBytes / 1048576.0:F1}");
 
         const int batchSize = 16;
         for (int batchStart = 0; batchStart < unloaded.Count; batchStart += batchSize)
@@ -342,10 +368,21 @@ public class PageManager : IDisposable
             ct.ThrowIfCancellationRequested();
 
             var batch = unloaded.Skip(batchStart).Take(batchSize).ToList();
-            await Task.WhenAll(batch.Select(item => LoadSingleThumbnailAsync(item, ct)));
+            var parallelism = RecommendedThumbnailParallelism();
+            for (int i = 0; i < batch.Count; i += parallelism)
+            {
+                ct.ThrowIfCancellationRequested();
+                var slice = batch.Skip(i).Take(parallelism).ToList();
+                await Task.WhenAll(slice.Select(item => LoadSingleThumbnailAsync(item, ct)));
+            }
+            _thumbCache.TrimForPressure();
 
             // Only dispatch if we're still the active page load
-            if (ct.IsCancellationRequested) return;
+            if (ct.IsCancellationRequested)
+            {
+                AppLogger.Memory($"Page.Thumb.Cancel page={pageIndex} elapsedMs={sw.ElapsedMilliseconds}");
+                return;
+            }
 
             var loadedInBatch = batch.Where(i => i.IsLoaded).ToList();
             if (loadedInBatch.Count > 0)
@@ -361,6 +398,18 @@ public class PageManager : IDisposable
                 }, DispatcherPriority.Normal);
             }
         }
+        AppLogger.Memory($"Page.Thumb.End page={pageIndex} loaded={unloaded.Count(i => i.IsLoaded)}/{unloaded.Count} pressure={MemoryPressureMonitor.Current} thumbCacheMB={_thumbCache.EstimatedMemoryBytes / 1048576.0:F1} elapsedMs={sw.ElapsedMilliseconds}");
+    }
+
+    private static int RecommendedThumbnailParallelism()
+    {
+        return MemoryPressureMonitor.Current switch
+        {
+            MemoryPressureMonitor.PressureLevel.Critical => 1,
+            MemoryPressureMonitor.PressureLevel.High => 2,
+            MemoryPressureMonitor.PressureLevel.Medium => 3,
+            _ => 6
+        };
     }
 
     private async Task LoadSingleThumbnailAsync(ImageViewItem item, CancellationToken ct = default)
@@ -399,8 +448,16 @@ public class PageManager : IDisposable
     private void PreloadAdjacentPages(
         int currentPage, int totalPages,
         List<string> activeFileList,
-        Func<string, List<string>> getTagsForFile)
+        Func<string, List<string>> getTagsForFile,
+        CancellationToken parentCt)
     {
+        if (parentCt.IsCancellationRequested) return;
+        if (MemoryPressureMonitor.Current != MemoryPressureMonitor.PressureLevel.Low)
+        {
+            AppLogger.Memory($"Page.Preload.Skip page={currentPage} reason=pressure level={MemoryPressureMonitor.Current}");
+            return;
+        }
+
         // Cancel previous preload
         _preloadCts?.Cancel();
         _preloadCts?.Dispose();
@@ -409,8 +466,13 @@ public class PageManager : IDisposable
 
         _ = Task.Run(async () =>
         {
-            await Task.Delay(300, ct);
+            await Task.Delay(2000, ct);
             if (ct.IsCancellationRequested) return;
+            if (MemoryPressureMonitor.Current != MemoryPressureMonitor.PressureLevel.Low)
+            {
+                AppLogger.Memory($"Page.Preload.Skip page={currentPage} reason=delayed-pressure level={MemoryPressureMonitor.Current}");
+                return;
+            }
 
             int? preloadPrev = null, preloadNext = null;
             lock (_pageCacheLock)
@@ -429,6 +491,7 @@ public class PageManager : IDisposable
                 }
             }
             if (ct.IsCancellationRequested) return;
+            AppLogger.Memory($"Page.Preload.Start page={currentPage} prev={preloadPrev?.ToString() ?? "-"} next={preloadNext?.ToString() ?? "-"} cached={CachedPageCount}");
             if (preloadPrev.HasValue)
                 _ = LoadPageThumbnailsAsync(preloadPrev.Value, ct);
             if (preloadNext.HasValue)
@@ -454,19 +517,39 @@ public class PageManager : IDisposable
     {
         lock (_pageCacheLock)
         {
-            if (_pageCache.Count <= MaxCachedPages) return;
+            var maxCachedPages = RecommendedCachedPages();
+            if (_pageCache.Count <= maxCachedPages) return;
 
             var mustKeep = new HashSet<int> { currentPage };
-            if (currentPage - 1 >= 0) mustKeep.Add(currentPage - 1);
-            if (currentPage + 1 < totalPages) mustKeep.Add(currentPage + 1);
+            if (maxCachedPages >= 2 && currentPage - 1 >= 0) mustKeep.Add(currentPage - 1);
+            if (maxCachedPages >= 3 && currentPage + 1 < totalPages) mustKeep.Add(currentPage + 1);
 
+            int evictedPages = 0;
+            int evictedItems = 0;
             foreach (var key in _pageCache.Keys.ToList())
             {
                 if (mustKeep.Contains(key)) continue;
                 if (_pageCache.TryGetValue(key, out var evicted))
+                {
                     foreach (var item in evicted) item.ThumbnailData = null;
+                    evictedItems += evicted.Count;
+                }
                 _pageCache.Remove(key);
+                evictedPages++;
             }
+            if (evictedPages > 0)
+                AppLogger.Memory($"Page.Trim current={currentPage} max={maxCachedPages} evictedPages={evictedPages} evictedItems={evictedItems} cached={_pageCache.Count} thumbCacheMB={_thumbCache.EstimatedMemoryBytes / 1048576.0:F1}");
         }
+    }
+
+    private static int RecommendedCachedPages()
+    {
+        return MemoryPressureMonitor.Current switch
+        {
+            MemoryPressureMonitor.PressureLevel.Critical => 1,
+            MemoryPressureMonitor.PressureLevel.High => 1,
+            MemoryPressureMonitor.PressureLevel.Medium => 2,
+            _ => MaxCachedPages
+        };
     }
 }

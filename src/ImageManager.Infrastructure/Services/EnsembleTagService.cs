@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Helpers;
 
 namespace ImageManager.Infrastructure.Services;
 
@@ -23,6 +24,7 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
     // === 内存诊断采样计数器 ===
     private int _predictCount;
     private const int MemSampleInterval = 50;
+    private const double ParallelPrivLimitMB = 6500;
 
     public event Action<AutoTagProgress>? ProgressChanged;
 
@@ -87,15 +89,30 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
         int callId = Interlocked.Increment(ref _predictCount);
         bool sample = callId % MemSampleInterval == 0;
 
-        if (sample) AppLogger.Memory($"Ensemble#{callId}.Start {fileName}");
+        bool useParallel = ShouldRunParallel();
+        if (sample)
+            AppLogger.Memory($"Ensemble#{callId}.Start mode={(useParallel ? "Parallel" : "Sequential")} {fileName}");
 
-        // Keep model inference sequential during batch auto-tagging. Running WD and
-        // PixAI at the same time doubles Skia/ONNX transient allocations per image.
-        var rating = await _wd.PredictRatingAsync(imagePath, ct);
-        if (sample) AppLogger.Memory($"Ensemble#{callId}.AfterRating {fileName}");
+        SystemRating rating;
+        List<TagPrediction> pixaiPreds;
+        float[]? embedding;
+        if (useParallel)
+        {
+            var ratingTask = _wd.PredictRatingAsync(imagePath, ct);
+            var pixaiTask = _pixai.PredictWithEmbeddingAsync(imagePath, ct);
+            await Task.WhenAll(ratingTask, pixaiTask);
+            rating = ratingTask.Result;
+            (pixaiPreds, embedding) = pixaiTask.Result;
+            if (sample) AppLogger.Memory($"Ensemble#{callId}.AfterParallel {fileName}");
+        }
+        else
+        {
+            rating = await _wd.PredictRatingAsync(imagePath, ct);
+            if (sample) AppLogger.Memory($"Ensemble#{callId}.AfterRating {fileName}");
 
-        var (pixaiPreds, embedding) = await _pixai.PredictWithEmbeddingAsync(imagePath, ct);
-        if (sample) AppLogger.Memory($"Ensemble#{callId}.AfterPixai {fileName}");
+            (pixaiPreds, embedding) = await _pixai.PredictWithEmbeddingAsync(imagePath, ct);
+            if (sample) AppLogger.Memory($"Ensemble#{callId}.AfterPixai {fileName}");
+        }
 
         // 画师识别
         string? artistName = null;
@@ -148,6 +165,15 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
             ArtistName = artistName,
             ArtistConfidence = artistConf
         };
+    }
+
+    private static bool ShouldRunParallel()
+    {
+        var level = MemoryPressureMonitor.Current;
+        if (level >= MemoryPressureMonitor.PressureLevel.High)
+            return false;
+
+        return MemoryPressureMonitor.CommitChargeMB < ParallelPrivLimitMB;
     }
 
     public IReadOnlyList<ModelStatus> GetModelStatuses()

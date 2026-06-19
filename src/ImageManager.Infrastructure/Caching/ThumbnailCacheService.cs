@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Helpers;
 using ImageManager.Infrastructure.Imaging;
 using ImageManager.Infrastructure.Video;
 
@@ -191,6 +192,19 @@ public class ThumbnailCacheService : IThumbnailCacheService
 
         if (Interlocked.Read(ref _totalBytes) < 0)
             Interlocked.Exchange(ref _totalBytes, 0);
+    }
+
+    public void TrimForPressure()
+    {
+        var limit = MemoryPressureMonitor.Current switch
+        {
+            MemoryPressureMonitor.PressureLevel.Critical => MaxMemoryBytes / 4,
+            MemoryPressureMonitor.PressureLevel.High => MaxMemoryBytes / 2,
+            MemoryPressureMonitor.PressureLevel.Medium => MaxMemoryBytes * 3 / 4,
+            _ => MaxMemoryBytes
+        };
+
+        Trim(limit);
     }
 
     private void AddToMemory(string filePath, byte[] data, int decodeWidth, int width, int height)

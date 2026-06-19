@@ -262,6 +262,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private readonly SemaphoreSlim _maintenanceGate = new(1, 1);
     private CancellationTokenSource? _hashCts;
     private DispatcherTimer? _idleTimer;
+    private DateTime _deferMaintenanceUntilUtc = DateTime.MinValue;
     private FileSystemWatcher? _folderWatcher;
     private CancellationTokenSource? _folderWatchDebounceCts;
     private CancellationTokenSource? _widthDebounceCts;
@@ -867,6 +868,12 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private async Task PrecomputeHashesAsync(CancellationToken ct, long? folderId = null)
     {
+        if (AutoTagRuntimeState.IsRunning)
+        {
+            AppLogger.Info("HashPrecompute skipped while auto-tagging is running");
+            return;
+        }
+
         // Unified cancellation: cancel any previous run, link with caller's token
         var oldCts = Interlocked.Exchange(ref _hashCts, CancellationTokenSource.CreateLinkedTokenSource(ct));
         oldCts?.Cancel();
@@ -888,6 +895,8 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private async Task PrecomputeHashesCoreAsync(CancellationToken ct, long? folderId)
     {
+        if (AutoTagRuntimeState.IsRunning) return;
+
         var files = _allFiles.ToArray();
         if (files.Length == 0) return;
         AppLogger.Memory($"HashPrecompute.Start total={files.Length}");
@@ -1078,6 +1087,25 @@ public partial class MainWindowViewModel : ViewModelBase
     private void OnIdleTimerTick(object? sender, EventArgs e)
     {
         _idleTimer?.Stop();
+        var remaining = _deferMaintenanceUntilUtc - DateTime.UtcNow;
+        if (remaining > TimeSpan.Zero)
+        {
+            _idleTimer = new DispatcherTimer(remaining, DispatcherPriority.Background, OnIdleTimerTick);
+            _idleTimer.Start();
+            return;
+        }
+
+        var heapMB = GC.GetTotalMemory(false) / 1048576.0;
+        if (MemoryPressureMonitor.Current >= MemoryPressureMonitor.PressureLevel.Medium || heapMB >= 512)
+        {
+            AppLogger.Memory($"HashPrecompute deferred by memory pressure heapMB={heapMB:F1} level={MemoryPressureMonitor.Current}");
+            MemoryPressureMonitor.CompactLoh();
+            _deferMaintenanceUntilUtc = DateTime.UtcNow.AddSeconds(15);
+            _idleTimer = new DispatcherTimer(TimeSpan.FromSeconds(15), DispatcherPriority.Background, OnIdleTimerTick);
+            _idleTimer.Start();
+            return;
+        }
+
         var folder = CurrentFolder;
         var showAll = ShowAllSubfolders; // capture before Task.Run
         if (string.IsNullOrEmpty(folder)) return;
@@ -1151,6 +1179,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (pageIndex < 0 || pageIndex >= TotalPages) return;
         var sw = Stopwatch.StartNew();
         PerfLogger.Log($"[ShowPage] START page={pageIndex}");
+        DeferHashPrecomputeForPaging();
         _isNavigating = true;
         CurrentPage = pageIndex;
         _isNavigating = false;
@@ -1160,6 +1189,28 @@ public partial class MainWindowViewModel : ViewModelBase
         await _pageManager.ShowPageAsync(pageIndex, TotalPages,
             ActiveFileList, GetTagsForFile, IsShowingSearchResult, CurrentFolder);
         PerfLogger.Log($"[ShowPage] END elapsed={sw.ElapsedMilliseconds}ms");
+    }
+
+    private void DeferHashPrecomputeForPaging()
+    {
+        _deferMaintenanceUntilUtc = DateTime.UtcNow.AddSeconds(15);
+        var cts = Volatile.Read(ref _hashCts);
+        if (cts != null)
+        {
+            try
+            {
+                cts.Cancel();
+                AppLogger.Memory("HashPrecompute deferred by paging");
+            }
+            catch { }
+        }
+
+        if (!string.IsNullOrEmpty(CurrentFolder))
+        {
+            _idleTimer?.Stop();
+            _idleTimer = new DispatcherTimer(TimeSpan.FromSeconds(15), DispatcherPriority.Background, OnIdleTimerTick);
+            _idleTimer.Start();
+        }
     }
 
     // ==================== Thumbnail Zoom ====================

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using ImageManager.Infrastructure.Helpers;
 
 namespace ImageManager.Infrastructure.Caching;
 
@@ -35,8 +36,8 @@ public sealed class PreviewImageCache
     private const double Beta = 0.5;     // distance weight
     private const double Gamma = 0.1;    // size/resolution weight
 
-    private const int MaxEntries = 20;
-    private const long MaxMemoryBytes = 400 * 1024 * 1024; // 400 MB for JPEG cache
+    private const int MaxEntries = 6;
+    private const long MaxMemoryBytes = 160 * 1024 * 1024; // raw BGRA preview cache budget
     private long _totalBytes;
 
     // Current browsing position (set externally by preloader)
@@ -203,6 +204,27 @@ public sealed class PreviewImageCache
                     Interlocked.Add(ref _totalBytes, -entry.SizeBytes);
                     entry.Data = null!;
                 }
+            }
+        }
+    }
+
+    public void TrimForPressure()
+    {
+        var limit = MemoryPressureMonitor.Current switch
+        {
+            MemoryPressureMonitor.PressureLevel.Critical => 0,
+            MemoryPressureMonitor.PressureLevel.High => MaxMemoryBytes / 4,
+            MemoryPressureMonitor.PressureLevel.Medium => MaxMemoryBytes / 2,
+            _ => MaxMemoryBytes
+        };
+
+        lock (_lock)
+        {
+            while (_entries.Count > 0 && Interlocked.Read(ref _totalBytes) > limit)
+            {
+                var victim = FindEvictionVictim();
+                if (victim == null) break;
+                EvictEntry(victim);
             }
         }
     }

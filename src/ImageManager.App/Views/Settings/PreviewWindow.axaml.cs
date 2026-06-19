@@ -26,6 +26,7 @@ public partial class PreviewWindow : Window
     private CancellationTokenSource? _loadCts;
     private CancellationTokenSource? _settleCts;
     private int _settleVersion;
+    private bool _cleanupDone;
     private readonly ImagePreloader _preloader;
 
     // Throttle: during rapid key-repeat, skip intermediate loads
@@ -56,23 +57,32 @@ public partial class PreviewWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
-        // Save position BEFORE native window destruction (Closed fires too late)
-        Vm.SavedLeft = Position.X;
-        Vm.SavedTop = Position.Y;
-        StopGif();
-        CancelAllLoads();
-        ClearPool();
+        CleanupPreviewSession();
         base.OnClosed(e);
     }
 
     protected override void OnClosing(WindowClosingEventArgs e)
     {
+        CleanupPreviewSession();
+        base.OnClosing(e);
+    }
+
+    private void CleanupPreviewSession()
+    {
+        if (_cleanupDone) return;
+        _cleanupDone = true;
+
         Vm.SavedLeft = Position.X;
         Vm.SavedTop = Position.Y;
+        AppLogger.Memory("Preview.WindowClosing");
         StopGif();
         CancelAllLoads();
+        ImgFull.Source = null;
+        ImgGif.Source = null;
+        Vm.ReleaseImage();
         ClearPool();
-        base.OnClosing(e);
+        _preloader.ShutdownPreviewSession();
+        AppLogger.Memory("Preview.WindowClosed");
     }
 
     /// <summary>Create with image list for navigation.</summary>
@@ -240,6 +250,7 @@ public partial class PreviewWindow : Window
                 _imageReady = true;
                 Vm.UpdateInfo();
                 FitToViewport();
+                _preloader.OnNavigationSettled(index);
             }
             else
             {
