@@ -50,7 +50,11 @@ public static class VideoMetadataExtractor
 
             return null;
         }
-        catch (Exception ex)
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
         {
             return null;
         }
