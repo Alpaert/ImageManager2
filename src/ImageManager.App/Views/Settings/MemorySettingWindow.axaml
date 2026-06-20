@@ -78,6 +78,24 @@
                                        Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
                         </StackPanel>
 
+                        <StackPanel Spacing="2">
+                            <CheckBox Content="启用自定义角色识别"
+                                      IsChecked="{Binding EnableCharacterRecognition}"
+                                      FontSize="12"/>
+                            <TextBlock Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
+                                       Text="{Binding CharacterMatchThreshold, StringFormat='角色匹配阈值: {0:0.00}'}"/>
+                            <Slider Minimum="0.1" Maximum="0.9"
+                                    Value="{Binding CharacterMatchThreshold}"
+                                    TickFrequency="0.05" IsSnapToTickEnabled="True" Width="400"/>
+                            <TextBlock Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
+                                       Text="{Binding CharacterMaxMatches, StringFormat='每张图最多写入角色数: {0}'}"/>
+                            <Slider Minimum="1" Maximum="5"
+                                    Value="{Binding CharacterMaxMatches}"
+                                    TickFrequency="1" IsSnapToTickEnabled="True" Width="400"/>
+                            <TextBlock Text="仅双模型模式生效；使用角色嵌入库和 PixAI embedding 做本地相似度匹配"
+                                       Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
+                        </StackPanel>
+
                     </StackPanel>
 
                     <!-- 单模型设置 -->

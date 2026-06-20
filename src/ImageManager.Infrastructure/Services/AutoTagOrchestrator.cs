@@ -27,6 +27,7 @@ public class AutoTagOrchestrator : IDisposable
     private readonly TagServiceFactory _factory;
     private readonly DeepSeekRecommendService _recommendService;
     private readonly ArtistEmbeddingStore _artistStore;
+    private readonly CharacterEmbeddingStore _characterStore;
     private readonly PixaiTagService _pixaiService;
     private readonly IMessenger _messenger;
     private TagMode _currentMode = TagMode.Ensemble;
@@ -47,6 +48,7 @@ public class AutoTagOrchestrator : IDisposable
         TagServiceFactory factory,
         DeepSeekRecommendService recommendService,
         ArtistEmbeddingStore artistStore,
+        CharacterEmbeddingStore characterStore,
         PixaiTagService pixaiService,
         IMessenger messenger)
     {
@@ -61,6 +63,7 @@ public class AutoTagOrchestrator : IDisposable
         _factory = factory;
         _recommendService = recommendService;
         _artistStore = artistStore;
+        _characterStore = characterStore;
         _pixaiService = pixaiService;
         _messenger = messenger;
 
@@ -72,7 +75,8 @@ public class AutoTagOrchestrator : IDisposable
     }
 
     public void Configure(TagMode mode, double confidenceThreshold, int maxTagsPerImage,
-        double pixaiThreshold, double artistMatchThreshold, string? apiKey)
+        double pixaiThreshold, double artistMatchThreshold, bool enableCharacterRecognition,
+        double characterMatchThreshold, int characterMaxMatchesPerImage, string? apiKey)
     {
         _currentMode = mode;
 
@@ -91,7 +95,10 @@ public class AutoTagOrchestrator : IDisposable
                 {
                     ["pixai"] = pixaiThreshold
                 },
-                ArtistMatchThreshold = artistMatchThreshold
+                ArtistMatchThreshold = artistMatchThreshold,
+                EnableCharacterRecognition = enableCharacterRecognition,
+                CharacterMatchThreshold = characterMatchThreshold,
+                CharacterMaxMatchesPerImage = Math.Clamp(characterMaxMatchesPerImage, 1, 5)
             });
         }
 
@@ -331,4 +338,15 @@ public class AutoTagOrchestrator : IDisposable
     }
 
     public int GetArtistStoreCount() => _artistStore.Count;
+
+    public void RegisterCharacterWithEmbedding(string characterName, float[] embedding, int imageCount)
+    {
+        _characterStore.Add(characterName, embedding, imageCount);
+        var modelsDir = Path.Combine(_thumbCache.CacheDirectory, "models");
+        var dbPath = Path.Combine(modelsDir, "character_embeddings.bin");
+        _characterStore.Save(dbPath);
+        AppLogger.Tag("Character", $"注册角色 character={characterName} imgs={imageCount} storeCount={_characterStore.Count}");
+    }
+
+    public int GetCharacterStoreCount() => _characterStore.Count;
 }

@@ -1151,6 +1151,9 @@ public partial class MainWindow : Window
             settings.SingleModelMinConfidence, 75,
             settings.EnsemblePixaiMinConfidence,
             settings.ArtistMatchThreshold,
+            settings.EnableCharacterRecognition,
+            settings.CharacterMatchThreshold,
+            settings.CharacterMaxMatchesPerImage,
             settings.DeepSeekApiKey);
 
         var filePaths = selected.Select(i => i.FilePath).Distinct().ToList();
@@ -1770,6 +1773,9 @@ public partial class MainWindow : Window
             settings.SingleModelMinConfidence, 75,
             settings.EnsemblePixaiMinConfidence,
             settings.ArtistMatchThreshold,
+            settings.EnableCharacterRecognition,
+            settings.CharacterMatchThreshold,
+            settings.CharacterMaxMatchesPerImage,
             settings.DeepSeekApiKey);
 
         var messenger = App.Services.GetRequiredService<IMessenger>();
@@ -2073,6 +2079,9 @@ public partial class MainWindow : Window
             Vm.AppSettings.EnsembleMaxTagsPerImage,
             Vm.AppSettings.EnsemblePixaiMinConfidence,
             Vm.AppSettings.ArtistMatchThreshold,
+            Vm.AppSettings.EnableCharacterRecognition,
+            Vm.AppSettings.CharacterMatchThreshold,
+            Vm.AppSettings.CharacterMaxMatchesPerImage,
             Vm.AppSettings.SingleModelMinConfidence,
             path => new Infrastructure.Caching.DiskThumbnailCache(path).EstimateDiskUsage(),
             pathChanged =>
@@ -2093,6 +2102,9 @@ public partial class MainWindow : Window
                 Vm.AppSettings.EnsembleMaxTagsPerImage = memVm.EnsembleMaxTags;
                 Vm.AppSettings.EnsemblePixaiMinConfidence = memVm.PixaiMinConfidence;
                 Vm.AppSettings.ArtistMatchThreshold = memVm.ArtistMatchThreshold;
+                Vm.AppSettings.EnableCharacterRecognition = memVm.EnableCharacterRecognition;
+                Vm.AppSettings.CharacterMatchThreshold = memVm.CharacterMatchThreshold;
+                Vm.AppSettings.CharacterMaxMatchesPerImage = Math.Clamp(memVm.CharacterMaxMatches, 1, 5);
                 Vm.AppSettings.SingleModelMinConfidence = memVm.SingleModelMinConfidence;
                 var cache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
                 cache.SwitchCacheDirectory(newPath);
@@ -2198,7 +2210,6 @@ public partial class MainWindow : Window
 
                 // Phase 2: 批量推理需要重建的画师
                 int built = 0;
-                int batchSize = 16;  // 每次批量处理 16 张
                 foreach (var (artistName, artistDir, imgCount) in toBuild)
                 {
                     built++;
@@ -2215,24 +2226,14 @@ public partial class MainWindow : Window
 
                     if (images.Count == 0) continue;
 
-                    // 批量推理：每 batchSize 张一批
                     float[]? sumEmb = null;
                     int valid = 0;
-                    for (int batchStart = 0; batchStart < images.Count; batchStart += batchSize)
+                    var embeddings = await ExtractEmbeddingsForLibraryAsync(pixai, images, artistName);
+                    foreach (var emb in embeddings)
                     {
-                        var batch = images.Skip(batchStart).Take(batchSize).ToList();
-                        try
-                        {
-                            var embs = await pixai.GetEmbeddingsBatchAsync(batch);
-                            if (embs == null) continue;
-                            foreach (var emb in embs)
-                            {
-                                if (sumEmb == null) sumEmb = new float[emb.Length];
-                                for (int j = 0; j < emb.Length; j++) sumEmb[j] += emb[j];
-                                valid++;
-                            }
-                        }
-                        catch { }
+                        if (sumEmb == null) sumEmb = new float[emb.Length];
+                        for (int j = 0; j < emb.Length; j++) sumEmb[j] += emb[j];
+                        valid++;
                     }
 
                     if (sumEmb != null && valid > 0)
@@ -2250,6 +2251,202 @@ public partial class MainWindow : Window
 
         var win = new Settings.ArtistDbBuilderWindow { DataContext = vm };
         await win.ShowDialog(this);
+    }
+
+    private async void MenuCharacterDbBuilder_Click(object? sender, RoutedEventArgs e)
+    {
+        var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
+
+        if (!controller.IsModelLoaded)
+        {
+            Vm.StatusText = "正在加载打标模型...";
+            try { await controller.LoadModelAsync(); }
+            catch (Exception ex) { Vm.StatusText = $"模型加载失败: {ex.Message}"; return; }
+        }
+
+        var vm = new ViewModels.ArtistDbBuilderViewModel
+        {
+            StatusText = "就绪",
+            ReferenceDescription = "每个子文件夹 = 一个角色，文件夹名 = 角色名，文件夹内为该角色的参考图",
+            LibraryTitle = "当前角色库",
+            MeanEmbeddingHint = "每个角色取所有参考图的嵌入均值",
+            RecommendedCountHint = "建议每个角色 20-50 张代表图",
+            IncrementalHint = "新角色可随时添加，自动与已有库合并"
+        };
+
+        vm.OnSelectFolder = async _ =>
+        {
+            var result = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+            {
+                Title = "选择角色参考图根目录（子文件夹名为角色名）",
+                AllowMultiple = false
+            });
+            if (result.Count > 0)
+                vm.ReferenceDir = result[0].Path.LocalPath;
+        };
+
+        vm.OnBuildAsync = dir =>
+        {
+            return Task.Run(async () =>
+            {
+                var pixai = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.PixaiTagService>();
+                var store = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.CharacterEmbeddingStore>();
+
+                var characterDirs = Directory.GetDirectories(dir);
+                if (characterDirs.Length == 0)
+                {
+                    await App.UI.InvokeAsync(() => vm.StatusText = "未找到子文件夹");
+                    return;
+                }
+
+                var toBuild = new List<(string name, string dir, int imgCount)>();
+                int skipped = 0;
+                foreach (var characterDir in characterDirs)
+                {
+                    var characterName = Path.GetFileName(characterDir);
+                    var images = Directory.GetFiles(characterDir)
+                        .Where(f => FileTypeConstants.IsMediaFile(f))
+                        .ToList();
+                    int currentCount = images.Count;
+                    int storedCount = store.GetImageCount(characterName);
+
+                    if (storedCount == currentCount && storedCount > 0)
+                    {
+                        skipped++;
+                        continue;
+                    }
+                    toBuild.Add((characterName, characterDir, currentCount));
+                }
+
+                if (toBuild.Count == 0)
+                {
+                    await App.UI.InvokeAsync(() =>
+                        vm.StatusText = $"全部 {skipped} 个角色无需更新");
+                    return;
+                }
+
+                int built = 0;
+                foreach (var (characterName, characterDir, imgCount) in toBuild)
+                {
+                    built++;
+                    var label = store.GetImageCount(characterName) > 0 ? $"重建 {characterName}" : $"新增 {characterName}";
+                    var hint = $"跳过{skipped} / 处理{built}/{toBuild.Count}: {label}";
+                    await App.UI.InvokeAsync(() =>
+                    {
+                        vm.ReportProgress(built, toBuild.Count, $"{hint} ({imgCount}张)");
+                    });
+
+                    var images = Directory.GetFiles(characterDir)
+                        .Where(f => FileTypeConstants.IsMediaFile(f))
+                        .ToList();
+
+                    if (images.Count == 0) continue;
+
+                    float[]? sumEmb = null;
+                    int valid = 0;
+                    var embeddings = await ExtractEmbeddingsForLibraryAsync(pixai, images, characterName);
+                    foreach (var emb in embeddings)
+                    {
+                        if (sumEmb == null) sumEmb = new float[emb.Length];
+                        for (int j = 0; j < emb.Length; j++) sumEmb[j] += emb[j];
+                        valid++;
+                    }
+
+                    if (sumEmb != null && valid > 0)
+                    {
+                        for (int j = 0; j < sumEmb.Length; j++) sumEmb[j] /= valid;
+                        controller.RegisterCharacterWithEmbedding(characterName, sumEmb, valid);
+                    }
+                }
+
+                await App.UI.InvokeAsync(() =>
+                    vm.ReportProgress(toBuild.Count, toBuild.Count,
+                        $"完成！跳过 {skipped} / 重建+新增 {toBuild.Count}，共 {controller.GetCharacterStoreCount()} 个角色"));
+            });
+        };
+
+        var win = new Settings.ArtistDbBuilderWindow
+        {
+            DataContext = vm,
+            Title = "角色嵌入库构建工具"
+        };
+        await win.ShowDialog(this);
+    }
+
+    private static async Task<List<float[]>> ExtractEmbeddingsForLibraryAsync(
+        PixaiTagService pixai,
+        List<string> images,
+        string libraryItemName)
+    {
+        var result = new List<float[]>();
+        int batchSize = 2;
+        int index = 0;
+
+        while (index < images.Count)
+        {
+            var actualBatchSize = Math.Min(batchSize, images.Count - index);
+            var batch = images.Skip(index).Take(actualBatchSize).ToList();
+
+            try
+            {
+                var embs = await pixai.GetEmbeddingsBatchAsync(batch);
+                if (embs != null)
+                    result.AddRange(embs);
+
+                index += actualBatchSize;
+            }
+            catch (Exception ex) when (IsOnnxMemoryException(ex))
+            {
+                AppLogger.Warn(
+                    $"Embedding library batch memory pressure item={libraryItemName} batch={actualBatchSize}: {ex.Message}");
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+
+                if (actualBatchSize > 1)
+                {
+                    batchSize = Math.Max(1, actualBatchSize / 2);
+                    continue;
+                }
+
+                try
+                {
+                    var emb = await pixai.GetEmbeddingAsync(batch[0]);
+                    if (emb != null)
+                        result.Add(emb);
+                }
+                catch (Exception singleEx)
+                {
+                    AppLogger.Warn(
+                        $"Embedding library skipped image item={libraryItemName} file={Path.GetFileName(batch[0])}: {singleEx.Message}");
+                }
+
+                index++;
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Warn(
+                    $"Embedding library batch failed item={libraryItemName} batch={actualBatchSize}: {ex.Message}");
+
+                if (actualBatchSize > 1)
+                {
+                    batchSize = 1;
+                    continue;
+                }
+
+                index++;
+            }
+        }
+
+        return result;
+    }
+
+    private static bool IsOnnxMemoryException(Exception ex)
+    {
+        return ex is Microsoft.ML.OnnxRuntime.OnnxRuntimeException &&
+               (ex.Message.Contains("Available memory", StringComparison.OrdinalIgnoreCase) ||
+                ex.Message.Contains("AllocateRawInternal", StringComparison.OrdinalIgnoreCase) ||
+                ex.Message.Contains("BFCArena", StringComparison.OrdinalIgnoreCase));
     }
 
     private async void MenuTagManage_Click(object? sender, RoutedEventArgs e)

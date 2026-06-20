@@ -144,6 +144,7 @@
 
                     <MenuItem Header="标签管理" Click="MenuTagManage_Click"/>
                     <MenuItem Header="画师嵌入库构建" Click="MenuArtistDbBuilder_Click"/>
+                    <MenuItem Header="角色嵌入库构建" Click="MenuCharacterDbBuilder_Click"/>
                     <MenuItem Header="快捷键设置" Click="MenuShortcutSettings_Click"/>
                     <MenuItem Header="帮助" Click="MenuHelp_Click"/>
                 </MenuItem>

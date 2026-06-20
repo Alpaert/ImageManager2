@@ -49,6 +49,9 @@ public class MergeConfig
     };
     /// <summary>画师嵌入匹配余弦相似度阈值（默认 0.35）</summary>
     public double ArtistMatchThreshold { get; set; } = 0.35;
+    public bool EnableCharacterRecognition { get; set; } = true;
+    public double CharacterMatchThreshold { get; set; } = 0.35;
+    public int CharacterMaxMatchesPerImage { get; set; } = 1;
 }
 
 // ==================== Interface ====================

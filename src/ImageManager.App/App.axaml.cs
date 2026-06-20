@@ -132,6 +132,7 @@ public partial class App : Application
         // ==================== Ensemble Tag Services ====================
         services.AddSingleton<ChineseTagLibrary>();
         services.AddSingleton<ArtistEmbeddingStore>();
+        services.AddSingleton<CharacterEmbeddingStore>();
         services.AddSingleton<PixaiTagService>();
         services.AddSingleton<WdRatingService>();
         services.AddSingleton<TagResultMerger>();

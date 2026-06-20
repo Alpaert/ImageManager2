@@ -17,6 +17,7 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
     private readonly TagResultMerger _merger;
     private readonly ChineseTagLibrary _chineseLib;
     private readonly ArtistEmbeddingStore _artistStore;
+    private readonly CharacterEmbeddingStore _characterStore;
     private MergeConfig _mergeConfig = new();
     public TagMode Mode => TagMode.Ensemble;
     public bool IsModelLoaded => _wd.IsLoaded && _pixai.IsModelLoaded;
@@ -33,13 +34,15 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
         PixaiTagService pixai,
         TagResultMerger merger,
         ChineseTagLibrary chineseLib,
-        ArtistEmbeddingStore artistStore)
+        ArtistEmbeddingStore artistStore,
+        CharacterEmbeddingStore characterStore)
     {
         _wd = wd;
         _pixai = pixai;
         _merger = merger;
         _chineseLib = chineseLib;
         _artistStore = artistStore;
+        _characterStore = characterStore;
 
         _pixai.ProgressChanged += p => ProgressChanged?.Invoke(p);
     }
@@ -69,8 +72,9 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
         var artistDbPath = Path.Combine(modelsRootDir, "artist_embeddings.bin");
         _artistStore.Load(artistDbPath);
         _chineseLib.LoadArtistNames(Path.Combine(modelsRootDir, "artist_names.txt"));
+        _characterStore.Load(Path.Combine(modelsRootDir, "character_embeddings.bin"));
 
-        AppLogger.Info($"=== 模式 B 加载完成 wd={_wd.IsLoaded} pixai={_pixai.IsModelLoaded} zhTags={_chineseLib.Count} artists={_artistStore.Count} ===");
+        AppLogger.Info($"=== 模式 B 加载完成 wd={_wd.IsLoaded} pixai={_pixai.IsModelLoaded} zhTags={_chineseLib.Count} artists={_artistStore.Count} characters={_characterStore.Count} ===");
     }
 
     public async Task<SystemRating> PredictRatingAsync(string imagePath, CancellationToken ct = default)
@@ -129,6 +133,19 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
 
 
 
+        IReadOnlyList<(string CharacterName, double Similarity)> characterMatches =
+            Array.Empty<(string CharacterName, double Similarity)>();
+        if (embedding != null &&
+            _mergeConfig.EnableCharacterRecognition &&
+            _characterStore.Count > 0)
+        {
+            var maxMatches = Math.Clamp(_mergeConfig.CharacterMaxMatchesPerImage, 1, 5);
+            characterMatches = _characterStore.SearchTop(
+                embedding,
+                _mergeConfig.CharacterMatchThreshold,
+                maxMatches);
+        }
+
         var sourceTags = new Dictionary<string, List<TagPrediction>>
         {
             ["pixai"] = pixaiPreds
@@ -150,14 +167,29 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
         }
 
         // 画师识别结果追加到标签列表
+        int insertIndex = rIdx >= 0 && rIdx < 4 ? 1 : 0;
         if (artistName != null)
         {
             var artistZh = _chineseLib.Lookup(artistName) ?? artistName;
-            merged.Insert(1, new TagPrediction(artistName, artistConf)
+            merged.Insert(insertIndex, new TagPrediction(artistName, artistConf)
             {
                 ChineseName = artistZh,
                 SourceModels = new List<string> { "embedding" }
             });
+            insertIndex++;
+        }
+
+        foreach (var match in characterMatches)
+        {
+            if (ContainsTag(merged, match.CharacterName))
+                continue;
+
+            merged.Insert(insertIndex, new TagPrediction(match.CharacterName, match.Similarity)
+            {
+                ChineseName = match.CharacterName,
+                SourceModels = new List<string> { "character_embedding" }
+            });
+            insertIndex++;
         }
 
         return new EnsembleResult(rating, merged, sourceTags)
@@ -165,6 +197,13 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
             ArtistName = artistName,
             ArtistConfidence = artistConf
         };
+    }
+
+    private static bool ContainsTag(IEnumerable<TagPrediction> tags, string name)
+    {
+        return tags.Any(t =>
+            string.Equals(t.TagName, name, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(t.ChineseName, name, StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool ShouldRunParallel()

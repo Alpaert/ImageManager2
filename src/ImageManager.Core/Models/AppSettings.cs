@@ -45,5 +45,8 @@ public class AppSettings
     public int EnsembleMaxTagsPerImage { get; set; } = 75;
     public double EnsemblePixaiMinConfidence { get; set; } = 0.30;   // PixAI 打标置信度
     public double ArtistMatchThreshold { get; set; } = 0.35;          // 画师嵌入匹配阈值
+    public bool EnableCharacterRecognition { get; set; } = true;
+    public double CharacterMatchThreshold { get; set; } = 0.35;
+    public int CharacterMaxMatchesPerImage { get; set; } = 1;
     public double SingleModelMinConfidence { get; set; } = 0.15;
 }

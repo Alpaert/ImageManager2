@@ -11,8 +11,8 @@
         <StackPanel Grid.Row="0" Spacing="14">
             <Border Padding="14" BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
                 <StackPanel Spacing="8">
-                    <TextBlock Text="参考图目录" FontWeight="SemiBold" FontSize="14"/>
-                    <TextBlock Text="每个子文件夹 = 一位画师，文件夹名 = 画师名，文件夹内为该画师的参考图"
+                    <TextBlock Text="{Binding ReferenceTitle}" FontWeight="SemiBold" FontSize="14"/>
+                    <TextBlock Text="{Binding ReferenceDescription}"
                                Foreground="{DynamicResource MutedFgBrush}" FontSize="11" TextWrapping="Wrap"/>
 
                     <StackPanel Orientation="Horizontal" Spacing="10">
@@ -25,16 +25,16 @@
 
             <Border Padding="14" BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
                 <StackPanel Spacing="8">
-                    <TextBlock Text="当前画师库" FontWeight="SemiBold" FontSize="14"/>
+                    <TextBlock Text="{Binding LibraryTitle}" FontWeight="SemiBold" FontSize="14"/>
 
                     <StackPanel Spacing="4">
-                        <TextBlock Text="每位画师取所有参考图的嵌入均值"
+                        <TextBlock Text="{Binding MeanEmbeddingHint}"
                                    Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
-                        <TextBlock Text="• 建议每位画师 5-20 张代表作"
+                        <TextBlock Text="{Binding RecommendedCountHint}"
                                    Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
-                        <TextBlock Text="• 嵌入维度: 1024 (PixAI embedding)"
+                        <TextBlock Text="嵌入维度: 1024 (PixAI embedding)"
                                    Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
-                        <TextBlock Text="• 新画师可随时添加，自动与已有库合并"
+                        <TextBlock Text="{Binding IncrementalHint}"
                                    Foreground="{DynamicResource MutedFgBrush}" FontSize="11"/>
                     </StackPanel>
 

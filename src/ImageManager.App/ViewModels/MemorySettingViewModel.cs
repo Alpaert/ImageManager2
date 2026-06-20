@@ -18,6 +18,9 @@ public partial class MemorySettingViewModel : ViewModelBase
     [ObservableProperty] private int _ensembleMaxTags = 75;
     [ObservableProperty] private double _pixaiMinConfidence = 0.30;
     [ObservableProperty] private double _artistMatchThreshold = 0.35;
+    [ObservableProperty] private bool _enableCharacterRecognition = true;
+    [ObservableProperty] private double _characterMatchThreshold = 0.35;
+    [ObservableProperty] private int _characterMaxMatches = 1;
 
     // --- 单模型设置 ---
     [ObservableProperty] private double _singleModelMinConfidence = 0.15;
@@ -31,6 +34,7 @@ public partial class MemorySettingViewModel : ViewModelBase
         string deepSeekApiKey,
         int tagMode, int ensembleMaxTags,
         double pixaiMinConfidence, double artistMatchThreshold,
+        bool enableCharacterRecognition, double characterMatchThreshold, int characterMaxMatches,
         double singleModelMinConfidence,
         Func<string, long>? getDiskUsage,
         Action<bool>? onSave)
@@ -41,6 +45,9 @@ public partial class MemorySettingViewModel : ViewModelBase
         _ensembleMaxTags = ensembleMaxTags > 0 ? ensembleMaxTags : 75;
         _pixaiMinConfidence = pixaiMinConfidence > 0 ? pixaiMinConfidence : 0.30;
         _artistMatchThreshold = artistMatchThreshold > 0 ? artistMatchThreshold : 0.35;
+        _enableCharacterRecognition = enableCharacterRecognition;
+        _characterMatchThreshold = characterMatchThreshold > 0 ? characterMatchThreshold : 0.35;
+        _characterMaxMatches = Math.Clamp(characterMaxMatches > 0 ? characterMaxMatches : 1, 1, 5);
         _singleModelMinConfidence = singleModelMinConfidence > 0 ? singleModelMinConfidence : 0.15;
         _originalCachePath = cachePath;
         GetDiskUsage = getDiskUsage;
