@@ -7,6 +7,7 @@ public static class PerfLogger
 {
     private static readonly object _lock = new();
     private static string? _logPath;
+    private const long MaxLogDirectoryBytes = 25L * 1024 * 1024;
 
     public static string LogPath
     {
@@ -14,9 +15,13 @@ public static class PerfLogger
         {
             if (_logPath == null)
             {
-                var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ImageManager");
+                var dir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "ImageManager",
+                    "logs");
                 Directory.CreateDirectory(dir);
-                _logPath = Path.Combine(dir, "perf.log");
+                _logPath = Path.Combine(dir, $"perf_{DateTime.Now:yyyyMMdd_HHmmss}.log");
+                CleanupOldLogs(dir, _logPath);
             }
             return _logPath;
         }
@@ -39,4 +44,32 @@ public static class PerfLogger
 
     [Conditional("DEBUG")]
     public static void LogEnd(string phase, long elapsedMs) => Log($"[-] {phase} done {elapsedMs}ms");
+
+    private static void CleanupOldLogs(string dir, string currentPath)
+    {
+        try
+        {
+            var files = new DirectoryInfo(dir)
+                .EnumerateFiles("*.log")
+                .OrderBy(f => f.LastWriteTimeUtc)
+                .ToList();
+            long totalBytes = files.Sum(f => f.Length);
+
+            foreach (var file in files)
+            {
+                if (totalBytes <= MaxLogDirectoryBytes) break;
+                if (string.Equals(file.FullName, currentPath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var length = file.Length;
+                try
+                {
+                    file.Delete();
+                    totalBytes -= length;
+                }
+                catch { }
+            }
+        }
+        catch { }
+    }
 }

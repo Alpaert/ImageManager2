@@ -31,6 +31,8 @@ public enum ImageSortOrder
     ResolutionAsc, ResolutionDesc
 }
 
+internal readonly record struct FileEnumerationResult(List<string> Files, bool Canceled);
+
 public partial class MainWindowViewModel : ViewModelBase
 {
     private readonly ISettingsRepository _settingsRepo;
@@ -134,20 +136,36 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         if (SearchScope == 0 || string.IsNullOrEmpty(CurrentFolder))
             return _allFiles;
-        return await GetImageFilesRecursiveAsync(CurrentFolder);
+        var result = await EnumerateMediaFilesAsync(CurrentFolder, recursive: true, CurrentFolderWorkToken);
+        return result.Canceled ? _allFiles : result.Files;
     }
 
-    private static async Task<List<string>> GetImageFilesRecursiveAsync(string root)
+    private static Task<FileEnumerationResult> EnumerateMediaFilesAsync(
+        string root,
+        bool recursive,
+        CancellationToken ct = default)
     {
-        var exts = FileTypeConstants.AllMediaExtensions;
-        try
+        return Task.Run(() =>
         {
-            return await Task.Run(() =>
-                Directory.EnumerateFiles(root, "*.*", SearchOption.AllDirectories)
-                    .Where(f => exts.Contains(Path.GetExtension(f)))
-                    .ToList());
-        }
-        catch { return new List<string>(); }
+            var files = new List<string>();
+            try
+            {
+                var searchOption = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+                foreach (var file in Directory.EnumerateFiles(root, "*.*", searchOption))
+                {
+                    if (ct.IsCancellationRequested)
+                        return new FileEnumerationResult(files, true);
+                    if (FileTypeConstants.IsMediaFile(file))
+                        files.Add(file);
+                }
+            }
+            catch
+            {
+                return new FileEnumerationResult(new List<string>(), false);
+            }
+
+            return new FileEnumerationResult(files, ct.IsCancellationRequested);
+        }, CancellationToken.None);
     }
 
     private FolderTreeNode? FindNodeByPath(string path)
@@ -261,6 +279,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private readonly SemaphoreSlim _hashGate = new(1, 1);
     private readonly SemaphoreSlim _maintenanceGate = new(1, 1);
     private CancellationTokenSource? _hashCts;
+    private CancellationTokenSource _folderWorkCts = new();
     private DispatcherTimer? _idleTimer;
     private DateTime _deferMaintenanceUntilUtc = DateTime.MinValue;
     private FileSystemWatcher? _folderWatcher;
@@ -390,19 +409,15 @@ public partial class MainWindowViewModel : ViewModelBase
         SyncUISettingsFromAppData();
 
         // Clean orphan thumbnails from externally-deleted files
-        _ = Task.Run(async () =>
+        RunBackgroundSafe("initial-orphan-cleanup", CancellationToken.None, async token =>
         {
-            try
-            {
-                var orphanFolders = await _metaRepo.UnlinkOrphanFolderIdsAsync();
-                if (orphanFolders > 0)
-                    AppLogger.Info($"ImageMeta orphan FolderId unlinked count={orphanFolders}");
+            var orphanFolders = await _metaRepo.UnlinkOrphanFolderIdsAsync();
+            if (orphanFolders > 0)
+                AppLogger.Info($"ImageMeta orphan FolderId unlinked count={orphanFolders}");
 
-                var unlinked = await _metaRepo.GetAllUnlinkedAsync();
-                foreach (var m in unlinked)
-                    _thumbCache.DeleteFromDiskCache(m.FilePath);
-            }
-            catch { }
+            var unlinked = await _metaRepo.GetAllUnlinkedAsync();
+            foreach (var m in unlinked)
+                _thumbCache.DeleteFromDiskCache(m.FilePath);
         });
 
         // Defer tag count refresh — not needed for initial display
@@ -564,6 +579,7 @@ public partial class MainWindowViewModel : ViewModelBase
         var sw = Stopwatch.StartNew();
         PerfLogger.Log($"[LoadFolder] START folder={Path.GetFileName(folder)} showAll={ShowAllSubfolders}");
         var requestVersion = BeginFolderViewRequest();
+        var folderWorkToken = BeginFolderWorkScope(folder);
         var showAllSubfolders = ShowAllSubfolders;
 
         if (!Directory.Exists(folder))
@@ -602,6 +618,7 @@ public partial class MainWindowViewModel : ViewModelBase
         _idleTimer.Start();
 
         await Task.Yield();
+        if (folderWorkToken.IsCancellationRequested) return;
         PerfLogger.Log($"[LoadFolder] 2-yield done {sw.ElapsedMilliseconds}ms");
 
         // 线程池诊断
@@ -614,16 +631,16 @@ public partial class MainWindowViewModel : ViewModelBase
 
         if (showAllSubfolders)
         {
-            await RebuildFileListAsync(requestVersion, folder, true);
+            await RebuildFileListAsync(requestVersion, folder, true, folderWorkToken);
             PerfLogger.Log($"[LoadFolder] END (showAll) total={_allFiles.Count} elapsed={sw.ElapsedMilliseconds}ms");
             return;
         }
 
         // Check if this folder already has FolderId markers in DB
         PerfLogger.Log($"[LoadFolder] 3-db-query-folder start {sw.ElapsedMilliseconds}ms");
-        var folderInfo = await Task.Run(() => _folderRepo.GetByPathAsync(folder));
+        var folderInfo = await Task.Run(() => _folderRepo.GetByPathAsync(folder), folderWorkToken);
         PerfLogger.Log($"[LoadFolder] 3-db-query-folder done {sw.ElapsedMilliseconds}ms");
-        if (isCurrent?.Invoke() == false)
+        if (folderWorkToken.IsCancellationRequested || isCurrent?.Invoke() == false)
             return;
         long? folderId = folderInfo?.Id;
         var exts = FileTypeConstants.AllMediaExtensions.ToArray();
@@ -633,10 +650,22 @@ public partial class MainWindowViewModel : ViewModelBase
         try
         {
             _allFiles = await Task.Run(() =>
-                Directory.EnumerateFiles(folder, "*.*", SearchOption.TopDirectoryOnly)
-                    .Where(f => exts.Contains(Path.GetExtension(f).ToLower()))
-                    .ToList()
-            );
+            {
+                var files = new List<string>();
+                foreach (var file in Directory.EnumerateFiles(folder, "*.*", SearchOption.TopDirectoryOnly))
+                {
+                    if (folderWorkToken.IsCancellationRequested)
+                        return files;
+                    if (exts.Contains(Path.GetExtension(file).ToLower()))
+                        files.Add(file);
+                }
+                return files;
+            }, CancellationToken.None);
+        }
+        catch (OperationCanceledException)
+        {
+            AppLogger.Memory($"[FolderWork] load canceled folder={Path.GetFileName(folder)}");
+            return;
         }
         catch (Exception ex)
         {
@@ -644,6 +673,7 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
         PerfLogger.Log($"[LoadFolder] disk-enum done count={_allFiles.Count} {sw.ElapsedMilliseconds}ms");
+        if (folderWorkToken.IsCancellationRequested) return;
         AppLogger.Memory($"LoadFolder.DiskEnum count={_allFiles.Count}");
 
         if (_allFiles.Count == 0)
@@ -670,18 +700,87 @@ public partial class MainWindowViewModel : ViewModelBase
     /// <summary>Public wrapper for code-behind: sync current folder and refresh UI, then compute missing hashes</summary>
     public async Task SyncCurrentFolderAsync()
     {
+        var folderWorkToken = CurrentFolderWorkToken;
         if (string.IsNullOrEmpty(CurrentFolder)) return;
         var fi = await _folderRepo.GetByPathAsync(CurrentFolder);
         if (fi == null) return;
         var exts = FileTypeConstants.AllMediaExtensions.ToArray();
-        await SyncFolderAsync(CurrentFolder, fi.Id, exts);
+        await SyncFolderAsync(CurrentFolder, fi.Id, exts, folderWorkToken);
 
-        _ = Task.Run(async () =>
+        RunBackgroundSafe("sync-current-folder-hash", folderWorkToken, async token =>
         {
-            try { await Task.Delay(3000); }
-            catch { return; }
-            await PrecomputeHashesAsync(CancellationToken.None, fi.Id);
+            await Task.Delay(3000, token);
+            await PrecomputeHashesAsync(token, fi.Id);
         });
+    }
+
+    public async Task RecomputeFailedHashesForFolderAsync(FolderTreeNode folder)
+    {
+        if (folder == null || string.IsNullOrWhiteSpace(folder.Path))
+        {
+            StatusText = "未选择文件夹";
+            return;
+        }
+
+        if (!Directory.Exists(folder.Path))
+        {
+            StatusText = "文件夹不存在";
+            return;
+        }
+
+        List<string> retryPaths;
+        try
+        {
+            retryPaths = await _metaRepo.ResetFailedHashStatusByFolderAsync(folder.Path);
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"Reset failed hash status failed: {folder.Path} | {ex.Message}");
+            StatusText = $"重置失败项失败: {ex.Message}";
+            return;
+        }
+
+        if (retryPaths.Count == 0)
+        {
+            StatusText = "没有需要重新计算的失败项";
+            return;
+        }
+
+        var previousFiles = _allFiles;
+        var previousFolder = CurrentFolder;
+        var previousShowAll = ShowAllSubfolders;
+        var folderWorkToken = CurrentFolderWorkToken;
+        try
+        {
+            StatusText = $"正在重新计算 {retryPaths.Count} 个失败项...";
+            var files = retryPaths
+                .Where(path => File.Exists(path) && FileTypeConstants.IsImageFile(path))
+                .ToList();
+            if (files.Count == 0)
+            {
+                StatusText = "失败项文件不存在或不是图片文件";
+                return;
+            }
+
+            _allFiles = files;
+            await PrecomputeHashesAsync(folderWorkToken, folder.DbId > 0 ? folder.DbId : null);
+            StatusText = $"已重新计算失败项: {retryPaths.Count}";
+        }
+        catch (OperationCanceledException)
+        {
+            StatusText = "重新计算失败项已取消";
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"Recompute failed hashes failed: {folder.Path} | {ex.Message}");
+            StatusText = $"重新计算失败项失败: {ex.Message}";
+        }
+        finally
+        {
+            if (string.Equals(CurrentFolder, previousFolder, StringComparison.OrdinalIgnoreCase)
+                && ShowAllSubfolders == previousShowAll)
+                _allFiles = previousFiles;
+        }
     }
 
     private void StartWatchingCurrentFolder()
@@ -691,12 +790,13 @@ public partial class MainWindowViewModel : ViewModelBase
 
         _folderWatcher = new FileSystemWatcher(CurrentFolder)
         {
-            IncludeSubdirectories = false,
-            NotifyFilter = NotifyFilters.FileName,
+            IncludeSubdirectories = ShowAllSubfolders,
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite,
             EnableRaisingEvents = false
         };
         _folderWatcher.Created += OnFolderFileCreated;
         _folderWatcher.Deleted += OnFolderFileDeleted;
+        _folderWatcher.Renamed += OnFolderFileRenamed;
         _folderWatcher.EnableRaisingEvents = true;
     }
 
@@ -710,6 +810,7 @@ public partial class MainWindowViewModel : ViewModelBase
             _folderWatcher.EnableRaisingEvents = false;
             _folderWatcher.Created -= OnFolderFileCreated;
             _folderWatcher.Deleted -= OnFolderFileDeleted;
+            _folderWatcher.Renamed -= OnFolderFileRenamed;
             _folderWatcher.Dispose();
             _folderWatcher = null;
         }
@@ -729,28 +830,25 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void OnFolderFileCreated(object sender, FileSystemEventArgs e)
     {
-        if (!FileTypeConstants.IsMediaFile(e.Name))
-            return;
-
-        _folderWatchDebounceCts?.Cancel();
-        _folderWatchDebounceCts?.Dispose();
-        _folderWatchDebounceCts = new CancellationTokenSource();
-        var ct = _folderWatchDebounceCts.Token;
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(2000, ct);
-                await SyncCurrentFolderAsync();
-            }
-            catch (OperationCanceledException) { }
-        });
+        QueueFolderRefreshForWatcherEvent(e);
     }
 
     private void OnFolderFileDeleted(object sender, FileSystemEventArgs e)
     {
-        if (!FileTypeConstants.IsMediaFile(e.Name))
+        QueueFolderRefreshForWatcherEvent(e);
+    }
+
+    private void OnFolderFileRenamed(object sender, RenamedEventArgs e)
+    {
+        if (!FileTypeConstants.IsMediaFile(e.Name) && !FileTypeConstants.IsMediaFile(e.OldName))
+            return;
+
+        QueueFolderRefreshForWatcherEvent(e, force: true);
+    }
+
+    private void QueueFolderRefreshForWatcherEvent(FileSystemEventArgs e, bool force = false)
+    {
+        if (!force && !FileTypeConstants.IsMediaFile(e.FullPath))
             return;
 
         _folderWatchDebounceCts?.Cancel();
@@ -758,33 +856,131 @@ public partial class MainWindowViewModel : ViewModelBase
         _folderWatchDebounceCts = new CancellationTokenSource();
         var ct = _folderWatchDebounceCts.Token;
 
-        _ = Task.Run(async () =>
+        RunBackgroundSafe("folder-watcher-refresh", ct, async token =>
         {
-            try
+            await Task.Delay(2000, token);
+            await _dispatcher.InvokeAsync(async () =>
             {
-                await Task.Delay(2000, ct);
-                await SyncCurrentFolderAsync();
-            }
-            catch (OperationCanceledException) { }
+                await RefreshCurrentFolderFromDiskAsync("watcher");
+            });
         });
+    }
+
+    public async Task RefreshCurrentFolderFromDiskAsync(string reason = "refresh")
+    {
+        var folderWorkToken = CurrentFolderWorkToken;
+        if (string.IsNullOrEmpty(CurrentFolder) || !Directory.Exists(CurrentFolder)) return;
+
+        try
+        {
+            if (folderWorkToken.IsCancellationRequested)
+                return;
+            FileEnumerationResult refreshEnumResult;
+            if (ShowAllSubfolders)
+            {
+                refreshEnumResult = await EnumerateMediaFilesAsync(CurrentFolder, recursive: true, folderWorkToken);
+            }
+            else
+            {
+                refreshEnumResult = await Task.Run(() =>
+                {
+                    var files = new List<string>();
+                    foreach (var file in Directory.EnumerateFiles(CurrentFolder, "*.*", SearchOption.TopDirectoryOnly))
+                    {
+                        if (folderWorkToken.IsCancellationRequested)
+                            return new FileEnumerationResult(files, true);
+                        if (FileTypeConstants.IsMediaFile(file))
+                            files.Add(file);
+                    }
+                    return new FileEnumerationResult(files, folderWorkToken.IsCancellationRequested);
+                }, CancellationToken.None);
+            }
+            if (refreshEnumResult.Canceled)
+                return;
+            var diskFiles = refreshEnumResult.Files;
+
+            await SortFilesAsync(diskFiles, CurrentSortOrder, ShowAllSubfolders);
+
+            var oldSet = new HashSet<string>(_allFiles, StringComparer.OrdinalIgnoreCase);
+            var newSet = new HashSet<string>(diskFiles, StringComparer.OrdinalIgnoreCase);
+            var deleted = oldSet.Where(path => !newSet.Contains(path)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var added = diskFiles.Where(path => !oldSet.Contains(path)).ToList();
+            if (deleted.Count == 0 && added.Count == 0) return;
+
+            AppLogger.Memory($"FolderRefresh reason={reason} added={added.Count} deleted={deleted.Count} showAll={ShowAllSubfolders}");
+            _allFiles = diskFiles;
+            if (_tagSearch.SearchResultFiles.Count > 0)
+                _tagSearch.SearchResultFiles.RemoveAll(path => deleted.Contains(path));
+
+            TotalPages = ActiveFileList.Count == 0 ? 0 : (ActiveFileList.Count + PageManager.PageSize - 1) / PageManager.PageSize;
+            PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
+            if (CurrentPage >= TotalPages && TotalPages > 0)
+                CurrentPage = TotalPages - 1;
+
+            if (TotalPages == 0)
+            {
+                Images = new ObservableCollection<ImageViewItem>();
+                _pageManager.InvalidateCache();
+                StatusText = "该文件夹内没有媒体文件";
+                return;
+            }
+
+            _pageManager.RemoveFromCache(CurrentPage);
+            await ShowPageAsync(CurrentPage);
+            StatusText = $"总文件数: {_allFiles.Count}";
+
+            var fi = await _folderRepo.GetByPathAsync(CurrentFolder);
+            if (fi != null)
+            {
+                var exts = FileTypeConstants.AllMediaExtensions.ToArray();
+                var currentFolder = CurrentFolder;
+                var showAll = ShowAllSubfolders;
+                RunBackgroundSafe("folder-refresh-sync", folderWorkToken, token =>
+                    SyncFolderAsync(currentFolder, fi.Id, exts, token, recursive: showAll));
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            AppLogger.Memory($"FolderRefresh canceled reason={reason} folder={Path.GetFileName(CurrentFolder)}");
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"FolderRefresh failed reason={reason}: {ex.Message}");
+        }
     }
 
     /// <summary>
     /// Sync folder: detect new/deleted files, compute hashes for new files, refresh UI if changed.
     /// Returns true if any files were added or removed.
     /// </summary>
-    private async Task<bool> SyncFolderAsync(string folder, long folderId, string[] exts, Func<bool>? isCurrent = null)
+    private async Task<bool> SyncFolderAsync(
+        string folder,
+        long folderId,
+        string[] exts,
+        CancellationToken ct = default,
+        bool recursive = false,
+        Func<bool>? isCurrent = null)
     {
         try
         {
             // Disk enum + DB query on background thread to avoid blocking UI
             var diskFiles = await Task.Run(() =>
-                new HashSet<string>(
-                    Directory.EnumerateFiles(folder, "*.*", SearchOption.TopDirectoryOnly)
-                        .Where(f => FileTypeConstants.IsMediaFile(f)),
-                    StringComparer.OrdinalIgnoreCase));
+            {
+                var files = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var searchOption = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+                foreach (var file in Directory.EnumerateFiles(folder, "*.*", searchOption))
+                {
+                    if (ct.IsCancellationRequested)
+                        return files;
+                    if (FileTypeConstants.IsMediaFile(file))
+                        files.Add(file);
+                }
+                return files;
+            }, CancellationToken.None);
+            if (ct.IsCancellationRequested)
+                return false;
 
-            var dbFiles = await Task.Run(() => _metaRepo.GetByFolderIdAsync(folderId));
+            var dbFiles = await Task.Run(() => _metaRepo.GetByFolderIdAsync(folderId), ct);
             var dbSet = new HashSet<string>(dbFiles.Select(m => m.FilePath), StringComparer.OrdinalIgnoreCase);
 
             // MD5 + DB on background thread to avoid blocking UI
@@ -793,13 +989,20 @@ public partial class MainWindowViewModel : ViewModelBase
                 var newFiles = new List<string>();
                 foreach (var file in diskFiles)
                 {
+                    ct.ThrowIfCancellationRequested();
                     if (!dbSet.Contains(file))
                     {
                         string? md5 = null;
                         try
                         {
+                            ct.ThrowIfCancellationRequested();
                             using var fs = File.OpenRead(file);
                             md5 = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(fs)).ToLowerInvariant();
+                            ct.ThrowIfCancellationRequested();
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
                         }
                         catch { }
                         if (!string.IsNullOrEmpty(md5))
@@ -844,6 +1047,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 bool deleted = false;
                 foreach (var meta in dbFiles)
                 {
+                    ct.ThrowIfCancellationRequested();
                     if (!diskFiles.Contains(meta.FilePath) && !File.Exists(meta.FilePath))
                     {
                         await _metaRepo.SetFolderIdAsync(meta.FilePath, 0L);
@@ -852,7 +1056,7 @@ public partial class MainWindowViewModel : ViewModelBase
                     }
                 }
                 return (newFiles, deleted);
-            });
+            }, ct);
 
             if (newFiles.Count > 0 || deleted)
             {
@@ -871,6 +1075,10 @@ public partial class MainWindowViewModel : ViewModelBase
                 }
                 return true;
             }
+        }
+        catch (OperationCanceledException)
+        {
+            AppLogger.Memory($"[SyncFolder] canceled folder={Path.GetFileName(folder)}");
         }
         catch { }
         return false;
@@ -910,7 +1118,7 @@ public partial class MainWindowViewModel : ViewModelBase
         var files = _allFiles.ToArray();
         if (files.Length == 0) return;
 
-        HashSet<string> existingSet = await GetHashedPathsWithRetryAsync(files);
+        HashSet<string> existingSet = await GetHashedPathsWithRetryAsync(files, ct);
 
         var needsHashing = files
             .Where(f => !existingSet.Contains(f))
@@ -948,7 +1156,10 @@ public partial class MainWindowViewModel : ViewModelBase
         int cpuConcurrency = Math.Max(1, Math.Min(4, Environment.ProcessorCount - 1));
         using var cpuSlots = new SemaphoreSlim(cpuConcurrency);
         var upsertBatch = new ConcurrentQueue<ImageMeta>();
+        var failedBatch = new ConcurrentQueue<ImageMeta>();
         int processed = 0;
+        int failed = 0;
+        int failedLogCount = 0;
         int totalNeed = needsHashing.Count;
 
         _dispatcher.InvokeAsync(() =>
@@ -966,6 +1177,7 @@ public partial class MainWindowViewModel : ViewModelBase
                         try
                         {
                             var phash = HashService.ComputeCombinedPerceptualHashFromBytes(item.Data);
+                            var hashSucceeded = !string.IsNullOrEmpty(phash);
                             var meta = new ImageMeta
                             {
                                 FilePath = item.Path,
@@ -974,7 +1186,7 @@ public partial class MainWindowViewModel : ViewModelBase
                                 LastWriteTicks = item.LastWriteTicks,
                                 FolderId = folderId, // may be null — BulkUpsert will preserve existing non-null
                                 PerceptualHash = phash,
-                                HashStatus = string.IsNullOrEmpty(phash) ? 0 : 1
+                                HashStatus = hashSucceeded ? 1 : -1
                             };
                             try
                             {
@@ -983,7 +1195,7 @@ public partial class MainWindowViewModel : ViewModelBase
                             }
                             catch { }
 
-                            if (!string.IsNullOrEmpty(meta.PerceptualHash))
+                            if (hashSucceeded)
                                 _phashCache[item.Path] = meta.PerceptualHash;
                             upsertBatch.Enqueue(meta);
 
@@ -1029,15 +1241,27 @@ public partial class MainWindowViewModel : ViewModelBase
                     }
                     else
                     {
+                        token.ThrowIfCancellationRequested();
                         using var fs = File.OpenRead(path);
                         fileHash = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(fs)).ToLowerInvariant();
+                        token.ThrowIfCancellationRequested();
                     }
                     var hashInput = ThumbnailGenerator.DecodeForHashInput(path, 256);
-                    if (hashInput == null) return;
+                    if (hashInput == null)
+                    {
+                        failedBatch.Enqueue(CreateFailedHashMeta(path, fileHash, fi, folderId));
+                        Interlocked.Increment(ref failed);
+                        if (Interlocked.Increment(ref failedLogCount) <= 5)
+                            AppLogger.Warn($"HashPrecompute decode skipped: {path}");
+                        return;
+                    }
                     await channel.Writer.WriteAsync(
                         (path, hashInput, fi.Length, fi.LastWriteTimeUtc.Ticks, fileHash), token);
                 }
                 catch (OperationCanceledException) { }
+                catch (Exception ex) when (HandleHashProducerFailure(path, ex))
+                {
+                }
                 catch (Exception ex) { AppLogger.Warn($"Hash producer 文件失败: {ex.Message}"); }
             });
         channel.Writer.Complete();
@@ -1048,9 +1272,13 @@ public partial class MainWindowViewModel : ViewModelBase
             await _metaRepo.BulkUpsertAsync(final);
         Interlocked.Add(ref processed, final.Count);
 
+        var failedFinal = DrainFailedBatch();
+        if (failedFinal.Count > 0)
+            await _metaRepo.BulkUpsertAsync(failedFinal);
+
         _dispatcher.InvokeAsync(() =>
             BackgroundStatusText = "");
-        AppLogger.Memory($"HashPrecompute.End processed={processed}");
+        AppLogger.Memory($"HashPrecompute.End processed={processed} failed={failed}");
         return;
 
         List<ImageMeta> DrainBatch()
@@ -1060,29 +1288,50 @@ public partial class MainWindowViewModel : ViewModelBase
                 list.Add(m);
             return list;
         }
+
+        List<ImageMeta> DrainFailedBatch()
+        {
+            var list = new List<ImageMeta>();
+            while (failedBatch.TryDequeue(out var m))
+                list.Add(m);
+            return list;
+        }
+
+        bool HandleHashProducerFailure(string path, Exception ex)
+        {
+            try
+            {
+                var fi = new FileInfo(path);
+                failedBatch.Enqueue(CreateFailedHashMeta(path, null, fi, folderId));
+                Interlocked.Increment(ref failed);
+            }
+            catch { }
+
+            if (Interlocked.Increment(ref failedLogCount) <= 5)
+                AppLogger.Warn($"Hash producer 文件失败: {path} | {ex.Message}");
+            return true;
+        }
     }
 
     /// <summary>Query HashStatus=1 paths with retry. On total failure, returns all files
     /// as "already hashed" to skip this cycle safely (idle timer will retrigger).</summary>
-    private async Task<HashSet<string>> GetHashedPathsWithRetryAsync(string[] files)
+    private async Task<HashSet<string>> GetHashedPathsWithRetryAsync(string[] files, CancellationToken ct)
     {
         const int maxRetries = 3;
         for (int attempt = 1; attempt <= maxRetries; attempt++)
         {
+            ct.ThrowIfCancellationRequested();
             try
             {
                 var result = await _metaRepo.GetHashedPathsAsync(files.ToList());
                 // Warm the in-memory phash cache for similarity search
-                _ = Task.Run(async () =>
+                RunBackgroundSafe("phash-cache-warmup", ct, async token =>
                 {
-                    try
-                    {
-                        var hashDict = await _metaRepo.GetPerceptualHashesByPathsAsync(files.ToList());
-                        foreach (var kv in hashDict)
-                            if (!string.IsNullOrEmpty(kv.Value))
-                                _phashCache[kv.Key] = kv.Value;
-                    }
-                    catch { }
+                    token.ThrowIfCancellationRequested();
+                    var hashDict = await _metaRepo.GetPerceptualHashesByPathsAsync(files.ToList());
+                    foreach (var kv in hashDict)
+                        if (!string.IsNullOrEmpty(kv.Value))
+                            _phashCache[kv.Key] = kv.Value;
                 });
                 return result;
             }
@@ -1090,7 +1339,7 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 AppLogger.Warn($"GetHashedPathsAsync 失败 ({attempt}/{maxRetries}): {ex.Message}");
                 if (attempt < maxRetries)
-                    await Task.Delay(TimeSpan.FromMilliseconds(200 * Math.Pow(2, attempt - 1)));
+                    await Task.Delay(TimeSpan.FromMilliseconds(200 * Math.Pow(2, attempt - 1)), ct);
             }
         }
         AppLogger.Error("GetHashedPathsAsync 全部重试失败，跳过本轮哈希预计算");
@@ -1098,6 +1347,17 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     /// <summary>用户停止切换文件夹 5 秒后执行维护任务（CleanMeta、PrecomputeHashes、SyncFolder）</summary>
+    private static ImageMeta CreateFailedHashMeta(string path, string? fileHash, FileInfo fileInfo, long? folderId)
+        => new()
+        {
+            FilePath = path,
+            FileHash = fileHash,
+            FileSize = fileInfo.Exists ? fileInfo.Length : 0,
+            LastWriteTicks = fileInfo.Exists ? fileInfo.LastWriteTimeUtc.Ticks : 0,
+            FolderId = folderId,
+            HashStatus = -1
+        };
+
     private void OnIdleTimerTick(object? sender, EventArgs e)
     {
         _idleTimer?.Stop();
@@ -1124,13 +1384,17 @@ public partial class MainWindowViewModel : ViewModelBase
         var showAll = ShowAllSubfolders; // capture before Task.Run
         if (string.IsNullOrEmpty(folder)) return;
         var exts = FileTypeConstants.AllMediaExtensions.ToArray();
+        var folderWorkToken = CurrentFolderWorkToken;
 
-        _ = Task.Run(async () =>
+        RunBackgroundSafe("folder-maintenance", folderWorkToken, async token =>
         {
+            var gateEntered = false;
             // 非阻塞获取：如果 AutoTag 正在运行则跳过本次维护
-            if (!await _maintenanceGate.WaitAsync(0)) return;
+            if (!await _maintenanceGate.WaitAsync(0, token)) return;
+            gateEntered = true;
             try
             {
+                token.ThrowIfCancellationRequested();
                 var folderInfo = await _folderRepo.GetByPathAsync(folder);
                 var folderId = folderInfo?.Id;
                 var diskFiles = new HashSet<string>(_allFiles, StringComparer.OrdinalIgnoreCase);
@@ -1139,12 +1403,11 @@ public partial class MainWindowViewModel : ViewModelBase
 
                 if (folderId.HasValue)
                 {
-                    await PrecomputeHashesAsync(CancellationToken.None, folderId);
-                    await SyncFolderAsync(folder, folderId.Value, exts);
+                    await PrecomputeHashesAsync(token, folderId);
+                    await SyncFolderAsync(folder, folderId.Value, exts, token, recursive: showAll);
                 }
             }
-            catch { }
-            finally { _maintenanceGate.Release(); }
+            finally { if (gateEntered) _maintenanceGate.Release(); }
         });
     }
 
@@ -1271,17 +1534,16 @@ partial void OnCornerRadiusDipChanged(double value)
             _widthDebounceCts = new CancellationTokenSource();
             var capturedWidth = baseWidth;
             var token = _widthDebounceCts.Token;
-            _ = Task.Run(async () =>
+            RunBackgroundSafe("thumbnail-width-debounce", token, async ct =>
             {
-                try { await Task.Delay(50, token); }
-                catch { return; }
-                if (token.IsCancellationRequested) return;
+                await Task.Delay(50, ct);
+                if (ct.IsCancellationRequested) return;
                 await _dispatcher.InvokeAsync(() =>
                 {
-                    if (!token.IsCancellationRequested)
+                    if (!ct.IsCancellationRequested)
                         ThumbnailBaseWidth = capturedWidth;
                 });
-            }, token);
+            });
         }
     }
 
@@ -1290,8 +1552,9 @@ partial void OnCornerRadiusDipChanged(double value)
         if (value) SearchScope = 1; // auto-switch to recursive
         if (string.IsNullOrEmpty(CurrentFolder)) return;
         var requestVersion = BeginFolderViewRequest();
+        var folderWorkToken = BeginFolderWorkScope(CurrentFolder);
         var folder = CurrentFolder;
-        _ = RebuildFileListAsync(requestVersion, folder, value);
+        _ = RebuildFileListAsync(requestVersion, folder, value, folderWorkToken);
     }
 
     partial void OnFolderSearchTextChanged(string value)
@@ -1518,26 +1781,51 @@ partial void OnCornerRadiusDipChanged(double value)
     public Task RebuildFileListAsync()
     {
         var requestVersion = BeginFolderViewRequest();
-        return RebuildFileListAsync(requestVersion, CurrentFolder, ShowAllSubfolders);
+        return RebuildFileListAsync(requestVersion, CurrentFolder, ShowAllSubfolders, CurrentFolderWorkToken);
     }
 
-    private async Task RebuildFileListAsync(int requestVersion, string folderPath, bool showAllSubfolders)
+    private async Task RebuildFileListAsync(
+        int requestVersion,
+        string folderPath,
+        bool showAllSubfolders,
+        CancellationToken folderWorkToken = default)
     {
         if (string.IsNullOrEmpty(folderPath) || !Directory.Exists(folderPath))
             return;
 
-        var rebuiltFiles = showAllSubfolders
-            ? await GetImageFilesRecursiveAsync(folderPath)
-            : await Task.Run(() =>
-                Directory.EnumerateFiles(folderPath, "*.*", SearchOption.TopDirectoryOnly)
-                    .Where(f => FileTypeConstants.IsMediaFile(f))
-                    .ToList());
+        if (folderWorkToken.IsCancellationRequested)
+            return;
+        FileEnumerationResult rebuildEnumResult;
+        if (showAllSubfolders)
+        {
+            rebuildEnumResult = await EnumerateMediaFilesAsync(folderPath, recursive: true, folderWorkToken);
+        }
+        else
+        {
+            rebuildEnumResult = await Task.Run(() =>
+            {
+                var files = new List<string>();
+                foreach (var file in Directory.EnumerateFiles(folderPath, "*.*", SearchOption.TopDirectoryOnly))
+                {
+                    if (folderWorkToken.IsCancellationRequested)
+                        return new FileEnumerationResult(files, true);
+                    if (FileTypeConstants.IsMediaFile(file))
+                        files.Add(file);
+                }
+                return new FileEnumerationResult(files, folderWorkToken.IsCancellationRequested);
+            }, CancellationToken.None);
+        }
+        if (rebuildEnumResult.Canceled)
+            return;
+        var rebuiltFiles = rebuildEnumResult.Files;
 
-        if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
+        if (folderWorkToken.IsCancellationRequested ||
+            !IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
             return;
 
         await SortFilesAsync(rebuiltFiles, CurrentSortOrder, showAllSubfolders);
-        if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
+        if (folderWorkToken.IsCancellationRequested ||
+            !IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
             return;
 
         _allFiles = rebuiltFiles;
@@ -1567,14 +1855,14 @@ partial void OnCornerRadiusDipChanged(double value)
         // Load tags in background — page already visible, tags fill in asynchronously
         if (showAllSubfolders)
         {
-            _ = Task.Run(async () =>
+            RunBackgroundSafe("show-all-tags-and-hash", folderWorkToken, async token =>
             {
-                try
-                {
-                    var tagMap = await _metaRepo.GetTagMapByFolderAsync(folderPath);
-                    if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
-                        return;
-                    int loadedCount = 0;
+                token.ThrowIfCancellationRequested();
+                var tagMap = await _metaRepo.GetTagMapByFolderAsync(folderPath);
+                if (token.IsCancellationRequested ||
+                    !IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
+                    return;
+                int loadedCount = 0;
                     lock (_tagCacheLock)
                     {
                         foreach (var kv in tagMap)
@@ -1597,12 +1885,11 @@ partial void OnCornerRadiusDipChanged(double value)
                         });
                     }
 
-                    await Task.Delay(3000);
-                    if (!IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
+                    await Task.Delay(3000, token);
+                    if (token.IsCancellationRequested ||
+                        !IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
                         return;
-                    await PrecomputeHashesAsync(CancellationToken.None, (await _folderRepo.GetByPathAsync(folderPath))?.Id);
-                }
-                catch { }
+                    await PrecomputeHashesAsync(token, (await _folderRepo.GetByPathAsync(folderPath))?.Id);
             });
         }
     }
@@ -1610,6 +1897,61 @@ partial void OnCornerRadiusDipChanged(double value)
     private int BeginFolderViewRequest()
     {
         return Interlocked.Increment(ref _folderViewRequestVersion);
+    }
+
+    private CancellationToken BeginFolderWorkScope(string folderPath)
+    {
+        var oldCts = Interlocked.Exchange(ref _folderWorkCts, new CancellationTokenSource());
+        try
+        {
+            oldCts.Cancel();
+            AppLogger.Memory($"[FolderWork] cancel old folder={Path.GetFileName(CurrentFolder ?? "")}");
+        }
+        catch { }
+        finally
+        {
+            oldCts.Dispose();
+        }
+
+        _pageManager.CancelCurrentLoads();
+        _idleTimer?.Stop();
+        return _folderWorkCts.Token;
+    }
+
+    private CancellationToken CurrentFolderWorkToken => Volatile.Read(ref _folderWorkCts).Token;
+
+    private void RunBackgroundSafe(string name, CancellationToken ct, Func<CancellationToken, Task> work)
+    {
+        if (ct.IsCancellationRequested)
+            return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                await work(ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                AppLogger.Memory($"[Background] canceled name={name}");
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Warn($"[Background] failed name={name}: {ex.Message}");
+            }
+        }, CancellationToken.None);
+    }
+
+    public void ShutdownBackgroundWork()
+    {
+        StopWatchingCurrentFolder();
+        _idleTimer?.Stop();
+        _pageManager.CancelCurrentLoads();
+        _folderWorkCts.Cancel();
+        _hashCts?.Cancel();
+        _searchCts?.Cancel();
+        _widthDebounceCts?.Cancel();
     }
 
     private bool IsFolderViewRequestCurrent(int requestVersion, string folderPath, bool showAllSubfolders)
@@ -1739,6 +2081,8 @@ partial void OnCornerRadiusDipChanged(double value)
     {
         // Guard against OnCurrentPageChanged firing ShowPageAsync during paging updates
         _isNavigating = true;
+        try
+        {
 
         // Remove from master lists
         _allFiles.RemoveAll(p => deletedPaths.Contains(p));
@@ -1824,10 +2168,12 @@ partial void OnCornerRadiusDipChanged(double value)
             await _pageManager.LoadThumbnailsForItemsAsync(reloadItems);
 
         // Clear all cached pages except current (stale after deletion), then store current
-        _pageManager.InvalidateCache();
-        _pageManager.SetPageCache(CurrentPage, Images.ToList());
-
-        _isNavigating = false;
+        _pageManager.InvalidateCacheExceptPage(CurrentPage, Images.ToList());
+        }
+        finally
+        {
+            _isNavigating = false;
+        }
     }
 
 

@@ -732,7 +732,7 @@ public class ImageMetaRepository : IImageMetaRepository
         {
             var rows = await conn.QueryAsync<string>(@"
                 SELECT FilePath FROM ImageMeta
-                WHERE FilePath COLLATE NOCASE IN @Paths AND HashStatus = 1",
+                WHERE FilePath COLLATE NOCASE IN @Paths AND HashStatus IN (1, -1)",
                 new { Paths = chunk });
             foreach (var path in rows)
                 result.Add(path);
@@ -744,6 +744,38 @@ public class ImageMetaRepository : IImageMetaRepository
     {
         using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync("UPDATE ImageMeta SET HashStatus = 0");
+    }
+
+    public async Task<List<string>> ResetFailedHashStatusByFolderAsync(string folderPath)
+    {
+        using var conn = _dbFactory.CreateConnection();
+        using var txn = conn.BeginTransaction();
+        var normalized = Common.Helpers.PathHelper.NormalizeFolderPath(folderPath);
+        var paths = (await conn.QueryAsync<string>(@"
+            SELECT FilePath FROM ImageMeta
+            WHERE HashStatus = -1
+              AND FilePath LIKE @Prefix",
+            new { Prefix = normalized + "%" }, txn)).ToList();
+
+        if (paths.Count > 0)
+        {
+            var now = DateTime.UtcNow;
+            foreach (var chunk in paths.Chunk(900))
+            {
+                await conn.ExecuteAsync(@"
+                    UPDATE ImageMeta
+                    SET HashStatus = 0,
+                        FileHash = NULL,
+                        PerceptualHash = NULL,
+                        UpdatedAt = @Now
+                    WHERE HashStatus = -1
+                      AND FilePath COLLATE NOCASE IN @Paths",
+                    new { Paths = chunk, Now = now }, txn);
+            }
+        }
+
+        txn.Commit();
+        return paths;
     }
 
     public async Task<ImageMeta?> GetByFileHashAsync(string fileHash)

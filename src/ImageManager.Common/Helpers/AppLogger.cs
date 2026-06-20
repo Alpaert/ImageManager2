@@ -11,9 +11,10 @@ namespace ImageManager.Common.Helpers;
 public static class AppLogger
 {
     private static string? _logDir;
+    private static string? _logPath;
     private static readonly object _lock = new();
-    private static string _currentDate = string.Empty;
     private static StreamWriter? _writer;
+    private const long MaxLogDirectoryBytes = 25L * 1024 * 1024;
 
     // ==================== 内存日志频率控制 ====================
     // 相同 (caller, phase) 每 ThrottleInterval 次调用只输出一次，避免日志爆炸
@@ -34,6 +35,8 @@ public static class AppLogger
     {
         _logDir = System.IO.Path.Combine(cacheDir, "logs");
         System.IO.Directory.CreateDirectory(_logDir);
+        _logPath = System.IO.Path.Combine(_logDir, $"ensemble_{DateTime.Now:yyyyMMdd_HHmmss}.log");
+        CleanupOldLogs();
     }
 
     public static void Info(string message, [CallerMemberName] string caller = "")
@@ -158,20 +161,15 @@ public static class AppLogger
     private static void Write(string level, string message, string caller)
     {
         if (_logDir == null) return;
+        if (_logPath == null)
+            _logPath = System.IO.Path.Combine(_logDir, $"ensemble_{DateTime.Now:yyyyMMdd_HHmmss}.log");
         var now = DateTime.Now;
-        var date = now.ToString("yyyyMMdd");
 
         lock (_lock)
         {
             try
             {
-                if (date != _currentDate)
-                {
-                    _writer?.Dispose();
-                    _writer = new StreamWriter(
-                        System.IO.Path.Combine(_logDir, $"ensemble_{date}.log"), append: true);
-                    _currentDate = date;
-                }
+                _writer ??= new StreamWriter(_logPath, append: true);
 
                 var ts = now.ToString("HH:mm:ss.fff");
                 _writer?.WriteLine($"[{ts}] [{level}] [{caller}] {message}");
@@ -188,5 +186,36 @@ public static class AppLogger
             try { _writer?.Dispose(); } catch { }
             _writer = null;
         }
+    }
+
+    private static void CleanupOldLogs()
+    {
+        if (_logDir == null) return;
+
+        try
+        {
+            var files = new DirectoryInfo(_logDir)
+                .EnumerateFiles("*.log")
+                .OrderBy(f => f.LastWriteTimeUtc)
+                .ToList();
+            long totalBytes = files.Sum(f => f.Length);
+
+            foreach (var file in files)
+            {
+                if (totalBytes <= MaxLogDirectoryBytes) break;
+                if (_logPath != null &&
+                    string.Equals(file.FullName, _logPath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var length = file.Length;
+                try
+                {
+                    file.Delete();
+                    totalBytes -= length;
+                }
+                catch { }
+            }
+        }
+        catch { }
     }
 }

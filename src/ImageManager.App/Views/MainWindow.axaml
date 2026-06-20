@@ -110,6 +110,7 @@
                             <Separator/>
                             <MenuItem Header="计算此文件夹的图片标签" Click="MenuComputeAutoTags_Click"/>
                             <MenuItem Header="计算此文件夹及所有子文件夹的图片标签" Click="MenuComputeAutoTagsRecursive_Click"/>
+                            <MenuItem Header="重新计算失败的图片指纹" Click="MenuRecomputeFailedHashes_Click"/>
                             <Separator/>
                             <MenuItem Header="清空此文件夹所有图片的标签" Click="MenuClearFolderTags_Click"/>
                         </ContextMenu>

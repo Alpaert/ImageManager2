@@ -73,6 +73,7 @@ public static class VideoThumbnailGenerator
         }
         catch (OperationCanceledException)
         {
+            AppLogger.Info($"[VideoThumb] canceled file={Path.GetFileName(filePath)}");
             throw;
         }
         catch (Exception ex)
@@ -108,6 +109,10 @@ public static class VideoThumbnailGenerator
                     if (data.Length > 0) return data;
                 }
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
             catch { }
             finally
             {
@@ -127,6 +132,10 @@ public static class VideoThumbnailGenerator
                     if (data.Length > 0) return data;
                 }
             }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
             catch { }
             finally
             {
@@ -134,6 +143,10 @@ public static class VideoThumbnailGenerator
             }
 
             return null;
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
         }
         catch
         {
@@ -192,6 +205,11 @@ public static class VideoThumbnailGenerator
                 AppLogger.Warn($"[Video] thumbnail stderr: {error.Substring(0, Math.Min(150, error.Length))}");
 
             return null;
+        }
+        catch (OperationCanceledException)
+        {
+            AppLogger.Info($"[VideoThumb] canceled file={Path.GetFileName(filePath)}");
+            throw;
         }
         catch (Exception ex)
         {

@@ -145,6 +145,12 @@ public class PageManager : IDisposable
         }
     }
 
+    public void CancelCurrentLoads()
+    {
+        _zoomDebounceCts?.Cancel();
+        CancelPageLoad();
+    }
+
     public void LoadThumbnailsForItems(List<ImageViewItem> items)
     {
         var toLoad = items.Where(i => !i.IsLoaded).ToList();
@@ -295,6 +301,23 @@ public class PageManager : IDisposable
                 foreach (var item in page)
                     item.ThumbnailData = null;
             _pageCache.Clear();
+        }
+    }
+
+    public void InvalidateCacheExceptPage(int pageIndex, List<ImageViewItem> currentItems)
+    {
+        lock (_pageCacheLock)
+        {
+            foreach (var key in _pageCache.Keys.ToList())
+            {
+                if (key == pageIndex) continue;
+                if (_pageCache.TryGetValue(key, out var page))
+                    foreach (var item in page)
+                        item.ThumbnailData = null;
+                _pageCache.Remove(key);
+            }
+
+            _pageCache[pageIndex] = currentItems;
         }
     }
 

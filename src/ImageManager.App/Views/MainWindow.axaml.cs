@@ -465,14 +465,32 @@ public partial class MainWindow : Window
                 }
             });
 
-            if (string.Equals(Path.GetFullPath(targetFolder).TrimEnd('\\', '/'),
-                    Path.GetFullPath(Vm.CurrentFolder).TrimEnd('\\', '/'),
-                    StringComparison.OrdinalIgnoreCase))
-                await Vm.SyncCurrentFolderAsync();
+            if (IsFolderWithinCurrentView(targetFolder))
+                await Vm.RefreshCurrentFolderFromDiskAsync("folder-drop");
 
             Vm.StatusText = $"已复制 {filePaths.Count} 个文件到目标文件夹";
         }
         catch { }
+    }
+
+    private bool IsFolderWithinCurrentView(string targetFolder)
+    {
+        if (string.IsNullOrWhiteSpace(Vm.CurrentFolder)) return false;
+        try
+        {
+            var target = Path.GetFullPath(targetFolder).TrimEnd('\\', '/');
+            var current = Path.GetFullPath(Vm.CurrentFolder).TrimEnd('\\', '/');
+            if (string.Equals(target, current, StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (!Vm.ShowAllSubfolders)
+                return false;
+            return target.StartsWith(current + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                || target.StartsWith(current + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>Extract ALL file paths from DragEventArgs (not just images)</summary>
@@ -1593,6 +1611,13 @@ public partial class MainWindow : Window
         await RunAutoTagAsync(folder, files);
     }
 
+    private async void MenuRecomputeFailedHashes_Click(object? sender, RoutedEventArgs e)
+    {
+        var folder = GetContextMenuFolder(sender);
+        if (folder == null) return;
+        await Vm.RecomputeFailedHashesForFolderAsync(folder);
+    }
+
     private async void MenuClearFolderTags_Click(object? sender, RoutedEventArgs e)
     {
         var folder = GetContextMenuFolder(sender);
@@ -2020,6 +2045,7 @@ public partial class MainWindow : Window
         Vm.ScrollRestoreRequested -= OnScrollRestore;
         Vm.ScrollToSelectedRequested -= OnScrollToSelected;
         Vm.TreeScrollToNodeRequested -= OnTreeScrollToNode;
+        Vm.ShutdownBackgroundWork();
         _ = Vm.SaveSettingsAsync();
     }
     private async void MenuThumbnailSettings_Click(object? sender, RoutedEventArgs e)
