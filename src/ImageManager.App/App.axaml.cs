@@ -1,5 +1,6 @@
 using System.Text;
 using Avalonia;
+using Avalonia.Controls;
 using Avalonia.Controls.ApplicationLifetimes;
 using Avalonia.Media;
 using Avalonia.Styling;
@@ -26,45 +27,12 @@ public partial class App : Application
     public static ServiceProvider Services { get; private set; } = null!;
     /// <summary>UI-thread dispatcher for safe cross-thread UI access. Set after DI container is built.</summary>
     public static IDispatcher UI { get; private set; } = null!;
-    public static string CacheDirectoryPath { get; private set; } =
-        System.IO.Path.Combine(AppContext.BaseDirectory, "Cache");
+    public static string CacheDirectoryPath { get; private set; } = StartupCacheConfig.DefaultCacheDirectory;
+    private static StartupCacheConfig _startupCacheConfig = StartupCacheConfig.Load();
 
-    private static ServiceProvider ConfigureServices()
+    private static ServiceProvider ConfigureServices(string cacheDir)
     {
         var services = new ServiceCollection();
-
-        // Boot config: always at %LocalAppData%\ImageManager\config.json
-        var bootDir = System.IO.Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "ImageManager");
-        System.IO.Directory.CreateDirectory(bootDir);
-        var configPath = System.IO.Path.Combine(bootDir, "config.json");
-
-        string cacheDir = @"C:\ImageManagerCache";
-        string prevCacheDir = "";
-        if (System.IO.File.Exists(configPath))
-        {
-            try
-            {
-                var lines = System.IO.File.ReadAllLines(configPath);
-                foreach (var line in lines)
-                {
-                    var idx = line.IndexOf('=');
-                    if (idx < 0) continue;
-                    var key = line[..idx].Trim();
-                    var val = line[(idx + 1)..].Trim();
-                    if (key.Equals("CacheDirectory", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(val))
-                        cacheDir = val;
-                    else if (key.Equals("PreviousCacheDirectory", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(val))
-                        prevCacheDir = val;
-                }
-            }
-            catch { }
-        }
-        else
-        {
-            System.IO.File.WriteAllText(configPath, $"CacheDirectory={cacheDir}");
-        }
 
         CacheDirectoryPath = cacheDir;
 
@@ -80,29 +48,7 @@ public partial class App : Application
         // Migrate DB from previous cache dir (if user switched dirs) or old boot dir
         if (!System.IO.File.Exists(dbPath))
         {
-            string[] candidateDirs = [
-                prevCacheDir,
-                System.IO.Path.Combine(bootDir), // %LocalAppData%\ImageManager (legacy)
-            ];
-            foreach (var srcDir in candidateDirs)
-            {
-                if (string.IsNullOrWhiteSpace(srcDir)) continue;
-                var srcDb = System.IO.Path.Combine(srcDir, "data.db");
-                if (!System.IO.File.Exists(srcDb)) continue;
-                try
-                {
-                    System.IO.File.Copy(srcDb, dbPath);
-                    foreach (var suffix in new[] { "-wal", "-shm" })
-                    {
-                        if (System.IO.File.Exists(srcDb + suffix))
-                        {
-                            try { System.IO.File.Copy(srcDb + suffix, dbPath + suffix); } catch { }
-                        }
-                    }
-                    break;
-                }
-                catch { }
-            }
+            MigrateDatabaseIfAvailable(dbPath);
         }
 
         // Create connection factory
@@ -212,12 +158,29 @@ public partial class App : Application
 
     public override void Initialize()
     {
-        Services = ConfigureServices();
         AvaloniaXamlLoader.Load(this);
     }
 
     public override async void OnFrameworkInitializationCompleted()
     {
+        if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktopLifetime)
+        {
+            desktopLifetime.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+            ApplyColors(true);
+            var ready = await EnsureStartupCacheDirectoryAsync();
+            if (!ready)
+            {
+                desktopLifetime.Shutdown();
+                return;
+            }
+
+            Services = ConfigureServices(CacheDirectoryPath);
+        }
+        else
+        {
+            Services = ConfigureServices(CacheDirectoryPath);
+        }
+
         UI = Services.GetRequiredService<IDispatcher>();
 
         // 显式加载 onnxruntime.dll，绕过 LoadLibrary → System32 优先级问题
@@ -255,6 +218,8 @@ public partial class App : Application
 
             var vm = Services.GetRequiredService<MainWindowViewModel>();
             desktop.MainWindow = new MainWindow { DataContext = vm };
+            desktop.MainWindow.Show();
+            desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
         }
 
         // ========== 全局未处理异常捕获 ==========
@@ -281,6 +246,99 @@ public partial class App : Application
 
         base.OnFrameworkInitializationCompleted();
         Common.Helpers.AppLogger.Memory("App.Init");
+    }
+
+    private static void MigrateDatabaseIfAvailable(string dbPath)
+    {
+        string[] candidateDirs = [
+            _startupCacheConfig.PreviousCacheDirectory,
+            System.IO.Path.GetDirectoryName(StartupCacheConfig.ConfigPath) ?? "", // %LocalAppData%\ImageManager (legacy)
+        ];
+
+        foreach (var srcDir in candidateDirs)
+        {
+            if (string.IsNullOrWhiteSpace(srcDir)) continue;
+
+            var srcDb = System.IO.Path.Combine(srcDir, "data.db");
+            if (!System.IO.File.Exists(srcDb)) continue;
+
+            try
+            {
+                System.IO.File.Copy(srcDb, dbPath);
+                foreach (var suffix in new[] { "-wal", "-shm" })
+                {
+                    if (System.IO.File.Exists(srcDb + suffix))
+                        System.IO.File.Copy(srcDb + suffix, dbPath + suffix);
+                }
+                return;
+            }
+            catch (Exception ex)
+            {
+                foreach (var path in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
+                {
+                    try
+                    {
+                        if (System.IO.File.Exists(path))
+                            System.IO.File.Delete(path);
+                    }
+                    catch { }
+                }
+
+                throw new InvalidOperationException(
+                    $"Failed to migrate database from {srcDb} to {dbPath}", ex);
+            }
+        }
+    }
+
+    private static async Task<bool> EnsureStartupCacheDirectoryAsync()
+    {
+        _startupCacheConfig = StartupCacheConfig.Load();
+
+        if (!_startupCacheConfig.CachePromptShown)
+        {
+            var firstRunWindow = new Views.Settings.StartupCacheWindow(
+                _startupCacheConfig.CacheDirectory,
+                isRepairRequired: false);
+            var accepted = await ShowStartupWindowAsync(firstRunWindow);
+            var selectedPath = accepted
+                ? firstRunWindow.SelectedPath
+                : StartupCacheConfig.DefaultCacheDirectory;
+
+            if (!StartupCacheConfig.TryValidateWritableDirectory(selectedPath, out _))
+                selectedPath = StartupCacheConfig.DefaultCacheDirectory;
+
+            _startupCacheConfig.SetCacheDirectory(selectedPath, promptShown: true);
+            _startupCacheConfig.Save();
+        }
+
+        while (!StartupCacheConfig.TryValidateWritableDirectory(_startupCacheConfig.CacheDirectory, out var error))
+        {
+            var repairWindow = new Views.Settings.StartupCacheWindow(
+                _startupCacheConfig.CacheDirectory,
+                isRepairRequired: true,
+                repairReason: error);
+            var accepted = await ShowStartupWindowAsync(repairWindow);
+            if (!accepted)
+                return false;
+
+            _startupCacheConfig.SetCacheDirectory(repairWindow.SelectedPath, promptShown: true);
+            _startupCacheConfig.Save();
+        }
+
+        CacheDirectoryPath = Path.GetFullPath(_startupCacheConfig.CacheDirectory);
+        return true;
+    }
+
+    private static Task<bool> ShowStartupWindowAsync(Window window)
+    {
+        var tcs = new TaskCompletionSource<bool>();
+        window.Closed += (_, _) =>
+        {
+            tcs.TrySetResult(window is Views.Settings.StartupCacheWindow startup
+                && startup.IsAccepted);
+        };
+        window.Show();
+        return tcs.Task;
     }
 
     private async Task ApplySavedThemeAsync()

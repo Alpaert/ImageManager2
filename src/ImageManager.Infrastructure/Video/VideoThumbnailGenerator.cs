@@ -38,7 +38,7 @@ public static class VideoThumbnailGenerator
             if (metadata == null)
             {
                 AppLogger.Warn($"[Video] 元数据提取失败: {Path.GetFileName(filePath)}");
-                return GeneratePlaceholder(decodeWidth, "元数据提取失败");
+                return null;
             }
 
             double duration = metadata.Value.Duration;
@@ -56,7 +56,7 @@ public static class VideoThumbnailGenerator
             if (thumbnailData == null)
             {
                 AppLogger.Warn($"[Video] 帧提取失败: {Path.GetFileName(filePath)}");
-                return GeneratePlaceholder(decodeWidth, "帧提取失败");
+                return null;
             }
 
             AppLogger.Info($"[Video] 缩略图生成成功: {Path.GetFileName(filePath)}, {thumbnailData.Length} bytes");
@@ -71,10 +71,14 @@ public static class VideoThumbnailGenerator
                 ThumbnailTimestamp = startTimestamp
             };
         }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             AppLogger.Error($"[Video] 生成异常: {Path.GetFileName(filePath)}, {ex.Message}");
-            return GeneratePlaceholder(decodeWidth, $"异常: {ex.Message}");
+            return null;
         }
     }
 
@@ -246,73 +250,6 @@ public static class VideoThumbnailGenerator
         {
             try { if (tempFile != null && File.Exists(tempFile)) File.Delete(tempFile); }
             catch { }
-        }
-    }
-
-    /// <summary>
-    /// 生成占位符缩略图（灰色背景 + 播放图标）
-    /// </summary>
-    private static VideoThumbnailResult GeneratePlaceholder(int decodeWidth, string reason)
-    {
-        try
-        {
-            int width = decodeWidth;
-            int height = decodeWidth * 9 / 16; // 16:9 比例
-
-            using var bitmap = new SkiaSharp.SKBitmap(width, height);
-            using var canvas = new SkiaSharp.SKCanvas(bitmap);
-
-            // 深灰色背景
-            canvas.Clear(new SkiaSharp.SKColor(64, 64, 64));
-
-            // 绘制播放图标（白色三角形）
-            using var paint = new SkiaSharp.SKPaint
-            {
-                Color = SkiaSharp.SKColors.White,
-                Style = SkiaSharp.SKPaintStyle.Fill,
-                IsAntialias = true
-            };
-
-            float centerX = width / 2f;
-            float centerY = height / 2f;
-            float size = Math.Min(width, height) / 4f;
-
-            var path = new SkiaSharp.SKPath();
-            path.MoveTo(centerX - size * 0.5f, centerY - size * 0.6f);
-            path.LineTo(centerX + size * 0.7f, centerY);
-            path.LineTo(centerX - size * 0.5f, centerY + size * 0.6f);
-            path.Close();
-
-            canvas.DrawPath(path, paint);
-
-            // 编码为 JPEG
-            using var image = SkiaSharp.SKImage.FromBitmap(bitmap);
-            using var data = image.Encode(SkiaSharp.SKEncodedImageFormat.Jpeg, 85);
-
-            return new VideoThumbnailResult
-            {
-                ThumbnailData = data.ToArray(),
-                Width = 1920,
-                Height = 1080,
-                Duration = 0,
-                ThumbnailTimestamp = 0
-            };
-        }
-        catch
-        {
-            // 最简占位符：1x1 像素灰色图片（JPEG 最小合法结构）
-            return new VideoThumbnailResult
-            {
-                ThumbnailData = new byte[] {
-                    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46,
-                    0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
-                    0xFF, 0xD9
-                },
-                Width = 1920,
-                Height = 1080,
-                Duration = 0,
-                ThumbnailTimestamp = 0
-            };
         }
     }
 

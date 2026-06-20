@@ -13,6 +13,7 @@ using Avalonia.VisualTree;
 using System.Runtime.InteropServices;
 using ImageManager.App.Controls;
 using ImageManager.App.Helpers;
+using ImageManager.App.Services;
 using ImageManager.App.ViewModels;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
@@ -913,6 +914,16 @@ public partial class MainWindow : Window
         {
             await EditTagsForItemsAsync(selected);
         }
+    }
+
+    private async void MenuRegenerateThumbnail_Click(object? sender, RoutedEventArgs e)
+    {
+        var clicked = GetCtxItem(sender);
+        if (clicked == null) return;
+
+        var items = GetTargetItemsForContextMenu(clicked);
+        await App.Services.GetRequiredService<PageManager>().RegenerateThumbnailsAsync(items);
+        Vm.StatusText = $"已重新生成 {items.Count} 个缩略图";
     }
 
     private async Task<bool> EditTagForItemAsync(ImageViewItem item)
@@ -2040,8 +2051,16 @@ public partial class MainWindow : Window
             path => new Infrastructure.Caching.DiskThumbnailCache(path).EstimateDiskUsage(),
             pathChanged =>
             {
+                if (memVm == null) return;
+
                 var oldPath = Vm.AppSettings.DiskCacheDirectory;
-                var newPath = memVm.CachePath;
+                var newPath = Path.GetFullPath(memVm.CachePath);
+                if (!StartupCacheConfig.TryValidateWritableDirectory(newPath, out var validationError))
+                {
+                    _ = ShowInfoDialogAsync(validationError);
+                    return;
+                }
+
                 Vm.AppSettings.DiskCacheDirectory = newPath;
                 Vm.AppSettings.DeepSeekApiKey = memVm.DeepSeekApiKey;
                 Vm.AppSettings.TagMode = memVm.TagMode;
@@ -2055,13 +2074,17 @@ public partial class MainWindow : Window
                 _ = Vm.SaveSettingsAsync();
 
                 // Update boot config with previous path for startup DB migration
-                var bootDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "ImageManager");
-                Directory.CreateDirectory(bootDir);
-                var configPath = Path.Combine(bootDir, "config.json");
-                File.WriteAllText(configPath,
-                    $"CacheDirectory={newPath}\nPreviousCacheDirectory={oldPath}");
+                var startupConfig = StartupCacheConfig.Load();
+                startupConfig.PreviousCacheDirectory = oldPath;
+                startupConfig.CacheDirectory = newPath;
+                startupConfig.CachePromptShown = true;
+                startupConfig.Save();
+
+                if (pathChanged)
+                {
+                    _ = ShowInfoDialogAsync(
+                        "缓存位置已更新。缩略图和临时文件会立即使用新目录，数据库会在下次启动时迁移到新目录。");
+                }
             });
 
         var win = new Settings.MemorySettingWindow { DataContext = memVm };

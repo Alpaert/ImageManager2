@@ -39,7 +39,7 @@ public class PageManager : IDisposable
     private int _preSearchPageIndex;
 
     private readonly SemaphoreSlim _thumbnailLoadSemaphore = new(6);
-    private readonly SemaphoreSlim _videoLoadSemaphore = new(4);
+    private readonly SemaphoreSlim _videoLoadSemaphore = new(2);
     private int _thumbnailDecodeWidth = 200;
     private int _currentZoomLevel;
     private PageUiState _currentUiState;
@@ -159,6 +159,24 @@ public class PageManager : IDisposable
         var toLoad = items.Where(i => !i.IsLoaded).ToList();
         foreach (var item in toLoad)
             await LoadSingleThumbnailAsync(item);
+    }
+
+    public async Task RegenerateThumbnailsAsync(List<ImageViewItem> items)
+    {
+        foreach (var item in items.DistinctBy(i => i.FilePath))
+        {
+            _thumbCache.InvalidateThumbnail(item.FilePath);
+            item.ThumbnailData = null;
+            item.IsLoaded = false;
+            item.IsLoading = true;
+            item.NotifyAll();
+        }
+
+        foreach (var item in items.DistinctBy(i => i.FilePath))
+        {
+            await LoadSingleThumbnailAsync(item);
+            PostLoadedItems(new[] { item });
+        }
     }
 
     public int EstimateVisibleItemCount(PageUiState state)
@@ -344,7 +362,11 @@ public class PageManager : IDisposable
         return list;
     }
 
-    private async Task LoadPageThumbnailsAsync(int pageIndex, CancellationToken ct = default)
+    private async Task LoadPageThumbnailsAsync(
+        int pageIndex,
+        CancellationToken ct = default,
+        bool includeVideos = true,
+        bool cacheOnlyVideos = false)
     {
         List<ImageViewItem> pageItems;
         lock (_pageCacheLock)
@@ -354,26 +376,32 @@ public class PageManager : IDisposable
 
         var unloaded = pageItems.Where(i => !i.IsLoaded).ToList();
         if (unloaded.Count == 0) return;
+        var imageItems = unloaded.Where(i => !FileTypeConstants.IsVideoFile(i.FilePath)).ToList();
+        var videoItems = includeVideos
+            ? unloaded.Where(i => FileTypeConstants.IsVideoFile(i.FilePath)).ToList()
+            : new List<ImageViewItem>();
+        var skippedVideos = includeVideos ? 0 : unloaded.Count - imageItems.Count;
 
         ThreadPool.GetAvailableThreads(out var w, out var io);
         ThreadPool.GetMaxThreads(out var mw, out var mio);
         var sw = Stopwatch.StartNew();
         var pressure = MemoryPressureMonitor.Current;
-        PerfLogger.Log($"[PageMgr] LoadThumbnails unloaded={unloaded.Count} ThreadPool={mw-w}/{mw}");
-        AppLogger.Memory($"Page.Thumb.Start page={pageIndex} unloaded={unloaded.Count} pressure={pressure} thumbCacheMB={_thumbCache.EstimatedMemoryBytes / 1048576.0:F1}");
+        PerfLogger.Log($"[PageMgr] LoadThumbnails unloaded={unloaded.Count} images={imageItems.Count} videos={videoItems.Count} skippedVideos={skippedVideos} ThreadPool={mw-w}/{mw}");
+        AppLogger.Memory($"Page.Thumb.Start page={pageIndex} unloaded={unloaded.Count} images={imageItems.Count} videos={videoItems.Count} skippedVideos={skippedVideos} pressure={pressure} thumbCacheMB={_thumbCache.EstimatedMemoryBytes / 1048576.0:F1}");
 
         const int batchSize = 16;
-        for (int batchStart = 0; batchStart < unloaded.Count; batchStart += batchSize)
+        for (int batchStart = 0; batchStart < imageItems.Count; batchStart += batchSize)
         {
             ct.ThrowIfCancellationRequested();
 
-            var batch = unloaded.Skip(batchStart).Take(batchSize).ToList();
+            var batch = imageItems.Skip(batchStart).Take(batchSize).ToList();
             var parallelism = RecommendedThumbnailParallelism();
             for (int i = 0; i < batch.Count; i += parallelism)
             {
                 ct.ThrowIfCancellationRequested();
                 var slice = batch.Skip(i).Take(parallelism).ToList();
                 await Task.WhenAll(slice.Select(item => LoadSingleThumbnailAsync(item, ct)));
+                PostLoadedItems(slice);
             }
             _thumbCache.TrimForPressure();
 
@@ -383,22 +411,34 @@ public class PageManager : IDisposable
                 AppLogger.Memory($"Page.Thumb.Cancel page={pageIndex} elapsedMs={sw.ElapsedMilliseconds}");
                 return;
             }
-
-            var loadedInBatch = batch.Where(i => i.IsLoaded).ToList();
-            if (loadedInBatch.Count > 0)
-            {
-                // Post to UI (fire-and-forget) — ThumbnailData set already marshals PropertyChanged via Avalonia
-                Dispatcher.UIThread.Post(() =>
-                {
-                    foreach (var loadedItem in loadedInBatch)
-                    {
-                        loadedItem.IsLoading = false;
-                        loadedItem.NotifyAll();
-                    }
-                }, DispatcherPriority.Normal);
-            }
         }
-        AppLogger.Memory($"Page.Thumb.End page={pageIndex} loaded={unloaded.Count(i => i.IsLoaded)}/{unloaded.Count} pressure={MemoryPressureMonitor.Current} thumbCacheMB={_thumbCache.EstimatedMemoryBytes / 1048576.0:F1} elapsedMs={sw.ElapsedMilliseconds}");
+        foreach (var item in videoItems)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (cacheOnlyVideos)
+                await LoadSingleThumbnailCacheOnlyAsync(item, ct);
+            else
+                await LoadSingleThumbnailAsync(item, ct);
+            PostLoadedItems(new[] { item });
+            _thumbCache.TrimForPressure();
+        }
+
+        AppLogger.Memory($"Page.Thumb.End page={pageIndex} loaded={unloaded.Count(i => i.IsLoaded)}/{unloaded.Count} videosLoaded={videoItems.Count(i => i.IsLoaded)}/{videoItems.Count} skippedVideos={skippedVideos} pressure={MemoryPressureMonitor.Current} thumbCacheMB={_thumbCache.EstimatedMemoryBytes / 1048576.0:F1} elapsedMs={sw.ElapsedMilliseconds}");
+    }
+
+    private static void PostLoadedItems(IEnumerable<ImageViewItem> items)
+    {
+        var loadedItems = items.Where(i => i.IsLoaded).ToList();
+        if (loadedItems.Count == 0) return;
+
+        Dispatcher.UIThread.Post(() =>
+        {
+            foreach (var loadedItem in loadedItems)
+            {
+                loadedItem.IsLoading = false;
+                loadedItem.NotifyAll();
+            }
+        }, DispatcherPriority.Normal);
     }
 
     private static int RecommendedThumbnailParallelism()
@@ -442,7 +482,47 @@ public class PageManager : IDisposable
         catch { if (isVideo) PerfLogger.Log($"[Thumb] VIDEO FAIL {Path.GetFileName(item.FilePath)}"); }
         finally { semaphore.Release(); }
 
+        if (!item.IsLoaded && ct.IsCancellationRequested)
+            return;
+
+        if (!item.IsLoaded)
+        {
+            Dispatcher.UIThread.Post(() =>
+            {
+                item.IsLoading = false;
+                item.NotifyAll();
+            }, DispatcherPriority.Normal);
+        }
+
         if (isVideo) PerfLogger.Log($"[Thumb] VIDEO done {Path.GetFileName(item.FilePath)} elapsed={sw!.ElapsedMilliseconds}ms");
+    }
+
+    private async Task LoadSingleThumbnailCacheOnlyAsync(ImageViewItem item, CancellationToken ct = default)
+    {
+        bool isVideo = FileTypeConstants.IsVideoFile(item.FilePath);
+        var semaphore = isVideo ? _videoLoadSemaphore : _thumbnailLoadSemaphore;
+
+        await semaphore.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var (data, w, h) = await Task.Run(() =>
+                _thumbCache.TryGetCachedThumbnail(item.FilePath, _thumbnailDecodeWidth), ct
+            ).ConfigureAwait(false);
+
+            if (data != null)
+            {
+                item.ThumbnailData = data;
+                item.Width = w > 0 ? w : 1920;
+                item.Height = h > 0 ? h : 1080;
+                item.IsLoaded = true;
+            }
+            else
+            {
+                item.IsLoading = false;
+            }
+        }
+        catch (OperationCanceledException) { }
+        finally { semaphore.Release(); }
     }
 
     private void PreloadAdjacentPages(
@@ -493,9 +573,9 @@ public class PageManager : IDisposable
             if (ct.IsCancellationRequested) return;
             AppLogger.Memory($"Page.Preload.Start page={currentPage} prev={preloadPrev?.ToString() ?? "-"} next={preloadNext?.ToString() ?? "-"} cached={CachedPageCount}");
             if (preloadPrev.HasValue)
-                _ = LoadPageThumbnailsAsync(preloadPrev.Value, ct);
+                _ = LoadPageThumbnailsAsync(preloadPrev.Value, ct, includeVideos: true, cacheOnlyVideos: true);
             if (preloadNext.HasValue)
-                _ = LoadPageThumbnailsAsync(preloadNext.Value, ct);
+                _ = LoadPageThumbnailsAsync(preloadNext.Value, ct, includeVideos: true, cacheOnlyVideos: true);
         }, ct);
     }
 

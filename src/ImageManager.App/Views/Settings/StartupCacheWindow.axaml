@@ -1,0 +1,49 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="ImageManager.App.Views.Settings.StartupCacheWindow"
+        Title="缓存位置"
+        Width="560" Height="280"
+        CanResize="False"
+        WindowStartupLocation="CenterScreen">
+    <Grid RowDefinitions="*,Auto" Margin="18">
+        <StackPanel Grid.Row="0" Spacing="12">
+            <TextBlock x:Name="TitleText"
+                       Text="设置缓存位置"
+                       FontWeight="SemiBold"
+                       FontSize="18"/>
+            <TextBlock x:Name="DescriptionText"
+                       Text="ImageManager 会把数据库、缩略图缓存、视频帧、搜索临时文件和 AI 模型缓存放在这个目录。默认位置是 C:\ImageManagerCache。"
+                       Foreground="{DynamicResource SecondaryFgBrush}"
+                       TextWrapping="Wrap"/>
+            <StackPanel Spacing="6">
+                <TextBlock Text="缓存目录" FontWeight="SemiBold"/>
+                <StackPanel Orientation="Horizontal" Spacing="10">
+                    <TextBox x:Name="PathBox" Width="410"/>
+                    <Button Content="浏览..." Width="82" Click="BtnBrowse_Click"/>
+                </StackPanel>
+                <TextBlock x:Name="ErrorText"
+                           Foreground="#FFFF6B6B"
+                           TextWrapping="Wrap"
+                           IsVisible="False"/>
+            </StackPanel>
+        </StackPanel>
+
+        <StackPanel Grid.Row="1"
+                    Orientation="Horizontal"
+                    HorizontalAlignment="Right"
+                    Spacing="10"
+                    Margin="0,16,0,0">
+            <Button x:Name="ExitButton"
+                    Content="退出"
+                    Width="80"
+                    IsVisible="False"
+                    Click="BtnExit_Click"/>
+            <Button Content="使用默认位置"
+                    Width="110"
+                    Click="BtnDefault_Click"/>
+            <Button Content="继续"
+                    Width="80"
+                    Click="BtnContinue_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

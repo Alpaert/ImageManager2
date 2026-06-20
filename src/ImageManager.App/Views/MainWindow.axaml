@@ -374,6 +374,7 @@
                                         <MenuItem Header="Soutubot（本子）" Click="MenuSearchOnline_Click" Tag="soutubot"/>
                                         <MenuItem Header="Danbooru IQDB" Click="MenuSearchOnline_Click" Tag="danbooru_iqdb"/>
                                     </MenuItem>
+                                    <MenuItem Header="重新生成缩略图" Click="MenuRegenerateThumbnail_Click"/>
                                     <MenuItem Header="在资源管理器中打开" Click="MenuOpenInExplorer_Click"/>
                                     <Separator/>
                                     <MenuItem Header="删除该图片文件" Click="MenuDeleteFile_Click"/>

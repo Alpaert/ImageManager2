@@ -150,6 +150,18 @@ public class DiskThumbnailCache
         }
     }
 
+    public bool Exists(string filePath)
+    {
+        try
+        {
+            return File.Exists(GetCacheFilePath(filePath)) || File.Exists(GetOldCacheFilePath(filePath));
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public void Delete(string filePath)
     {
         try
@@ -161,6 +173,27 @@ public class DiskThumbnailCache
             var oldPath = GetOldCacheFilePath(filePath);
             if (File.Exists(oldPath))
                 File.Delete(oldPath);
+        }
+        catch { }
+    }
+
+    public void DeleteCurrentWidth(string filePath)
+    {
+        try
+        {
+            var cachePath = GetCacheFilePath(filePath);
+            var metaPath = Path.ChangeExtension(cachePath, ".json");
+            if (File.Exists(cachePath))
+                File.Delete(cachePath);
+            if (File.Exists(metaPath))
+                File.Delete(metaPath);
+
+            var oldPath = GetOldCacheFilePath(filePath);
+            var oldMetaPath = Path.ChangeExtension(oldPath, ".json");
+            if (File.Exists(oldPath))
+                File.Delete(oldPath);
+            if (File.Exists(oldMetaPath))
+                File.Delete(oldMetaPath);
         }
         catch { }
     }
@@ -178,10 +211,16 @@ public class DiskThumbnailCache
                 var cachePath = Path.Combine(dir, folderHash, hashName);
                 if (File.Exists(cachePath))
                     File.Delete(cachePath);
+                var metaPath = Path.ChangeExtension(cachePath, ".json");
+                if (File.Exists(metaPath))
+                    File.Delete(metaPath);
                 // Old flat path (backward compat cleanup)
                 var oldPath = Path.Combine(dir, hashName);
                 if (File.Exists(oldPath))
                     File.Delete(oldPath);
+                var oldMetaPath = Path.ChangeExtension(oldPath, ".json");
+                if (File.Exists(oldMetaPath))
+                    File.Delete(oldMetaPath);
             }
 
             // Also delete video original frame

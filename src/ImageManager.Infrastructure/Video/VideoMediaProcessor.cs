@@ -1,12 +1,10 @@
 using System.Security.Cryptography;
 using ImageManager.Common.Constants;
-using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Imaging;
 
 namespace ImageManager.Infrastructure.Video;
 
-/// <summary>视频媒体处理器 — 原分辨率帧缓存 + SkiaSharp 缩放</summary>
 public class VideoMediaProcessor : IMediaProcessor
 {
     private readonly string _cacheDirectory;
@@ -24,30 +22,56 @@ public class VideoMediaProcessor : IMediaProcessor
         int decodeWidth,
         CancellationToken ct)
     {
-        var originalPath = await EnsureOriginalFrameCachedAsync(filePath, ct);
-        if (originalPath == null)
+        var originalPath = GetOriginalFramePath(filePath);
+        if (File.Exists(originalPath))
         {
-            // fallback: 旧逻辑直接生成
-            var result = await VideoThumbnailGenerator.GenerateAsync(filePath, decodeWidth, ct);
-            if (result == null) return null;
-            return new MediaResult
+            Common.Helpers.PerfLogger.Log($"[VideoCache] ORIGINAL FRAME HIT {Path.GetFileName(filePath)}");
+            var thumbnailData = ThumbnailGenerator.Generate(originalPath, decodeWidth);
+            if (thumbnailData != null)
             {
-                Data = result.ThumbnailData ?? Array.Empty<byte>(),
-                Width = result.Width,
-                Height = result.Height
-            };
+                var (w, h) = ThumbnailGenerator.GetDimensions(originalPath);
+                return new MediaResult { Data = thumbnailData, Width = w, Height = h };
+            }
         }
 
-        var thumbnailData = ThumbnailGenerator.Generate(originalPath, decodeWidth);
-        if (thumbnailData == null) return null;
+        var originalFrame = await VideoThumbnailGenerator.ExtractOriginalFrameAsync(filePath, ct);
+        if (originalFrame is { Length: > 0 })
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(originalPath);
+                if (!string.IsNullOrWhiteSpace(dir))
+                    Directory.CreateDirectory(dir);
+                await File.WriteAllBytesAsync(originalPath, originalFrame, ct);
+                Common.Helpers.PerfLogger.Log($"[VideoCache] FFMPEG EXTRACT saved original {Path.GetFileName(filePath)}");
 
-        var (w, h) = ThumbnailGenerator.GetDimensions(originalPath);
-        return new MediaResult { Data = thumbnailData, Width = w, Height = h };
+                var thumbnailData = ThumbnailGenerator.Generate(originalPath, decodeWidth);
+                if (thumbnailData != null)
+                {
+                    var (w, h) = ThumbnailGenerator.GetDimensions(originalPath);
+                    return new MediaResult { Data = thumbnailData, Width = w, Height = h };
+                }
+            }
+            catch
+            {
+                try { if (File.Exists(originalPath)) File.Delete(originalPath); } catch { }
+            }
+        }
+
+        Common.Helpers.PerfLogger.Log($"[VideoCache] FFMPEG EXTRACT fallback scaled {Path.GetFileName(filePath)}");
+        var result = await VideoThumbnailGenerator.GenerateAsync(filePath, decodeWidth, ct);
+        if (result == null) return null;
+
+        return new MediaResult
+        {
+            Data = result.ThumbnailData ?? Array.Empty<byte>(),
+            Width = result.Width,
+            Height = result.Height
+        };
     }
 
     public (int Width, int Height) GetDimensions(string filePath)
     {
-        // 优先从缓存的原分辨率帧读取
         var cachedPath = GetOriginalFramePath(filePath);
         if (File.Exists(cachedPath))
             return ThumbnailGenerator.GetDimensions(cachedPath);
@@ -62,30 +86,6 @@ public class VideoMediaProcessor : IMediaProcessor
         catch
         {
             return (1920, 1080);
-        }
-    }
-
-    private async Task<string?> EnsureOriginalFrameCachedAsync(string filePath, CancellationToken ct)
-    {
-        var cachePath = GetOriginalFramePath(filePath);
-        if (File.Exists(cachePath))
-            return cachePath;
-
-        var frameData = await VideoThumbnailGenerator.ExtractOriginalFrameAsync(filePath, ct);
-        if (frameData == null || frameData.Length == 0)
-            return null;
-
-        try
-        {
-            var dir = Path.GetDirectoryName(cachePath);
-            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
-            await File.WriteAllBytesAsync(cachePath, frameData, ct);
-            return cachePath;
-        }
-        catch
-        {
-            return null;
         }
     }
 
