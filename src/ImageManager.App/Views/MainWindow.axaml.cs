@@ -575,8 +575,9 @@ public partial class MainWindow : Window
         _ = Vm.SaveSettingsAsync();
     }
 
-    private async void BtnDetectDuplicates_Click(object? sender, RoutedEventArgs e)
+    private async void MenuDetectDuplicates_Click(object? sender, RoutedEventArgs e)
     {
+        AppLogger.Info("Menu.Tool.DetectDuplicates.Open");
         var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
         {
             Title = "选择重复图片存放的目标文件夹",
@@ -585,7 +586,17 @@ public partial class MainWindow : Window
 
         if (folders.Count > 0)
         {
-            await Vm.DetectDuplicatesCommand.ExecuteAsync(folders[0].Path.LocalPath);
+            var target = folders[0].Path.LocalPath;
+            AppLogger.Info($"Menu.Tool.DetectDuplicates.Target path={target}");
+            try
+            {
+                await Vm.DetectDuplicatesCommand.ExecuteAsync(target);
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Error($"Menu.Tool.DetectDuplicates.Error type={ex.GetType().FullName} message={ex.Message}");
+                throw;
+            }
         }
     }
 

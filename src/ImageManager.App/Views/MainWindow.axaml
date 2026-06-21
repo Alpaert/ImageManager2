@@ -136,19 +136,25 @@
                 <MenuItem Header="设置" Height="28" Padding="12,4">
                     <MenuItem Header="设置主界面大小" Click="MenuSetMainSize_Click"/>
                     <MenuItem Header="设置预览窗口大小" Click="MenuSetPreviewSize_Click"/>
-
+                    <Separator/>
                     <MenuItem Header="外观设置" Click="MenuAppearanceSettings_Click"/>
                     <MenuItem Header="壁纸设置" Click="MenuWallpaperSettings_Click"/>
                     <MenuItem Header="缩略图选项" Click="MenuThumbnailSettings_Click"/>
-                    <MenuItem Header="内存与缓存设置" Click="MenuMemorySettings_Click"/>
-
-                    <MenuItem Header="标签管理" Click="MenuTagManage_Click"/>
+                    <MenuItem Header="缓存与 AI 设置" Click="MenuMemorySettings_Click"/>
+                    <Separator/>
+                    <MenuItem Header="快捷键设置" Click="MenuShortcutSettings_Click"/>
+                </MenuItem>
+                <MenuItem Header="AI" Height="28" Padding="12,4">
+                    <MenuItem Header="AI 推荐" Click="MenuAiRecommend_Click"/>
+                    <Separator/>
                     <MenuItem Header="画师嵌入库构建" Click="MenuArtistDbBuilder_Click"/>
                     <MenuItem Header="角色嵌入库构建" Click="MenuCharacterDbBuilder_Click"/>
-                    <MenuItem Header="快捷键设置" Click="MenuShortcutSettings_Click"/>
-                    <MenuItem Header="帮助" Click="MenuHelp_Click"/>
                 </MenuItem>
-                <MenuItem Header="AI推荐" Height="28" Padding="12,4" Click="MenuAiRecommend_Click"/>
+                <MenuItem Header="工具" Height="28" Padding="12,4">
+                    <MenuItem Header="标签管理" Click="MenuTagManage_Click"/>
+                    <MenuItem Header="检测重复图片" Click="MenuDetectDuplicates_Click"/>
+                </MenuItem>
+                <MenuItem Header="帮助" Height="28" Padding="12,4" Click="MenuHelp_Click"/>
                 <CheckBox Content="全展示" IsChecked="{Binding ShowAllSubfolders}"
                           VerticalAlignment="Center" Margin="12,0,0,0" FontSize="12"/>
             </Menu>
@@ -171,12 +177,6 @@
 
         <!-- Toolbar Row 1: Actions -->
         <StackPanel Orientation="Horizontal" Margin="5,5,5,2" Grid.Row="1" Grid.Column="1">
-            <Button Content="选择图片文件夹" Margin="0,0,5,0"
-                    FontSize="12" Padding="8,4" Click="BtnSelectFolder_Click"/>
-            <Button Content="保存数据" Margin="0,0,5,0"
-                    FontSize="12" Padding="8,4" Click="BtnSaveData_Click"/>
-            <Button Content="全局检测重复并移动（未实现暂时）" Margin="0,0,5,0"
-                    FontSize="12" Padding="8,4" Click="BtnDetectDuplicates_Click"/>
             <Button Content="清除所有筛选" Margin="0,0,5,0"
                     FontSize="12" Padding="8,4"
                     Command="{Binding ClearFilterCommand}"/>
