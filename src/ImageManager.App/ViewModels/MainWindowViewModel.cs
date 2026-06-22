@@ -286,6 +286,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private CancellationTokenSource? _folderWatchDebounceCts;
     private CancellationTokenSource? _widthDebounceCts;
     private int _resultNavigationVersion;
+    private HashSet<string>? _pendingSelectionRestorePaths;
 
     // 用于精确等待 Images 集合更新完成的信号
     private TaskCompletionSource<bool>? _imagesUpdatedTcs;
@@ -324,6 +325,7 @@ public partial class MainWindowViewModel : ViewModelBase
         _pageManager.PageChanged += args =>
         {
             Images = new ObservableCollection<ImageViewItem>(args.Items);
+            RestorePendingSelection(Images);
             _isNavigating = true;
             CurrentPage = args.PageIndex;
             _isNavigating = false;
@@ -926,6 +928,7 @@ public partial class MainWindowViewModel : ViewModelBase
             }
 
             _pageManager.RemoveFromCache(CurrentPage);
+            CaptureSelectionForNextPageRefresh();
             await ShowPageAsync(CurrentPage);
             StatusText = $"总文件数: {_allFiles.Count}";
 
@@ -1589,6 +1592,29 @@ partial void OnCornerRadiusDipChanged(double value)
             ClearHighlightRecursive(root);
     }
 
+    private void CaptureSelectionForNextPageRefresh()
+    {
+        var selected = Images
+            .Where(i => i.IsSelected && !string.IsNullOrWhiteSpace(i.FilePath))
+            .Select(i => i.FilePath)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        _pendingSelectionRestorePaths = selected.Count > 0 ? selected : null;
+    }
+
+    private void RestorePendingSelection(IEnumerable<ImageViewItem> items)
+    {
+        var selectedPaths = _pendingSelectionRestorePaths;
+        _pendingSelectionRestorePaths = null;
+        if (selectedPaths is not { Count: > 0 }) return;
+
+        foreach (var item in items)
+        {
+            if (selectedPaths.Contains(item.FilePath))
+                item.IsSelected = true;
+        }
+    }
+
     private static void ClearHighlightRecursive(FolderTreeNode node)
     {
         node.IsSearchHighlight = false;
@@ -1847,6 +1873,8 @@ partial void OnCornerRadiusDipChanged(double value)
             // Keep current page — don't jump to 0 on background refresh
             int targetPage = CurrentPage;
             if (targetPage >= TotalPages) targetPage = Math.Max(0, TotalPages - 1);
+            if (targetPage == CurrentPage)
+                CaptureSelectionForNextPageRefresh();
             await ShowPageAsync(targetPage);
         }
 
@@ -1879,8 +1907,14 @@ partial void OnCornerRadiusDipChanged(double value)
                         // Refresh current page to show newly loaded tags
                         _ = _dispatcher.InvokeAsync(() =>
                         {
-                            _pageManager.InvalidateCache();
-                            _ = ShowPageAsync(CurrentPage);
+                            foreach (var item in Images)
+                            {
+                                if (tagMap.TryGetValue(item.FilePath, out var tags))
+                                {
+                                    item.Tags = new List<string>(tags);
+                                    item.NotifyAll();
+                                }
+                            }
                             StatusText = $"总文件数: {_allFiles.Count} (含子文件夹) | 标签: {loadedCount}";
                         });
                     }
@@ -2138,6 +2172,7 @@ partial void OnCornerRadiusDipChanged(double value)
             item.Tags = GetTagsForFile(gapPaths[i]);
             item.IsLoading = true;
             item.IsLoaded = false;
+            item.IsSelected = false;
             item.ThumbnailData = null;
             item.Width = 1;
             item.Height = 1;
