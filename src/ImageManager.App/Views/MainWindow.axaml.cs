@@ -20,6 +20,7 @@ using ImageManager.Common.Helpers;
 using ImageManager.Infrastructure.Data;
 using ImageManager.Infrastructure.Imaging;
 using ImageManager.Infrastructure.Services;
+using ImageManager.Infrastructure.Video;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace ImageManager.App.Views;
@@ -35,6 +36,7 @@ public partial class MainWindow : Window
 
     private CancellationTokenSource? _scrollAnimCts;
     private int _autoTagRunVersion;
+    private int _videoOriginalFrameBatchRunning;
 
     public MainWindow()
     {
@@ -1714,6 +1716,118 @@ public partial class MainWindow : Window
         await RunAutoTagAsync(folder, files);
     }
 
+    private async void MenuComputeVideoOriginalFramesRecursive_Click(object? sender, RoutedEventArgs e)
+    {
+        var folder = GetContextMenuFolder(sender);
+        if (folder == null) return;
+
+        if (Interlocked.CompareExchange(ref _videoOriginalFrameBatchRunning, 1, 0) != 0)
+        {
+            Vm.StatusText = "视频原始帧计算正在进行中";
+            return;
+        }
+
+        var rootPath = folder.Path;
+        Vm.StatusText = "正在扫描视频文件...";
+
+        try
+        {
+            var videos = await GetVideoFilesRecursiveAsync(rootPath);
+            if (videos.Count == 0)
+            {
+                Vm.StatusText = "文件夹及子文件夹无视频";
+                Interlocked.Exchange(ref _videoOriginalFrameBatchRunning, 0);
+                return;
+            }
+
+            var originalFrames = App.Services.GetRequiredService<VideoOriginalFrameCacheService>();
+            Vm.StatusText = $"正在计算 {videos.Count} 个视频的原始帧...";
+            Vm.BackgroundStatusText = $"视频原始帧 0/{videos.Count}";
+
+            _ = Task.Run(async () =>
+            {
+                var existed = 0;
+                var generated = 0;
+                var failed = 0;
+
+                try
+                {
+                    for (var i = 0; i < videos.Count; i++)
+                    {
+                        var path = videos[i];
+                        var index = i + 1;
+
+                        await App.UI.InvokeAsync(() =>
+                        {
+                            Vm.BackgroundStatusText =
+                                $"视频原始帧 {index}/{videos.Count} | 已有 {existed} / 新增 {generated} / 失败 {failed}";
+                        });
+
+                        VideoOriginalFrameResult result;
+                        try
+                        {
+                            result = await originalFrames.EnsureAsync(path);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            result = new VideoOriginalFrameResult(false, false, null, ex.Message);
+                        }
+
+                        if (result.Success)
+                        {
+                            if (result.AlreadyExisted)
+                                existed++;
+                            else
+                                generated++;
+                        }
+                        else
+                        {
+                            failed++;
+                            AppLogger.Warn($"VideoOriginalFrames batch failed file={path} error={result.Error}");
+                        }
+                    }
+
+                    await App.UI.InvokeAsync(() =>
+                    {
+                        Vm.StatusText = $"视频原始帧完成: 已有 {existed}, 新增 {generated}, 失败 {failed}";
+                        Vm.BackgroundStatusText = "";
+                    });
+                }
+                catch (OperationCanceledException)
+                {
+                    await App.UI.InvokeAsync(() =>
+                    {
+                        Vm.StatusText = "视频原始帧计算已取消";
+                        Vm.BackgroundStatusText = "";
+                    });
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Error($"VideoOriginalFrames batch error: {ex}");
+                    await App.UI.InvokeAsync(() =>
+                    {
+                        Vm.StatusText = $"视频原始帧计算失败: {ex.Message}";
+                        Vm.BackgroundStatusText = "";
+                    });
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _videoOriginalFrameBatchRunning, 0);
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            Interlocked.Exchange(ref _videoOriginalFrameBatchRunning, 0);
+            Vm.BackgroundStatusText = "";
+            Vm.StatusText = $"扫描视频失败: {ex.Message}";
+        }
+    }
+
     private static async Task<List<string>> GetImageFilesInFolderAsync(string path)
     {
         try
@@ -1742,6 +1856,34 @@ public partial class MainWindow : Window
                     {
                         foreach (var f in Directory.EnumerateFiles(dir))
                             if (FileTypeConstants.IsMediaFile(f))
+                                files.Add(f);
+                        foreach (var sub in Directory.EnumerateDirectories(dir))
+                            dirs.Enqueue(sub);
+                    }
+                    catch { }
+                }
+                return files;
+            });
+        }
+        catch { return new List<string>(); }
+    }
+
+    private static async Task<List<string>> GetVideoFilesRecursiveAsync(string root)
+    {
+        try
+        {
+            return await Task.Run(() =>
+            {
+                var files = new List<string>();
+                var dirs = new Queue<string>();
+                dirs.Enqueue(root);
+                while (dirs.Count > 0)
+                {
+                    var dir = dirs.Dequeue();
+                    try
+                    {
+                        foreach (var f in Directory.EnumerateFiles(dir))
+                            if (FileTypeConstants.IsVideoFile(f))
                                 files.Add(f);
                         foreach (var sub in Directory.EnumerateDirectories(dir))
                             dirs.Enqueue(sub);

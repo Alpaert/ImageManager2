@@ -995,6 +995,26 @@ public partial class MainWindowViewModel : ViewModelBase
                     ct.ThrowIfCancellationRequested();
                     if (!dbSet.Contains(file))
                     {
+                        if (FileTypeConstants.IsVideoFile(file))
+                        {
+                            try
+                            {
+                                var fi = new FileInfo(file);
+                                await _metaRepo.UpsertAsync(new ImageMeta
+                                {
+                                    FilePath = file,
+                                    FolderId = folderId,
+                                    FileSize = fi.Length,
+                                    LastWriteTicks = fi.LastWriteTimeUtc.Ticks,
+                                    HashStatus = -1
+                                });
+                            }
+                            catch { }
+
+                            newFiles.Add(file);
+                            continue;
+                        }
+
                         string? md5 = null;
                         try
                         {
@@ -2252,6 +2272,9 @@ partial void OnCornerRadiusDipChanged(double value)
                     }
                     else
                     {
+                        if (FileTypeConstants.IsVideoFile(path))
+                            continue;
+
                         // Fallback: read file header for unhashed files
                         try
                         {
@@ -2335,6 +2358,8 @@ partial void OnCornerRadiusDipChanged(double value)
     {
         if (_metaCache.TryGetValue(path, out var m) && m.Width > 0)
             return (long)m.Width * m.Height;
+        if (FileTypeConstants.IsVideoFile(path))
+            return 0;
         try
         {
             var (w, h) = ImageManager.Infrastructure.Imaging.ThumbnailGenerator.GetDimensions(path);

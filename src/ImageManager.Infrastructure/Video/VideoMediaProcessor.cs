@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using ImageManager.Common.Constants;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Imaging;
@@ -7,11 +6,11 @@ namespace ImageManager.Infrastructure.Video;
 
 public class VideoMediaProcessor : IMediaProcessor
 {
-    private readonly string _cacheDirectory;
+    private readonly VideoOriginalFrameCacheService _originalFrames;
 
-    public VideoMediaProcessor(string cacheDirectory)
+    public VideoMediaProcessor(VideoOriginalFrameCacheService originalFrames)
     {
-        _cacheDirectory = cacheDirectory;
+        _originalFrames = originalFrames;
     }
 
     public bool CanHandle(string extension)
@@ -34,27 +33,17 @@ public class VideoMediaProcessor : IMediaProcessor
             }
         }
 
-        var originalFrame = await VideoThumbnailGenerator.ExtractOriginalFrameAsync(filePath, ct);
-        if (originalFrame is { Length: > 0 })
-        {
-            try
-            {
-                var dir = Path.GetDirectoryName(originalPath);
-                if (!string.IsNullOrWhiteSpace(dir))
-                    Directory.CreateDirectory(dir);
-                await File.WriteAllBytesAsync(originalPath, originalFrame, ct);
-                Common.Helpers.PerfLogger.Log($"[VideoCache] FFMPEG EXTRACT saved original {Path.GetFileName(filePath)}");
+        if (!File.Exists(filePath))
+            return null;
 
-                var thumbnailData = ThumbnailGenerator.Generate(originalPath, decodeWidth);
-                if (thumbnailData != null)
-                {
-                    var (w, h) = ThumbnailGenerator.GetDimensions(originalPath);
-                    return new MediaResult { Data = thumbnailData, Width = w, Height = h };
-                }
-            }
-            catch
+        var originalFrame = await _originalFrames.EnsureAsync(filePath, ct);
+        if (originalFrame.Success && originalFrame.Path is not null && File.Exists(originalFrame.Path))
+        {
+            var thumbnailData = ThumbnailGenerator.Generate(originalFrame.Path, decodeWidth);
+            if (thumbnailData != null)
             {
-                try { if (File.Exists(originalPath)) File.Delete(originalPath); } catch { }
+                var (w, h) = ThumbnailGenerator.GetDimensions(originalFrame.Path);
+                return new MediaResult { Data = thumbnailData, Width = w, Height = h };
             }
         }
 
@@ -76,6 +65,9 @@ public class VideoMediaProcessor : IMediaProcessor
         if (File.Exists(cachedPath))
             return ThumbnailGenerator.GetDimensions(cachedPath);
 
+        if (!File.Exists(filePath))
+            return (1920, 1080);
+
         try
         {
             var task = VideoThumbnailGenerator.GetDimensionsAsync(filePath);
@@ -91,21 +83,6 @@ public class VideoMediaProcessor : IMediaProcessor
 
     internal string GetOriginalFramePath(string filePath)
     {
-        var folderHash = GetFolderHash(filePath);
-        var fileHash = GetFileHash(filePath);
-        return Path.Combine(_cacheDirectory, "video_originals", folderHash, fileHash + ".jpg");
-    }
-
-    private static string GetFolderHash(string filePath)
-    {
-        var dir = Path.GetDirectoryName(filePath) ?? "_root";
-        var hashBytes = MD5.HashData(System.Text.Encoding.UTF8.GetBytes(dir.ToLowerInvariant()));
-        return Convert.ToHexString(hashBytes).ToLowerInvariant()[..8];
-    }
-
-    private static string GetFileHash(string filePath)
-    {
-        var hashBytes = MD5.HashData(System.Text.Encoding.UTF8.GetBytes(filePath.ToLowerInvariant()));
-        return Convert.ToHexString(hashBytes).ToLowerInvariant();
+        return _originalFrames.GetOriginalFramePath(filePath);
     }
 }

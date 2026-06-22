@@ -93,10 +93,12 @@ public class ThumbnailCacheService : IThumbnailCacheService
         int decodeWidth,
         CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+        if (string.IsNullOrWhiteSpace(filePath))
             return (null, 0, 0);
 
         var isVideo = FileTypeConstants.IsVideoFile(filePath);
+        if (!isVideo && !File.Exists(filePath))
+            return (null, 0, 0);
 
         if (decodeWidth != DecodeWidth)
         {
@@ -163,10 +165,12 @@ public class ThumbnailCacheService : IThumbnailCacheService
 
     public (byte[]? Data, int Width, int Height) TryGetCachedThumbnail(string filePath, int decodeWidth)
     {
-        if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+        if (string.IsNullOrWhiteSpace(filePath))
             return (null, 0, 0);
 
         var isVideo = FileTypeConstants.IsVideoFile(filePath);
+        if (!isVideo && !File.Exists(filePath))
+            return (null, 0, 0);
 
         if (_index.TryGetValue(filePath, out var node)
             && node.Value.Data != null

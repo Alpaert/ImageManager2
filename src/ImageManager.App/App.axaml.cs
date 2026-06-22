@@ -17,6 +17,7 @@ using ImageManager.Infrastructure.Data;
 using ImageManager.Infrastructure.Data.Repositories;
 using ImageManager.Infrastructure.Hashing;
 using ImageManager.Infrastructure.Services;
+using ImageManager.Infrastructure.Video;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -116,7 +117,9 @@ public partial class App : Application
         services.AddSingleton<IDuplicateService, DuplicateService>();
 
         // ==================== Media Processor Factory ====================
-        services.AddSingleton<IMediaProcessorFactory>(new MediaProcessorFactory(cacheDir));
+        services.AddSingleton(new VideoOriginalFrameCacheService(cacheDir));
+        services.AddSingleton<IMediaProcessorFactory>(sp =>
+            new MediaProcessorFactory(sp.GetRequiredService<VideoOriginalFrameCacheService>()));
 
         services.AddSingleton<ThumbnailCacheService>(sp =>
             new ThumbnailCacheService(
