@@ -198,8 +198,42 @@ public class PageManager : IDisposable
 
     public int ComputeDecodeWidth()
     {
-        int w = (int)(ZoomLevels[_currentZoomLevel] * 2);
+        var baseWidth = ZoomLevels[_currentZoomLevel];
+        if (string.Equals(_currentUiState.WaterfallMode, "Horizontal", StringComparison.OrdinalIgnoreCase))
+        {
+            int horizontalWidth = (int)(baseWidth * 3);
+            return Math.Clamp(horizontalWidth, 512, 2048);
+        }
+
+        int w = (int)(baseWidth * 2);
         return Math.Clamp(w, 300, 1600);
+    }
+
+    public async Task RefreshDecodeWidthForCurrentModeAsync()
+    {
+        int newDecodeWidth = ComputeDecodeWidth();
+        if (newDecodeWidth == _thumbnailDecodeWidth)
+            return;
+
+        _thumbnailDecodeWidth = newDecodeWidth;
+        _thumbCache.DecodeWidth = _thumbnailDecodeWidth;
+        await _thumbCache.ClearAsync();
+
+        lock (_pageCacheLock)
+        {
+            foreach (var page in _pageCache.Values)
+            {
+                foreach (var item in page)
+                {
+                    item.IsLoaded = false;
+                    item.IsLoading = true;
+                    item.ThumbnailData = null;
+                    item.NotifyAll();
+                }
+            }
+        }
+
+        _ = LoadPageThumbnailsAsync(_activePageIndex);
     }
 
     public (double baseWidth, bool rebuildTriggered) OnZoomTickChanged(

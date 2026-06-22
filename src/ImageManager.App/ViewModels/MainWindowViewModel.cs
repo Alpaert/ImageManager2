@@ -1504,7 +1504,13 @@ public partial class MainWindowViewModel : ViewModelBase
             _ = ShowPageAsync(value);
     }
 
-    partial void OnWaterfallModeChanged(string value) => OnPropertyChanged(nameof(GridThumbnailHeight));
+    partial void OnWaterfallModeChanged(string value)
+    {
+        OnPropertyChanged(nameof(GridThumbnailHeight));
+        _pageManager.UpdateUiState(new PageUiState(
+            ThumbnailBaseWidth, WaterfallMode, AppSettings.ThumbnailAspectRatio));
+        _ = _pageManager.RefreshDecodeWidthForCurrentModeAsync();
+    }
     partial void OnThumbnailBaseWidthChanged(double value) => OnPropertyChanged(nameof(GridThumbnailHeight));
     partial void OnShowFileNameChanged(bool value) => OnPropertyChanged(nameof(ShowAnyThumbnailText));
     partial void OnShowTagsChanged(bool value) => OnPropertyChanged(nameof(ShowAnyThumbnailText));
@@ -1527,7 +1533,7 @@ partial void OnCornerRadiusDipChanged(double value)
     {
         SaveZoomForMode(WaterfallMode);
         _pageManager.UpdateUiState(new PageUiState(
-            (double)0, WaterfallMode, AppSettings.ThumbnailAspectRatio));
+            ThumbnailBaseWidth, WaterfallMode, AppSettings.ThumbnailAspectRatio));
         var (baseWidth, _) = _pageManager.OnZoomTickChanged(value, CurrentPage, TotalPages,
             ActiveFileList, GetTagsForFile);
         if ((int)baseWidth != (int)ThumbnailBaseWidth)
