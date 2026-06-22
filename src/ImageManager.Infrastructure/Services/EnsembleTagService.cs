@@ -195,7 +195,8 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
         return new EnsembleResult(rating, merged, sourceTags)
         {
             ArtistName = artistName,
-            ArtistConfidence = artistConf
+            ArtistConfidence = artistConf,
+            Embedding = embedding
         };
     }
 

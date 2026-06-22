@@ -414,6 +414,14 @@ public class TagSearchEngine
         }
     }
 
+    public Task RefreshCurrentCoTagSuggestionsAsync()
+    {
+        if (!_coTagMode)
+            return Task.CompletedTask;
+
+        return RefreshCoTagSuggestionsAsync(_ => { });
+    }
+
     internal static string ExtractActiveToken(string text)
     {
         if (string.IsNullOrWhiteSpace(text)) return string.Empty;

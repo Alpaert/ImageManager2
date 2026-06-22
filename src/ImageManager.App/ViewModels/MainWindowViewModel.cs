@@ -2848,6 +2848,50 @@ partial void OnCornerRadiusDipChanged(double value)
         }
     }
 
+    public async Task RefreshTagsAfterExternalWriteAsync(IEnumerable<string> affectedPaths, bool refreshCounts = true)
+    {
+        var paths = affectedPaths
+            .Where(p => !string.IsNullOrWhiteSpace(p))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (paths.Count > 0)
+        {
+            var tagMap = await _metaRepo.GetTagMapByPathsAsync(paths);
+
+            lock (_tagCacheLock)
+            {
+                foreach (var path in paths)
+                {
+                    _tagCacheByPath[path] = tagMap.TryGetValue(path, out var tags)
+                        ? new List<string>(tags)
+                        : new List<string>();
+                }
+            }
+
+            await _dispatcher.InvokeAsync(() =>
+            {
+                foreach (var item in Images)
+                {
+                    if (!tagMap.TryGetValue(item.FilePath, out var tags))
+                        continue;
+
+                    item.Tags = new List<string>(tags);
+                    item.NotifyAll();
+                }
+            });
+        }
+
+        if (refreshCounts)
+        {
+            InvalidateTagCountsCache();
+            await RefreshTagCountsAsync(forceRefresh: true);
+        }
+
+        if (_tagSearch.IsSuggestionCoTagMode)
+            await _tagSearch.RefreshCurrentCoTagSuggestionsAsync();
+    }
+
     public List<TagCount> GetAllTagCounts()
     {
         lock (_tagCountsCacheLock)

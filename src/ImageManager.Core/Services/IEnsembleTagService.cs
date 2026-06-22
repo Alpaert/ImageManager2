@@ -29,6 +29,7 @@ public readonly record struct EnsembleResult(
 {
     public string? ArtistName { get; init; }
     public double ArtistConfidence { get; init; }
+    public float[]? Embedding { get; init; }
 }
 
 public readonly record struct ModelStatus(

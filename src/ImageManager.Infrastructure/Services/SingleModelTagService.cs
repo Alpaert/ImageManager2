@@ -68,13 +68,30 @@ public class SingleModelTagService : IEnsembleTagService, IDisposable
 
     public async Task<EnsembleResult> PredictWithSourcesAsync(string imagePath, CancellationToken ct = default)
     {
-        var preds = await PredictAsync(imagePath, ct);
+        var (preds, embedding) = await PredictPixaiAsync(imagePath, ct);
+        preds = preds
+            .Where(p => p.Confidence >= _minConfidence)
+            .ToList();
+
+        for (int i = 0; i < preds.Count; i++)
+        {
+            preds[i] = preds[i] with { ChineseName = _chineseLib.Lookup(preds[i].TagName) };
+        }
+
         var sourceTags = new Dictionary<string, List<TagPrediction>>
         {
             ["pixai"] = preds
         };
-        return new EnsembleResult(SystemRating.Unknown, preds, sourceTags);
+        return new EnsembleResult(SystemRating.Unknown, preds, sourceTags)
+        {
+            Embedding = embedding
+        };
     }
+
+    private async Task<(List<TagPrediction> Tags, float[]? Embedding)> PredictPixaiAsync(
+        string imagePath,
+        CancellationToken ct)
+        => await _pixai.PredictWithEmbeddingAsync(imagePath, ct);
 
     public IReadOnlyList<ModelStatus> GetModelStatuses()
     {

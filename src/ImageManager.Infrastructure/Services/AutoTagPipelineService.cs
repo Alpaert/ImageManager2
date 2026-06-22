@@ -18,9 +18,12 @@ public readonly record struct FolderTagActionResult(
 
 public class AutoTagPipelineService : IDisposable
 {
+    private const string EmbeddingModelKey = "pixai";
+    private const string EmbeddingModelVersion = "v0.9";
     private readonly IImageMetaRepository _metaRepo;
     private readonly IEnsembleTagService _tagService;
     private readonly IAutoTagStateRepository _stateRepo;
+    private readonly IImageEmbeddingRepository _embeddingRepo;
     private double _confidenceThreshold = 0.35;
     private int _maxTagsPerImage = 20;
     public event Action<AutoTagPipelineProgress>? ProgressChanged;
@@ -31,11 +34,13 @@ public class AutoTagPipelineService : IDisposable
     public AutoTagPipelineService(
         IImageMetaRepository metaRepo,
         IEnsembleTagService tagService,
-        IAutoTagStateRepository stateRepo)
+        IAutoTagStateRepository stateRepo,
+        IImageEmbeddingRepository embeddingRepo)
     {
         _metaRepo = metaRepo;
         _tagService = tagService;
         _stateRepo = stateRepo;
+        _embeddingRepo = embeddingRepo;
     }
 
     public void Configure(double confidenceThreshold, int maxTagsPerImage)
@@ -107,7 +112,7 @@ public class AutoTagPipelineService : IDisposable
             await _stateRepo.UpsertStateAsync(state);
         }
 
-        var channel = Channel.CreateBounded<(long ImageId, string FilePath, List<TagPrediction> Predictions)>(
+        var channel = Channel.CreateBounded<(long ImageId, string FilePath, List<TagPrediction> Predictions, float[]? Embedding)>(
             new BoundedChannelOptions(16) { SingleWriter = true, SingleReader = true,
                 FullMode = BoundedChannelFullMode.Wait });
 
@@ -153,12 +158,24 @@ public class AutoTagPipelineService : IDisposable
                     var meta = metas[i];
                     try
                     {
-                        var predictions = await activeTagService.PredictAsync(meta.FilePath, ct);
+                        List<TagPrediction> predictions;
+                        float[]? embedding = null;
+                        if (activeTagService is IEnsembleTagService ensemble)
+                        {
+                            var result = await ensemble.PredictWithSourcesAsync(meta.FilePath, ct);
+                            predictions = result.MergedTags;
+                            embedding = result.Embedding;
+                        }
+                        else
+                        {
+                            predictions = await activeTagService.PredictAsync(meta.FilePath, ct);
+                        }
+
                         var filtered = predictions
                             .Where(p => p.Confidence >= _confidenceThreshold)
                             .Take(_maxTagsPerImage)
                             .ToList();
-                        await channel.Writer.WriteAsync((meta.Id, meta.FilePath, filtered), ct);
+                        await channel.Writer.WriteAsync((meta.Id, meta.FilePath, filtered, embedding), ct);
                     }
                     catch (OperationCanceledException) { break; }
                     catch (OutOfMemoryException ex)
@@ -184,6 +201,7 @@ public class AutoTagPipelineService : IDisposable
         {
             var completed = 0;
             var stampBuffer = new List<string>(100);
+            var embeddingBuffer = new List<(long ImageMetaId, string? FileHash, float[] Embedding)>(100);
             try
             {
                 await foreach (var item in channel.Reader.ReadAllAsync(ct))
@@ -198,6 +216,8 @@ public class AutoTagPipelineService : IDisposable
                         Interlocked.Increment(ref processed);
                         completed++;
                         stampBuffer.Add(item.FilePath);
+                        if (item.Embedding is { Length: > 0 })
+                            embeddingBuffer.Add((item.ImageId, null, item.Embedding));
                         processedPaths.Add(item.FilePath);
 
                         if (stampBuffer.Count >= 100)
@@ -205,6 +225,7 @@ public class AutoTagPipelineService : IDisposable
                             AppLogger.Memory($"Consumer.Stamp {completed}/{total}");
                             await _metaRepo.SetAutoTagStatusBatchAsync(stampBuffer, 1);
                             stampBuffer.Clear();
+                            await FlushEmbeddingBufferAsync(embeddingBuffer);
                         }
 
                         if (completed % 10 == 0 || completed == metas.Count)
@@ -240,6 +261,7 @@ public class AutoTagPipelineService : IDisposable
             // Flush remaining stamps
             if (stampBuffer.Count > 0)
                 await _metaRepo.SetAutoTagStatusBatchAsync(stampBuffer, 1);
+            await FlushEmbeddingBufferAsync(embeddingBuffer);
 
             if (!errors.IsEmpty)
             {
@@ -276,6 +298,24 @@ public class AutoTagPipelineService : IDisposable
         }
 
         return processedPaths;
+    }
+
+    private async Task FlushEmbeddingBufferAsync(List<(long ImageMetaId, string? FileHash, float[] Embedding)> buffer)
+    {
+        if (buffer.Count == 0) return;
+
+        try
+        {
+            await _embeddingRepo.UpsertBatchAsync(buffer, EmbeddingModelKey, EmbeddingModelVersion);
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"Embedding batch save failed count={buffer.Count}: {ex.Message}");
+        }
+        finally
+        {
+            buffer.Clear();
+        }
     }
 
     public void Dispose() => ProgressChanged = null;

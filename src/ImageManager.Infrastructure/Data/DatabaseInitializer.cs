@@ -89,6 +89,20 @@ public static class DatabaseInitializer
                 FOREIGN KEY (FolderId) REFERENCES Folder(Id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS ImageEmbedding (
+                ImageMetaId   INTEGER NOT NULL REFERENCES ImageMeta(Id) ON DELETE CASCADE,
+                ModelKey      TEXT NOT NULL,
+                ModelVersion  TEXT NOT NULL,
+                EmbeddingDim  INTEGER NOT NULL,
+                EmbeddingBlob BLOB NOT NULL,
+                FileHash      TEXT,
+                UpdatedAt     TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (ImageMetaId, ModelKey, ModelVersion)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_imageembedding_model
+                ON ImageEmbedding(ModelKey, ModelVersion);
+
             """;
         cmd.ExecuteNonQuery();
     }

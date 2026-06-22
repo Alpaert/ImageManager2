@@ -111,6 +111,7 @@ public partial class App : Application
         services.AddSingleton<ITagMappingRepository, TagMappingRepository>();
         services.AddSingleton<IFolderRepository, FolderRepository>();
         services.AddSingleton<ISettingsRepository, SettingsRepository>();
+        services.AddSingleton<IImageEmbeddingRepository, ImageEmbeddingRepository>();
 
         services.AddSingleton<IHashService, HashService>();
         services.AddSingleton<ISimilarImageService, SimilarImageService>();

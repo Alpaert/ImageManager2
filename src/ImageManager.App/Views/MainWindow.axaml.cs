@@ -17,6 +17,7 @@ using ImageManager.App.Services;
 using ImageManager.App.ViewModels;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
+using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Data;
 using ImageManager.Infrastructure.Imaging;
 using ImageManager.Infrastructure.Services;
@@ -960,6 +961,7 @@ public partial class MainWindow : Window
 
     private async Task<bool> EditTagForItemAsync(ImageViewItem item)
     {
+        await Vm.RefreshTagCountsAsync(forceRefresh: true);
         var allTags = Vm.GetAllTagCounts();
 
         // ✅ 如果 Tags 为空，主动从数据库加载
@@ -1032,6 +1034,7 @@ public partial class MainWindow : Window
 
     private async Task EditTagsForItemsAsync(List<ImageViewItem> items)
     {
+        await Vm.RefreshTagCountsAsync(forceRefresh: true);
         var allTags = Vm.GetAllTagCounts();
 
         // ✅ 批量从数据库加载 Tags（如果缓存未命中）
@@ -1719,6 +1722,13 @@ public partial class MainWindow : Window
         await RunAutoTagAsync(folder, files);
     }
 
+    private async void MenuMatchCharacterEmbeddingsRecursive_Click(object? sender, RoutedEventArgs e)
+    {
+        var folder = GetContextMenuFolder(sender);
+        if (folder == null) return;
+        await RunCharacterEmbeddingMatchAsync(folder.Path);
+    }
+
     private void MenuStopVideoOriginalFrames_Click(object? sender, RoutedEventArgs e)
     {
         var cts = Volatile.Read(ref _videoOriginalFrameBatchCts);
@@ -1889,6 +1899,97 @@ public partial class MainWindow : Window
             Interlocked.Exchange(ref _videoOriginalFrameBatchRunning, 0);
             Interlocked.CompareExchange(ref _videoOriginalFrameBatchCts, null, batchCts);
             batchCts.Dispose();
+        }
+    }
+
+    private async Task RunCharacterEmbeddingMatchAsync(string rootPath)
+    {
+        const string modelKey = "pixai";
+        const string modelVersion = "v0.9";
+        const string source = "CharacterEmbedding";
+
+        Vm.StatusText = "正在匹配人物 Embedding...";
+
+        try
+        {
+            var imageFiles = (await GetImageFilesRecursiveAsync(rootPath))
+                .Where(FileTypeConstants.IsImageFile)
+                .ToList();
+            if (imageFiles.Count == 0)
+            {
+                Vm.StatusText = "文件夹及子文件夹无图片";
+                return;
+            }
+
+            var embeddingRepo = App.Services.GetRequiredService<IImageEmbeddingRepository>();
+            var characterStore = App.Services.GetRequiredService<CharacterEmbeddingStore>();
+            if (characterStore.Count == 0)
+            {
+                Vm.StatusText = "角色 Embedding 库为空，请先构建角色库";
+                return;
+            }
+
+            var settings = Vm.AppSettings;
+            var embeddings = await embeddingRepo.GetByFolderPrefixAsync(rootPath, modelKey, modelVersion);
+            var imageSet = new HashSet<string>(imageFiles, StringComparer.OrdinalIgnoreCase);
+            embeddings = embeddings
+                .Where(e => imageSet.Contains(e.FilePath))
+                .ToList();
+
+            var missing = imageFiles.Count - embeddings.Count;
+            var matched = 0;
+            var written = 0;
+            var pending = new List<(long ImageMetaId, string TagName)>(100);
+            var pendingPaths = new List<string>(100);
+
+            for (var i = 0; i < embeddings.Count; i++)
+            {
+                var item = embeddings[i];
+                var matches = characterStore.SearchTop(
+                    item.Embedding,
+                    settings.CharacterMatchThreshold,
+                    Math.Clamp(settings.CharacterMaxMatchesPerImage, 1, 5));
+
+                foreach (var match in matches)
+                {
+                    pending.Add((item.ImageMetaId, match.CharacterName));
+                    pendingPaths.Add(item.FilePath);
+                }
+
+                if (matches.Count > 0)
+                    matched++;
+
+                if (pending.Count >= 100)
+                {
+                    written += await embeddingRepo.AddCharacterEmbeddingTagsAsync(pending, source);
+                    await Vm.RefreshTagsAfterExternalWriteAsync(pendingPaths);
+                    pending.Clear();
+                    pendingPaths.Clear();
+                }
+
+                if ((i + 1) % 200 == 0 || i + 1 == embeddings.Count)
+                {
+                    Vm.BackgroundStatusText =
+                        $"人物 Embedding 匹配 {i + 1}/{embeddings.Count} | 命中 {matched} / 缺失 {missing}";
+                }
+            }
+
+            if (pending.Count > 0)
+            {
+                written += await embeddingRepo.AddCharacterEmbeddingTagsAsync(pending, source);
+                await Vm.RefreshTagsAfterExternalWriteAsync(pendingPaths);
+            }
+
+            Vm.BackgroundStatusText = "";
+            Vm.StatusText =
+                $"人物 Embedding 匹配完成: 图片 {imageFiles.Count}, 有向量 {embeddings.Count}, 缺失 {missing}, 命中 {matched}, 写入 {written}";
+            await Vm.RefreshTagsAfterExternalWriteAsync(Array.Empty<string>());
+        }
+        catch (Exception ex)
+        {
+            Vm.BackgroundStatusText = "";
+            Vm.StatusText = $"人物 Embedding 匹配失败: {ex.Message}";
+            AppLogger.Error($"Character embedding match failed: {ex}");
         }
     }
 
@@ -2668,6 +2769,7 @@ public partial class MainWindow : Window
 
     private async void MenuTagManage_Click(object? sender, RoutedEventArgs e)
     {
+        await Vm.RefreshTagCountsAsync(forceRefresh: true);
         var allTags = Vm.GetAllTagCounts();
         var tagVm = new ViewModels.TagManageViewModel(
             allTags,

@@ -29,7 +29,10 @@ public class AutoTagOrchestrator : IDisposable
     private readonly ArtistEmbeddingStore _artistStore;
     private readonly CharacterEmbeddingStore _characterStore;
     private readonly PixaiTagService _pixaiService;
+    private readonly IImageEmbeddingRepository _embeddingRepo;
     private readonly IMessenger _messenger;
+    private const string EmbeddingModelKey = "pixai";
+    private const string EmbeddingModelVersion = "v0.9";
     private TagMode _currentMode = TagMode.Ensemble;
     private CancellationTokenSource? _cts;
 
@@ -50,6 +53,7 @@ public class AutoTagOrchestrator : IDisposable
         ArtistEmbeddingStore artistStore,
         CharacterEmbeddingStore characterStore,
         PixaiTagService pixaiService,
+        IImageEmbeddingRepository embeddingRepo,
         IMessenger messenger)
     {
         _pipeline = pipeline;
@@ -65,6 +69,7 @@ public class AutoTagOrchestrator : IDisposable
         _artistStore = artistStore;
         _characterStore = characterStore;
         _pixaiService = pixaiService;
+        _embeddingRepo = embeddingRepo;
         _messenger = messenger;
 
         // Wire pipeline progress → messenger
@@ -209,11 +214,16 @@ public class AutoTagOrchestrator : IDisposable
 
     public async Task<List<TagTranslationDto>> RunSingleImageAsync(string filePath)
     {
-        var predictions = await _tagService.PredictAsync(filePath);
+        var activeTagService = _factory.Create(_currentMode);
+        var result = await activeTagService.PredictWithSourcesAsync(filePath);
+        var predictions = result.MergedTags;
         var filtered = predictions
             .Where(p => p.Confidence >= 0.1)
             .Take(300)
             .ToList();
+
+        if (result.Embedding is { Length: > 0 })
+            await SaveImageEmbeddingAsync(filePath, result.Embedding);
 
         var existingMappings = await _mappingRepo.GetAllAsync();
         var items = new List<TagTranslationDto>();
@@ -233,6 +243,27 @@ public class AutoTagOrchestrator : IDisposable
         }
 
         return items;
+    }
+
+    private async Task SaveImageEmbeddingAsync(string filePath, float[] embedding)
+    {
+        try
+        {
+            var meta = await _metaRepo.GetByPathAsync(filePath);
+            if (meta == null || meta.Id <= 0)
+                return;
+
+            await _embeddingRepo.UpsertAsync(
+                meta.Id,
+                meta.FileHash,
+                embedding,
+                EmbeddingModelKey,
+                EmbeddingModelVersion);
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"Embedding save failed path={Path.GetFileName(filePath)}: {ex.Message}");
+        }
     }
 
     public async Task SaveMappingsAndTagsAsync(string filePath, List<TagTranslationDto> items)
