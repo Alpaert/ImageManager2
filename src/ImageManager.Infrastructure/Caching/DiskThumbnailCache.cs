@@ -231,11 +231,66 @@ public class DiskThumbnailCache
         catch { }
     }
 
+    public void MoveAllWidths(string oldPath, string newPath)
+    {
+        try
+        {
+            if (!Directory.Exists(_cacheRoot)) return;
+
+            var oldHashName = GetCacheFileName(oldPath);
+            var oldFolderHash = GetFolderHash(oldPath);
+            var newHashName = GetCacheFileName(newPath);
+            var newFolderHash = GetFolderHash(newPath);
+
+            foreach (var dir in Directory.EnumerateDirectories(_cacheRoot, "w*"))
+            {
+                MoveCacheFile(
+                    Path.Combine(dir, oldFolderHash, oldHashName),
+                    Path.Combine(dir, newFolderHash, newHashName));
+                MoveCacheFile(
+                    Path.ChangeExtension(Path.Combine(dir, oldFolderHash, oldHashName), ".json"),
+                    Path.ChangeExtension(Path.Combine(dir, newFolderHash, newHashName), ".json"));
+
+                MoveCacheFile(Path.Combine(dir, oldHashName), Path.Combine(dir, newHashName));
+                MoveCacheFile(
+                    Path.ChangeExtension(Path.Combine(dir, oldHashName), ".json"),
+                    Path.ChangeExtension(Path.Combine(dir, newHashName), ".json"));
+            }
+
+            MoveCacheFile(
+                Path.Combine(_cacheRoot, "video_originals", oldFolderHash, oldHashName),
+                Path.Combine(_cacheRoot, "video_originals", newFolderHash, newHashName));
+        }
+        catch { }
+    }
+
     private string GetCacheFileName(string filePath)
     {
         using var md5 = System.Security.Cryptography.MD5.Create();
         var hashBytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(filePath.ToLowerInvariant()));
         return Convert.ToHexString(hashBytes).ToLowerInvariant() + ".jpg";
+    }
+
+    private static void MoveCacheFile(string sourcePath, string destinationPath)
+    {
+        try
+        {
+            if (!File.Exists(sourcePath))
+                return;
+
+            var destinationDir = Path.GetDirectoryName(destinationPath);
+            if (!string.IsNullOrEmpty(destinationDir))
+                Directory.CreateDirectory(destinationDir);
+
+            if (File.Exists(destinationPath))
+            {
+                File.Delete(sourcePath);
+                return;
+            }
+
+            File.Move(sourcePath, destinationPath);
+        }
+        catch { }
     }
 
     public long EstimateDiskUsage()

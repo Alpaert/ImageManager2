@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Caching;
 using ImageManager.Infrastructure.Imaging;
 
 namespace ImageManager.Infrastructure.Services;
@@ -7,10 +8,12 @@ namespace ImageManager.Infrastructure.Services;
 public class DuplicateService : IDuplicateService
 {
     private readonly IImageMetaRepository _metaRepo;
+    private readonly ThumbnailCacheService _thumbCache;
 
-    public DuplicateService(IImageMetaRepository metaRepo)
+    public DuplicateService(IImageMetaRepository metaRepo, ThumbnailCacheService thumbCache)
     {
         _metaRepo = metaRepo;
+        _thumbCache = thumbCache;
     }
 
     public async Task<(int exactCount, int fuzzyCount)> DetectAndMoveDuplicatesAsync(
@@ -92,6 +95,7 @@ public class DuplicateService : IDuplicateService
             var destPath = Common.Helpers.PathHelper.GetNonConflictingPath(
                 Path.Combine(targetDir, fileName));
             File.Move(oldPath, destPath);
+            _thumbCache.MoveDiskCache(oldPath, destPath);
 
             var meta = await _metaRepo.GetByPathAsync(oldPath);
             if (meta != null)

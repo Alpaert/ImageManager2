@@ -97,8 +97,6 @@ public class ThumbnailCacheService : IThumbnailCacheService
             return (null, 0, 0);
 
         var isVideo = FileTypeConstants.IsVideoFile(filePath);
-        if (!isVideo && !File.Exists(filePath))
-            return (null, 0, 0);
 
         if (decodeWidth != DecodeWidth)
         {
@@ -140,6 +138,9 @@ public class ThumbnailCacheService : IThumbnailCacheService
                     return (cached, w, h);
                 }
 
+                if (!File.Exists(filePath))
+                    return (cached, 0, 0);
+
                 var processor = _factory.GetProcessor(filePath);
                 (w, h) = processor.GetDimensions(filePath);
                 _diskCache.SaveMeta(filePath, w, h);
@@ -147,6 +148,9 @@ public class ThumbnailCacheService : IThumbnailCacheService
                 return (cached, w, h);
             }
         }
+
+        if (!isVideo && !File.Exists(filePath))
+            return (null, 0, 0);
 
         if (isVideo) PerfLogger.Log($"[Cache] GENERATE start {Path.GetFileName(filePath)}");
         var processorGen = _factory.GetProcessor(filePath);
@@ -169,8 +173,6 @@ public class ThumbnailCacheService : IThumbnailCacheService
             return (null, 0, 0);
 
         var isVideo = FileTypeConstants.IsVideoFile(filePath);
-        if (!isVideo && !File.Exists(filePath))
-            return (null, 0, 0);
 
         if (_index.TryGetValue(filePath, out var node)
             && node.Value.Data != null
@@ -319,6 +321,13 @@ public class ThumbnailCacheService : IThumbnailCacheService
     }
 
     public void DeleteFromDiskCache(string filePath) => _diskCache.DeleteAllWidths(filePath);
+
+    public void MoveDiskCache(string oldPath, string newPath)
+    {
+        ClearMemoryEntry(oldPath);
+        ClearMemoryEntry(newPath);
+        _diskCache.MoveAllWidths(oldPath, newPath);
+    }
 
     public void ClearMemoryEntry(string filePath)
     {

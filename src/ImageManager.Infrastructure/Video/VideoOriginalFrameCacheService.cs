@@ -33,7 +33,10 @@ public sealed class VideoOriginalFrameCacheService
         return File.Exists(GetOriginalFramePath(filePath));
     }
 
-    public async Task<VideoOriginalFrameResult> EnsureAsync(string filePath, CancellationToken ct = default)
+    public async Task<VideoOriginalFrameResult> EnsureAsync(
+        string filePath,
+        CancellationToken ct = default,
+        bool cancelExtractionOnCancellation = false)
     {
         var originalPath = GetOriginalFramePath(filePath);
         if (File.Exists(originalPath))
@@ -43,7 +46,10 @@ public sealed class VideoOriginalFrameCacheService
         var lazy = _inflight.GetOrAdd(
             key,
             _ => new Lazy<Task<VideoOriginalFrameResult>>(
-                () => EnsureCoreAsync(filePath, originalPath, CancellationToken.None),
+                () => EnsureCoreAsync(
+                    filePath,
+                    originalPath,
+                    cancelExtractionOnCancellation ? ct : CancellationToken.None),
                 LazyThreadSafetyMode.ExecutionAndPublication));
 
         var task = lazy.Value;

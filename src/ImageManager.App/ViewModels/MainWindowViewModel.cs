@@ -419,7 +419,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
             var unlinked = await _metaRepo.GetAllUnlinkedAsync();
             foreach (var m in unlinked)
-                _thumbCache.DeleteFromDiskCache(m.FilePath);
+                _thumbCache.InvalidateThumbnail(m.FilePath);
         });
 
         // Defer tag count refresh — not needed for initial display
@@ -476,7 +476,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
                 var metas = await _metaRepo.GetByFolderAsync(SelectedFolderNode.Path);
                 foreach (var meta in metas)
-                    _thumbCache.DeleteFromDiskCache(meta.FilePath);
+                    _thumbCache.InvalidateThumbnail(meta.FilePath);
             }
             catch { }
         }
@@ -837,6 +837,8 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void OnFolderFileDeleted(object sender, FileSystemEventArgs e)
     {
+        if (FileTypeConstants.IsMediaFile(e.FullPath))
+            _thumbCache.InvalidateThumbnail(e.FullPath);
         QueueFolderRefreshForWatcherEvent(e);
     }
 
@@ -844,6 +846,11 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         if (!FileTypeConstants.IsMediaFile(e.Name) && !FileTypeConstants.IsMediaFile(e.OldName))
             return;
+
+        if (FileTypeConstants.IsMediaFile(e.OldFullPath) && FileTypeConstants.IsMediaFile(e.FullPath))
+            _thumbCache.MoveDiskCache(e.OldFullPath, e.FullPath);
+        else if (FileTypeConstants.IsMediaFile(e.OldFullPath))
+            _thumbCache.InvalidateThumbnail(e.OldFullPath);
 
         QueueFolderRefreshForWatcherEvent(e, force: true);
     }
@@ -1074,7 +1081,7 @@ public partial class MainWindowViewModel : ViewModelBase
                     if (!diskFiles.Contains(meta.FilePath) && !File.Exists(meta.FilePath))
                     {
                         await _metaRepo.SetFolderIdAsync(meta.FilePath, 0L);
-                        _thumbCache.DeleteFromDiskCache(meta.FilePath);
+                        _thumbCache.InvalidateThumbnail(meta.FilePath);
                         deleted = true;
                     }
                 }

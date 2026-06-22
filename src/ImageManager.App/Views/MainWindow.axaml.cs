@@ -37,6 +37,7 @@ public partial class MainWindow : Window
     private CancellationTokenSource? _scrollAnimCts;
     private int _autoTagRunVersion;
     private int _videoOriginalFrameBatchRunning;
+    private CancellationTokenSource? _videoOriginalFrameBatchCts;
 
     public MainWindow()
     {
@@ -132,7 +133,7 @@ public partial class MainWindow : Window
             try
             {
                 File.Delete(item.FilePath);
-                thumbCache.DeleteFromDiskCache(item.FilePath);
+                thumbCache.InvalidateThumbnail(item.FilePath);
                 deletedPaths.Add(item.FilePath);
                 successCount++;
             }
@@ -1293,7 +1294,6 @@ public partial class MainWindow : Window
         var targetDir = folders[0].Path.LocalPath;
         Vm.StatusText = "正在复制...";
         int success = 0;
-
         await Task.Run(() =>
         {
             Directory.CreateDirectory(targetDir);
@@ -1337,6 +1337,7 @@ public partial class MainWindow : Window
 
         await Task.Run(() =>
         {
+            var thumbCache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
             Directory.CreateDirectory(targetDir);
             foreach (var item in items)
             {
@@ -1350,7 +1351,9 @@ public partial class MainWindow : Window
                 {
                     var destPath = Common.Helpers.PathHelper.GetNonConflictingPath(
                         Path.Combine(targetDir, Path.GetFileName(item.FilePath)));
-                    File.Move(item.FilePath, destPath);
+                    var oldPath = item.FilePath;
+                    File.Move(oldPath, destPath);
+                    thumbCache.MoveDiskCache(oldPath, destPath);
                     Interlocked.Increment(ref success);
                 }
                 catch { }
@@ -1716,7 +1719,20 @@ public partial class MainWindow : Window
         await RunAutoTagAsync(folder, files);
     }
 
-    private async void MenuComputeVideoOriginalFramesRecursive_Click(object? sender, RoutedEventArgs e)
+    private void MenuStopVideoOriginalFrames_Click(object? sender, RoutedEventArgs e)
+    {
+        var cts = Volatile.Read(ref _videoOriginalFrameBatchCts);
+        if (Volatile.Read(ref _videoOriginalFrameBatchRunning) == 0 || cts == null)
+        {
+            Vm.StatusText = "当前没有视频原始帧计算任务";
+            return;
+        }
+
+        cts.Cancel();
+        Vm.StatusText = "正在停止视频原始帧计算...";
+    }
+
+    private void MenuComputeVideoOriginalFramesRecursive_Click(object? sender, RoutedEventArgs e)
     {
         var folder = GetContextMenuFolder(sender);
         if (folder == null) return;
@@ -1727,104 +1743,152 @@ public partial class MainWindow : Window
             return;
         }
 
-        var rootPath = folder.Path;
-        Vm.StatusText = "正在扫描视频文件...";
+        var batchCts = new CancellationTokenSource();
+        var oldCts = Interlocked.Exchange(ref _videoOriginalFrameBatchCts, batchCts);
+        oldCts?.Dispose();
+        _ = RunVideoOriginalFrameBatchAsync(folder.Path, batchCts);
+    }
+
+    private async Task RunVideoOriginalFrameBatchAsync(string rootPath, CancellationTokenSource batchCts)
+    {
+        var token = batchCts.Token;
 
         try
         {
+            await App.UI.InvokeAsync(() =>
+            {
+                Vm.StatusText = "正在扫描视频文件...";
+                Vm.BackgroundStatusText = "";
+            });
+
             var videos = await GetVideoFilesRecursiveAsync(rootPath);
+            token.ThrowIfCancellationRequested();
+
             if (videos.Count == 0)
             {
-                Vm.StatusText = "文件夹及子文件夹无视频";
-                Interlocked.Exchange(ref _videoOriginalFrameBatchRunning, 0);
+                await App.UI.InvokeAsync(() =>
+                {
+                    Vm.StatusText = "文件夹及子文件夹无视频";
+                    Vm.BackgroundStatusText = "";
+                });
                 return;
             }
 
             var originalFrames = App.Services.GetRequiredService<VideoOriginalFrameCacheService>();
-            Vm.StatusText = $"正在计算 {videos.Count} 个视频的原始帧...";
-            Vm.BackgroundStatusText = $"视频原始帧 0/{videos.Count}";
+            var existing = 0;
+            var missingVideos = new List<string>();
 
-            _ = Task.Run(async () =>
+            await App.UI.InvokeAsync(() =>
             {
-                var existed = 0;
-                var generated = 0;
-                var failed = 0;
+                Vm.StatusText = $"正在检查 {videos.Count} 个视频的原始帧缓存...";
+                Vm.BackgroundStatusText = $"视频原始帧检查 0/{videos.Count}";
+            });
 
-                try
+            for (var i = 0; i < videos.Count; i++)
+            {
+                token.ThrowIfCancellationRequested();
+
+                if (originalFrames.Exists(videos[i]))
+                    existing++;
+                else
+                    missingVideos.Add(videos[i]);
+
+                if ((i + 1) % 100 == 0 || i + 1 == videos.Count)
                 {
-                    for (var i = 0; i < videos.Count; i++)
-                    {
-                        var path = videos[i];
-                        var index = i + 1;
-
-                        await App.UI.InvokeAsync(() =>
-                        {
-                            Vm.BackgroundStatusText =
-                                $"视频原始帧 {index}/{videos.Count} | 已有 {existed} / 新增 {generated} / 失败 {failed}";
-                        });
-
-                        VideoOriginalFrameResult result;
-                        try
-                        {
-                            result = await originalFrames.EnsureAsync(path);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            throw;
-                        }
-                        catch (Exception ex)
-                        {
-                            result = new VideoOriginalFrameResult(false, false, null, ex.Message);
-                        }
-
-                        if (result.Success)
-                        {
-                            if (result.AlreadyExisted)
-                                existed++;
-                            else
-                                generated++;
-                        }
-                        else
-                        {
-                            failed++;
-                            AppLogger.Warn($"VideoOriginalFrames batch failed file={path} error={result.Error}");
-                        }
-                    }
-
+                    var checkedCount = i + 1;
+                    var missingCount = missingVideos.Count;
                     await App.UI.InvokeAsync(() =>
                     {
-                        Vm.StatusText = $"视频原始帧完成: 已有 {existed}, 新增 {generated}, 失败 {failed}";
-                        Vm.BackgroundStatusText = "";
+                        Vm.BackgroundStatusText =
+                            $"视频原始帧检查 {checkedCount}/{videos.Count} | 已有 {existing} / 缺失 {missingCount}";
                     });
+                }
+            }
+
+            var missing = missingVideos.Count;
+            await App.UI.InvokeAsync(() =>
+            {
+                Vm.StatusText = $"视频原始帧: 总数 {videos.Count}, 已有 {existing}, 缺失 {missing}";
+                Vm.BackgroundStatusText = missing == 0
+                    ? ""
+                    : $"视频原始帧生成 0/{missing} | 已有 {existing} / 新增 0 / 失败 0";
+            });
+
+            if (missing == 0)
+                return;
+
+            var generated = 0;
+            var failed = 0;
+
+            for (var i = 0; i < missingVideos.Count; i++)
+            {
+                token.ThrowIfCancellationRequested();
+                var path = missingVideos[i];
+                var index = i + 1;
+
+                await App.UI.InvokeAsync(() =>
+                {
+                    Vm.BackgroundStatusText =
+                        $"视频原始帧生成 {index}/{missing} | 已有 {existing} / 新增 {generated} / 失败 {failed}";
+                });
+
+                VideoOriginalFrameResult result;
+                try
+                {
+                    result = await originalFrames.EnsureAsync(
+                        path,
+                        token,
+                        cancelExtractionOnCancellation: true);
                 }
                 catch (OperationCanceledException)
                 {
-                    await App.UI.InvokeAsync(() =>
-                    {
-                        Vm.StatusText = "视频原始帧计算已取消";
-                        Vm.BackgroundStatusText = "";
-                    });
+                    throw;
                 }
                 catch (Exception ex)
                 {
-                    AppLogger.Error($"VideoOriginalFrames batch error: {ex}");
-                    await App.UI.InvokeAsync(() =>
-                    {
-                        Vm.StatusText = $"视频原始帧计算失败: {ex.Message}";
-                        Vm.BackgroundStatusText = "";
-                    });
+                    result = new VideoOriginalFrameResult(false, false, null, ex.Message);
                 }
-                finally
+
+                if (result.Success)
                 {
-                    Interlocked.Exchange(ref _videoOriginalFrameBatchRunning, 0);
+                    if (!result.AlreadyExisted)
+                        generated++;
                 }
+                else
+                {
+                    failed++;
+                    AppLogger.Warn($"VideoOriginalFrames batch failed file={path} error={result.Error}");
+                }
+            }
+
+            await App.UI.InvokeAsync(() =>
+            {
+                Vm.StatusText = $"视频原始帧完成: 总数 {videos.Count}, 已有 {existing}, 新增 {generated}, 失败 {failed}";
+                Vm.BackgroundStatusText = "";
+            });
+        }
+        catch (OperationCanceledException)
+        {
+            await App.UI.InvokeAsync(() =>
+            {
+                Vm.StatusText = "视频原始帧计算已停止";
+                Vm.BackgroundStatusText = "";
             });
         }
         catch (Exception ex)
         {
+            AppLogger.Error($"VideoOriginalFrames batch error: {ex}");
+            await App.UI.InvokeAsync(() =>
+            {
+                Vm.StatusText = $"视频原始帧计算失败: {ex.Message}";
+                Vm.BackgroundStatusText = "";
+            });
+        }
+        finally
+        {
             Interlocked.Exchange(ref _videoOriginalFrameBatchRunning, 0);
-            Vm.BackgroundStatusText = "";
-            Vm.StatusText = $"扫描视频失败: {ex.Message}";
+            Interlocked.CompareExchange(ref _videoOriginalFrameBatchCts, null, batchCts);
+            batchCts.Dispose();
         }
     }
 
