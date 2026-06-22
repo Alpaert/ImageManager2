@@ -961,8 +961,7 @@ public partial class MainWindow : Window
 
     private async Task<bool> EditTagForItemAsync(ImageViewItem item)
     {
-        await Vm.RefreshTagCountsAsync(forceRefresh: true);
-        var allTags = Vm.GetAllTagCounts();
+        var allTags = Vm.GetAllTagCountsSnapshot();
 
         // ✅ 如果 Tags 为空，主动从数据库加载
         var currentTags = item.Tags;
@@ -1034,8 +1033,7 @@ public partial class MainWindow : Window
 
     private async Task EditTagsForItemsAsync(List<ImageViewItem> items)
     {
-        await Vm.RefreshTagCountsAsync(forceRefresh: true);
-        var allTags = Vm.GetAllTagCounts();
+        var allTags = Vm.GetAllTagCountsSnapshot();
 
         // ✅ 批量从数据库加载 Tags（如果缓存未命中）
         var filePaths = items.Select(i => i.FilePath).ToList();
@@ -1962,7 +1960,7 @@ public partial class MainWindow : Window
                 if (pending.Count >= 100)
                 {
                     written += await embeddingRepo.AddCharacterEmbeddingTagsAsync(pending, source);
-                    await Vm.RefreshTagsAfterExternalWriteAsync(pendingPaths);
+                    await Vm.RefreshTagsAfterExternalWriteAsync(pendingPaths, refreshCounts: false);
                     pending.Clear();
                     pendingPaths.Clear();
                 }
@@ -1977,7 +1975,7 @@ public partial class MainWindow : Window
             if (pending.Count > 0)
             {
                 written += await embeddingRepo.AddCharacterEmbeddingTagsAsync(pending, source);
-                await Vm.RefreshTagsAfterExternalWriteAsync(pendingPaths);
+                await Vm.RefreshTagsAfterExternalWriteAsync(pendingPaths, refreshCounts: false);
             }
 
             Vm.BackgroundStatusText = "";

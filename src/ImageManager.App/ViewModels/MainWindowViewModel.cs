@@ -2905,6 +2905,14 @@ partial void OnCornerRadiusDipChanged(double value)
         return _tagSearch.AllTagCounts;
     }
 
+    public List<TagCount> GetAllTagCountsSnapshot()
+    {
+        var counts = GetAllTagCounts();
+        if (counts.Count == 0)
+            _ = RefreshTagCountsAsync();
+        return counts;
+    }
+
     private void InvalidateTagCountsCache()
     {
         lock (_tagCountsCacheLock)
