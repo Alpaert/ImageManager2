@@ -6,8 +6,11 @@
     <Nullable>enable</Nullable>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
     <ApplicationIcon>64.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 明确启用 Avalonia XAML 编译 -->
+    <EnableDefaultAvaloniaItems>true</EnableDefaultAvaloniaItems>
   </PropertyGroup>
 
   <ItemGroup>
