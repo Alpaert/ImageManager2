@@ -366,6 +366,9 @@ FodyWeavers.xsd
 *.zip
 *.7z
 
+# ffmpeg 二进制文件 - 不推送
+libffmpeg/
+
 # Claude Code 本地配置
 .claude/
 
