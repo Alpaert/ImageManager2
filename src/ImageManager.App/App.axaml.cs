@@ -31,6 +31,20 @@ public partial class App : Application
     public static string CacheDirectoryPath { get; private set; } = StartupCacheConfig.DefaultCacheDirectory;
     private static StartupCacheConfig _startupCacheConfig = StartupCacheConfig.Load();
 
+    public static void ReleaseInferenceSessions()
+    {
+        if (Services == null)
+            return;
+
+        try { Services.GetService<ChineseClipService>()?.ReleaseAllSessions(); }
+        catch (Exception ex) { AppLogger.Warn($"Release Chinese-CLIP session failed: {ex.Message}"); }
+        try { Services.GetService<OnnxTagService>()?.ReleaseSession(); }
+        catch (Exception ex) { AppLogger.Warn($"Release WD session failed: {ex.Message}"); }
+        try { Services.GetService<PixaiTagService>()?.ReleaseSession(); }
+        catch (Exception ex) { AppLogger.Warn($"Release PixAI session failed: {ex.Message}"); }
+        AppLogger.Memory("App.ReleaseInferenceSessions");
+    }
+
     private static ServiceProvider ConfigureServices(string cacheDir)
     {
         var services = new ServiceCollection();
@@ -111,10 +125,13 @@ public partial class App : Application
         services.AddSingleton<ITagMappingRepository, TagMappingRepository>();
         services.AddSingleton<IFolderRepository, FolderRepository>();
         services.AddSingleton<ISettingsRepository, SettingsRepository>();
+        services.AddSingleton<ICharacterTagSuppressionRepository, CharacterTagSuppressionRepository>();
         services.AddSingleton<IImageEmbeddingRepository, ImageEmbeddingRepository>();
 
         services.AddSingleton<IHashService, HashService>();
+        services.AddSingleton(new ChineseClipService(cacheDir));
         services.AddSingleton<ISimilarImageService, SimilarImageService>();
+        services.AddSingleton<IVectorIndexService, VectorIndexService>();
         services.AddSingleton<IDuplicateService, DuplicateService>();
 
         // ==================== Media Processor Factory ====================
@@ -223,8 +240,9 @@ public partial class App : Application
 
             var vm = Services.GetRequiredService<MainWindowViewModel>();
             desktop.MainWindow = new MainWindow { DataContext = vm };
+            desktop.MainWindow.Closed += (_, _) => desktop.Shutdown();
+            desktop.Exit += (_, _) => ReleaseInferenceSessions();
             desktop.MainWindow.Show();
-            desktop.ShutdownMode = ShutdownMode.OnMainWindowClose;
         }
 
         // ========== 全局未处理异常捕获 ==========

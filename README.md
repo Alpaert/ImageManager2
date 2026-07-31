@@ -63,9 +63,17 @@ models\
 ├── wd14\                     # WD14 分级模型（Ensemble 模式需要）
 │   ├── model.onnx
 │   └── selected_tags.csv
+├── chinese-clip-vit-base-patch16\
+│   ├── vocab.txt
+│   ├── preprocessor_config.json
+│   └── onnx\
+│       ├── chinese_clip_image_encoder.onnx
+│       └── chinese_clip_text_encoder.onnx
 ├── artist_embeddings.bin     # 画师嵌入库（可选）
 └── artist_names.txt          # 画师中文名列表（可选）
 ```
+
+Chinese-CLIP 图片向量需要先在“设置 → 相似搜索向量索引”中生成。语义图搜图和中文自然语言搜图共享同一套图片向量；氛围和颜色索引不需要额外模型。索引窗口可选择全部图库或指定文件夹，并可控制是否包含子文件夹；指定文件夹的完全重建不会影响其他目录的已有向量。
 
 **两种打标模式：**
 - **SingleModel** — 仅 PixAI，轻量快速

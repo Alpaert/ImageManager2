@@ -204,6 +204,17 @@ public abstract class OnnxTagServiceBase : IDisposable
         }
     }
 
+    public void ReleaseSession()
+    {
+        lock (_idleLock)
+        {
+            _idleCts?.Cancel();
+            _idleCts?.Dispose();
+            _idleCts = null;
+        }
+        DisposeSession();
+    }
+
     private void DisposeSession()
     {
         // 先获取推理锁，确保没有正在进行的推理使用 _session

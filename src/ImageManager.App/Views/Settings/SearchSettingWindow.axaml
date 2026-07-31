@@ -1,0 +1,41 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ImageManager.App.ViewModels"
+        x:Class="ImageManager.App.Views.Settings.SearchSettingWindow"
+        x:DataType="vm:SearchSettingViewModel"
+        Title="搜索设置"
+        Width="540" Height="380"
+        CanResize="False">
+    <Grid RowDefinitions="*,Auto" Margin="16">
+        <Border Grid.Row="0" Padding="16"
+                BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+            <StackPanel Spacing="12">
+                <TextBlock Text="感知搜索展示模式" FontWeight="SemiBold" FontSize="15"/>
+                <TextBlock Text="跳转模式只影响感知搜索；自然语言、氛围和颜色始终排列展示。"
+                           TextWrapping="Wrap" Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"/>
+                <ComboBox SelectedIndex="{Binding ResultModeIndex}" Width="190" HorizontalAlignment="Left">
+                    <ComboBoxItem>排列搜索（推荐）</ComboBoxItem>
+                    <ComboBoxItem>跳转搜索</ComboBoxItem>
+                </ComboBox>
+                <TextBlock Text="排列搜索：严格近重复优先，再补充宽松感知候选。"
+                           TextWrapping="Wrap" Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"/>
+                <TextBlock Text="跳转搜索：只使用严格近重复结果，跳转文件夹并高亮图片。"
+                           TextWrapping="Wrap" Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"/>
+                <Separator Margin="0,4"/>
+                <TextBlock Text="最大搜索结果数" FontWeight="SemiBold" FontSize="14"/>
+                <NumericUpDown Value="{Binding ResultLimit}"
+                               Minimum="1" Maximum="500" Increment="10"
+                               Width="140" HorizontalAlignment="Left"/>
+                <TextBlock Text="适用于所有搜索，默认 50，允许范围 1–500。"
+                           Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"/>
+            </StackPanel>
+        </Border>
+
+        <StackPanel Grid.Row="1" Orientation="Horizontal"
+                    HorizontalAlignment="Right" Spacing="10" Margin="0,16,0,0">
+            <Button Content="取消" Width="80" Click="BtnCancel_Click"/>
+            <Button Content="确定" Width="80"
+                    Command="{Binding SaveCommand}" Click="BtnOk_Click"/>
+        </StackPanel>
+    </Grid>
+</Window>

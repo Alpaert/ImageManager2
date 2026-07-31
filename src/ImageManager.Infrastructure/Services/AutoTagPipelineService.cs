@@ -24,6 +24,7 @@ public class AutoTagPipelineService : IDisposable
     private readonly IEnsembleTagService _tagService;
     private readonly IAutoTagStateRepository _stateRepo;
     private readonly IImageEmbeddingRepository _embeddingRepo;
+    private readonly ICharacterTagSuppressionRepository _suppressionRepo;
     private double _confidenceThreshold = 0.35;
     private int _maxTagsPerImage = 20;
     public event Action<AutoTagPipelineProgress>? ProgressChanged;
@@ -35,12 +36,14 @@ public class AutoTagPipelineService : IDisposable
         IImageMetaRepository metaRepo,
         IEnsembleTagService tagService,
         IAutoTagStateRepository stateRepo,
-        IImageEmbeddingRepository embeddingRepo)
+        IImageEmbeddingRepository embeddingRepo,
+        ICharacterTagSuppressionRepository suppressionRepo)
     {
         _metaRepo = metaRepo;
         _tagService = tagService;
         _stateRepo = stateRepo;
         _embeddingRepo = embeddingRepo;
+        _suppressionRepo = suppressionRepo;
     }
 
     public void Configure(double confidenceThreshold, int maxTagsPerImage)
@@ -210,7 +213,11 @@ public class AutoTagPipelineService : IDisposable
                     {
                         if (item.Predictions.Count > 0)
                         {
-                            var tagNames = item.Predictions.Select(p => p.ChineseName ?? p.TagName).ToList();
+                            var suppressed = await _suppressionRepo.GetSuppressedTagsAsync(item.ImageId);
+                            var tagNames = item.Predictions
+                                .Where(p => !IsSuppressedCharacterPrediction(p, suppressed))
+                                .Select(p => p.ChineseName ?? p.TagName)
+                                .ToList();
                             await _metaRepo.AddAutoTagsAsync(item.ImageId, tagNames);
                         }
                         Interlocked.Increment(ref processed);
@@ -316,6 +323,16 @@ public class AutoTagPipelineService : IDisposable
         {
             buffer.Clear();
         }
+    }
+
+    private static bool IsSuppressedCharacterPrediction(TagPrediction prediction, HashSet<string> suppressed)
+    {
+        if (suppressed.Count == 0 ||
+            prediction.SourceModels?.Contains("character_embedding", StringComparer.OrdinalIgnoreCase) != true)
+            return false;
+
+        var name = prediction.ChineseName ?? prediction.TagName;
+        return suppressed.Contains(name);
     }
 
     public void Dispose() => ProgressChanged = null;

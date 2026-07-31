@@ -22,6 +22,11 @@ public class SettingsRepository : ISettingsRepository, IDisposable
         var rows = await conn.QueryAsync<(string Key, string Value)>(
             "SELECT Key, Value FROM AppSetting");
         var dict = rows.ToDictionary(r => r.Key, r => r.Value, StringComparer.OrdinalIgnoreCase);
+        if (!dict.ContainsKey(nameof(AppSettings.PerceptualSearchResultMode)) &&
+            dict.TryGetValue("VectorSearchResultMode", out var legacySearchMode))
+        {
+            dict[nameof(AppSettings.PerceptualSearchResultMode)] = legacySearchMode;
+        }
 
         var settings = new AppSettings();
         var props = AppSettingProperties;

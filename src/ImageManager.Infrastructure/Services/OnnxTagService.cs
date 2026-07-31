@@ -153,6 +153,17 @@ public class OnnxTagService : IAutoTagService, IDisposable
         }
     }
 
+    public void ReleaseSession()
+    {
+        lock (_idleLock)
+        {
+            _idleCts?.Cancel();
+            _idleCts?.Dispose();
+            _idleCts = null;
+        }
+        DisposeSession();
+    }
+
     private void DisposeSession()
     {
         _inferenceLock.Wait();

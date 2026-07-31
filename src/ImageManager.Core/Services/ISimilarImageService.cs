@@ -1,10 +1,20 @@
+using ImageManager.Core.Models;
+
 namespace ImageManager.Core.Services;
 
 public interface ISimilarImageService
 {
-    Task<List<string>> FindSimilarAsync(
+    Task<List<SimilaritySearchResult>> SearchByImageAsync(
         string baseFilePath,
         IEnumerable<string> candidates,
-        int threshold = 5,
+        SimilaritySearchMode mode,
+        int limit = 50,
         CancellationToken ct = default);
+
+    Task<List<SimilaritySearchResult>> SearchByTextAsync(
+        string query,
+        IEnumerable<string> candidates,
+        int limit = 50,
+        CancellationToken ct = default);
+
 }

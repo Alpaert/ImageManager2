@@ -96,12 +96,21 @@ public static class DatabaseInitializer
                 EmbeddingDim  INTEGER NOT NULL,
                 EmbeddingBlob BLOB NOT NULL,
                 FileHash      TEXT,
+                SourceFileSize INTEGER,
+                SourceLastWriteTicks INTEGER,
                 UpdatedAt     TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (ImageMetaId, ModelKey, ModelVersion)
             );
 
             CREATE INDEX IF NOT EXISTS idx_imageembedding_model
                 ON ImageEmbedding(ModelKey, ModelVersion);
+
+            CREATE TABLE IF NOT EXISTS SuppressedCharacterTag (
+                ImageMetaId INTEGER NOT NULL REFERENCES ImageMeta(Id) ON DELETE CASCADE,
+                TagName     TEXT NOT NULL COLLATE NOCASE,
+                CreatedAt   TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (ImageMetaId, TagName)
+            );
 
             """;
         cmd.ExecuteNonQuery();
@@ -114,6 +123,8 @@ public static class DatabaseInitializer
         TryAddColumn(conn, "ALTER TABLE ImageMeta ADD COLUMN SystemRating INTEGER DEFAULT -1;");
         TryAddColumn(conn, "ALTER TABLE ImageMeta ADD COLUMN AutoTagStatus INTEGER DEFAULT 0;");
         TryAddColumn(conn, "ALTER TABLE ImageMeta ADD COLUMN HashStatus INTEGER DEFAULT 0;");
+        TryAddColumn(conn, "ALTER TABLE ImageEmbedding ADD COLUMN SourceFileSize INTEGER;");
+        TryAddColumn(conn, "ALTER TABLE ImageEmbedding ADD COLUMN SourceLastWriteTicks INTEGER;");
         TryAddColumns(conn, """
             ALTER TABLE ImageMeta ADD COLUMN Duration REAL DEFAULT NULL;
             ALTER TABLE ImageMeta ADD COLUMN ThumbnailTimestamp REAL DEFAULT NULL;
@@ -123,7 +134,11 @@ public static class DatabaseInitializer
     private static void CreateIndexes(SqliteConnection conn)
     {
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = "CREATE INDEX IF NOT EXISTS idx_imagemeta_folderid ON ImageMeta(FolderId);";
+        cmd.CommandText = """
+            CREATE INDEX IF NOT EXISTS idx_imagemeta_folderid ON ImageMeta(FolderId);
+            CREATE INDEX IF NOT EXISTS idx_suppressedcharactertag_image
+                ON SuppressedCharacterTag(ImageMetaId);
+            """;
         cmd.ExecuteNonQuery();
     }
 

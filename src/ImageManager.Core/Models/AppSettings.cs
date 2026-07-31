@@ -33,6 +33,8 @@ public class AppSettings
     public List<string> FavoriteTags { get; set; } = new();
     public Dictionary<string, string> FolderAliases { get; set; } = new();
     public Dictionary<string, string> ShortcutBindings { get; set; } = new();
+    public PerceptualSearchResultMode PerceptualSearchResultMode { get; set; } = PerceptualSearchResultMode.Ranked;
+    public int SimilaritySearchResultLimit { get; set; } = 50;
 
     /// <summary>Hash algorithm version — bump to force re-computation of all perceptual hashes</summary>
     public string HashVersion { get; set; } = "1";

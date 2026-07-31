@@ -39,6 +39,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private readonly IFolderRepository _folderRepo;
     private readonly IImageMetaRepository _metaRepo;
     private readonly ITagRepository _tagRepo;
+    private readonly ICharacterTagSuppressionRepository _characterTagSuppressionRepo;
     private readonly ISimilarImageService _similarService;
     private readonly IDuplicateService _duplicateService;
     private readonly ThumbnailCacheService _thumbCache;
@@ -124,12 +125,21 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private bool _isFolderSearchPopupOpen;
     [ObservableProperty] private int _searchScope; // 0=current folder, 1=recursive
     [ObservableProperty] private bool _showAllSubfolders;
+    [ObservableProperty] private int _selectedSimilarityMode;
+    [ObservableProperty] private string _naturalLanguageQuery = string.Empty;
+    private static readonly SimilaritySearchMode[] SimilaritySearchModeValues =
+        [SimilaritySearchMode.Perceptual, SimilaritySearchMode.Semantic, SimilaritySearchMode.Atmosphere, SimilaritySearchMode.Color];
+    public IReadOnlyList<string> SimilaritySearchModes { get; } =
+        ["感知相似", "语义相似", "氛围相似", "颜色相似"];
     private int _currentResultIndex;
-    public string SearchResultInfo => IsShowingSearchResult && _tagSearch.SearchResultFiles.Count > 0
-        ? $"找到 {_tagSearch.SearchResultFiles.Count} 张相似图片  第 {_currentResultIndex + 1}/{_tagSearch.SearchResultFiles.Count}"
+    private readonly Dictionary<string, float> _similarityScores = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, SimilarityMatchKind> _similarityMatchKinds = new(StringComparer.OrdinalIgnoreCase);
+    public string SearchResultInfo => _tagSearch.SearchResultFiles.Count > 0
+        ? FormatSearchResultInfo()
         : "";
     public bool HasSearchResults => _tagSearch.SearchResultFiles.Count > 0;
     public event Action? ScrollToSelectedRequested;
+    public event Action? ScrollSearchResultsToTopRequested;
     public event Action<FolderTreeNode>? TreeScrollToNodeRequested;
 
     private async Task<List<string>> GetSearchScopeFilesAsync()
@@ -206,8 +216,7 @@ public partial class MainWindowViewModel : ViewModelBase
         get
         {
             var searchFiles = _tagSearch.SearchResultFiles;
-            var baseList = IsShowingSearchResult && searchFiles.Count > 0
-                ? searchFiles : _allFiles;
+            var baseList = IsShowingSearchResult ? searchFiles : _allFiles;
             if (OrientationFilter == OrientationFilter.All)
                 return baseList;
             return _orientationFilteredFiles;
@@ -276,6 +285,7 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private ImageSortOrder _currentSortOrder = ImageSortOrder.FileNameAsc;
     private int _folderViewRequestVersion;
     private CancellationTokenSource? _searchCts;
+    private int _searchRequestVersion;
     private readonly SemaphoreSlim _hashGate = new(1, 1);
     private readonly SemaphoreSlim _maintenanceGate = new(1, 1);
     private CancellationTokenSource? _hashCts;
@@ -293,12 +303,15 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private readonly ImageManager.Infrastructure.Services.ArtistEmbeddingStore _artistStore;
     private readonly ImageManager.Infrastructure.Services.ChineseTagLibrary _chineseLib;
+    private readonly ImageManager.Infrastructure.Services.CharacterEmbeddingStore _characterStore;
+    private bool _characterStoreLoadAttempted;
 
     public MainWindowViewModel(
         ISettingsRepository settingsRepo,
         IFolderRepository folderRepo,
         IImageMetaRepository metaRepo,
         ITagRepository tagRepo,
+        ICharacterTagSuppressionRepository characterTagSuppressionRepo,
         ISimilarImageService similarService,
         IDuplicateService duplicateService,
         ThumbnailCacheService thumbCache,
@@ -306,6 +319,7 @@ public partial class MainWindowViewModel : ViewModelBase
         ImageManager.Infrastructure.Services.TagSearchEngine tagSearch,
         ImageManager.Infrastructure.Services.ArtistEmbeddingStore artistStore,
         ImageManager.Infrastructure.Services.ChineseTagLibrary chineseLib,
+        ImageManager.Infrastructure.Services.CharacterEmbeddingStore characterStore,
         CommunityToolkit.Mvvm.Messaging.IMessenger messenger,
         ImageManager.Core.Services.IDispatcher dispatcher)
     {
@@ -313,6 +327,7 @@ public partial class MainWindowViewModel : ViewModelBase
         _folderRepo = folderRepo;
         _metaRepo = metaRepo;
         _tagRepo = tagRepo;
+        _characterTagSuppressionRepo = characterTagSuppressionRepo;
         _similarService = similarService;
         _duplicateService = duplicateService;
         _thumbCache = thumbCache;
@@ -320,6 +335,7 @@ public partial class MainWindowViewModel : ViewModelBase
         _tagSearch = tagSearch;
         _artistStore = artistStore;
         _chineseLib = chineseLib;
+        _characterStore = characterStore;
         _dispatcher = dispatcher;
 
         _pageManager.PageChanged += args =>
@@ -2089,7 +2105,7 @@ partial void OnCornerRadiusDipChanged(double value)
         CurrentTagFilter = raw;
 
         if (!IsShowingSearchResult)
-            _pageManager.SavePreSearchState(Images, CurrentPage);
+            _pageManager.SavePreSearchState(CurrentPage);
 
         try
         {
@@ -2253,8 +2269,7 @@ partial void OnCornerRadiusDipChanged(double value)
 
     private async Task RebuildFromOrientationFilterAsync()
     {
-        var source = IsShowingSearchResult && _tagSearch.SearchResultFiles.Count > 0
-            ? _tagSearch.SearchResultFiles : _allFiles;
+        var source = IsShowingSearchResult ? _tagSearch.SearchResultFiles : _allFiles;
 
         if (OrientationFilter == OrientationFilter.All)
         {
@@ -2388,6 +2403,8 @@ partial void OnCornerRadiusDipChanged(double value)
             // Restore normal page view
             IsShowingSearchResult = false;
             _tagSearch.SearchResultFiles.Clear();
+            _similarityScores.Clear();
+            _similarityMatchKinds.Clear();
 
             TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
             PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
@@ -2396,7 +2413,7 @@ partial void OnCornerRadiusDipChanged(double value)
             {
                 await RebuildFileListAsync();
             }
-            else if (_pageManager.TryRestorePreSearchState(out _, out var pageIndex))
+            else if (_pageManager.TryRestorePreSearchState(out var pageIndex))
             {
                 await ShowPageAsync(pageIndex);
                 StatusText = $"总文件数: {_allFiles.Count}";
@@ -2420,48 +2437,259 @@ partial void OnCornerRadiusDipChanged(double value)
     [RelayCommand]
     private async Task SearchSimilarAsync(string filePath)
     {
+        var mode = SimilaritySearchModeValues[
+            Math.Clamp(SelectedSimilarityMode, 0, SimilaritySearchModeValues.Length - 1)];
+        var (requestVersion, requestCts) = BeginSearchRequest();
         StatusText = "正在搜索相似图片...";
-        _searchCts?.Cancel();
-        _searchCts?.Dispose();
-        _searchCts = new CancellationTokenSource();
 
         if (!IsShowingSearchResult)
-            _pageManager.SavePreSearchState(Images, CurrentPage);
+            _pageManager.SavePreSearchState(CurrentPage);
 
         try
         {
-            var results = await _similarService.FindSimilarAsync(
-                filePath, await GetSearchScopeFilesAsync(), 5, _searchCts.Token);
-
-            _tagSearch.SearchResultFiles = results.ToList();
-
-            if (_tagSearch.SearchResultFiles.Count == 0)
-            {
-                StatusText = "未找到相似图片";
-                OnPropertyChanged(nameof(HasSearchResults));
-                return;
-            }
-
-            StatusText = $"找到 {_tagSearch.SearchResultFiles.Count} 张相似图片";
-            OnPropertyChanged(nameof(HasSearchResults));
-            _currentResultIndex = 0;
-            await NavigateToResultAsync();
+            var candidates = (await GetSearchScopeFilesAsync()).ToList();
+            requestCts.Token.ThrowIfCancellationRequested();
+            var resultLimit = Math.Clamp(AppSettings.SimilaritySearchResultLimit, 1, 500);
+            var results = await _similarService.SearchByImageAsync(
+                filePath, candidates, mode, resultLimit, requestCts.Token);
+            await ApplySimilarityResultsAsync(
+                results,
+                mode,
+                () => IsCurrentSearchRequest(requestVersion, requestCts));
         }
         catch (OperationCanceledException)
         {
-            StatusText = "搜索已取消";
+            if (IsCurrentSearchRequest(requestVersion, requestCts))
+                StatusText = "搜索已取消";
+        }
+        catch (Exception ex)
+        {
+            if (IsCurrentSearchRequest(requestVersion, requestCts))
+                StatusText = $"相似搜索失败: {ex.Message}";
+        }
+        finally
+        {
+            CompleteSearchRequest(requestCts);
+        }
+    }
+
+    public void SelectSimilarityMode(SimilaritySearchMode mode)
+    {
+        var index = Array.IndexOf(SimilaritySearchModeValues, mode);
+        if (index >= 0)
+            SelectedSimilarityMode = index;
+    }
+
+    [RelayCommand]
+    private async Task SearchNaturalLanguageAsync()
+    {
+        var query = NaturalLanguageQuery.Trim();
+        if (query.Length == 0)
+        {
+            StatusText = "请输入自然语言描述";
+            return;
+        }
+
+        var (requestVersion, requestCts) = BeginSearchRequest();
+        StatusText = "正在进行自然语言搜索...";
+        if (!IsShowingSearchResult)
+            _pageManager.SavePreSearchState(CurrentPage);
+
+        try
+        {
+            var candidates = (await GetSearchScopeFilesAsync()).ToList();
+            requestCts.Token.ThrowIfCancellationRequested();
+            var resultLimit = Math.Clamp(AppSettings.SimilaritySearchResultLimit, 1, 500);
+            var results = await _similarService.SearchByTextAsync(
+                query, candidates, resultLimit, requestCts.Token);
+            await ApplySimilarityResultsAsync(
+                results,
+                SimilaritySearchMode.Semantic,
+                () => IsCurrentSearchRequest(requestVersion, requestCts));
+        }
+        catch (OperationCanceledException)
+        {
+            if (IsCurrentSearchRequest(requestVersion, requestCts))
+                StatusText = "搜索已取消";
+        }
+        catch (Exception ex)
+        {
+            if (IsCurrentSearchRequest(requestVersion, requestCts))
+                StatusText = $"自然语言搜索失败: {ex.Message}";
+        }
+        finally
+        {
+            CompleteSearchRequest(requestCts);
         }
     }
 
     [RelayCommand]
     private void StopSearch()
     {
+        Volatile.Read(ref _searchCts)?.Cancel();
+    }
+
+    private (int Version, CancellationTokenSource Cancellation) BeginSearchRequest()
+    {
+        var requestVersion = Interlocked.Increment(ref _searchRequestVersion);
+        var requestCts = new CancellationTokenSource();
+        var previous = Interlocked.Exchange(ref _searchCts, requestCts);
+        previous?.Cancel();
+        previous?.Dispose();
+        return (requestVersion, requestCts);
+    }
+
+    private bool IsCurrentSearchRequest(int requestVersion, CancellationTokenSource requestCts)
+    {
+        return requestVersion == Volatile.Read(ref _searchRequestVersion) &&
+               ReferenceEquals(Volatile.Read(ref _searchCts), requestCts);
+    }
+
+    private void CompleteSearchRequest(CancellationTokenSource requestCts)
+    {
+        if (ReferenceEquals(Interlocked.CompareExchange(ref _searchCts, null, requestCts), requestCts))
+            requestCts.Dispose();
+    }
+
+    private async Task ApplySimilarityResultsAsync(
+        IReadOnlyList<SimilaritySearchResult> results,
+        SimilaritySearchMode searchMode,
+        Func<bool> isCurrentSearch)
+    {
+        if (!isCurrentSearch())
+            return;
+
+        var useRankedResults = searchMode != SimilaritySearchMode.Perceptual ||
+                               AppSettings.PerceptualSearchResultMode == PerceptualSearchResultMode.Ranked;
+        var displayedResults = searchMode == SimilaritySearchMode.Perceptual && !useRankedResults
+            ? results.Where(result => result.MatchKind == SimilarityMatchKind.PerceptualStrict).ToList()
+            : results.ToList();
+
+        _similarityScores.Clear();
+        _similarityMatchKinds.Clear();
+        foreach (var result in displayedResults)
+        {
+            _similarityScores[result.FilePath] = result.Score;
+            _similarityMatchKinds[result.FilePath] = result.MatchKind;
+        }
+        _tagSearch.SearchResultFiles = displayedResults.Select(result => result.FilePath).ToList();
+        OnPropertyChanged(nameof(HasSearchResults));
+        OnPropertyChanged(nameof(SearchResultInfo));
+
+        if (_tagSearch.SearchResultFiles.Count == 0)
+        {
+            if (useRankedResults)
+            {
+                IsShowingSearchResult = true;
+                await RebuildFromOrientationFilterAsync();
+                if (!isCurrentSearch())
+                    return;
+                ScrollSearchResultsToTopRequested?.Invoke();
+            }
+            else if (IsShowingSearchResult)
+            {
+                IsShowingSearchResult = false;
+                await RebuildFromOrientationFilterAsync();
+                if (!isCurrentSearch())
+                    return;
+            }
+
+            StatusText = searchMode switch
+            {
+                SimilaritySearchMode.Perceptual when !useRankedResults => "除原图外未找到严格相似图片",
+                SimilaritySearchMode.Perceptual => "未找到达到基础相似度的图片",
+                _ => "未找到结果；请先在设置中建立对应向量索引"
+            };
+            return;
+        }
+
+        StatusText = FormatSimilarityStatus(displayedResults, searchMode);
+        _currentResultIndex = 0;
+        if (useRankedResults)
+            await ShowRankedSimilarityResultsAsync(isCurrentSearch);
+        else
+            await ShowJumpSimilarityResultsAsync(isCurrentSearch);
+    }
+
+    private async Task ShowRankedSimilarityResultsAsync(Func<bool> isCurrentSearch)
+    {
+        IsShowingSearchResult = true;
+        Interlocked.Increment(ref _resultNavigationVersion);
+        await RebuildFromOrientationFilterAsync();
+        if (!isCurrentSearch())
+            return;
+
+        _currentResultIndex = 0;
+        if (Images.Count > 0)
+        {
+            foreach (var image in Images)
+                image.IsSelected = false;
+            Images[0].IsSelected = true;
+        }
+
+        OnPropertyChanged(nameof(SearchResultInfo));
+        ScrollSearchResultsToTopRequested?.Invoke();
+    }
+
+    private async Task ShowJumpSimilarityResultsAsync(Func<bool> isCurrentSearch)
+    {
+        if (IsShowingSearchResult)
+        {
+            IsShowingSearchResult = false;
+            await RebuildFromOrientationFilterAsync();
+            if (!isCurrentSearch())
+                return;
+        }
+        else
+        {
+            var files = ActiveFileList;
+            TotalPages = files.Count == 0 ? 0 : (files.Count + PageManager.PageSize - 1) / PageManager.PageSize;
+            PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
+            _pageManager.InvalidateCache();
+        }
+
+        await NavigateToResultAsync(forcePageReload: true);
+    }
+
+    private List<string> ResultNavigationFiles =>
+        IsShowingSearchResult ? ActiveFileList : _tagSearch.SearchResultFiles;
+
+    private string FormatSearchResultInfo()
+    {
+        var files = ResultNavigationFiles;
+        var scoreText = _currentResultIndex >= 0 && _currentResultIndex < files.Count &&
+                        _similarityScores.TryGetValue(files[_currentResultIndex], out var score)
+            ? $"  相似度 {score:0.000}"
+            : string.Empty;
+        var matchKindText = _currentResultIndex >= 0 && _currentResultIndex < files.Count &&
+                            _similarityMatchKinds.TryGetValue(files[_currentResultIndex], out var matchKind)
+            ? matchKind switch
+            {
+                SimilarityMatchKind.PerceptualStrict => "  严格近重复",
+                SimilarityMatchKind.PerceptualFallback => "  宽松候选",
+                _ => string.Empty
+            }
+            : string.Empty;
+        return $"找到 {files.Count} 张相似图片  第 {_currentResultIndex + 1}/{files.Count}{matchKindText}{scoreText}";
+    }
+
+    private static string FormatSimilarityStatus(
+        IReadOnlyCollection<SimilaritySearchResult> results,
+        SimilaritySearchMode searchMode)
+    {
+        if (searchMode != SimilaritySearchMode.Perceptual)
+            return $"找到 {results.Count} 张相似图片";
+        var strictCount = results.Count(result => result.MatchKind == SimilarityMatchKind.PerceptualStrict);
+        var fallbackCount = results.Count - strictCount;
+        return fallbackCount > 0
+            ? $"找到 {results.Count} 张图片（严格 {strictCount}，宽松候选 {fallbackCount}）"
+            : $"找到 {strictCount} 张严格相似图片";
     }
 
     [RelayCommand]
     private async Task PrevResult()
     {
-        var total = _tagSearch.SearchResultFiles.Count;
+        var total = ResultNavigationFiles.Count;
         if (total == 0) return;
         _currentResultIndex = (_currentResultIndex - 1 + total) % total;
         await NavigateToResultAsync();
@@ -2470,19 +2698,19 @@ partial void OnCornerRadiusDipChanged(double value)
     [RelayCommand]
     private async Task NextResult()
     {
-        var total = _tagSearch.SearchResultFiles.Count;
+        var total = ResultNavigationFiles.Count;
         if (total == 0) return;
         _currentResultIndex = (_currentResultIndex + 1) % total;
         await NavigateToResultAsync();
     }
 
-    private async Task NavigateToResultAsync()
+    private async Task NavigateToResultAsync(bool forcePageReload = false)
     {
         // === 阶段0：版本控制 ===
         var navigationVersion = Interlocked.Increment(ref _resultNavigationVersion);
         bool IsCurrentNavigation() => navigationVersion == Volatile.Read(ref _resultNavigationVersion);
 
-        var files = _tagSearch.SearchResultFiles;
+        var files = ResultNavigationFiles;
         if (files.Count == 0) return;
 
         var targetPath = files[_currentResultIndex];
@@ -2569,7 +2797,7 @@ partial void OnCornerRadiusDipChanged(double value)
 
         // 切换到目标页
         int targetPage = indexInList / PageManager.PageSize;
-        if (targetPage != CurrentPage)
+        if (forcePageReload || targetPage != CurrentPage)
         {
             await ShowPageAsync(targetPage);
             if (!IsCurrentNavigation()) return;
@@ -2697,11 +2925,13 @@ partial void OnCornerRadiusDipChanged(double value)
     }
 
     [RelayCommand]
-    private void BackFromSearch()
+    private async Task BackFromSearch()
     {
         if (!IsShowingSearchResult) return;
         IsShowingSearchResult = false;
         _tagSearch.SearchResultFiles.Clear();
+        _similarityScores.Clear();
+        _similarityMatchKinds.Clear();
         OnPropertyChanged(nameof(HasSearchResults));
 
         // Recalculate paging for normal folder view
@@ -2710,17 +2940,17 @@ partial void OnCornerRadiusDipChanged(double value)
 
         if (ShowAllSubfolders && !string.IsNullOrEmpty(CurrentFolder))
         {
-            _ = RebuildFileListAsync();
+            await RebuildFileListAsync();
         }
-        else if (_pageManager.TryRestorePreSearchState(out _, out var pageIndex))
+        else if (_pageManager.TryRestorePreSearchState(out var pageIndex))
         {
-            _ = ShowPageAsync(pageIndex);
+            await ShowPageAsync(pageIndex);
             StatusText = $"总文件数: {_allFiles.Count}";
             ScrollRestoreRequested?.Invoke();
         }
         else if (!string.IsNullOrEmpty(CurrentFolder))
         {
-            _ = LoadFolderAsync(CurrentFolder);
+            await LoadFolderAsync(CurrentFolder);
         }
     }
 
@@ -2967,19 +3197,26 @@ partial void OnCornerRadiusDipChanged(double value)
 
     public async Task SetImageTagsAsync(string filePath, List<string> tags)
     {
+        var normalizedTags = tags
+            .Select(t => t.Trim())
+            .Where(t => !string.IsNullOrWhiteSpace(t))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
         await Task.Run(async () =>
         {
             var meta = await _metaRepo.GetByPathAsync(filePath);
             if (meta != null)
             {
-                await _metaRepo.SetTagsAsync(meta.Id, tags);
-                await _metaRepo.SetAutoTagStatusByPathAsync(filePath, 0);
+                var oldTags = meta.Tags.Select(t => t.Name).ToList();
+                await UpdateCharacterTagSuppressionsAsync(meta.Id, oldTags, normalizedTags);
+                await _metaRepo.SetTagsAsync(meta.Id, normalizedTags);
             }
         });
 
         lock (_tagCacheLock)
         {
-            _tagCacheByPath[filePath] = tags;
+            _tagCacheByPath[filePath] = normalizedTags;
         }
     }
 
@@ -3027,7 +3264,14 @@ partial void OnCornerRadiusDipChanged(double value)
 
         var pathToId = await _metaRepo.GetIdsByPathsAsync(filePaths);
         if (pathToId.Count > 0)
+        {
+            if (IsCharacterTag(tag))
+            {
+                await _characterTagSuppressionRepo.UnsuppressBatchAsync(
+                    pathToId.Values.Select(id => (id, tag)).ToList());
+            }
             await _metaRepo.AddTagToImagesAsync(pathToId.Values.ToList(), tag);
+        }
 
         InvalidateTagCountsCache();
         await RefreshTagCountsAsync(forceRefresh: true);
@@ -3046,7 +3290,14 @@ partial void OnCornerRadiusDipChanged(double value)
 
         var pathToId = await _metaRepo.GetIdsByPathsAsync(filePaths);
         if (pathToId.Count > 0)
+        {
             await _metaRepo.RemoveTagFromImagesAsync(pathToId.Values.ToList(), tag);
+            if (IsCharacterTag(tag))
+            {
+                await _characterTagSuppressionRepo.SuppressBatchAsync(
+                    pathToId.Values.Select(id => (id, tag)).ToList());
+            }
+        }
 
         InvalidateTagCountsCache();
         await RefreshTagCountsAsync(forceRefresh: true);
@@ -3182,6 +3433,44 @@ partial void OnCornerRadiusDipChanged(double value)
         }
 
         return result;
+    }
+
+    private async Task UpdateCharacterTagSuppressionsAsync(
+        long imageId,
+        IReadOnlyCollection<string> oldTags,
+        IReadOnlyCollection<string> newTags)
+    {
+        var oldSet = oldTags.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var newSet = newTags.ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var removedCharacters = oldSet
+            .Where(t => !newSet.Contains(t) && IsCharacterTag(t))
+            .ToList();
+        if (removedCharacters.Count > 0)
+            await _characterTagSuppressionRepo.SuppressAsync(imageId, removedCharacters);
+
+        var addedCharacters = newSet
+            .Where(IsCharacterTag)
+            .ToList();
+        if (addedCharacters.Count > 0)
+            await _characterTagSuppressionRepo.UnsuppressAsync(imageId, addedCharacters);
+    }
+
+    private bool IsCharacterTag(string tag)
+    {
+        EnsureCharacterStoreLoaded();
+        return !string.IsNullOrWhiteSpace(tag) &&
+               _characterStore.Characters.ContainsKey(tag.Trim());
+    }
+
+    private void EnsureCharacterStoreLoaded()
+    {
+        if (_characterStore.Count > 0 || _characterStoreLoadAttempted)
+            return;
+
+        _characterStoreLoadAttempted = true;
+        var dbPath = Path.Combine(_thumbCache.CacheDirectory, "models", "character_embeddings.bin");
+        _characterStore.Load(dbPath);
     }
 
     // ==================== Settings ====================

@@ -144,6 +144,8 @@
                     <MenuItem Header="壁纸设置" Click="MenuWallpaperSettings_Click"/>
                     <MenuItem Header="缩略图选项" Click="MenuThumbnailSettings_Click"/>
                     <MenuItem Header="缓存与 AI 设置" Click="MenuMemorySettings_Click"/>
+                    <MenuItem Header="搜索设置" Click="MenuSearchSettings_Click"/>
+                    <MenuItem Header="相似搜索向量索引" Click="MenuVectorIndexSettings_Click"/>
                     <Separator/>
                     <MenuItem Header="快捷键设置" Click="MenuShortcutSettings_Click"/>
                 </MenuItem>
@@ -264,7 +266,10 @@
                        Margin="16,0,0,0" Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
                        VerticalAlignment="Center"/>
 
-            <!-- Drag-to-search similar zone -->
+            <ComboBox Width="115" Margin="12,0,0,0"
+                      ItemsSource="{Binding SimilaritySearchModes}"
+                      SelectedIndex="{Binding SelectedSimilarityMode}"/>
+
             <Border x:Name="DragSearchZone" Margin="16,0,0,0"
                     Padding="10,5" BorderThickness="1"
                     BorderBrush="{DynamicResource AccentBrush}" CornerRadius="6"
@@ -272,10 +277,16 @@
                     DragDrop.AllowDrop="True"
                     DragDrop.DragOver="DragSearchZone_DragOver"
                     DragDrop.Drop="DragSearchZone_Drop">
-                <TextBlock Text="拖拽图片到此查相似"
+                <TextBlock Text="拖拽图片按所选模式搜索"
                            VerticalAlignment="Center"
                            Foreground="#818CF8" FontSize="12"/>
             </Border>
+
+            <TextBox Width="220" Margin="10,0,0,0"
+                     PlaceholderText="中文自然语言搜图"
+                     Text="{Binding NaturalLanguageQuery}"/>
+            <Button Content="语义搜图" Margin="5,0,0,0" Padding="8,4"
+                    Command="{Binding SearchNaturalLanguageCommand}"/>
 			<CheckBox x:Name="ChkLocalSearch" Content="局部匹配（暂未实现）"
 					  Foreground="{DynamicResource AccentBrush}"
 					  Margin="10,0,0,0" VerticalAlignment="Center"/>
@@ -363,7 +374,12 @@
                                     <MenuItem Header="自动打标" Click="MenuAutoTag_Click"/>
                                     <MenuItem Header="清空选中图片的标签" Click="MenuClearSelectedTags_Click"/>
                                     <MenuItem Header="复制图片到剪贴板" Click="MenuCopyImage_Click"/>
-                                    <MenuItem Header="查找相似图片（本文件夹）" Click="MenuFindSimilar_Click"/>
+                                    <MenuItem Header="查找相似图片">
+                                        <MenuItem Header="感知相似" Tag="0" Click="MenuFindSimilar_Click"/>
+                                        <MenuItem Header="语义相似" Tag="1" Click="MenuFindSimilar_Click"/>
+                                        <MenuItem Header="氛围相似" Tag="2" Click="MenuFindSimilar_Click"/>
+                                        <MenuItem Header="颜色相似" Tag="3" Click="MenuFindSimilar_Click"/>
+                                    </MenuItem>
                                     <Separator/>
                                     <MenuItem Header="在线搜图">
 										<MenuItem Header="不要来回切换ip地址，容易被搜图网站ban"/>

@@ -17,6 +17,7 @@ using ImageManager.App.Services;
 using ImageManager.App.ViewModels;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
+using ImageManager.Core.Models;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Data;
 using ImageManager.Infrastructure.Imaging;
@@ -207,6 +208,7 @@ public partial class MainWindow : Window
 
         Vm.ScrollRestoreRequested += OnScrollRestore;
         Vm.ScrollToSelectedRequested += OnScrollToSelected;
+        Vm.ScrollSearchResultsToTopRequested += OnScrollSearchResultsToTop;
         Vm.TreeScrollToNodeRequested += OnTreeScrollToNode;
 
         // Restore startup size
@@ -756,7 +758,11 @@ public partial class MainWindow : Window
         // Middle mouse button: open tag editor for this image
         if (point.Properties.IsMiddleButtonPressed)
         {
-            await EditTagForItemAsync(item);
+            var selected = Vm.Images.Where(i => i.IsSelected).ToList();
+            if (selected.Count > 1 && selected.Contains(item))
+                await EditTagsForItemsAsync(selected);
+            else
+                await EditTagForItemAsync(item);
             return;
         }
 
@@ -1237,10 +1243,25 @@ public partial class MainWindow : Window
         var baseItem = GetCtxItem(sender);
         if (baseItem == null) return;
 
+        if (int.TryParse((sender as MenuItem)?.Tag?.ToString(), out var mode) &&
+            Enum.IsDefined(typeof(SimilaritySearchMode), mode))
+        {
+            Vm.SelectSimilarityMode((SimilaritySearchMode)mode);
+        }
+
         Vm.StatusText = "正在全文件夹搜索相似图片...";
         Vm.PreSearchScrollOffset = ThumbnailScrollViewer.Offset.Y;
         // Run on background thread to avoid UI freeze
         await Vm.SearchSimilarCommand.ExecuteAsync(baseItem.FilePath);
+    }
+
+    private async void MenuVectorIndexSettings_Click(object? sender, RoutedEventArgs e)
+    {
+        var indexService = App.Services.GetRequiredService<IVectorIndexService>();
+        var clipService = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.ChineseClipService>();
+        var viewModel = new VectorIndexViewModel(indexService, clipService);
+        var window = new Settings.VectorIndexWindow { DataContext = viewModel };
+        await window.ShowDialog(this);
     }
 
     private async void MenuSearchOnline_Click(object? sender, RoutedEventArgs e)
@@ -2272,9 +2293,29 @@ public partial class MainWindow : Window
         await win.ShowDialog(this);
     }
 
+    private async void MenuSearchSettings_Click(object? sender, RoutedEventArgs e)
+    {
+        var viewModel = new SearchSettingViewModel(
+            Vm.AppSettings.PerceptualSearchResultMode,
+            Vm.AppSettings.SimilaritySearchResultLimit,
+            async (mode, resultLimit) =>
+            {
+                Vm.AppSettings.PerceptualSearchResultMode = mode;
+                Vm.AppSettings.SimilaritySearchResultLimit = resultLimit;
+                await Vm.SaveSettingsAsync();
+            });
+        var window = new Settings.SearchSettingWindow { DataContext = viewModel };
+        await window.ShowDialog(this);
+    }
+
     private void OnScrollRestore()
     {
         ThumbnailScrollViewer.Offset = new Vector(0, Vm.PreSearchScrollOffset);
+    }
+
+    private void OnScrollSearchResultsToTop()
+    {
+        ThumbnailScrollViewer.Offset = new Vector(0, 0);
     }
 
     private async void OnScrollToSelected()
@@ -2366,8 +2407,10 @@ public partial class MainWindow : Window
     {
         Vm.ScrollRestoreRequested -= OnScrollRestore;
         Vm.ScrollToSelectedRequested -= OnScrollToSelected;
+        Vm.ScrollSearchResultsToTopRequested -= OnScrollSearchResultsToTop;
         Vm.TreeScrollToNodeRequested -= OnTreeScrollToNode;
         Vm.ShutdownBackgroundWork();
+        App.ReleaseInferenceSessions();
         _ = Vm.SaveSettingsAsync();
     }
     private async void MenuThumbnailSettings_Click(object? sender, RoutedEventArgs e)

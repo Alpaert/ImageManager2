@@ -35,8 +35,7 @@ public class PageManager : IDisposable
     private readonly object _pageCacheLock = new();
     private int _activePageIndex;
 
-    private List<ImageViewItem>? _preSearchPageItems;
-    private int _preSearchPageIndex;
+    private int? _preSearchPageIndex;
 
     private readonly SemaphoreSlim _thumbnailLoadSemaphore = new(6);
     private readonly SemaphoreSlim _videoLoadSemaphore = new(2);
@@ -328,12 +327,13 @@ public class PageManager : IDisposable
 
     public void InvalidateCache()
     {
+        CancelPageLoad();
         _currentUiState = default;
         lock (_pageCacheLock)
         {
             foreach (var page in _pageCache.Values)
                 foreach (var item in page)
-                    item.ThumbnailData = null;
+                    ResetThumbnailState(item);
             _pageCache.Clear();
         }
     }
@@ -347,7 +347,7 @@ public class PageManager : IDisposable
                 if (key == pageIndex) continue;
                 if (_pageCache.TryGetValue(key, out var page))
                     foreach (var item in page)
-                        item.ThumbnailData = null;
+                        ResetThumbnailState(item);
                 _pageCache.Remove(key);
             }
 
@@ -367,29 +367,30 @@ public class PageManager : IDisposable
         lock (_pageCacheLock) { _pageCache[pageIndex] = items; }
     }
 
-    public void SavePreSearchState(IReadOnlyList<ImageViewItem> currentItems, int pageIndex)
+    public void SavePreSearchState(int pageIndex)
     {
-        _preSearchPageItems = currentItems.ToList();
         _preSearchPageIndex = pageIndex;
     }
 
-    public bool TryRestorePreSearchState(out List<ImageViewItem>? items, out int pageIndex)
+    public bool TryRestorePreSearchState(out int pageIndex)
     {
-        if (_preSearchPageItems is { Count: > 0 })
+        if (_preSearchPageIndex is int savedPageIndex)
         {
-            lock (_pageCacheLock)
-            {
-                _pageCache.Clear();
-                _pageCache[_preSearchPageIndex] = _preSearchPageItems;
-            }
-            items = _preSearchPageItems;
-            pageIndex = _preSearchPageIndex;
-            _preSearchPageItems = null;
+            _preSearchPageIndex = null;
+            InvalidateCache();
+            pageIndex = savedPageIndex;
             return true;
         }
-        items = null;
         pageIndex = 0;
         return false;
+    }
+
+    private static void ResetThumbnailState(ImageViewItem item)
+    {
+        item.ThumbnailData = null;
+        item.IsLoaded = false;
+        item.IsLoading = true;
+        item.NotifyAll();
     }
 
     // ==================== Private Methods ====================
@@ -668,7 +669,7 @@ public class PageManager : IDisposable
                 if (mustKeep.Contains(key)) continue;
                 if (_pageCache.TryGetValue(key, out var evicted))
                 {
-                    foreach (var item in evicted) item.ThumbnailData = null;
+                    foreach (var item in evicted) ResetThumbnailState(item);
                     evictedItems += evicted.Count;
                 }
                 _pageCache.Remove(key);

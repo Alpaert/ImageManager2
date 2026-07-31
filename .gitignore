@@ -386,3 +386,6 @@ libffmpeg/
 .cc-connect-data/
 config.toml
 .config.toml.lock
+
+# 本地模型与转换素材 - 不推送
+/杂项（不要上传到远程库）/

@@ -8,6 +8,7 @@ internal static class OnnxSessionFactory
     private const long OneGb = 1024L * 1024 * 1024;
     private const long DefaultWdCudaMemoryLimitBytes = 1L * OneGb;
     private const long DefaultPixaiCudaMemoryLimitBytes = 2L * OneGb;
+    private const long DefaultChineseClipCudaMemoryLimitBytes = 1L * OneGb;
     private const long DefaultCudaMemoryLimitBytes = 2L * OneGb;
 
     public static SessionOptions CreateOptions()
@@ -109,6 +110,7 @@ internal static class OnnxSessionFactory
         {
             "WD" or "WD14" => DefaultWdCudaMemoryLimitBytes,
             "PIXAI" => DefaultPixaiCudaMemoryLimitBytes,
+            "CHINESE-CLIP-TEXT" or "CHINESE-CLIP-IMAGE" => DefaultChineseClipCudaMemoryLimitBytes,
             _ => DefaultCudaMemoryLimitBytes
         };
     }

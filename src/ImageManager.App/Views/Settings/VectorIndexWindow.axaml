@@ -1,0 +1,67 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ImageManager.App.ViewModels"
+        x:Class="ImageManager.App.Views.Settings.VectorIndexWindow"
+        x:DataType="vm:VectorIndexViewModel"
+        Title="相似搜索向量索引"
+        Width="800" Height="610"
+        WindowStartupLocation="CenterOwner">
+    <ScrollViewer>
+        <StackPanel Margin="20" Spacing="14">
+            <TextBlock Text="相似搜索向量索引" FontSize="22" FontWeight="SemiBold"/>
+            <TextBlock Text="自然语言搜索与语义图搜图共享 Chinese-CLIP 图片向量。氛围和颜色索引不需要 AI 模型。"
+                       TextWrapping="Wrap" Opacity="0.8"/>
+            <Border Padding="12" BorderThickness="1" CornerRadius="6">
+                <StackPanel Spacing="8">
+                    <TextBlock Text="生成范围" FontWeight="SemiBold"/>
+                    <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+                        <TextBox Text="{Binding SelectedFolderDisplay}" IsReadOnly="True"/>
+                        <Button Grid.Column="1" Content="选择文件夹" Command="{Binding SelectFolderCommand}"
+                                IsEnabled="{Binding !IsRunning}"/>
+                        <Button Grid.Column="2" Content="全部图库" Command="{Binding UseAllImagesCommand}"
+                                IsEnabled="{Binding !IsRunning}"/>
+                    </Grid>
+                    <CheckBox Content="包含子文件夹" IsChecked="{Binding IncludeSubfolders}"
+                              IsEnabled="{Binding !IsRunning}"/>
+                    <TextBlock Text="{Binding ScopeDescription}" TextWrapping="Wrap" Opacity="0.8"/>
+                </StackPanel>
+            </Border>
+            <Border Padding="12" BorderThickness="1" CornerRadius="6">
+                <StackPanel Spacing="5">
+                    <TextBlock Text="Chinese-CLIP 模型目录" FontWeight="SemiBold"/>
+                    <TextBlock Text="{Binding ModelDirectory}" TextWrapping="Wrap" FontFamily="Consolas"/>
+                    <TextBlock Text="需要 onnx/chinese_clip_image_encoder.onnx、onnx/chinese_clip_text_encoder.onnx、vocab.txt 和 preprocessor_config.json。"
+                               TextWrapping="Wrap" Opacity="0.75"/>
+                </StackPanel>
+            </Border>
+
+            <Border Padding="12" BorderThickness="1" CornerRadius="6">
+                <Grid ColumnDefinitions="170,*,Auto,Auto" RowDefinitions="Auto,Auto,Auto" RowSpacing="10" ColumnSpacing="8">
+                    <TextBlock Grid.Row="0" Text="Chinese-CLIP 语义" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                    <TextBlock Grid.Row="0" Grid.Column="1" Text="{Binding SemanticStatus}" VerticalAlignment="Center"/>
+                    <Button Grid.Row="0" Grid.Column="2" Content="增量生成" Command="{Binding BuildSemanticCommand}" IsEnabled="{Binding !IsRunning}"/>
+                    <Button Grid.Row="0" Grid.Column="3" Content="完全重建" Command="{Binding RebuildSemanticCommand}" IsEnabled="{Binding !IsRunning}"/>
+
+                    <TextBlock Grid.Row="1" Text="氛围签名" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                    <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding AtmosphereStatus}" VerticalAlignment="Center"/>
+                    <Button Grid.Row="1" Grid.Column="2" Content="增量生成" Command="{Binding BuildAtmosphereCommand}" IsEnabled="{Binding !IsRunning}"/>
+                    <Button Grid.Row="1" Grid.Column="3" Content="完全重建" Command="{Binding RebuildAtmosphereCommand}" IsEnabled="{Binding !IsRunning}"/>
+
+                    <TextBlock Grid.Row="2" Text="颜色签名" FontWeight="SemiBold" VerticalAlignment="Center"/>
+                    <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding ColorStatus}" VerticalAlignment="Center"/>
+                    <Button Grid.Row="2" Grid.Column="2" Content="增量生成" Command="{Binding BuildColorCommand}" IsEnabled="{Binding !IsRunning}"/>
+                    <Button Grid.Row="2" Grid.Column="3" Content="完全重建" Command="{Binding RebuildColorCommand}" IsEnabled="{Binding !IsRunning}"/>
+                </Grid>
+            </Border>
+
+            <ProgressBar Minimum="0" Maximum="{Binding ProgressMaximum}" Value="{Binding ProgressValue}" Height="12"/>
+            <TextBlock Text="{Binding ProgressText}" TextWrapping="Wrap"/>
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Content="刷新状态" Command="{Binding RefreshCommand}" IsEnabled="{Binding !IsRunning}"/>
+                <Button Content="暂停" Command="{Binding PauseCommand}" IsEnabled="{Binding IsRunning}"/>
+                <Button Content="继续" Command="{Binding ResumeCommand}" IsEnabled="{Binding IsRunning}"/>
+                <Button Content="取消" Command="{Binding CancelCommand}" IsEnabled="{Binding IsRunning}"/>
+            </StackPanel>
+        </StackPanel>
+    </ScrollViewer>
+</Window>
