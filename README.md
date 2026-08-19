@@ -59,10 +59,10 @@ dotnet run --project src/ImageManager.App
 models\
 ├── pixai\                    # PixAI 标签模型
 │   ├── model.onnx
-│   └── selected_tags.csv     # 中文标签库
+│   └── selected_tags.csv     # 中文 Tag 映射表
 ├── wd14\                     # WD14 分级模型（Ensemble 模式需要）
 │   ├── model.onnx
-│   └── selected_tags.csv
+│   └── selected_tags.csv     # 中文 Tag 映射表
 ├── chinese-clip-vit-base-patch16\
 │   ├── vocab.txt
 │   ├── preprocessor_config.json
@@ -72,6 +72,33 @@ models\
 ├── artist_embeddings.bin     # 画师嵌入库（可选）
 └── artist_names.txt          # 画师中文名列表（可选）
 ```
+
+#### 官方模型
+
+| 用途 | 官方模型名称 | 下载地址 | 本地目录 |
+|------|----------------|----------|----------|
+| AI 标签与嵌入 | PixAI Tagger v0.9 ONNX (`deepghs/pixai-tagger-v0.9-onnx`) | [Hugging Face](https://huggingface.co/deepghs/pixai-tagger-v0.9-onnx) | `models\pixai\` |
+| 内容分级 | WD SwinV2 Tagger v3 (`SmilingWolf/wd-swinv2-tagger-v3`) | [Hugging Face](https://huggingface.co/SmilingWolf/wd-swinv2-tagger-v3) | `models\wd14\` |
+| 中文语义检索 | Chinese-CLIP ViT-Base-Patch16 (`OFA-Sys/chinese-clip-vit-base-patch16`) | [Hugging Face](https://huggingface.co/OFA-Sys/chinese-clip-vit-base-patch16) | `models\chinese-clip-vit-base-patch16\` |
+
+PixAI 和 WD14 在首次使用 AI 打标时会尝试从 Hugging Face 自动下载。Chinese-CLIP 官方仓库提供源模型，本项目使用的是转换后的 ONNX 文件，需按上述目录结构放置。
+
+#### 百度网盘整合包
+
+- 文件名：`models.rar`
+- 下载链接：[https://pan.baidu.com/s/1etlyTmgaIPLFSqWiZre6qA](https://pan.baidu.com/s/1etlyTmgaIPLFSqWiZre6qA)
+- 提取码：`1234`
+
+解压后将 `models` 目录放到当前配置的缓存目录下。例如使用默认缓存位置时，最终路径为 `C:\ImageManagerCache\models\`。
+
+#### 中文 Tag 映射表
+
+仓库的 [`tag-mappings`](tag-mappings/) 目录保存了已翻译的完整标签表：
+
+- `tag-mappings\pixai\selected_tags.csv`
+- `tag-mappings\wd14\selected_tags.csv`
+
+手动从官方地址下载模型时，请将对应的中文映射表复制到缓存目录的模型子目录，覆盖同名的 `selected_tags.csv`。映射表保留了模型所需的原始字段，并在 `zh_name` 列中提供中文名称。
 
 Chinese-CLIP 图片向量需要先在“设置 → 相似搜索向量索引”中生成。语义图搜图和中文自然语言搜图共享同一套图片向量；氛围和颜色索引不需要额外模型。索引窗口可选择全部图库或指定文件夹，并可控制是否包含子文件夹；指定文件夹的完全重建不会影响其他目录的已有向量。
 
@@ -103,7 +130,7 @@ src/
 图片文件 → PixAI 单模型推理 → CSV 查表替换中文 → 写入数据库
 ```
 
-全程自动，无需人工审核。中文标签库从 PixAI 模型附带的 `selected_tags.csv` 加载。
+全程自动，无需人工审核。运行时从缓存目录 `models\pixai\selected_tags.csv` 的 `zh_name` 列加载中文标签映射。
 
 ## 许可证
 
