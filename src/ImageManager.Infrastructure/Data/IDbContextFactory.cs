@@ -9,5 +9,5 @@ namespace ImageManager.Infrastructure.Data;
 /// </summary>
 public interface IDbContextFactory
 {
-    SqliteConnection CreateConnection();
+    SqliteConnection CreateConnection(int commandTimeout = 30);
 }

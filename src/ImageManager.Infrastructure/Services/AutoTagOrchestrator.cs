@@ -1,4 +1,4 @@
-using System.Security.Cryptography;
+using System.Diagnostics;
 using CommunityToolkit.Mvvm.Messaging;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
@@ -35,6 +35,12 @@ public class AutoTagOrchestrator : IDisposable
     private const string EmbeddingModelVersion = "v0.9";
     private TagMode _currentMode = TagMode.Ensemble;
     private CancellationTokenSource? _cts;
+    private readonly object _runLock = new();
+    private bool _disposed;
+    private bool _pipelineHadErrors;
+    public bool LastRunCancelled { get; private set; }
+    public int LastPreparationFailed { get; private set; }
+    public int LastSkippedCount { get; private set; }
 
     /// <summary>Paths actually processed in the last pipeline run (excluding skipped).</summary>
     public List<string> LastProcessedPaths { get; private set; } = new();
@@ -74,7 +80,10 @@ public class AutoTagOrchestrator : IDisposable
 
         // Wire pipeline progress → messenger
         _pipeline.ProgressChanged += p =>
+        {
+            if (p.Phase == "Error") _pipelineHadErrors = true;
             _messenger.Send(new AutoTagProgressMessage(p.Phase, p.Processed, p.Total, p.StatusText));
+        };
         _tagService.ProgressChanged += p =>
             _messenger.Send(new AutoTagProgressMessage("Model", p.Processed, p.Total, p.StatusText));
     }
@@ -133,89 +142,159 @@ public class AutoTagOrchestrator : IDisposable
         return await _pipeline.DetermineActionAsync(folderId, fileCount);
     }
 
-    public async Task RunPipelineAsync(long folderId, string folderPath, List<string> filePaths, string action)
+    public Task RunPipelineAsync(long folderId, string folderPath, List<string> filePaths, string action,
+        CancellationToken cancellationToken = default) =>
+        RunAsync(folderId, _ => Task.FromResult(filePaths), action, false, cancellationToken);
+
+    public Task RunSelectedImagesAsync(List<string> filePaths, CancellationToken cancellationToken = default) =>
+        RunAsync(0, _ => Task.FromResult(filePaths), "Start", true, cancellationToken);
+
+    public Task RunFolderAsync(long folderId, string folderPath, bool recursive,
+        CancellationToken cancellationToken = default) =>
+        RunAsync(folderId, ct => Task.Run(() => ScanFolder(folderPath, recursive, ct), ct),
+            "Start", false, cancellationToken);
+
+    private List<string> ScanFolder(string root, bool recursive, CancellationToken ct)
     {
-        filePaths = filePaths.Where(f => FileTypeConstants.IsImageFile(f)).ToList();
-        if (filePaths.Count == 0)
+        var watch = Stopwatch.StartNew();
+        var files = new List<string>();
+        var folders = new Queue<string>();
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        folders.Enqueue(Path.GetFullPath(root));
+        Publish("Scan", 0, 0, "正在扫描图片文件...");
+        while (folders.TryDequeue(out var folder))
         {
-            LastProcessedPaths = new List<string>();
-            _messenger.Send(new AutoTagProgressMessage("Done", 0, 0, "没有图片文件需要处理"));
-            return;
-        }
-
-        AppLogger.Memory($"Orch.Start action={action} files={filePaths.Count} folder={Path.GetFileName(folderPath)}");
-
-        var statusMap = await _metaRepo.GetStatusMapByPathsAsync(filePaths);
-
-        var metas = new List<(long Id, string FilePath)>();
-        foreach (var path in filePaths)
-        {
-            if (statusMap.TryGetValue(path, out var existing))
+            ct.ThrowIfCancellationRequested();
+            if (!visited.Add(folder)) continue;
+            try
             {
-                if (existing.Status == 1) { continue; }
-                metas.Add((existing.Id, path));
+                foreach (var file in Directory.EnumerateFiles(folder))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (FileTypeConstants.IsImageFile(file)) files.Add(file);
+                    if (files.Count > 0 && files.Count % 500 == 0)
+                        Publish("Scan", files.Count, 0, $"正在扫描图片文件：已找到 {files.Count} 张");
+                }
+                if (recursive)
+                    foreach (var child in Directory.EnumerateDirectories(folder))
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        // Junctions can lead back into an already scanned directory.
+                        if ((File.GetAttributes(child) & FileAttributes.ReparsePoint) == 0)
+                            folders.Enqueue(child);
+                    }
             }
-            else
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                long newId = 0;
-                try
-                {
-                    string md5;
-                    using (var fs = File.OpenRead(path))
-                        md5 = Convert.ToHexString(MD5.HashData(fs)).ToLowerInvariant();
-                    var match = await _metaRepo.GetByFileHashAsync(md5);
-                    if (match != null && !File.Exists(match.FilePath))
-                    {
-                        await _metaRepo.UpdateFilePathAsync(match.Id, path, folderId);
-                        newId = match.Id;
-                    }
-                    else
-                    {
-                        var fi = new FileInfo(path);
-                        var newMeta = new ImageMeta
-                        {
-                            FilePath = path, FileHash = md5, FolderId = folderId,
-                            FileSize = fi.Length, LastWriteTicks = fi.LastWriteTimeUtc.Ticks,
-                            HashStatus = 0  // Hash not yet computed
-                        };
-                        newId = await _metaRepo.UpsertAsync(newMeta);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    AppLogger.Warn($"AutoTag: failed to process new file {Path.GetFileName(path)}: {ex.Message}");
-                }
-                metas.Add((newId, path));
+                if (string.Equals(folder, Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase)) throw;
+                AppLogger.Warn($"AutoTag.Scan skipped folder={folder}: {ex.Message}");
             }
         }
-
-        if (metas.Count == 0)
-        {
-            LastProcessedPaths = new List<string>();
-            _messenger.Send(new AutoTagProgressMessage("Done", 0, 0, "全部图片已打标，跳过"));
-            return;
-        }
-
-        LastProcessedPaths = metas.Select(m => m.FilePath).ToList();
-
-        ResetCts();
-        try
-        {
-            var activeTagService = _factory.Create(_currentMode);
-            LastProcessedPaths = await _pipeline.RunInferenceAsync(folderId, metas, action, _cts!.Token, activeTagService);
-        }
-        catch (OperationCanceledException)
-        {
-            AppLogger.Info("AutoTag pipeline cancelled by user");
-        }
-
-        AppLogger.Memory($"Orch.End processed={LastProcessedPaths.Count}");
+        AppLogger.Info($"AutoTag.Scan files={files.Count} folders={visited.Count} elapsedMs={watch.ElapsedMilliseconds}");
+        return files;
     }
 
-    public async Task<List<TagTranslationDto>> RunSingleImageAsync(string filePath)
+    private void Publish(string phase, int processed, int total, string text) =>
+        _messenger.Send(new AutoTagProgressMessage(phase, processed, total, text));
+
+    private Task RunAsync(long folderId, Func<CancellationToken, Task<List<string>>> getFiles,
+        string action, bool selectedImages, CancellationToken cancellationToken)
+    {
+        CancellationTokenSource run;
+        lock (_runLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_cts != null) throw new InvalidOperationException("自动打标正在进行中");
+            run = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            _cts = run;
+        }
+        // Establish cancellation and maintenance exclusion synchronously, before queuing work.
+        var autoTagRun = AutoTagRuntimeState.Enter();
+        return Task.Run(async () =>
+        {
+            using var runScope = autoTagRun;
+            var ct = run.Token;
+            var watch = Stopwatch.StartNew();
+            LastProcessedPaths = new();
+            LastRunCancelled = false;
+            LastPreparationFailed = 0;
+            LastSkippedCount = 0;
+            _pipelineHadErrors = false;
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                var files = await getFiles(ct);
+                var preparation = await new AutoTagPreparationService(_metaRepo).PrepareAsync(folderId, files,
+                    p => Publish(p.Phase, p.Processed, p.Total, p.StatusText), ct);
+                LastPreparationFailed = preparation.Failed;
+                LastSkippedCount = preparation.Skipped;
+                if (preparation.Images.Count == 0)
+                {
+                    Publish(preparation.Failed > 0 ? "Error" : "Done", 0, preparation.Total,
+                        preparation.Failed > 0 ? $"已跳过 {preparation.Skipped} 张，{preparation.Failed} 张准备失败，请查看日志" :
+                        preparation.Total == 0 ? "没有图片文件需要处理" : $"全部 {preparation.Skipped} 张图片已打标，跳过");
+                    return;
+                }
+
+                ct.ThrowIfCancellationRequested();
+                var activeTagService = _factory.Create(_currentMode);
+                if (!activeTagService.IsModelLoaded)
+                {
+                    Publish("Model", 0, preparation.Images.Count, "正在加载打标模型...");
+                    var modelWatch = Stopwatch.StartNew();
+                    await activeTagService.LoadModelAsync(ModelPath, ct);
+                    AppLogger.Info($"AutoTag.Model elapsedMs={modelWatch.ElapsedMilliseconds}");
+                }
+                ct.ThrowIfCancellationRequested();
+                Publish("Inference", 0, preparation.Images.Count,
+                    $"正在推理 {preparation.Images.Count} 张图片（已跳过 {preparation.Skipped} 张）...");
+                if (selectedImages)
+                {
+                    foreach (var meta in preparation.Images)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        Publish("Inference", LastProcessedPaths.Count, preparation.Images.Count,
+                            $"正在推理：{LastProcessedPaths.Count + 1}/{preparation.Images.Count}");
+                        var items = await RunSingleImageAsync(meta.FilePath, ct);
+                        ct.ThrowIfCancellationRequested();
+                        if (items.Count > 0) await SaveMappingsAndTagsAsync(meta.FilePath, items);
+                        await _metaRepo.SetAutoTagStatusByPathAsync(meta.FilePath, 1);
+                        LastProcessedPaths.Add(meta.FilePath);
+                    }
+                }
+                else
+                {
+                    LastProcessedPaths = await _pipeline.RunInferenceAsync(folderId, preparation.Images, action, ct, activeTagService);
+                }
+                ct.ThrowIfCancellationRequested();
+                Publish(_pipelineHadErrors || preparation.Failed > 0 || LastProcessedPaths.Count < preparation.Images.Count ? "Error" : "Done",
+                    LastProcessedPaths.Count, preparation.Total,
+                    $"打标完成 {LastProcessedPaths.Count} 张，跳过 {preparation.Skipped} 张，准备失败 {preparation.Failed} 张" +
+                    (LastProcessedPaths.Count < preparation.Images.Count ? $"，未完成 {preparation.Images.Count - LastProcessedPaths.Count} 张，请查看日志" :
+                        _pipelineHadErrors ? "，部分数据保存失败，请查看日志" : ""));
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                LastRunCancelled = true;
+                Publish("Stopped", LastProcessedPaths.Count, 0, $"自动打标已停止，完成 {LastProcessedPaths.Count} 张");
+            }
+            finally
+            {
+                AppLogger.Info($"AutoTag.End processed={LastProcessedPaths.Count} skipped={LastSkippedCount} " +
+                    $"prepareFailed={LastPreparationFailed} cancelled={LastRunCancelled} elapsedMs={watch.ElapsedMilliseconds}");
+                lock (_runLock)
+                {
+                    if (ReferenceEquals(_cts, run)) _cts = null;
+                    run.Dispose();
+                }
+            }
+        });
+    }
+
+    public async Task<List<TagTranslationDto>> RunSingleImageAsync(string filePath, CancellationToken ct = default)
     {
         var activeTagService = _factory.Create(_currentMode);
-        var result = await activeTagService.PredictWithSourcesAsync(filePath);
+        var result = await activeTagService.PredictWithSourcesAsync(filePath, ct);
         var predictions = result.MergedTags;
         var filtered = predictions
             .Where(p => p.Confidence >= 0.1)
@@ -298,27 +377,20 @@ public class AutoTagOrchestrator : IDisposable
         return count;
     }
 
-    public async Task CancelAsync()
+    public Task CancelAsync()
     {
-        _cts?.Cancel();
-        await Task.CompletedTask;
-    }
-
-    private void ResetCts()
-    {
-        if (_cts != null)
-        {
-            _cts.Cancel();
-            _cts.Dispose();
-        }
-        _cts = new CancellationTokenSource();
+        lock (_runLock) _cts?.Cancel();
+        return Task.CompletedTask;
     }
 
     public void Dispose()
     {
-        _cts?.Cancel();
-        _cts?.Dispose();
-        _cts = null;
+        lock (_runLock)
+        {
+            _disposed = true;
+            _cts?.Cancel();
+            // The active run owns disposal; a cancellation callback must never see a disposed source.
+        }
     }
 
     public async Task MarkFolderDoneAsync(long folderId)

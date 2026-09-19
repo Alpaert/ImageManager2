@@ -31,6 +31,34 @@
         <Style Selector="Button:disabled">
             <Setter Property="Foreground" Value="{DynamicResource MutedFgBrush}"/>
         </Style>
+        <Style Selector="Button.toolbar-compact">
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Padding" Value="8,4"/>
+            <Setter Property="MinHeight" Value="29"/>
+            <Setter Property="CornerRadius" Value="5"/>
+        </Style>
+        <Style Selector="Button.toolbar-chip">
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Padding" Value="8,3"/>
+            <Setter Property="MinHeight" Value="26"/>
+            <Setter Property="CornerRadius" Value="13"/>
+            <Setter Property="Background" Value="{DynamicResource SelectedBgBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource CtrlBorderBrush}"/>
+        </Style>
+        <Style Selector="Button.toolbar-chip:pointerover">
+            <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
+        </Style>
+        <Style Selector="Button.accent">
+            <Setter Property="Background" Value="{DynamicResource AccentBrush}"/>
+            <Setter Property="Foreground" Value="#FFFFFFFF"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+        </Style>
+        <Style Selector="Button.accent:pointerover">
+            <Setter Property="Background" Value="{DynamicResource SelectedBgBrush}"/>
+            <Setter Property="Foreground" Value="{DynamicResource AppFgBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
+        </Style>
         <Style Selector="TextBox">
             <Setter Property="Background" Value="{DynamicResource InputBgBrush}"/>
             <Setter Property="Foreground" Value="{DynamicResource AppFgBrush}"/>
@@ -42,6 +70,11 @@
         </Style>
         <Style Selector="TextBox:focus">
             <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
+        </Style>
+        <Style Selector="TextBox.toolbar-compact">
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Padding" Value="6,4"/>
+            <Setter Property="MinHeight" Value="29"/>
         </Style>
         <Style Selector="ListBox">
             <Setter Property="Background" Value="Transparent"/>
@@ -71,8 +104,37 @@
             <Setter Property="Foreground" Value="{DynamicResource AppFgBrush}"/>
             <Setter Property="BorderBrush" Value="{DynamicResource CtrlBorderBrush}"/>
         </Style>
+        <Style Selector="ComboBox.toolbar-compact">
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Padding" Value="6,3"/>
+            <Setter Property="MinHeight" Value="29"/>
+        </Style>
         <Style Selector="CheckBox">
             <Setter Property="Foreground" Value="{DynamicResource AppFgBrush}"/>
+        </Style>
+        <Style Selector="CheckBox.toolbar-compact">
+            <Setter Property="FontSize" Value="12"/>
+        </Style>
+        <Style Selector="Border.toolbar-drop-zone">
+            <Setter Property="MinHeight" Value="29"/>
+            <Setter Property="Padding" Value="10,4"/>
+            <Setter Property="Background" Value="{DynamicResource ToolbarDropBgBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius" Value="6"/>
+        </Style>
+        <Style Selector="FlyoutPresenter.toolbar-flyout">
+            <Setter Property="Background" Value="{DynamicResource SurfaceBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource CtrlBorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="Padding" Value="10"/>
+            <Setter Property="MaxWidth" Value="640"/>
+            <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled"/>
+        </Style>
+        <Style Selector="Border.toolbar-drop-zone TextBlock">
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Foreground" Value="{DynamicResource ToolbarDropFgBrush}"/>
         </Style>
     </Application.Styles>
 </Application>

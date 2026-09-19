@@ -20,6 +20,8 @@ public class AppSettings
     public bool ThumbnailNoTextKeepPadding { get; set; } = false;
     public double ThumbnailCornerRadius { get; set; }
     public string ThemeVariant { get; set; } = "Dark";
+    /// <summary>Top search toolbar layout: A (layered) or C (command bar).</summary>
+    public string SearchToolbarLayout { get; set; } = "A";
     public string WaterfallMode { get; set; } = "None";
     public double GridZoomLevel { get; set; } = 1;
     public double VerticalZoomLevel { get; set; } = 1;
@@ -27,6 +29,8 @@ public class AppSettings
     public string ThumbnailBorderColor { get; set; } = "#FF808080";
     public string ThumbnailBackgroundColor { get; set; } = "#CCFFFFFF";
     public double ThumbnailOpacity { get; set; } = 1.0;
+    /// <summary>Maximum edge length, in pixels, for the thumbnail hover preview.</summary>
+    public int HoverPreviewMaxSize { get; set; } = 840;
     public string DiskCacheDirectory { get; set; } = @"C:\ImageManagerCache";
     public int MaxTagSuggestionCount { get; set; } = 30;
     public string LastFolder { get; set; } = string.Empty;

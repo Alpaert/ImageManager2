@@ -8,8 +8,8 @@ public partial class FolderTreeNode : ObservableObject
     private static readonly FolderTreeNode Placeholder = new() { DisplayName = "..." };
 
     public string Path { get; set; } = string.Empty;
-    public string DisplayName { get; set; } = string.Empty;
-    public string? Alias { get; set; }
+    [ObservableProperty] private string _displayName = string.Empty;
+    [ObservableProperty] private string? _alias;
     public long DbId { get; init; }
 
     [ObservableProperty] private bool _isExpanded;

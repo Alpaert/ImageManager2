@@ -58,6 +58,9 @@ public partial class VectorIndexViewModel : ViewModelBase
     [RelayCommand] private Task RebuildColorAsync() => RunAsync(VectorIndexKind.Color, true);
 
     [RelayCommand]
+    private Task RepairHashesAsync() => RunHashRepairAsync();
+
+    [RelayCommand]
     private async Task SelectFolderAsync()
     {
         if (IsRunning || FolderPicker == null)
@@ -127,6 +130,31 @@ public partial class VectorIndexViewModel : ViewModelBase
             IsPaused = false;
             await RefreshAsync();
         }
+    }
+
+    private async Task RunHashRepairAsync()
+    {
+        if (IsRunning) return;
+        IsRunning = true;
+        IsPaused = false;
+        ProgressValue = 0;
+        ProgressMaximum = 1;
+        ProgressText = "姝ｅ湪妫€娴嬪苟琛ュ厖鍥剧墖鎸囩汗...";
+        var progress = new Progress<HashRepairProgress>(p =>
+        {
+            ProgressMaximum = Math.Max(1, p.Total);
+            ProgressValue = p.Processed + p.Skipped;
+            ProgressText = $"鍥剧墖鎸囩汗: {p.Processed + p.Skipped}/{p.Total}  鏂板 {p.Generated}  璺宠繃 {p.Skipped}  澶辫触 {p.Failed}" +
+                           (string.IsNullOrWhiteSpace(p.CurrentFile) ? string.Empty : $" | {Path.GetFileName(p.CurrentFile)}");
+        });
+        try
+        {
+            await _indexService.RepairHashesAsync(CurrentScope, progress);
+            ProgressText = "鍥剧墖鎸囩汗琛ュ厖瀹屾垚";
+        }
+        catch (OperationCanceledException) { ProgressText = "鍥剧墖鎸囩汗淇宸插彇娑�"; }
+        catch (Exception ex) { ProgressText = $"鍥剧墖鎸囩汗淇澶辫触: {ex.Message}"; }
+        finally { IsRunning = false; IsPaused = false; await RefreshAsync(); }
     }
 
     private void UpdateProgress(VectorIndexProgress progress)

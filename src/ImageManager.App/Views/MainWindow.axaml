@@ -33,7 +33,7 @@
 		</Style>
 		<Style Selector="Button:pointerover /template/ ContentPresenter#PART_ContentPresenter">
 			<Setter Property="Foreground" Value="{Binding $parent[Button].Foreground}" />
-			<Setter Property="Background" Value="{DynamicResource CtrlHoverBgBrush}" />
+			<Setter Property="Background" Value="{Binding $parent[Button].Background}" />
 		</Style>
 		<Style Selector="Button:disabled /template/ ContentPresenter#PART_ContentPresenter">
 			<Setter Property="Foreground" Value="{Binding $parent[Button].Foreground}" />
@@ -104,18 +104,16 @@
                           PointerPressed="LstFolders_PointerPressed"
                           ScrollViewer.HorizontalScrollBarVisibility="Disabled">
                     <TreeView.ContextMenu>
-                        <ContextMenu>
-                            <MenuItem Header="重命名显示名称" Click="MenuRenameFolder_Click"/>
-                            <MenuItem Header="清除显示名称" Click="MenuClearFolderAlias_Click"/>
+                        <ContextMenu Opened="FolderContextMenu_Opened">
+                            <MenuItem x:Name="FolderAutoTagMenu" Header="自动打标…" Click="MenuComputeAutoTags_Click"/>
+                            <MenuItem x:Name="FolderCharacterMenu" Header="匹配角色标签…" Click="MenuMatchCharacterEmbeddingsRecursive_Click"/>
                             <Separator/>
-                            <MenuItem Header="计算此文件夹的图片标签" Click="MenuComputeAutoTags_Click"/>
-                            <MenuItem Header="计算此文件夹及所有子文件夹的图片标签" Click="MenuComputeAutoTagsRecursive_Click"/>
-                            <MenuItem Header="匹配此文件夹及子文件夹的人物 Embedding" Click="MenuMatchCharacterEmbeddingsRecursive_Click"/>
-                            <MenuItem Header="计算此文件夹及子文件夹的视频原始帧" Click="MenuComputeVideoOriginalFramesRecursive_Click"/>
-                            <MenuItem Header="停止计算视频原始帧" Click="MenuStopVideoOriginalFrames_Click"/>
-                            <MenuItem Header="重新计算失败的图片指纹" Click="MenuRecomputeFailedHashes_Click"/>
+                            <MenuItem Header="计算图片指纹…" Click="MenuComputeHashes_Click"/>
+                            <MenuItem x:Name="FolderVideoMenu" Header="生成视频原始帧…" Click="MenuComputeVideoOriginalFramesRecursive_Click"/>
+                            <MenuItem x:Name="FolderStopVideoMenu" Header="停止视频原始帧生成" IsVisible="False" Click="MenuStopVideoOriginalFrames_Click"/>
                             <Separator/>
-                            <MenuItem Header="清空此文件夹所有图片的标签" Click="MenuClearFolderTags_Click"/>
+                            <MenuItem Header="设置显示名称…" Click="MenuRenameFolder_Click"/>
+                            <MenuItem x:Name="FolderClearTagsMenu" Header="清空标签…" Click="MenuClearFolderTags_Click"/>
                         </ContextMenu>
                     </TreeView.ContextMenu>
                     <TreeView.ItemTemplate>
@@ -192,8 +190,7 @@
             <TextBlock Text="{Binding StatusText}"
                        Margin="10,0,0,0" Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
                        VerticalAlignment="Center"/>
-            <Button Content="⏹ 停止推理" Margin="10,0,0,0"
-                    FontSize="12" Padding="6,3"
+            <Button Content="停止推理" Classes="toolbar-compact" Margin="10,0,0,0"
                     IsVisible="{Binding IsAutoTagRunning}"
                     Command="{Binding StopAutoTagCommand}"/>
             <TextBlock Text="{Binding BackgroundStatusText}"
@@ -201,126 +198,226 @@
                        VerticalAlignment="Center"/>
         </StackPanel>
 
-        <!-- Toolbar Row 2: Filters -->
-        <StackPanel Orientation="Horizontal" Margin="5,0,5,2" Grid.Row="2" Grid.Column="1">
-            <TextBlock Text="搜索模式" VerticalAlignment="Center" Margin="0,0,5,0"
-                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
-            <ComboBox Width="70" Margin="-1,0,0,0" FontSize="11"
-                      SelectedIndex="{Binding SearchScope}">
-                <ComboBoxItem>当前</ComboBoxItem>
-                <ComboBoxItem>递归</ComboBoxItem>
-            </ComboBox>
-            <StackPanel>
-                <Border BorderBrush="{Binding SearchBoxBorderColor}"
-                        BorderThickness="1.5" CornerRadius="4">
-                    <TextBox x:Name="TxtTagSearch" Text="{Binding TagSearchText}"
-                             Width="200" PlaceholderText="输入 Tag 名称..."
-                             Background="{DynamicResource InputBgBrush}" BorderThickness="0"
-                             KeyDown="TxtTagSearch_KeyDown"
-                             GotFocus="TxtTagSearch_GotFocus"/>
-                </Border>
-                <Popup IsOpen="{Binding IsTagSearchPopupOpen}"
-                       Placement="Bottom">
-                    <Border Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource CtrlBorderBrush}"
-                            BorderThickness="1" CornerRadius="8" Padding="6"
-                            MaxWidth="300">
-                        <StackPanel>
-                            <TextBox PlaceholderText="过滤共有 Tag..." Text="{Binding CoTagFilterText}"
-                                     IsVisible="{Binding IsSuggestionCoTagMode}"
-                                     Margin="0,0,0,4" FontSize="12" />
-                            <ScrollViewer MaxHeight="400">
-                                <ItemsControl ItemsSource="{Binding TagSearchSuggestions}">
-                                <ItemsControl.ItemsPanel>
-                                    <ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate>
-                                </ItemsControl.ItemsPanel>
-                                <ItemsControl.ItemTemplate>
-                                    <DataTemplate x:DataType="models:TagCount">
-                                        <Button Margin="2" Padding="0" FontSize="12"
-                                                Click="TagSuggestion_Click" Tag="{Binding}">
-                                            <Border Padding="6,3" CornerRadius="3">
-                                                <TextBlock Text="{Binding Name}"/>
-                                            </Border>
-                                        </Button>
-                                    </DataTemplate>
-                                </ItemsControl.ItemTemplate>
-                            </ItemsControl>
-                        </ScrollViewer>
+        <!-- Toolbar Row 2: selectable search layout -->
+        <Grid Margin="5,0,5,2" Grid.Row="2" Grid.Column="1">
+            <!-- A: frequently used search stays visible; advanced search opens in an overlay. -->
+            <StackPanel IsVisible="{Binding IsSearchToolbarLayoutA}" Spacing="5">
+                <DockPanel LastChildFill="True">
+                    <Button DockPanel.Dock="Right" Content="相似搜索和高级功能 ▾" Classes="toolbar-compact"
+                            Margin="8,0,0,0" VerticalAlignment="Center"
+                            ToolTip.Tip="展开相似搜索和高级功能设置"
+                            DragDrop.AllowDrop="True"
+                            DragDrop.DragOver="DragSearchZone_DragOver"
+                            DragDrop.Drop="DragSearchZone_Drop">
+                        <Button.Flyout>
+                            <Flyout Placement="BottomEdgeAlignedRight"
+                                    FlyoutPresenterClasses="toolbar-flyout">
+                                <WrapPanel Width="520" ItemSpacing="6" LineSpacing="6">
+                                    <ComboBox Classes="toolbar-compact" Width="115"
+                                              ItemsSource="{Binding SimilaritySearchModes}"
+                                              SelectedIndex="{Binding SelectedSimilarityMode}"/>
+                                    <Border x:Name="DragSearchZoneA" Classes="toolbar-drop-zone" Cursor="Hand"
+                                            DragDrop.AllowDrop="True"
+                                            DragDrop.DragOver="DragSearchZone_DragOver"
+                                            DragDrop.Drop="DragSearchZone_Drop">
+                                        <TextBlock Text="拖拽图片按所选模式搜索" VerticalAlignment="Center" FontSize="12"/>
+                                    </Border>
+                                    <TextBox Classes="toolbar-compact" Width="220"
+                                             PlaceholderText="中文自然语言搜图"
+                                             Text="{Binding NaturalLanguageQuery}"/>
+                                    <Button Content="语义搜图" Classes="toolbar-compact"
+                                            Command="{Binding SearchNaturalLanguageCommand}"/>
+                                    <CheckBox Classes="toolbar-compact" Content="局部匹配（暂未实现）"
+                                              Foreground="{DynamicResource AccentBrush}"
+                                              VerticalAlignment="Center"/>
+                                    <Button Content="停止搜索" Classes="toolbar-compact"
+                                            Click="BtnStopSearch_Click"/>
+                                </WrapPanel>
+                            </Flyout>
+                        </Button.Flyout>
+                    </Button>
+                    <WrapPanel Orientation="Horizontal" ItemSpacing="6" LineSpacing="4">
+                        <StackPanel Orientation="Horizontal" Spacing="4">
+                            <TextBlock Text="搜索范围" VerticalAlignment="Center"
+                                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"/>
+                            <ComboBox Classes="toolbar-compact" Width="70" SelectedIndex="{Binding SearchScope}">
+                                <ComboBoxItem>当前</ComboBoxItem>
+                                <ComboBoxItem>递归</ComboBoxItem>
+                            </ComboBox>
                         </StackPanel>
-                    </Border>
-                </Popup>
+                        <StackPanel Orientation="Horizontal" Spacing="4">
+                            <StackPanel>
+                                <Border BorderBrush="{Binding SearchBoxBorderColor}" BorderThickness="1.5" CornerRadius="4">
+                                    <TextBox x:Name="TxtTagSearchA" Classes="toolbar-compact" Text="{Binding TagSearchText}"
+                                             Width="200" PlaceholderText="输入 Tag 名称…"
+                                             Background="{DynamicResource InputBgBrush}" BorderThickness="0"
+                                             KeyDown="TxtTagSearch_KeyDown" GotFocus="TxtTagSearch_GotFocus"/>
+                                </Border>
+                                <Popup IsOpen="{Binding IsTagSearchPopupOpenA}" Placement="Bottom">
+                                    <Border Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource CtrlBorderBrush}"
+                                            BorderThickness="1" CornerRadius="8" Padding="6" MaxWidth="300">
+                                        <StackPanel>
+                                            <TextBox Classes="toolbar-compact" PlaceholderText="过滤共有 Tag..." Text="{Binding CoTagFilterText}"
+                                                     IsVisible="{Binding IsSuggestionCoTagMode}" Margin="0,0,0,4"/>
+                                            <ScrollViewer MaxHeight="400">
+                                                <ItemsControl ItemsSource="{Binding TagSearchSuggestions}">
+                                                    <ItemsControl.ItemsPanel>
+                                                        <ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate>
+                                                    </ItemsControl.ItemsPanel>
+                                                    <ItemsControl.ItemTemplate>
+                                                        <DataTemplate x:DataType="models:TagCount">
+                                                            <Button Classes="toolbar-compact" Margin="2" Padding="0" Click="TagSuggestion_Click" Tag="{Binding}">
+                                                                <Border Padding="6,3" CornerRadius="3"><TextBlock Text="{Binding Name}"/></Border>
+                                                            </Button>
+                                                        </DataTemplate>
+                                                    </ItemsControl.ItemTemplate>
+                                                </ItemsControl>
+                                            </ScrollViewer>
+                                        </StackPanel>
+                                    </Border>
+                                </Popup>
+                            </StackPanel>
+                            <Button Content="搜索" Classes="toolbar-compact" ToolTip.Tip="按 Tag 搜索"
+                                    Command="{Binding SearchByTagCommand}"/>
+                        </StackPanel>
+                        <controls:DisplayFilterBar x:Name="DisplayFiltersBarA"/>
+                        <TextBlock Text="{Binding LoadedInfoText}" Margin="10,0,0,0"
+                                   Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
+                                   VerticalAlignment="Center"/>
+                    </WrapPanel>
+                </DockPanel>
+                <WrapPanel IsVisible="{Binding HasDisplayFilter}" ItemSpacing="6" LineSpacing="4">
+                    <Button Content="{Binding TypeFilterText}" Classes="toolbar-chip" IsVisible="{Binding HasTypeFilter}"
+                            Command="{Binding RemoveTypeFilterCommand}" ToolTip.Tip="移除此类型筛选"/>
+                    <Button Content="{Binding OrientationFilterText}" Classes="toolbar-chip" IsVisible="{Binding HasOrientationFilter}"
+                            Command="{Binding RemoveOrientationFilterCommand}" ToolTip.Tip="移除此方向筛选"/>
+                    <TextBlock Text="{Binding DisplayFilterCountText}" VerticalAlignment="Center" FontSize="12"/>
+                    <TextBlock Text="没有符合当前筛选的文件" IsVisible="{Binding IsDisplayFilterEmpty}" VerticalAlignment="Center"/>
+                    <Button Content="重置" Classes="toolbar-compact" Command="{Binding ResetDisplayFilterCommand}" IsVisible="{Binding IsDisplayFilterEmpty}"/>
+                </WrapPanel>
             </StackPanel>
-            <Button Content="按 Tag 搜索" Margin="0,0,8,0"
-                    FontSize="12" Padding="8,4"
-                    Command="{Binding SearchByTagCommand}"/>
 
-            <TextBlock Text="方向筛选:" VerticalAlignment="Center" Margin="10,0,5,0"
-                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
-            <Button Content="全部" Margin="0,0,3,0" FontSize="12" Padding="8,4"
-                    Command="{Binding FilterAllCommand}"/>
-            <Button Content="横图" Margin="0,0,3,0" FontSize="12" Padding="8,4"
-                    Command="{Binding FilterLandscapeCommand}"/>
-            <Button Content="竖图" Margin="0,0,3,0" FontSize="12" Padding="8,4"
-                    Command="{Binding FilterPortraitCommand}"/>
-
-            <TextBlock Text="{Binding LoadedInfoText}"
-                       Margin="16,0,0,0" Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
-                       VerticalAlignment="Center"/>
-
-            <ComboBox Width="115" Margin="12,0,0,0"
-                      ItemsSource="{Binding SimilaritySearchModes}"
-                      SelectedIndex="{Binding SelectedSimilarityMode}"/>
-
-            <Border x:Name="DragSearchZone" Margin="16,0,0,0"
-                    Padding="10,5" BorderThickness="1"
-                    BorderBrush="{DynamicResource AccentBrush}" CornerRadius="6"
-                    Background="#206366F1" Cursor="Hand"
-                    DragDrop.AllowDrop="True"
-                    DragDrop.DragOver="DragSearchZone_DragOver"
-                    DragDrop.Drop="DragSearchZone_Drop">
-                <TextBlock Text="拖拽图片按所选模式搜索"
-                           VerticalAlignment="Center"
-                           Foreground="#818CF8" FontSize="12"/>
-            </Border>
-
-            <TextBox Width="220" Margin="10,0,0,0"
-                     PlaceholderText="中文自然语言搜图"
-                     Text="{Binding NaturalLanguageQuery}"/>
-            <Button Content="语义搜图" Margin="5,0,0,0" Padding="8,4"
-                    Command="{Binding SearchNaturalLanguageCommand}"/>
-			<CheckBox x:Name="ChkLocalSearch" Content="局部匹配（暂未实现）"
-					  Foreground="{DynamicResource AccentBrush}"
-					  Margin="10,0,0,0" VerticalAlignment="Center"/>
-            <Button Content="停止搜索" Margin="10,0,0,0"
-                    FontSize="12" Padding="8,4"
-                    Click="BtnStopSearch_Click"/>
-        </StackPanel>
+            <!-- C: a compact command bar with dedicated popups for low-frequency search controls. -->
+            <StackPanel IsVisible="{Binding IsSearchToolbarLayoutC}" Spacing="5">
+                <WrapPanel Orientation="Horizontal" ItemSpacing="6" LineSpacing="4">
+                    <StackPanel Orientation="Horizontal" Spacing="4">
+                        <TextBlock Text="范围" VerticalAlignment="Center" Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"/>
+                        <ComboBox Classes="toolbar-compact" Width="70" ToolTip.Tip="搜索范围" SelectedIndex="{Binding SearchScope}">
+                            <ComboBoxItem>当前</ComboBoxItem>
+                            <ComboBoxItem>递归</ComboBoxItem>
+                        </ComboBox>
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Spacing="4">
+                        <StackPanel>
+                            <Border BorderBrush="{Binding SearchBoxBorderColor}" BorderThickness="1.5" CornerRadius="4">
+                                <TextBox x:Name="TxtTagSearchC" Classes="toolbar-compact" Text="{Binding TagSearchText}"
+                                         Width="200" PlaceholderText="输入 Tag 名称…"
+                                         Background="{DynamicResource InputBgBrush}" BorderThickness="0"
+                                         KeyDown="TxtTagSearch_KeyDown" GotFocus="TxtTagSearch_GotFocus"/>
+                            </Border>
+                            <Popup IsOpen="{Binding IsTagSearchPopupOpenC}" Placement="Bottom">
+                                <Border Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource CtrlBorderBrush}"
+                                        BorderThickness="1" CornerRadius="8" Padding="6" MaxWidth="300">
+                                    <StackPanel>
+                                        <TextBox Classes="toolbar-compact" PlaceholderText="过滤共有 Tag..." Text="{Binding CoTagFilterText}"
+                                                 IsVisible="{Binding IsSuggestionCoTagMode}" Margin="0,0,0,4"/>
+                                        <ScrollViewer MaxHeight="400">
+                                            <ItemsControl ItemsSource="{Binding TagSearchSuggestions}">
+                                                <ItemsControl.ItemsPanel>
+                                                    <ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate>
+                                                </ItemsControl.ItemsPanel>
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate x:DataType="models:TagCount">
+                                                        <Button Classes="toolbar-compact" Margin="2" Padding="0" Click="TagSuggestion_Click" Tag="{Binding}">
+                                                            <Border Padding="6,3" CornerRadius="3"><TextBlock Text="{Binding Name}"/></Border>
+                                                        </Button>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                        </ScrollViewer>
+                                    </StackPanel>
+                                </Border>
+                            </Popup>
+                        </StackPanel>
+                        <Button Content="搜索" Classes="toolbar-compact" ToolTip.Tip="按 Tag 搜索" Command="{Binding SearchByTagCommand}"/>
+                    </StackPanel>
+                    <controls:DisplayFilterBar x:Name="DisplayFiltersBarC"/>
+                    <Button Content="相似搜索 ▾" Classes="toolbar-compact"
+                            ToolTip.Tip="点击展开相似搜索设置，也可直接拖入图片"
+                            DragDrop.AllowDrop="True"
+                            DragDrop.DragOver="DragSearchZone_DragOver"
+                            DragDrop.Drop="DragSearchZone_Drop">
+                        <Button.Flyout>
+                            <Flyout Placement="Bottom">
+                                <StackPanel Width="300" Margin="6" Spacing="8">
+                                    <TextBlock Text="以图搜图" FontWeight="SemiBold"/>
+                                    <ComboBox Classes="toolbar-compact" ItemsSource="{Binding SimilaritySearchModes}" SelectedIndex="{Binding SelectedSimilarityMode}"/>
+                                    <Border x:Name="DragSearchZoneC" Classes="toolbar-drop-zone" Cursor="Hand" DragDrop.AllowDrop="True"
+                                            DragDrop.DragOver="DragSearchZone_DragOver" DragDrop.Drop="DragSearchZone_Drop">
+                                        <TextBlock Text="拖拽图片按所选模式搜索" TextAlignment="Center" FontSize="12"/>
+                                    </Border>
+                                </StackPanel>
+                            </Flyout>
+                        </Button.Flyout>
+                    </Button>
+                    <Button Content="更多…" Classes="toolbar-compact">
+                        <Button.Flyout>
+                            <Flyout Placement="Bottom">
+                                <StackPanel Width="320" Margin="6" Spacing="8">
+                                    <TextBlock Text="高级搜索" FontWeight="SemiBold"/>
+                                    <TextBox Classes="toolbar-compact" PlaceholderText="中文自然语言搜图" Text="{Binding NaturalLanguageQuery}"/>
+                                    <Button Content="语义搜图" Classes="toolbar-compact" HorizontalAlignment="Left" Command="{Binding SearchNaturalLanguageCommand}"/>
+                                    <CheckBox Classes="toolbar-compact" Content="局部匹配（暂未实现）" Foreground="{DynamicResource AccentBrush}"/>
+                                    <Separator/>
+                                    <Button Content="停止搜索" Classes="toolbar-compact" HorizontalAlignment="Left" Click="BtnStopSearch_Click"/>
+                                </StackPanel>
+                            </Flyout>
+                        </Button.Flyout>
+                    </Button>
+                    <TextBlock Text="{Binding LoadedInfoText}" Margin="8,0,0,0"
+                               Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12" VerticalAlignment="Center"/>
+                </WrapPanel>
+                <WrapPanel IsVisible="{Binding HasDisplayFilter}" ItemSpacing="6" LineSpacing="4">
+                    <Button Content="{Binding TypeFilterText}" Classes="toolbar-chip" IsVisible="{Binding HasTypeFilter}"
+                            Command="{Binding RemoveTypeFilterCommand}" ToolTip.Tip="移除此类型筛选"/>
+                    <Button Content="{Binding OrientationFilterText}" Classes="toolbar-chip" IsVisible="{Binding HasOrientationFilter}"
+                            Command="{Binding RemoveOrientationFilterCommand}" ToolTip.Tip="移除此方向筛选"/>
+                    <TextBlock Text="{Binding DisplayFilterCountText}" VerticalAlignment="Center" FontSize="12"/>
+                    <TextBlock Text="没有符合当前筛选的文件" IsVisible="{Binding IsDisplayFilterEmpty}" VerticalAlignment="Center"/>
+                    <Button Content="重置" Classes="toolbar-compact" Command="{Binding ResetDisplayFilterCommand}" IsVisible="{Binding IsDisplayFilterEmpty}"/>
+                </WrapPanel>
+            </StackPanel>
+        </Grid>
 
         <!-- Toolbar Row 3: Paging + Zoom -->
         <Border Grid.Row="3" Grid.Column="1"
-                Margin="5,2,5,5" Padding="6,5"
+                Margin="5,1,5,2" Padding="6,2"
                 BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="6">
-            <Grid ColumnDefinitions="*,Auto">
-                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center">
-                    <Button Content="上一页" Margin="0,0,5,0" FontSize="12" Padding="8,4"
+            <Grid ColumnDefinitions="*,Auto" VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <Button Content="上一页" Classes="toolbar-compact" Margin="0,0,5,0"
+                            VerticalAlignment="Center"
                             Command="{Binding PrevPageCommand}"/>
                     <TextBlock Text="页:" VerticalAlignment="Center" Margin="0,0,5,0"
-                               Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
-                    <ComboBox Width="80" ItemsSource="{Binding PageNumbers}"
+                               Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"/>
+                    <ComboBox Classes="toolbar-compact" Width="80" ItemsSource="{Binding PageNumbers}"
+                              VerticalAlignment="Center"
                               SelectedIndex="{Binding CurrentPage}"/>
                     <TextBlock Text="/" VerticalAlignment="Center" Margin="5,0,5,0"
-                               Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
-                    <TextBlock Text="{Binding TotalPages}" Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"
+                               Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"/>
+                    <TextBlock Text="{Binding TotalPages}" Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"
                                VerticalAlignment="Center"/>
-                    <Button Content="下一页" Margin="10,0,0,0" FontSize="12" Padding="8,4"
+                    <Button Content="下一页" Classes="toolbar-compact" Margin="10,0,0,0"
+                            VerticalAlignment="Center"
                             Command="{Binding NextPageCommand}"/>
                 </StackPanel>
 
                 <StackPanel Orientation="Horizontal" Grid.Column="1"
                             HorizontalAlignment="Right" VerticalAlignment="Center" Margin="10,0,5,0">
                     <TextBlock Text="缩略图缩放:" VerticalAlignment="Center" Margin="0,0,8,0"
-                               Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                               Foreground="{DynamicResource SecondaryFgBrush}" FontSize="12"/>
                     <Slider Minimum="1" Maximum="10" Value="{Binding ZoomTick}"
-                            Width="160"/>
+                            Width="160" VerticalAlignment="Center"/>
                 </StackPanel>
             </Grid>
         </Border>
@@ -365,11 +462,13 @@
                                 Background="{Binding $parent[Window].DataContext.ThumbnailBackgroundColor, Converter={StaticResource HexToBrush}}"
                                 Opacity="{Binding $parent[Window].DataContext.ThumbnailOpacity}"
                                 PointerPressed="Thumbnail_PointerPressed"
+                                PointerEntered="Thumbnail_PointerEntered"
+                                PointerExited="Thumbnail_PointerExited"
                                 PointerMoved="Thumbnail_PointerMoved"
                                 PointerReleased="Thumbnail_PointerReleased"
                                 DoubleTapped="Thumbnail_DoubleTapped">
                             <Border.ContextMenu>
-                                <ContextMenu>
+                                <ContextMenu Opened="ThumbnailContextMenu_Opened">
                                     <MenuItem Header="编辑 Tag" Click="MenuEditTag_Click"/>
                                     <MenuItem Header="自动打标" Click="MenuAutoTag_Click"/>
                                     <MenuItem Header="清空选中图片的标签" Click="MenuClearSelectedTags_Click"/>

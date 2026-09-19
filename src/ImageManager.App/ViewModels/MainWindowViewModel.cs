@@ -21,8 +21,6 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace ImageManager.App.ViewModels;
 
-public enum OrientationFilter { All, Landscape, Portrait }
-
 public enum ImageSortOrder
 {
     FileNameAsc, FileNameDesc,
@@ -55,6 +53,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     // Observable mirror properties for UI bindings (AppSettings is POCO, no INPC)
     [ObservableProperty] private string _waterfallMode = "None";
+    [ObservableProperty] private string _searchToolbarLayout = "A";
     [ObservableProperty] private bool _showFileName = true;
     [ObservableProperty] private bool _showTags = true;
     [ObservableProperty] private bool _showOrientation = true;
@@ -75,6 +74,8 @@ public partial class MainWindowViewModel : ViewModelBase
 
     public void SyncUISettingsFromAppData()
     {
+        AppSettings.SearchToolbarLayout = NormalizeSearchToolbarLayout(AppSettings.SearchToolbarLayout);
+        SearchToolbarLayout = AppSettings.SearchToolbarLayout;
         WaterfallMode = AppSettings.WaterfallMode;
         // Restore zoom for the current mode
         ZoomTick = AppSettings.WaterfallMode switch
@@ -91,6 +92,42 @@ public partial class MainWindowViewModel : ViewModelBase
         ThumbnailOpacity = AppSettings.ThumbnailOpacity;
         KeepPadding = AppSettings.ThumbnailNoTextKeepPadding;
         CornerRadiusDip = AppSettings.ThumbnailCornerRadius;
+    }
+
+    public bool IsSearchToolbarLayoutA => string.Equals(SearchToolbarLayout, "A", StringComparison.OrdinalIgnoreCase);
+    public bool IsSearchToolbarLayoutC => string.Equals(SearchToolbarLayout, "C", StringComparison.OrdinalIgnoreCase);
+    public bool IsTagSearchPopupOpenA => IsSearchToolbarLayoutA && IsTagSearchPopupOpen;
+    public bool IsTagSearchPopupOpenC => IsSearchToolbarLayoutC && IsTagSearchPopupOpen;
+
+    public void SetSearchToolbarLayout(string? layout)
+    {
+        var normalized = NormalizeSearchToolbarLayout(layout);
+        if (string.Equals(SearchToolbarLayout, normalized, StringComparison.OrdinalIgnoreCase))
+        {
+            AppSettings.SearchToolbarLayout = normalized;
+            return;
+        }
+
+        IsTagSearchPopupOpen = false;
+        SearchToolbarLayout = normalized;
+        AppSettings.SearchToolbarLayout = normalized;
+    }
+
+    private static string NormalizeSearchToolbarLayout(string? layout) =>
+        string.Equals(layout, "C", StringComparison.OrdinalIgnoreCase) ? "C" : "A";
+
+    partial void OnSearchToolbarLayoutChanged(string value)
+    {
+        OnPropertyChanged(nameof(IsSearchToolbarLayoutA));
+        OnPropertyChanged(nameof(IsSearchToolbarLayoutC));
+        OnPropertyChanged(nameof(IsTagSearchPopupOpenA));
+        OnPropertyChanged(nameof(IsTagSearchPopupOpenC));
+    }
+
+    partial void OnIsTagSearchPopupOpenChanged(bool value)
+    {
+        OnPropertyChanged(nameof(IsTagSearchPopupOpenA));
+        OnPropertyChanged(nameof(IsTagSearchPopupOpenC));
     }
 
     /// <summary>Save current zoom to AppSettings for the given mode</summary>
@@ -206,24 +243,13 @@ public partial class MainWindowViewModel : ViewModelBase
 
     // ==================== Paging ====================
     private List<string> _allFiles = new();
+    private int _fileListMutationVersion;
     [ObservableProperty] private int _currentPage;
     [ObservableProperty] private int _totalPages;
     [ObservableProperty] private ObservableCollection<int> _pageNumbers = new();
 
-    /// <summary>Current active file list, including orientation filter</summary>
-    public List<string> ActiveFileList
-    {
-        get
-        {
-            var searchFiles = _tagSearch.SearchResultFiles;
-            var baseList = IsShowingSearchResult ? searchFiles : _allFiles;
-            if (OrientationFilter == OrientationFilter.All)
-                return baseList;
-            return _orientationFilteredFiles;
-        }
-    }
-
-    private List<string> _orientationFilteredFiles = new();
+    /// <summary>Published display snapshot, shared by paging and selection.</summary>
+    public List<string> ActiveFileList => _displayFilteredFiles;
 
     public double PreSearchScrollOffset { get; set; }
     public event Action? ScrollRestoreRequested;
@@ -243,7 +269,6 @@ public partial class MainWindowViewModel : ViewModelBase
     // ==================== Filters ====================
     [ObservableProperty] private string _tagSearchText = string.Empty;
     [ObservableProperty] private string _currentTagFilter = string.Empty;
-    [ObservableProperty] private OrientationFilter _orientationFilter = OrientationFilter.All;
     [ObservableProperty] private ObservableCollection<TagCount> _tagSearchSuggestions = new();
     [ObservableProperty] private bool _isTagSearchPopupOpen;
     [ObservableProperty] private string _coTagFilterText = string.Empty;
@@ -258,7 +283,7 @@ public partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     private async Task StopAutoTag()
     {
-        StatusText = "正在停止推理...";
+        StatusText = "正在停止自动打标...";
         var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
         await controller.CancelAsync();
     }
@@ -357,27 +382,7 @@ public partial class MainWindowViewModel : ViewModelBase
             CoTagFilterText = string.Empty;
             OnPropertyChanged(nameof(IsSuggestionCoTagMode));
 
-            if (!msg.HasResults || msg.ResultFiles.Count == 0)
-            {
-                CurrentTagFilter = string.Empty;
-                return;
-            }
-
-            IsShowingSearchResult = true;
-            if (msg.TotalPages == 0)
-            {
-                Images = new ObservableCollection<ImageViewItem>();
-                TotalPages = 0;
-                PageNumbers = new ObservableCollection<int>();
-            }
-            else
-            {
-                TotalPages = msg.TotalPages;
-                PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, msg.TotalPages));
-                _pageManager.InvalidateCache();
-                _ = ShowPageAsync(0);
-            }
-            StatusText = msg.StatusText;
+            _ = ApplyTagSearchDisplayAsync();
         });
 
         // Suggestions changed
@@ -419,7 +424,7 @@ public partial class MainWindowViewModel : ViewModelBase
         var folders = await _folderRepo.GetAllAsync();
         var nodes = folders.Select(f => new FolderTreeNode
         {
-            Path = f.Path, DisplayName = f.DisplayName, DbId = f.Id
+            Path = f.Path, DisplayName = f.DisplayName, Alias = f.Alias, DbId = f.Id
         }).ToList();
         await Task.WhenAll(nodes.Select(n => n.EnsureExpanderVisibleAsync()));
         FolderTree = new ObservableCollection<FolderTreeNode>(nodes);
@@ -466,7 +471,7 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             var node = new FolderTreeNode
             {
-                Path = info.Path, DisplayName = info.DisplayName, DbId = info.Id
+                Path = info.Path, DisplayName = info.DisplayName, Alias = info.Alias, DbId = info.Id
             };
             await node.EnsureExpanderVisibleAsync();
             FolderTree.Add(node);
@@ -535,7 +540,10 @@ public partial class MainWindowViewModel : ViewModelBase
         await _folderRepo.UpdateAliasAsync(folderPath, alias);
         var node = FindNodeByPath(folderPath);
         if (node != null)
+        {
+            node.Alias = alias;
             node.DisplayName = alias ?? System.IO.Path.GetFileName(folderPath.TrimEnd('\\', '/'));
+        }
     }
 
     /// <summary>Relocate a folder whose path changed externally. Updates all paths in DB.</summary>
@@ -583,7 +591,7 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         if (!string.IsNullOrEmpty(preferredFilePath))
         {
-            var preferredIndex = _allFiles.FindIndex(f =>
+            var preferredIndex = ActiveFileList.FindIndex(f =>
                 string.Equals(f, preferredFilePath, StringComparison.OrdinalIgnoreCase));
             if (preferredIndex >= 0)
                 return preferredIndex / PageManager.PageSize;
@@ -617,7 +625,12 @@ public partial class MainWindowViewModel : ViewModelBase
 
         IsShowingSearchResult = false;
         Images.Clear();
-        _allFiles.Clear();
+        _allFiles = new();
+        _displayFilteredFiles = new();
+        _filteredNavigationFiles = new();
+        DisplayFilterSourceCount = 0;
+        DisplayFilterUnknownCount = 0;
+        NotifyDisplayFilterState();
         _pageManager.InvalidateCache();
         _phashCache.Clear();
         lock (_tagCacheLock) { _tagCacheByPath.Clear(); }
@@ -665,9 +678,10 @@ public partial class MainWindowViewModel : ViewModelBase
 
         // 磁盘枚举先行（<1ms），DB 查询在后台异步运行，不阻塞 LoadFolderAsync
         PerfLogger.Log($"[LoadFolder] disk-enum start {sw.ElapsedMilliseconds}ms");
+        List<string> loadedFiles;
         try
         {
-            _allFiles = await Task.Run(() =>
+            loadedFiles = await Task.Run(() =>
             {
                 var files = new List<string>();
                 foreach (var file in Directory.EnumerateFiles(folder, "*.*", SearchOption.TopDirectoryOnly))
@@ -690,19 +704,21 @@ public partial class MainWindowViewModel : ViewModelBase
             StatusText = $"读取文件夹失败: {ex.Message}";
             return;
         }
+        if (folderWorkToken.IsCancellationRequested || isCurrent?.Invoke() == false ||
+            !IsFolderViewRequestCurrent(requestVersion, folder, showAllSubfolders)) return;
+        _allFiles = loadedFiles;
         PerfLogger.Log($"[LoadFolder] disk-enum done count={_allFiles.Count} {sw.ElapsedMilliseconds}ms");
-        if (folderWorkToken.IsCancellationRequested) return;
         AppLogger.Memory($"LoadFolder.DiskEnum count={_allFiles.Count}");
 
-        if (_allFiles.Count == 0)
+        if (!await UpdateDisplayFilterAsync()) return;
+        SetDisplayPaging();
+        if (ActiveFileList.Count == 0)
         {
-            StatusText = "该文件夹内没有媒体文件";
+            LoadedInfoText = "";
+            StatusText = HasDisplayFilter ? "没有符合当前筛选的文件" : "该文件夹内没有媒体文件";
             return;
         }
-
-        TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-        PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-        StatusText = $"总文件数: {_allFiles.Count}";
+        StatusText = DisplayFilterCountText;
 
         // 立即显示第一页 — 无后台 Task.Run，和 ShowAll 路径一致
         PerfLogger.Log($"[LoadFolder] A-before-getstart {sw.ElapsedMilliseconds}ms tid={Environment.CurrentManagedThreadId}");
@@ -764,9 +780,6 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        var previousFiles = _allFiles;
-        var previousFolder = CurrentFolder;
-        var previousShowAll = ShowAllSubfolders;
         var folderWorkToken = CurrentFolderWorkToken;
         try
         {
@@ -780,8 +793,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 return;
             }
 
-            _allFiles = files;
-            await PrecomputeHashesAsync(folderWorkToken, folder.DbId > 0 ? folder.DbId : null);
+            await PrecomputeHashesAsync(folderWorkToken, folder.DbId > 0 ? folder.DbId : null, files);
             StatusText = $"已重新计算失败项: {retryPaths.Count}";
         }
         catch (OperationCanceledException)
@@ -793,11 +805,52 @@ public partial class MainWindowViewModel : ViewModelBase
             AppLogger.Warn($"Recompute failed hashes failed: {folder.Path} | {ex.Message}");
             StatusText = $"重新计算失败项失败: {ex.Message}";
         }
-        finally
+    }
+
+    /// <summary>Compute missing or failed image hashes for a folder and all descendants.</summary>
+    public async Task ComputeHashesIncrementallyForFolderAsync(FolderTreeNode folder)
+    {
+        if (folder == null || string.IsNullOrWhiteSpace(folder.Path) || !Directory.Exists(folder.Path))
         {
-            if (string.Equals(CurrentFolder, previousFolder, StringComparison.OrdinalIgnoreCase)
-                && ShowAllSubfolders == previousShowAll)
-                _allFiles = previousFiles;
+            StatusText = "鏂囦欢澶逛笉瀛樺湪";
+            return;
+        }
+
+        List<string> files;
+        try
+        {
+            files = await Task.Run(() => Directory.EnumerateFiles(folder.Path, "*.*", SearchOption.AllDirectories)
+                .Where(FileTypeConstants.IsImageFile)
+                .ToList());
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"璇诲彇鏂囦欢澶辫触: {ex.Message}";
+            return;
+        }
+
+        if (files.Count == 0)
+        {
+            StatusText = "鏂囦欢澶规棤鍥剧墖";
+            return;
+        }
+
+        var folderWorkToken = CurrentFolderWorkToken;
+        try
+        {
+            var folderInfo = await _folderRepo.GetByPathAsync(folder.Path);
+            StatusText = $"姝ｅ湪璁＄畻 {files.Count} 寮犲浘鐗囩殑鎸囩汗...";
+            await PrecomputeHashesAsync(folderWorkToken, folderInfo?.Id ?? (folder.DbId > 0 ? folder.DbId : null), files);
+            StatusText = $"澧炴湁璁＄畻瀹屾垚: {files.Count} 寮犲浘鐗�";
+        }
+        catch (OperationCanceledException)
+        {
+            StatusText = "鎸囩汗璁＄畻宸插彇娑�";
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"Incremental hash failed: {folder.Path} | {ex.Message}");
+            StatusText = $"鎸囩汗璁＄畻澶辫触: {ex.Message}";
         }
     }
 
@@ -926,6 +979,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
             await SortFilesAsync(diskFiles, CurrentSortOrder, ShowAllSubfolders);
 
+            if (folderWorkToken.IsCancellationRequested) return;
             var oldSet = new HashSet<string>(_allFiles, StringComparer.OrdinalIgnoreCase);
             var newSet = new HashSet<string>(diskFiles, StringComparer.OrdinalIgnoreCase);
             var deleted = oldSet.Where(path => !newSet.Contains(path)).ToHashSet(StringComparer.OrdinalIgnoreCase);
@@ -937,23 +991,9 @@ public partial class MainWindowViewModel : ViewModelBase
             if (_tagSearch.SearchResultFiles.Count > 0)
                 _tagSearch.SearchResultFiles.RemoveAll(path => deleted.Contains(path));
 
-            TotalPages = ActiveFileList.Count == 0 ? 0 : (ActiveFileList.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-            PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-            if (CurrentPage >= TotalPages && TotalPages > 0)
-                CurrentPage = TotalPages - 1;
-
-            if (TotalPages == 0)
-            {
-                Images = new ObservableCollection<ImageViewItem>();
-                _pageManager.InvalidateCache();
-                StatusText = "该文件夹内没有媒体文件";
-                return;
-            }
-
-            _pageManager.RemoveFromCache(CurrentPage);
             CaptureSelectionForNextPageRefresh();
-            await ShowPageAsync(CurrentPage);
-            StatusText = $"总文件数: {_allFiles.Count}";
+            await RebuildDisplayFilterAsync(CurrentPage);
+            if (folderWorkToken.IsCancellationRequested) return;
 
             var fi = await _folderRepo.GetByPathAsync(CurrentFolder);
             if (fi != null)
@@ -1015,7 +1055,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 var newFiles = new List<string>();
                 foreach (var file in diskFiles)
                 {
-                    ct.ThrowIfCancellationRequested();
+                    await AutoTagRuntimeState.WaitForIdleAsync(ct);
                     if (!dbSet.Contains(file))
                     {
                         if (FileTypeConstants.IsVideoFile(file))
@@ -1041,10 +1081,10 @@ public partial class MainWindowViewModel : ViewModelBase
                         string? md5 = null;
                         try
                         {
-                            ct.ThrowIfCancellationRequested();
+                            await AutoTagRuntimeState.WaitForIdleAsync(ct);
                             using var fs = File.OpenRead(file);
                             md5 = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(fs)).ToLowerInvariant();
-                            ct.ThrowIfCancellationRequested();
+                            await AutoTagRuntimeState.WaitForIdleAsync(ct);
                         }
                         catch (OperationCanceledException)
                         {
@@ -1085,7 +1125,16 @@ public partial class MainWindowViewModel : ViewModelBase
                                 continue;
                             }
                         }
-                        await _metaRepo.SetFolderIdAsync(file, folderId);
+                        var newFileInfo = new FileInfo(file);
+                        await _metaRepo.UpsertAsync(new ImageMeta
+                        {
+                            FilePath = file,
+                            FileHash = md5,
+                            FolderId = folderId,
+                            FileSize = newFileInfo.Length,
+                            LastWriteTicks = newFileInfo.LastWriteTimeUtc.Ticks,
+                            HashStatus = 0
+                        });
                         newFiles.Add(file);
                     }
                 }
@@ -1093,7 +1142,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 bool deleted = false;
                 foreach (var meta in dbFiles)
                 {
-                    ct.ThrowIfCancellationRequested();
+                    await AutoTagRuntimeState.WaitForIdleAsync(ct);
                     if (!diskFiles.Contains(meta.FilePath) && !File.Exists(meta.FilePath))
                     {
                         await _metaRepo.SetFolderIdAsync(meta.FilePath, 0L);
@@ -1130,7 +1179,7 @@ public partial class MainWindowViewModel : ViewModelBase
         return false;
     }
 
-    private async Task PrecomputeHashesAsync(CancellationToken ct, long? folderId = null)
+    private async Task PrecomputeHashesAsync(CancellationToken ct, long? folderId = null, IReadOnlyCollection<string>? paths = null)
     {
         if (AutoTagRuntimeState.IsRunning)
         {
@@ -1152,16 +1201,16 @@ public partial class MainWindowViewModel : ViewModelBase
         try
         {
             if (token.IsCancellationRequested) return;
-            await PrecomputeHashesCoreAsync(token, folderId);
+            await PrecomputeHashesCoreAsync(token, folderId, paths);
         }
         finally { _hashGate.Release(); }
     }
 
-    private async Task PrecomputeHashesCoreAsync(CancellationToken ct, long? folderId)
+    private async Task PrecomputeHashesCoreAsync(CancellationToken ct, long? folderId, IReadOnlyCollection<string>? paths = null)
     {
         if (AutoTagRuntimeState.IsRunning) return;
 
-        var files = _allFiles.ToArray();
+        var files = (paths ?? _allFiles).ToArray();
         if (files.Length == 0) return;
 
         HashSet<string> existingSet = await GetHashedPathsWithRetryAsync(files, ct);
@@ -1219,6 +1268,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 {
                     while (channel.Reader.TryRead(out var item))
                     {
+                        await AutoTagRuntimeState.WaitForIdleAsync(ct);
                         await cpuSlots.WaitAsync(ct);
                         try
                         {
@@ -1249,7 +1299,10 @@ public partial class MainWindowViewModel : ViewModelBase
                             {
                                 var batch = DrainBatch();
                                 if (batch.Count > 0)
+                                {
+                                    await AutoTagRuntimeState.WaitForIdleAsync(ct);
                                     await _metaRepo.BulkUpsertAsync(batch);
+                                }
                                 Interlocked.Add(ref processed, batch.Count);
                                 int snap = Interlocked.CompareExchange(ref processed, 0, 0);
                                 _dispatcher.InvokeAsync(() =>
@@ -1272,55 +1325,70 @@ public partial class MainWindowViewModel : ViewModelBase
         // Start consumers first, then produce with bounded parallelism
         var consumerTaskList = consumeTasks.ToList();
 
-        await Parallel.ForEachAsync(
-            needsHashing,
-            new ParallelOptions { MaxDegreeOfParallelism = ioConcurrency, CancellationToken = ct },
-            async (path, token) =>
-            {
-                try
+        try
+        {
+            await Parallel.ForEachAsync(
+                needsHashing,
+                new ParallelOptions { MaxDegreeOfParallelism = ioConcurrency, CancellationToken = ct },
+                async (path, token) =>
                 {
-                    var fi = new FileInfo(path);
-                    string fileHash;
-                    if (fileHashCache.TryGetValue(path, out var cachedHash))
+                    try
                     {
-                        fileHash = cachedHash;
+                        await AutoTagRuntimeState.WaitForIdleAsync(token);
+                        var fi = new FileInfo(path);
+                        string fileHash;
+                        if (fileHashCache.TryGetValue(path, out var cachedHash))
+                        {
+                            fileHash = cachedHash;
+                        }
+                        else
+                        {
+                            token.ThrowIfCancellationRequested();
+                            using var fs = File.OpenRead(path);
+                            fileHash = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(fs)).ToLowerInvariant();
+                            token.ThrowIfCancellationRequested();
+                        }
+                        var hashInput = ThumbnailGenerator.DecodeForHashInput(path, 256);
+                        if (hashInput == null)
+                        {
+                            failedBatch.Enqueue(CreateFailedHashMeta(path, fileHash, fi, folderId));
+                            Interlocked.Increment(ref failed);
+                            if (Interlocked.Increment(ref failedLogCount) <= 5)
+                                AppLogger.Warn($"HashPrecompute decode skipped: {path}");
+                            return;
+                        }
+                        await channel.Writer.WriteAsync(
+                            (path, hashInput, fi.Length, fi.LastWriteTimeUtc.Ticks, fileHash), token);
                     }
-                    else
+                    catch (OperationCanceledException) { }
+                    catch (Exception ex) when (HandleHashProducerFailure(path, ex))
                     {
-                        token.ThrowIfCancellationRequested();
-                        using var fs = File.OpenRead(path);
-                        fileHash = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(fs)).ToLowerInvariant();
-                        token.ThrowIfCancellationRequested();
                     }
-                    var hashInput = ThumbnailGenerator.DecodeForHashInput(path, 256);
-                    if (hashInput == null)
-                    {
-                        failedBatch.Enqueue(CreateFailedHashMeta(path, fileHash, fi, folderId));
-                        Interlocked.Increment(ref failed);
-                        if (Interlocked.Increment(ref failedLogCount) <= 5)
-                            AppLogger.Warn($"HashPrecompute decode skipped: {path}");
-                        return;
-                    }
-                    await channel.Writer.WriteAsync(
-                        (path, hashInput, fi.Length, fi.LastWriteTimeUtc.Ticks, fileHash), token);
-                }
-                catch (OperationCanceledException) { }
-                catch (Exception ex) when (HandleHashProducerFailure(path, ex))
-                {
-                }
-                catch (Exception ex) { AppLogger.Warn($"Hash producer 文件失败: {ex.Message}"); }
-            });
-        channel.Writer.Complete();
-        await Task.WhenAll(consumerTaskList);
+                    catch (Exception ex) { AppLogger.Warn($"Hash producer 文件失败: {ex.Message}"); }
+                });
+        }
+        finally
+        {
+            channel.Writer.TryComplete();
+            await Task.WhenAll(consumerTaskList);
+        }
+        ct.ThrowIfCancellationRequested();
+        await AutoTagRuntimeState.WaitForIdleAsync(ct);
 
         var final = DrainBatch();
-        if (final.Count > 0)
-            await _metaRepo.BulkUpsertAsync(final);
+        foreach (var batch in final.Chunk(100))
+        {
+            await AutoTagRuntimeState.WaitForIdleAsync(ct);
+            await _metaRepo.BulkUpsertAsync(batch.ToList());
+        }
         Interlocked.Add(ref processed, final.Count);
 
         var failedFinal = DrainFailedBatch();
-        if (failedFinal.Count > 0)
-            await _metaRepo.BulkUpsertAsync(failedFinal);
+        foreach (var batch in failedFinal.Chunk(100))
+        {
+            await AutoTagRuntimeState.WaitForIdleAsync(ct);
+            await _metaRepo.BulkUpsertAsync(batch.ToList());
+        }
 
         _dispatcher.InvokeAsync(() =>
             BackgroundStatusText = "");
@@ -1359,8 +1427,8 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
-    /// <summary>Query HashStatus=1 paths with retry. On total failure, returns all files
-    /// as "already hashed" to skip this cycle safely (idle timer will retrigger).</summary>
+    /// <summary>Query usable hashed paths with retry. On total failure, return an empty set
+    /// so files are not falsely treated as completed; the write path will report the error.</summary>
     private async Task<HashSet<string>> GetHashedPathsWithRetryAsync(string[] files, CancellationToken ct)
     {
         const int maxRetries = 3;
@@ -1389,7 +1457,7 @@ public partial class MainWindowViewModel : ViewModelBase
             }
         }
         AppLogger.Error("GetHashedPathsAsync 全部重试失败，跳过本轮哈希预计算");
-        return new HashSet<string>(files, StringComparer.OrdinalIgnoreCase);
+        return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
     }
 
     /// <summary>用户停止切换文件夹 5 秒后执行维护任务（CleanMeta、PrecomputeHashes、SyncFolder）</summary>
@@ -1905,29 +1973,10 @@ partial void OnCornerRadiusDipChanged(double value)
 
         _allFiles = rebuiltFiles;
         AppLogger.Memory($"RebuildList count={rebuiltFiles.Count}");
-        _tagSearch.SearchResultFiles.Sort(CreateSortComparison(CurrentSortOrder));
-        _orientationFilteredFiles.Clear();
-
-        var active = ActiveFileList;
-        TotalPages = active.Count == 0 ? 0 : (active.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-        PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-        _pageManager.InvalidateCache();
-
-        if (active.Count == 0)
-        {
-            Images = new ObservableCollection<ImageViewItem>();
-        }
-        else
-        {
-            // Keep current page — don't jump to 0 on background refresh
-            int targetPage = CurrentPage;
-            if (targetPage >= TotalPages) targetPage = Math.Max(0, TotalPages - 1);
-            if (targetPage == CurrentPage)
-                CaptureSelectionForNextPageRefresh();
-            await ShowPageAsync(targetPage);
-        }
-
-        StatusText = $"总文件数: {_allFiles.Count}";
+        CaptureSelectionForNextPageRefresh();
+        await RebuildDisplayFilterAsync(CurrentPage);
+        if (folderWorkToken.IsCancellationRequested ||
+            !IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders)) return;
 
         // Load tags in background — page already visible, tags fill in asynchronously
         if (showAllSubfolders)
@@ -1979,6 +2028,8 @@ partial void OnCornerRadiusDipChanged(double value)
 
     private int BeginFolderViewRequest()
     {
+        CancelDisplayFilter();
+        Interlocked.Increment(ref _resultNavigationVersion);
         return Interlocked.Increment(ref _folderViewRequestVersion);
     }
 
@@ -2028,6 +2079,7 @@ partial void OnCornerRadiusDipChanged(double value)
 
     public void ShutdownBackgroundWork()
     {
+        CancelDisplayFilter();
         StopWatchingCurrentFolder();
         _idleTimer?.Stop();
         _pageManager.CancelCurrentLoads();
@@ -2167,11 +2219,26 @@ partial void OnCornerRadiusDipChanged(double value)
         try
         {
 
-        // Remove from master lists
+        var filterWasPending = IsDisplayFilterBusy;
+        CancelDisplayFilter();
+        IsDisplayFilterBusy = false;
+        // Remove from master lists and both published snapshots.
+        ++_fileListMutationVersion;
+        _displayFilteredFiles.RemoveAll(p => deletedPaths.Contains(p));
+        _filteredNavigationFiles.RemoveAll(p => deletedPaths.Contains(p));
         _allFiles.RemoveAll(p => deletedPaths.Contains(p));
         if (_tagSearch.SearchResultFiles.Count > 0)
             _tagSearch.SearchResultFiles.RemoveAll(p => deletedPaths.Contains(p));
 
+        if (HasDisplayFilter || filterWasPending)
+        {
+            CaptureSelectionForNextPageRefresh();
+            await RebuildDisplayFilterAsync(CurrentPage);
+            return;
+        }
+
+        DisplayFilterSourceCount = (IsShowingSearchResult ? _tagSearch.SearchResultFiles : _allFiles).Count;
+        NotifyDisplayFilterState();
         // Recalculate paging
         var files = ActiveFileList;
         TotalPages = files.Count == 0 ? 0 : (files.Count + PageManager.PageSize - 1) / PageManager.PageSize;
@@ -2261,90 +2328,25 @@ partial void OnCornerRadiusDipChanged(double value)
     }
 
 
-    // ==================== Orientation Filter ====================
-
-    [RelayCommand] private async Task FilterAll() { OrientationFilter = OrientationFilter.All; await RebuildFromOrientationFilterAsync(); }
-    [RelayCommand] private async Task FilterLandscape() { OrientationFilter = OrientationFilter.Landscape; await RebuildFromOrientationFilterAsync(); }
-    [RelayCommand] private async Task FilterPortrait() { OrientationFilter = OrientationFilter.Portrait; await RebuildFromOrientationFilterAsync(); }
-
-    private async Task RebuildFromOrientationFilterAsync()
-    {
-        var source = IsShowingSearchResult ? _tagSearch.SearchResultFiles : _allFiles;
-
-        if (OrientationFilter == OrientationFilter.All)
-        {
-            _orientationFilteredFiles.Clear();
-        }
-        else
-        {
-            var wantLandscape = OrientationFilter == OrientationFilter.Landscape;
-            // Batch-load dimensions from DB (covers all hashed files in one query)
-            var dimensions = await _metaRepo.GetDimensionsByPathsAsync(source);
-
-            _orientationFilteredFiles = await Task.Run(() =>
-            {
-                var filtered = new List<string>();
-                foreach (var path in source)
-                {
-                    if (dimensions.TryGetValue(path, out var dim) && dim.Width > 0)
-                    {
-                        if ((wantLandscape && dim.Width >= dim.Height) ||
-                            (!wantLandscape && dim.Width < dim.Height))
-                            filtered.Add(path);
-                    }
-                    else
-                    {
-                        if (FileTypeConstants.IsVideoFile(path))
-                            continue;
-
-                        // Fallback: read file header for unhashed files
-                        try
-                        {
-                            var (w, h) = ThumbnailGenerator.GetDimensions(path);
-                            if ((wantLandscape && w >= h) || (!wantLandscape && w < h))
-                                filtered.Add(path);
-                        }
-                        catch { }
-                    }
-                }
-                return filtered;
-            });
-        }
-
-        var files = ActiveFileList;
-        TotalPages = files.Count == 0 ? 0 : (files.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-        PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-        _pageManager.InvalidateCache();
-
-        if (files.Count == 0)
-        {
-            Images = new ObservableCollection<ImageViewItem>();
-            StatusText = "没有符合方向筛选的图片";
-        }
-        else
-        {
-            await ShowPageAsync(0);
-            StatusText = $"{(OrientationFilter == OrientationFilter.Landscape ? "横图" : "竖图")}: {files.Count} 张";
-        }
-    }
-
     // ==================== Sort ====================
 
     public async Task SortImagesAsync(ImageSortOrder order)
     {
         CurrentSortOrder = order;
 
-        if (_allFiles.Count == 0) return;
-
-        await SortFilesAsync(_allFiles, order, ShowAllSubfolders);
-        _tagSearch.SearchResultFiles.Sort(CreateSortComparison(order));
-        _orientationFilteredFiles.Clear();
-
-        var active = ActiveFileList;
-        TotalPages = active.Count == 0 ? 0 : (active.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-        PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-        _pageManager.InvalidateCache();
-        await ShowPageAsync(0);
+        var folder = CurrentFolder;
+        var source = _allFiles;
+        var mutationVersion = _fileListMutationVersion;
+        var folderVersion = _folderViewRequestVersion;
+        var sorted = source.ToList();
+        await SortFilesAsync(sorted, order, ShowAllSubfolders);
+        if (!ReferenceEquals(source, _allFiles) || mutationVersion != _fileListMutationVersion ||
+            folderVersion != _folderViewRequestVersion ||
+            !string.Equals(folder, CurrentFolder, StringComparison.OrdinalIgnoreCase) || CurrentSortOrder != order) return;
+        _allFiles = sorted;
+        // Similarity result order is its relevance rank; only ordinary Tag results use file sorting.
+        if (_similarityScores.Count == 0) _tagSearch.SearchResultFiles.Sort(CreateSortComparison(order));
+        await RebuildDisplayFilterAsync();
 
         var labels = new Dictionary<ImageSortOrder, string>
         {
@@ -2395,41 +2397,12 @@ partial void OnCornerRadiusDipChanged(double value)
     {
         TagSearchText = string.Empty;
         CurrentTagFilter = string.Empty;
-        OrientationFilter = OrientationFilter.All;
-        _orientationFilteredFiles.Clear();
-
-        if (IsShowingSearchResult)
-        {
-            // Restore normal page view
-            IsShowingSearchResult = false;
-            _tagSearch.SearchResultFiles.Clear();
-            _similarityScores.Clear();
-            _similarityMatchKinds.Clear();
-
-            TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-            PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-
-            if (ShowAllSubfolders && !string.IsNullOrEmpty(CurrentFolder))
-            {
-                await RebuildFileListAsync();
-            }
-            else if (_pageManager.TryRestorePreSearchState(out var pageIndex))
-            {
-                await ShowPageAsync(pageIndex);
-                StatusText = $"总文件数: {_allFiles.Count}";
-                ScrollRestoreRequested?.Invoke();
-            }
-            else if (!string.IsNullOrEmpty(CurrentFolder))
-            {
-                await LoadFolderAsync(CurrentFolder);
-            }
-        }
-        else
-        {
-            TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-            PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-            await ShowPageAsync(0);
-        }
+        DisplayFilter = new();
+        IsShowingSearchResult = false;
+        _tagSearch.SearchResultFiles.Clear();
+        _similarityScores.Clear();
+        _similarityMatchKinds.Clear();
+        await RebuildDisplayFilterAsync();
     }
 
     // ==================== Similar Image Search ====================
@@ -2449,6 +2422,7 @@ partial void OnCornerRadiusDipChanged(double value)
         {
             var candidates = (await GetSearchScopeFilesAsync()).ToList();
             requestCts.Token.ThrowIfCancellationRequested();
+            AppLogger.Info($"SimilarSearch scope={SearchScope} candidates={candidates.Count} mode={mode} file={filePath}");
             var resultLimit = Math.Clamp(AppSettings.SimilaritySearchResultLimit, 1, 500);
             var results = await _similarService.SearchByImageAsync(
                 filePath, candidates, mode, resultLimit, requestCts.Token);
@@ -2581,7 +2555,7 @@ partial void OnCornerRadiusDipChanged(double value)
             if (useRankedResults)
             {
                 IsShowingSearchResult = true;
-                await RebuildFromOrientationFilterAsync();
+                await RebuildDisplayFilterAsync();
                 if (!isCurrentSearch())
                     return;
                 ScrollSearchResultsToTopRequested?.Invoke();
@@ -2589,7 +2563,7 @@ partial void OnCornerRadiusDipChanged(double value)
             else if (IsShowingSearchResult)
             {
                 IsShowingSearchResult = false;
-                await RebuildFromOrientationFilterAsync();
+                await RebuildDisplayFilterAsync();
                 if (!isCurrentSearch())
                     return;
             }
@@ -2615,7 +2589,7 @@ partial void OnCornerRadiusDipChanged(double value)
     {
         IsShowingSearchResult = true;
         Interlocked.Increment(ref _resultNavigationVersion);
-        await RebuildFromOrientationFilterAsync();
+        await RebuildDisplayFilterAsync();
         if (!isCurrentSearch())
             return;
 
@@ -2636,27 +2610,26 @@ partial void OnCornerRadiusDipChanged(double value)
         if (IsShowingSearchResult)
         {
             IsShowingSearchResult = false;
-            await RebuildFromOrientationFilterAsync();
+            await RebuildDisplayFilterAsync();
             if (!isCurrentSearch())
                 return;
         }
         else
         {
-            var files = ActiveFileList;
-            TotalPages = files.Count == 0 ? 0 : (files.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-            PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-            _pageManager.InvalidateCache();
+            await RebuildDisplayFilterAsync(CurrentPage);
+            if (!isCurrentSearch()) return;
         }
 
         await NavigateToResultAsync(forcePageReload: true);
     }
 
     private List<string> ResultNavigationFiles =>
-        IsShowingSearchResult ? ActiveFileList : _tagSearch.SearchResultFiles;
+        IsShowingSearchResult ? ActiveFileList : _filteredNavigationFiles;
 
     private string FormatSearchResultInfo()
     {
         var files = ResultNavigationFiles;
+        if (files.Count == 0) return "当前筛选下没有相似结果";
         var scoreText = _currentResultIndex >= 0 && _currentResultIndex < files.Count &&
                         _similarityScores.TryGetValue(files[_currentResultIndex], out var score)
             ? $"  相似度 {score:0.000}"
@@ -2717,7 +2690,7 @@ partial void OnCornerRadiusDipChanged(double value)
         var targetDir = Path.GetDirectoryName(targetPath) ?? "";
 
         // === 阶段1：展开并高亮目标文件夹 ===
-        bool needSwitchFolder = !ShowAllSubfolders &&
+        bool needSwitchFolder = !IsShowingSearchResult && !ShowAllSubfolders &&
                                 !string.Equals(CurrentFolder, targetDir, StringComparison.OrdinalIgnoreCase);
         bool shouldScroll = ShowAllSubfolders || needSwitchFolder;
 
@@ -2744,8 +2717,7 @@ partial void OnCornerRadiusDipChanged(double value)
             }
 
             // 轻量级文件枚举：仅加载目标文件夹的文件列表，不清除缓存和搜索状态
-            var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-                { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp" };
+            var exts = FileTypeConstants.AllMediaExtensions;
             var folderFiles = await Task.Run(() =>
             {
                 try
@@ -2768,15 +2740,13 @@ partial void OnCornerRadiusDipChanged(double value)
             // 更新文件列表并跳到目标文件所在页
             _allFiles = folderFiles;
             CurrentFolder = targetDir;
+            // Refilter the new folder; preserve the selected result after filter publication resets navigation.
+            if (!await UpdateDisplayFilterAsync(preserveNavigation: true) || !IsCurrentNavigation()) return;
+            _currentResultIndex = Math.Max(0, ResultNavigationFiles.FindIndex(f =>
+                string.Equals(f, targetPath, StringComparison.OrdinalIgnoreCase)));
+            SetDisplayPaging();
             _pageManager.InvalidateCache();
-            TotalPages = (folderFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-            PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-
-            int fileIdx = folderFiles.FindIndex(f =>
-                string.Equals(f, targetPath, StringComparison.OrdinalIgnoreCase));
-            int page = fileIdx >= 0 ? fileIdx / PageManager.PageSize : 0;
-            await ShowPageAsync(page);
-            if (!IsCurrentNavigation()) return;
+            forcePageReload = true;
 
             // 更新文件夹树选中状态（抑制 SelectionChanged 重入）
             _isProgrammaticFolderSelection = true;
@@ -2934,24 +2904,9 @@ partial void OnCornerRadiusDipChanged(double value)
         _similarityMatchKinds.Clear();
         OnPropertyChanged(nameof(HasSearchResults));
 
-        // Recalculate paging for normal folder view
-        TotalPages = (_allFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
-        PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
-
-        if (ShowAllSubfolders && !string.IsNullOrEmpty(CurrentFolder))
-        {
-            await RebuildFileListAsync();
-        }
-        else if (_pageManager.TryRestorePreSearchState(out var pageIndex))
-        {
-            await ShowPageAsync(pageIndex);
-            StatusText = $"总文件数: {_allFiles.Count}";
-            ScrollRestoreRequested?.Invoke();
-        }
-        else if (!string.IsNullOrEmpty(CurrentFolder))
-        {
-            await LoadFolderAsync(CurrentFolder);
-        }
+        var page = _pageManager.TryRestorePreSearchState(out var savedPage) ? savedPage : 0;
+        await RebuildDisplayFilterAsync(page);
+        ScrollRestoreRequested?.Invoke();
     }
 
     // ==================== Duplicate Detection ====================

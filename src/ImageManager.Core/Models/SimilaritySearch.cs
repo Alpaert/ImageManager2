@@ -55,3 +55,12 @@ public sealed record VectorIndexStatus(
     int TotalImages,
     int IndexedImages,
     int MissingOrStaleImages);
+
+public sealed record HashRepairProgress(
+    int Total,
+    int Processed,
+    int Generated,
+    int Skipped,
+    int Failed,
+    string? CurrentFile,
+    string? Error);

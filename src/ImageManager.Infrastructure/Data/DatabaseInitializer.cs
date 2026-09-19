@@ -136,6 +136,7 @@ public static class DatabaseInitializer
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             CREATE INDEX IF NOT EXISTS idx_imagemeta_folderid ON ImageMeta(FolderId);
+            CREATE INDEX IF NOT EXISTS idx_imagemeta_filepath_nocase ON ImageMeta(FilePath COLLATE NOCASE);
             CREATE INDEX IF NOT EXISTS idx_suppressedcharactertag_image
                 ON SuppressedCharacterTag(ImageMetaId);
             """;

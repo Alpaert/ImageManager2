@@ -2,12 +2,15 @@ using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Hashing;
+using ImageManager.Infrastructure.Imaging;
 
 namespace ImageManager.Infrastructure.Services;
 
 public sealed class VectorIndexService : IVectorIndexService
 {
     private readonly IImageEmbeddingRepository _repository;
+    private readonly IImageMetaRepository _metaRepository;
     private readonly ChineseClipService _chineseClip;
     private readonly ISimilarImageService _similarImageService;
     private readonly object _stateLock = new();
@@ -17,10 +20,12 @@ public sealed class VectorIndexService : IVectorIndexService
 
     public VectorIndexService(
         IImageEmbeddingRepository repository,
+        IImageMetaRepository metaRepository,
         ChineseClipService chineseClip,
         ISimilarImageService similarImageService)
     {
         _repository = repository;
+        _metaRepository = metaRepository;
         _chineseClip = chineseClip;
         _similarImageService = similarImageService;
     }
@@ -147,6 +152,107 @@ public sealed class VectorIndexService : IVectorIndexService
         }
     }
 
+    public async Task RepairHashesAsync(
+        VectorIndexScope scope,
+        IProgress<HashRepairProgress>? progress = null,
+        CancellationToken ct = default)
+    {
+        if (Interlocked.CompareExchange(ref _running, 1, 0) != 0)
+            throw new InvalidOperationException("宸叉湁绱㈠紩鎴栨寚绾逛换鍔℃鍦ㄨ繍琛�");
+
+        lock (_stateLock)
+        {
+            _runCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _paused = false;
+        }
+        var token = _runCancellation.Token;
+        var batch = new List<ImageMeta>(64);
+        try
+        {
+            var files = await EnumerateImageFilesAsync(scope, token);
+            if (files.Count == 0)
+            {
+                progress?.Report(new HashRepairProgress(0, 0, 0, 0, 0, null, null));
+                return;
+            }
+
+            var metadata = await _metaRepository.GetHashMetadataByPathsAsync(files);
+            var metadataMap = metadata.ToDictionary(item => item.FilePath, StringComparer.OrdinalIgnoreCase);
+            var pending = new List<string>();
+            foreach (var path in files)
+            {
+                token.ThrowIfCancellationRequested();
+                if (!metadataMap.TryGetValue(path, out var meta) || !IsUsableHash(meta, path))
+                    pending.Add(path);
+            }
+
+            var processed = 0;
+            var generated = 0;
+            var skipped = files.Count - pending.Count;
+            var failed = 0;
+            progress?.Report(new HashRepairProgress(files.Count, 0, 0, skipped, 0, null, null));
+            foreach (var path in pending)
+            {
+                token.ThrowIfCancellationRequested();
+                await WaitWhilePausedAsync(token);
+                try
+                {
+                    var info = new FileInfo(path);
+                    using var stream = File.OpenRead(path);
+                    var fileHash = Convert.ToHexString(System.Security.Cryptography.MD5.HashData(stream)).ToLowerInvariant();
+                    var perceptualHash = HashService.ComputeCombinedPerceptualHashFromFile(path);
+                    var dimensions = ThumbnailGenerator.GetDimensions(path);
+                    batch.Add(new ImageMeta
+                    {
+                        FilePath = path,
+                        FileHash = fileHash,
+                        PerceptualHash = perceptualHash,
+                        Width = dimensions.Width,
+                        Height = dimensions.Height,
+                        FileSize = info.Length,
+                        LastWriteTicks = info.LastWriteTimeUtc.Ticks,
+                        FolderId = metadataMap.TryGetValue(path, out var existing) ? existing.FolderId : null,
+                        HashStatus = string.IsNullOrEmpty(perceptualHash) ? -1 : 1
+                    });
+                    if (string.IsNullOrEmpty(perceptualHash)) failed++; else generated++;
+                    if (batch.Count >= 64)
+                    {
+                        await _metaRepository.BulkUpsertAsync(batch);
+                        batch.Clear();
+                    }
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    failed++;
+                    progress?.Report(new HashRepairProgress(files.Count, processed, generated, skipped, failed, path, ex.Message));
+                }
+                processed++;
+                progress?.Report(new HashRepairProgress(files.Count, processed, generated, skipped, failed, path, null));
+            }
+            if (batch.Count > 0)
+                await _metaRepository.BulkUpsertAsync(batch);
+            batch.Clear();
+            progress?.Report(new HashRepairProgress(files.Count, processed, generated, skipped, failed, null, null));
+        }
+        catch (OperationCanceledException)
+        {
+            if (batch.Count > 0)
+                await _metaRepository.BulkUpsertAsync(batch);
+            throw;
+        }
+        finally
+        {
+            lock (_stateLock)
+            {
+                _runCancellation?.Dispose();
+                _runCancellation = null;
+                _paused = false;
+            }
+            Interlocked.Exchange(ref _running, 0);
+        }
+    }
+
     public void Pause()
     {
         if (IsRunning)
@@ -180,6 +286,55 @@ public sealed class VectorIndexService : IVectorIndexService
                 root,
                 StringComparison.OrdinalIgnoreCase))
             .ToList();
+    }
+
+    private async Task<List<string>> EnumerateImageFilesAsync(VectorIndexScope scope, CancellationToken ct)
+    {
+        if (scope.IsAll)
+        {
+            var indexed = await _repository.GetSearchIndexCandidatesAsync(scope);
+            return indexed.Select(item => item.FilePath)
+                .Where(File.Exists)
+                .Where(FileTypeConstants.IsImageFile)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        var roots = new[] { Path.GetFullPath(scope.FolderPath!) };
+        var files = new List<string>();
+        foreach (var root in roots)
+        {
+            var option = scope.IsAll || scope.IncludeSubfolders ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+            try
+            {
+                var enumerationOptions = new EnumerationOptions
+                {
+                    RecurseSubdirectories = option == SearchOption.AllDirectories,
+                    IgnoreInaccessible = true,
+                    ReturnSpecialDirectories = false
+                };
+                foreach (var file in Directory.EnumerateFiles(root, "*.*", enumerationOptions))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (FileTypeConstants.IsImageFile(file)) files.Add(file);
+                }
+            }
+            catch (UnauthorizedAccessException) { }
+            catch (IOException) { }
+        }
+        return files.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private static bool IsUsableHash(ImageMeta meta, string path)
+    {
+        if (meta.HashStatus != 1 || string.IsNullOrWhiteSpace(meta.PerceptualHash) || meta.PerceptualHash.Split('|').Length < 4)
+            return false;
+        try
+        {
+            var info = new FileInfo(path);
+            return info.Length == meta.FileSize && info.LastWriteTimeUtc.Ticks == meta.LastWriteTicks;
+        }
+        catch { return false; }
     }
 
     private async Task<float[]> GenerateAsync(VectorIndexKind kind, string path, CancellationToken ct)

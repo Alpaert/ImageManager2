@@ -157,6 +157,7 @@ public sealed class SimilarImageService : ISimilarImageService
         var files = candidates.ToList();
         if (files.Count == 0)
             return [];
+        AppLogger.Info($"PerceptualSearch candidates={files.Count} base={Path.GetFileName(baseFilePath)}");
         var hashCache = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var hashes = await _metaRepository.GetPerceptualHashesByPathsAsync(files);
         foreach (var pair in hashes)
@@ -165,9 +166,37 @@ public sealed class SimilarImageService : ISimilarImageService
                 hashCache[pair.Key] = pair.Value;
         }
 
+        // Database hashes may be missing for older or interrupted indexing runs.
+        // Compute those candidates on demand so a stale HashStatus cannot make the
+        // entire perceptual search return no results.
+        var missing = files
+            .Where(path => !hashCache.ContainsKey(path) && File.Exists(path))
+            .ToList();
+        if (missing.Count > 0)
+        {
+            AppLogger.Info($"PerceptualSearch computing missing hashes: {missing.Count}");
+            await Task.Run(() => Parallel.ForEach(
+                missing,
+                new ParallelOptions
+                {
+                    CancellationToken = ct,
+                    MaxDegreeOfParallelism = Math.Max(1, Math.Min(Environment.ProcessorCount, 4))
+                },
+                path =>
+                {
+                    var hash = HashService.ComputeCombinedPerceptualHashFromFile(path);
+                    if (!string.IsNullOrEmpty(hash) && hash.Split('|').Length >= 4)
+                        hashCache[path] = hash;
+                }), ct);
+        }
+
         var baseHash = await Task.Run(() => HashService.ComputeCombinedPerceptualHashFromFile(baseFilePath), ct);
         if (string.IsNullOrEmpty(baseHash))
+        {
+            AppLogger.Warn($"PerceptualSearch base hash failed: {baseFilePath}");
             return [];
+        }
+        AppLogger.Info($"PerceptualSearch usableHashes={hashCache.Count} baseHashLength={baseHash.Length}");
         var results = new ConcurrentBag<SimilaritySearchResult>();
         await Task.Run(() => Parallel.ForEach(files, new ParallelOptions
         {

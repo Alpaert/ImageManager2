@@ -20,23 +20,32 @@ public class DbContextFactory : IDbContextFactory
         _connectionString = $"Data Source={dbPath}";
     }
 
-    public SqliteConnection CreateConnection()
+    public SqliteConnection CreateConnection(int commandTimeout = 30)
     {
         var conn = new SqliteConnection(_connectionString);
-        conn.Open();
+        conn.DefaultTimeout = commandTimeout;
+        try
+        {
+            conn.Open();
 
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = """
-            PRAGMA journal_mode=WAL;
-            PRAGMA busy_timeout=30000;
-            PRAGMA foreign_keys=ON;
-            PRAGMA cache_size=-8192;
-            PRAGMA synchronous=NORMAL;
-            PRAGMA temp_store=MEMORY;
-            """;
-        cmd.ExecuteNonQuery();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = $"""
+                PRAGMA busy_timeout={commandTimeout * 1000};
+                PRAGMA journal_mode=WAL;
+                PRAGMA foreign_keys=ON;
+                PRAGMA cache_size=-8192;
+                PRAGMA synchronous=NORMAL;
+                PRAGMA temp_store=MEMORY;
+                """;
+            cmd.ExecuteNonQuery();
 
-        return conn;
+            return conn;
+        }
+        catch
+        {
+            conn.Dispose();
+            throw;
+        }
     }
 
     /// <summary>

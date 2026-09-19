@@ -74,6 +74,23 @@ public class ImageMetaRepository : IImageMetaRepository
         return metas;
     }
 
+    public async Task<List<ImageMeta>> GetHashMetadataByPathsAsync(IReadOnlyCollection<string> filePaths)
+    {
+        if (filePaths.Count == 0) return [];
+        using var conn = _dbFactory.CreateConnection();
+        var result = new List<ImageMeta>();
+        foreach (var chunk in filePaths.Chunk(900))
+        {
+            var rows = await conn.QueryAsync<ImageMeta>(@"
+                SELECT Id, FilePath, FileHash, PerceptualHash, Width, Height,
+                       FileSize, LastWriteTicks, FolderId, HashStatus
+                FROM ImageMeta
+                WHERE FilePath COLLATE NOCASE IN @Paths", new { Paths = chunk });
+            result.AddRange(rows);
+        }
+        return result;
+    }
+
     public async Task<int> CountByFolderIdAsync(long folderId)
     {
         using var conn = _dbFactory.CreateConnection();
@@ -131,6 +148,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task<long> UpsertAsync(ImageMeta meta)
     {
+        using var writer = await MetadataWriteCoordinator.EnterAsync(_dbFactory);
         using var conn = _dbFactory.CreateConnection();
         using var txn = conn.BeginTransaction();
 
@@ -175,6 +193,16 @@ public class ImageMetaRepository : IImageMetaRepository
     public async Task BulkUpsertAsync(List<ImageMeta> metas)
     {
         if (metas.Count == 0) return;
+
+        // Keep background batches bounded, including the final drain of a hash job.
+        if (metas.Count > 100)
+        {
+            foreach (var batch in metas.Chunk(100))
+                await BulkUpsertAsync(batch.ToList());
+            return;
+        }
+
+        using var writer = await MetadataWriteCoordinator.EnterAsync(_dbFactory);
 
         for (int attempt = 1; ; attempt++)
         {
@@ -732,7 +760,10 @@ public class ImageMetaRepository : IImageMetaRepository
         {
             var rows = await conn.QueryAsync<string>(@"
                 SELECT FilePath FROM ImageMeta
-                WHERE FilePath COLLATE NOCASE IN @Paths AND HashStatus IN (1, -1)",
+                WHERE FilePath COLLATE NOCASE IN @Paths
+                  AND HashStatus = 1
+                  AND PerceptualHash IS NOT NULL
+                  AND PerceptualHash <> ''",
                 new { Paths = chunk });
             foreach (var path in rows)
                 result.Add(path);
@@ -792,6 +823,7 @@ public class ImageMetaRepository : IImageMetaRepository
 
     public async Task UpdateFilePathAsync(long id, string newPath, long newFolderId)
     {
+        using var writer = await MetadataWriteCoordinator.EnterAsync(_dbFactory);
         using var conn = _dbFactory.CreateConnection();
         await conn.ExecuteAsync(@"
             UPDATE ImageMeta SET FilePath = @Path, FolderId = @FolderId, UpdatedAt = @Now
@@ -799,20 +831,91 @@ public class ImageMetaRepository : IImageMetaRepository
             new { Path = newPath, FolderId = newFolderId, Now = DateTime.UtcNow, Id = id });
     }
 
-    public async Task<Dictionary<string, (long Id, int Status)>> GetStatusMapByPathsAsync(List<string> filePaths)
+    public async Task<Dictionary<string, (long Id, int Status)>> GetStatusMapByPathsAsync(List<string> filePaths,
+        CancellationToken cancellationToken = default, Action<int>? progress = null)
     {
         var result = new Dictionary<string, (long, int)>(StringComparer.OrdinalIgnoreCase);
+        cancellationToken.ThrowIfCancellationRequested();
         if (filePaths.Count == 0) return result;
         using var conn = _dbFactory.CreateConnection();
+        var completed = 0;
         foreach (var chunk in filePaths.Chunk(900))
         {
-            var rows = await conn.QueryAsync<(long Id, string FilePath, int Status)>(
+            cancellationToken.ThrowIfCancellationRequested();
+            var rows = await conn.QueryAsync<(long Id, string FilePath, int Status)>(new CommandDefinition(
                 "SELECT Id, FilePath, AutoTagStatus AS Status FROM ImageMeta WHERE FilePath COLLATE NOCASE IN @Paths",
-                new { Paths = chunk });
+                new { Paths = chunk }, cancellationToken: cancellationToken));
             foreach (var row in rows)
                 result[row.FilePath] = (row.Id, row.Status);
+            completed += chunk.Length;
+            progress?.Invoke(completed);
         }
+        cancellationToken.ThrowIfCancellationRequested();
         return result;
+    }
+
+    public async Task<Dictionary<string, (long Id, int Status)>> RegisterAutoTagFilesAsync(
+        IReadOnlyList<AutoTagFileRegistration> files, CancellationToken cancellationToken = default)
+    {
+        if (files.Count > 100) throw new ArgumentOutOfRangeException(nameof(files), "Registration batches must not exceed 100 files.");
+        cancellationToken.ThrowIfCancellationRequested();
+        if (files.Count == 0) return new(StringComparer.OrdinalIgnoreCase);
+        using var writer = await MetadataWriteCoordinator.EnterAsync(_dbFactory, cancellationToken);
+        for (var attempt = 1; ; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                // Bound both connection setup and transaction lock waits.
+                using var conn = _dbFactory.CreateConnection(commandTimeout: 1);
+                using var txn = conn.BeginTransaction();
+                var result = new Dictionary<string, (long Id, int Status)>(StringComparer.OrdinalIgnoreCase);
+                foreach (var file in files)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var meta = file.Metadata;
+                    var existing = await conn.QueryFirstOrDefaultAsync<(long Id, int Status)>(new CommandDefinition(
+                        "SELECT Id, AutoTagStatus FROM ImageMeta WHERE FilePath = @FilePath COLLATE NOCASE ORDER BY Id LIMIT 1",
+                        new { meta.FilePath }, txn, cancellationToken: cancellationToken));
+                    if (existing.Id > 0)
+                    {
+                        result[meta.FilePath] = existing;
+                        continue; // A folder scan may have registered this file while it was being hashed.
+                    }
+
+                    if (file.MovedImageId.HasValue && file.PreviousPath != null)
+                    {
+                        var moved = await conn.ExecuteAsync(new CommandDefinition(@"
+                            UPDATE ImageMeta SET FilePath = @FilePath, FolderId = @FolderId, UpdatedAt = @Now
+                            WHERE Id = @Id AND FilePath = @PreviousPath AND FileHash = @FileHash",
+                            new { meta.FilePath, meta.FolderId, meta.FileHash, Id = file.MovedImageId.Value,
+                                file.PreviousPath, Now = DateTime.UtcNow }, txn, cancellationToken: cancellationToken));
+                        if (moved > 0)
+                        {
+                            var status = await conn.ExecuteScalarAsync<int>(new CommandDefinition(
+                                "SELECT AutoTagStatus FROM ImageMeta WHERE Id = @Id",
+                                new { Id = file.MovedImageId.Value }, txn, cancellationToken: cancellationToken));
+                            result[meta.FilePath] = (file.MovedImageId.Value, status);
+                            continue;
+                        }
+                    }
+
+                    var id = await conn.ExecuteScalarAsync<long>(new CommandDefinition(@"
+                        INSERT INTO ImageMeta (FilePath, FileHash, FileSize, LastWriteTicks, FolderId, HashStatus)
+                        VALUES (@FilePath, @FileHash, @FileSize, @LastWriteTicks, @FolderId, 0);
+                        SELECT last_insert_rowid();", meta, txn, cancellationToken: cancellationToken));
+                    result[meta.FilePath] = (id, 0);
+                }
+                cancellationToken.ThrowIfCancellationRequested();
+                txn.Commit();
+                return result;
+            }
+            catch (SqliteException ex) when (ex.SqliteErrorCode is 5 or 6 && attempt < 3)
+            {
+                AppLogger.Warn($"AutoTag.Register locked attempt={attempt}/3 files={files.Count}");
+                await Task.Delay(100 * attempt, cancellationToken);
+            }
+        }
     }
 
     public async Task SetAutoTagStatusByPathAsync(string filePath, int status)
@@ -827,9 +930,10 @@ public class ImageMetaRepository : IImageMetaRepository
     {
         if (filePaths.Count == 0) return;
         using var conn = _dbFactory.CreateConnection();
-        await conn.ExecuteAsync(
-            "UPDATE ImageMeta SET AutoTagStatus = @Status WHERE FilePath IN @Paths",
-            new { Status = status, Paths = filePaths });
+        foreach (var chunk in filePaths.Chunk(900))
+            await conn.ExecuteAsync(
+                "UPDATE ImageMeta SET AutoTagStatus = @Status WHERE FilePath COLLATE NOCASE IN @Paths",
+                new { Status = status, Paths = chunk });
     }
 
     public async Task<List<ImageMeta>> GetAllUnlinkedAsync()

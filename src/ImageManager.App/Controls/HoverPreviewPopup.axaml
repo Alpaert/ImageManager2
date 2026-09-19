@@ -1,0 +1,42 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="ImageManager.App.Controls.HoverPreviewPopup"
+        Width="220"
+        Height="180"
+        CanResize="False"
+        ShowInTaskbar="False"
+        ShowActivated="False"
+        Topmost="True"
+        SystemDecorations="None"
+        WindowStartupLocation="Manual"
+        Background="Transparent">
+    <Border x:Name="PopupBorder"
+            Background="{DynamicResource SurfaceBrush}"
+            BorderBrush="{DynamicResource CtrlBorderBrush}"
+            BorderThickness="1"
+            CornerRadius="6"
+            Padding="10"
+            BoxShadow="0 4 14 0 #66000000">
+        <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="7">
+            <TextBlock x:Name="FileNameText"
+                       Grid.Row="0"
+                       FontWeight="SemiBold"
+                       TextTrimming="CharacterEllipsis"
+                       MaxLines="1" />
+            <Border Grid.Row="1"
+                    Background="#12000000"
+                    HorizontalAlignment="Center">
+                <Image x:Name="PreviewImage"
+                       Stretch="Fill"
+                       HorizontalAlignment="Center"
+                       VerticalAlignment="Center" />
+            </Border>
+            <TextBlock x:Name="InfoText"
+                       Grid.Row="2"
+                       FontSize="12"
+                       Foreground="{DynamicResource SecondaryFgBrush}"
+                       TextTrimming="CharacterEllipsis"
+                       MaxLines="1" />
+        </Grid>
+    </Border>
+</Window>

@@ -61,6 +61,24 @@
                     </StackPanel>
                 </Border>
 
+                <!-- 悬停预览 -->
+                <Border Padding="12" Background="{DynamicResource SurfaceBrush}"
+                        BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="悬停预览" FontWeight="SemiBold" FontSize="14"/>
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <TextBlock Text="预览最大边长:" VerticalAlignment="Center"
+                                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                            <TextBox Text="{Binding HoverPreviewMaxSizeText}" Width="80"/>
+                            <TextBlock Text="px（240~1600）"
+                                       Foreground="{DynamicResource MutedFgBrush}" FontSize="12"
+                                       VerticalAlignment="Center"/>
+                        </StackPanel>
+                        <TextBlock Text="图片会按原比例缩放，小图不会被强制放大。"
+                                   Foreground="{DynamicResource MutedFgBrush}" FontSize="12"/>
+                    </StackPanel>
+                </Border>
+
                 <!-- 缩略框宽高比 -->
                 <Border Padding="12" Background="{DynamicResource SurfaceBrush}"
                         BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">

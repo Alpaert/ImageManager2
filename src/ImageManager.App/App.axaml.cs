@@ -393,6 +393,8 @@ public partial class App : Application
             resources["HoverBgBrush"]        = new SolidColorBrush(Color.Parse("#363648"));
             resources["SecondaryFgBrush"]    = new SolidColorBrush(Color.Parse("#A1A1AA"));
             resources["MutedFgBrush"]        = new SolidColorBrush(Color.Parse("#71717A"));
+            resources["ToolbarDropBgBrush"]  = new SolidColorBrush(Color.Parse("#206366F1"));
+            resources["ToolbarDropFgBrush"]  = new SolidColorBrush(Color.Parse("#AAB0FF"));
         }
         else
         {
@@ -410,6 +412,8 @@ public partial class App : Application
             resources["HoverBgBrush"]        = new SolidColorBrush(Color.Parse("#E8E8EC"));
             resources["SecondaryFgBrush"]    = new SolidColorBrush(Color.Parse("#666666"));
             resources["MutedFgBrush"]        = new SolidColorBrush(Color.Parse("#999999"));
+            resources["ToolbarDropBgBrush"]  = new SolidColorBrush(Color.Parse("#246366F1"));
+            resources["ToolbarDropFgBrush"]  = new SolidColorBrush(Color.Parse("#4F46E5"));
         }
     }
 }

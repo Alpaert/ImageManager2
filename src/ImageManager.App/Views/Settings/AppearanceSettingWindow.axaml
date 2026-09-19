@@ -4,7 +4,7 @@
         x:Class="ImageManager.App.Views.Settings.AppearanceSettingWindow"
         x:DataType="vm:AppearanceSettingViewModel"
         Title="外观设置"
-        Width="380" Height="200"
+        Width="440" SizeToContent="Height" MinHeight="220"
         CanResize="False">
 	<Window.Styles>
 		<!-- 1. 让【所有菜单项】的默认文字颜色，绑定到你的动态资源 AppFgBrush -->
@@ -45,6 +45,16 @@
                     <ComboBoxItem>深色模式</ComboBoxItem>
                     <ComboBoxItem>浅色模式</ComboBoxItem>
                 </ComboBox>
+
+                <Separator Margin="0,4"/>
+
+                <TextBlock Text="搜索栏布局" FontWeight="SemiBold" FontSize="14"/>
+                <ComboBox Width="260"
+                          ItemsSource="{Binding SearchToolbarLayoutOptions}"
+                          SelectedIndex="{Binding SearchToolbarLayoutIndex}"/>
+                <TextBlock Text="A 将常用检索固定显示，高级搜索按需展开；C 使用紧凑命令栏，将低频功能收进菜单。"
+                           Foreground="{DynamicResource SecondaryFgBrush}"
+                           FontSize="12" TextWrapping="Wrap"/>
             </StackPanel>
         </Border>
 

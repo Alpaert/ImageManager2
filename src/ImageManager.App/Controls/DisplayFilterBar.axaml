@@ -1,0 +1,7 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="ImageManager.App.Controls.DisplayFilterBar">
+  <StackPanel Spacing="5">
+    <Button x:Name="FilterButton" Classes="toolbar-compact" Content="显示筛选 ▾"/>
+  </StackPanel>
+</UserControl>

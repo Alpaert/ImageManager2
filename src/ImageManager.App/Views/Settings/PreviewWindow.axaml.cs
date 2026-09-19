@@ -42,6 +42,7 @@ public partial class PreviewWindow : Window
         public int PixelHeight;
     }
     private readonly BitmapSlot[] _pool = { new(), new(), new() };
+    private readonly object _poolLock = new();
     private int _activeSlotIdx = -1;
     private static readonly Vector Dpi = new(96, 96);
 
@@ -181,13 +182,16 @@ public partial class PreviewWindow : Window
     /// <summary>Dispose all pooled WriteableBitmaps.</summary>
     private void ClearPool()
     {
-        for (int i = 0; i < 3; i++)
+        lock (_poolLock)
         {
-            _pool[i].Bitmap?.Dispose();
-            _pool[i].Bitmap = null;
-            _pool[i].ImageIndex = -1;
+            for (int i = 0; i < 3; i++)
+            {
+                _pool[i].Bitmap?.Dispose();
+                _pool[i].Bitmap = null;
+                _pool[i].ImageIndex = -1;
+            }
+            _activeSlotIdx = -1;
         }
-        _activeSlotIdx = -1;
     }
 
     // ==================== Image Loading (Async) ====================
@@ -230,15 +234,19 @@ public partial class PreviewWindow : Window
                 // Copy raw BGRA pixels directly into pool WriteableBitmap (on thread pool)
                 var wb = await Task.Run(() =>
                 {
-                    int slot = FindSlot(index);
-                    return PrepareSlot(slot, index, rawPixels, pixW, pixH);
+                    lock (_poolLock)
+                    {
+                        int slot = FindSlot(index);
+                        return PrepareSlot(slot, index, rawPixels, pixW, pixH);
+                    }
                 }, token);
 
                 if (wb == null || version != _loadVersion || token.IsCancellationRequested) return;
 
                 // Pointer swap — replaces old Source atomically
                 ImgFull.Source = wb;
-                _activeSlotIdx = FindSlot(index);
+                lock (_poolLock)
+                    _activeSlotIdx = Array.FindIndex(_pool, slot => slot.ImageIndex == index && ReferenceEquals(slot.Bitmap, wb));
 
                 Vm.PixelWidth = pixW;
                 Vm.PixelHeight = pixH;

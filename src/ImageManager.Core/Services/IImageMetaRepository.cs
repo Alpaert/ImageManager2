@@ -8,6 +8,7 @@ public interface IImageMetaRepository
     Task<ImageMeta?> GetByPathAsync(string filePath);
     Task<List<ImageMeta>> GetByFolderAsync(string folderPath);
     Task<List<ImageMeta>> GetByFolderIdAsync(long folderId);
+    Task<List<ImageMeta>> GetHashMetadataByPathsAsync(IReadOnlyCollection<string> filePaths);
     Task<int> CountByFolderIdAsync(long folderId);
     Task SetFolderIdAsync(string filePath, long folderId);
     Task<int> UnlinkFolderIdAsync(long folderId);
@@ -48,7 +49,7 @@ public interface IImageMetaRepository
     /// <summary>Batch-load FileHash for a set of file paths.</summary>
     Task<Dictionary<string, string>> GetFileHashesByPathsAsync(List<string> filePaths);
 
-    /// <summary>Returns paths where hash work is complete or intentionally skipped.</summary>
+    /// <summary>Returns paths where a usable perceptual hash was computed.</summary>
     Task<HashSet<string>> GetHashedPathsAsync(List<string> filePaths);
 
     /// <summary>Reset HashStatus to 0 for all records (used when hash algorithm version changes).</summary>
@@ -63,8 +64,13 @@ public interface IImageMetaRepository
     /// <summary>Update FilePath and FolderId for a moved file (preserves Id and tags).</summary>
     Task UpdateFilePathAsync(long id, string newPath, long newFolderId);
 
-    /// <summary>Batch-load (FilePath, Id, AutoTagStatus) for a list of paths. Only returns records where AutoTagStatus=0 or no record exists.</summary>
-    Task<Dictionary<string, (long Id, int Status)>> GetStatusMapByPathsAsync(List<string> filePaths);
+    /// <summary>Batch-load existing paths, IDs and tagging status; missing paths are omitted.</summary>
+    Task<Dictionary<string, (long Id, int Status)>> GetStatusMapByPathsAsync(List<string> filePaths,
+        CancellationToken cancellationToken = default, Action<int>? progress = null);
+
+    /// <summary>Register prepared files without overwriting existing metadata/tags. Rechecks paths and move candidates in a short transaction.</summary>
+    Task<Dictionary<string, (long Id, int Status)>> RegisterAutoTagFilesAsync(
+        IReadOnlyList<AutoTagFileRegistration> files, CancellationToken cancellationToken = default);
 
     /// <summary>Set AutoTagStatus for a given file path.</summary>
     Task SetAutoTagStatusByPathAsync(string filePath, int status);

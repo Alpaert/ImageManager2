@@ -54,6 +54,16 @@
                 </Grid>
             </Border>
 
+            <Border Padding="12" BorderThickness="1" CornerRadius="6">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                    <StackPanel Spacing="3">
+                        <TextBlock Text="图片指纹" FontWeight="SemiBold"/>
+                        <TextBlock Text="自动检测并补算当前范围内缺失或失效的感知哈希" Opacity="0.8" TextWrapping="Wrap"/>
+                    </StackPanel>
+                    <Button Grid.Column="1" Content="修复缺失哈希" Command="{Binding RepairHashesCommand}" IsEnabled="{Binding !IsRunning}"/>
+                </Grid>
+            </Border>
+
             <ProgressBar Minimum="0" Maximum="{Binding ProgressMaximum}" Value="{Binding ProgressValue}" Height="12"/>
             <TextBlock Text="{Binding ProgressText}" TextWrapping="Wrap"/>
             <StackPanel Orientation="Horizontal" Spacing="8">

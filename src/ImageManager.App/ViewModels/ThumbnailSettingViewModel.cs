@@ -20,6 +20,7 @@ public partial class ThumbnailSettingViewModel : ViewModelBase
     [ObservableProperty] private string _borderColor = "#FF808080";
     [ObservableProperty] private string _backgroundColor = "#CCFFFFFF";
     [ObservableProperty] private string _opacityText = "1";
+    [ObservableProperty] private string _hoverPreviewMaxSizeText = "840";
 
     public string[] WaterfallModes { get; } = { "None", "Vertical", "Horizontal" };
 
@@ -51,6 +52,7 @@ public partial class ThumbnailSettingViewModel : ViewModelBase
         BorderColor = data.ThumbnailBorderColor;
         BackgroundColor = data.ThumbnailBackgroundColor;
         OpacityText = data.ThumbnailOpacity.ToString("0.##");
+        HoverPreviewMaxSizeText = NormalizeHoverPreviewMaxSize(data.HoverPreviewMaxSize).ToString();
     }
 
     [RelayCommand]
@@ -75,7 +77,24 @@ public partial class ThumbnailSettingViewModel : ViewModelBase
             _data.ThumbnailOpacity = Math.Clamp(op, 0, 1);
         }
 
+        _data.HoverPreviewMaxSize = ParseHoverPreviewMaxSize(
+            HoverPreviewMaxSizeText,
+            _data.HoverPreviewMaxSize);
+
         _onChanged();
+    }
+
+    private static int ParseHoverPreviewMaxSize(string text, int fallback)
+    {
+        if (!int.TryParse(text, out var value))
+            value = fallback;
+
+        return NormalizeHoverPreviewMaxSize(value);
+    }
+
+    private static int NormalizeHoverPreviewMaxSize(int value)
+    {
+        return Math.Clamp(value > 0 ? value : 840, 240, 1600);
     }
 
     private static double ParseRatio(string text, double fallback)

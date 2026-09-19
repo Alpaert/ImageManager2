@@ -16,6 +16,10 @@ public interface IVectorIndexService
         VectorIndexScope scope,
         IProgress<VectorIndexProgress>? progress = null,
         CancellationToken ct = default);
+    Task RepairHashesAsync(
+        VectorIndexScope scope,
+        IProgress<HashRepairProgress>? progress = null,
+        CancellationToken ct = default);
 
     void Pause();
     void Resume();

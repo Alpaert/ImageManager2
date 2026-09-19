@@ -5,14 +5,15 @@
         x:Class="ImageManager.App.Views.Settings.PreviewWindow"
         x:DataType="vm:PreviewViewModel"
         Title="{Binding Title}"
-        Width="800" Height="600">
+        Width="800" Height="600"
+        Background="{DynamicResource AppBgBrush}">
 
     <Window.Resources>
         <conv:ByteArrayToBitmapConverter x:Key="BytesToBitmap"/>
     </Window.Resources>
 
-    <Grid RowDefinitions="*,Auto">
-        <Grid Grid.Row="0">
+    <Grid RowDefinitions="*,Auto" Background="{DynamicResource AppBgBrush}">
+        <Grid Grid.Row="0" Background="{DynamicResource AppBgBrush}">
             <ScrollViewer x:Name="Scroller"
                           HorizontalScrollBarVisibility="Auto"
                           VerticalScrollBarVisibility="Auto"

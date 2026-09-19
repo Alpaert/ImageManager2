@@ -10,6 +10,7 @@ using CommunityToolkit.Mvvm.Messaging;
 using ImageManager.Core.Messages;
 using Avalonia.Threading;
 using Avalonia.VisualTree;
+using Avalonia.Media.Imaging;
 using System.Runtime.InteropServices;
 using ImageManager.App.Controls;
 using ImageManager.App.Helpers;
@@ -38,12 +39,24 @@ public partial class MainWindow : Window
 
     private CancellationTokenSource? _scrollAnimCts;
     private int _autoTagRunVersion;
+    private bool _lastAutoTagRecursive;
+    // Accessed only on the UI thread; reserve before the first await and release in finally.
+    private FolderOperationScope? _autoTagScope;
+    private FolderOperationScope? _characterMatchScope;
+    private FolderOperationScope? _clearTagsScope;
+    private string? _videoOriginalFrameTargetName;
+    private string? _videoOriginalFrameTargetPath;
     private int _videoOriginalFrameBatchRunning;
     private CancellationTokenSource? _videoOriginalFrameBatchCts;
 
     public MainWindow()
     {
         InitializeComponent();
+        _hoverPreviewTimer = new DispatcherTimer(
+            TimeSpan.FromMilliseconds(600),
+            DispatcherPriority.Background,
+            OnHoverPreviewTimerTick);
+        CreateHoverPreviewCloseTimer();
         AddHandler(InputElement.KeyDownEvent, OnWindowKeyDown, RoutingStrategies.Tunnel);
         ThumbnailScrollViewer.AddHandler(ScrollViewer.PointerWheelChangedEvent,
             OnThumbnailScrollWheel, RoutingStrategies.Tunnel);
@@ -202,6 +215,7 @@ public partial class MainWindow : Window
     {
         base.OnLoaded(e);
         await Vm.InitializeAsync();
+        Vm.PropertyChanged += OnViewModelPropertyChanged;
 
         OnlineSearchHelper.SetTempDir(Path.Combine(Vm.AppSettings.DiskCacheDirectory, "search_temp"));
         OnlineSearchHelper.CleanupOldTempFiles();
@@ -233,6 +247,9 @@ public partial class MainWindow : Window
 
     private async void OnWindowKeyDown(object? sender, KeyEventArgs e)
     {
+        if (e.Key == Key.Escape)
+            CloseHoverPreview();
+
         // Don't intercept shortcuts when user is typing in a text field
         if (e.Source is TextBox)
             return;
@@ -306,6 +323,7 @@ public partial class MainWindow : Window
 
     private async void OnThumbnailScrollWheel(object? sender, PointerWheelEventArgs e)
     {
+        CloseHoverPreview();
         // Ctrl+Wheel = zoom
         if (e.KeyModifiers.HasFlag(KeyModifiers.Control))
         {
@@ -374,6 +392,7 @@ public partial class MainWindow : Window
 
     private async void LstFolders_SelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
+        CloseHoverPreview();
         if (Vm._isProgrammaticFolderSelection) return;
         Vm.ClearSearchHighlight();
         if (e.AddedItems.Count > 0 && e.AddedItems[0] is ViewModels.FolderTreeNode folder)
@@ -660,6 +679,7 @@ public partial class MainWindow : Window
 
     private void ImagePanelHost_PointerPressed(object? sender, Avalonia.Input.PointerPressedEventArgs e)
     {
+        CloseHoverPreview();
         // Only start box selection if clicked on empty area (not on a thumbnail Border)
         var source = e.Source as Avalonia.Controls.Control;
         while (source != null)
@@ -745,6 +765,8 @@ public partial class MainWindow : Window
         if (sender is not Avalonia.Controls.Border border) return;
         if (border.DataContext is not ImageViewItem item) return;
 
+        CloseHoverPreview();
+
         // Dismiss tag search popup when clicking on an image
         Vm.IsTagSearchPopupOpen = false;
         RootGrid.Focus();
@@ -827,6 +849,307 @@ public partial class MainWindow : Window
     private ImageViewItem? _pendingClick;
     private int _lastSelectedIndex = -1;
 
+    // Hover preview state is UI-thread confined. The request version makes a
+    // completed background decode harmless after the pointer has moved away.
+    private readonly DispatcherTimer _hoverPreviewTimer;
+    private DispatcherTimer _hoverPreviewCloseTimer = null!;
+    private HoverPreviewPopup? _hoverPreview;
+    private CancellationTokenSource? _hoverPreviewCts;
+    private ImageViewItem? _hoverPreviewCandidate;
+    private Border? _hoverPreviewSource;
+    private PixelRect? _hoverPreviewSourceRect;
+    private PixelPoint _hoverPreviewAnchor;
+    private PixelPoint? _hoverPreviewLastPointerScreen;
+    private int _hoverPreviewRequestVersion;
+    private int _hoverPreviewCloseGeneration;
+
+    private HoverPreviewPopup CreateHoverPreviewPopup()
+    {
+        var popup = new HoverPreviewPopup();
+        popup.PointerEnteredPreview += OnHoverPreviewPointerEntered;
+        popup.PointerExitedPreview += OnHoverPreviewPointerExited;
+        return popup;
+    }
+
+    private void ReleaseHoverPreviewPopup()
+    {
+        var popup = _hoverPreview;
+        if (popup == null)
+            return;
+
+        popup.PointerEnteredPreview -= OnHoverPreviewPointerEntered;
+        popup.PointerExitedPreview -= OnHoverPreviewPointerExited;
+        popup.Close();
+        _hoverPreview = null;
+    }
+
+    private void CreateHoverPreviewCloseTimer()
+    {
+        var generation = ++_hoverPreviewCloseGeneration;
+        _hoverPreviewCloseTimer = new DispatcherTimer(
+            TimeSpan.FromMilliseconds(220),
+            DispatcherPriority.Background,
+            (_, _) =>
+            {
+                if (generation == _hoverPreviewCloseGeneration)
+                    CloseHoverPreviewIfPointerLeftHoverSession();
+            });
+    }
+
+    private void StopHoverPreviewCloseTimer()
+    {
+        _hoverPreviewCloseGeneration++;
+        _hoverPreviewCloseTimer.Stop();
+    }
+
+    private int GetHoverPreviewMaxSize() =>
+        Vm.AppSettings.HoverPreviewMaxSize > 0
+            ? Vm.AppSettings.HoverPreviewMaxSize
+            : HoverPreviewPopup.DefaultMaxPreviewWidth;
+
+    private void Thumbnail_PointerEntered(object? sender, PointerEventArgs e)
+    {
+        if (sender is not Border border || border.DataContext is not ImageViewItem item)
+            return;
+        if (!FileTypeConstants.IsImageFile(item.FilePath) || !File.Exists(item.FilePath))
+            return;
+
+        var pointer = this.PointToScreen(e.GetPosition(this));
+        _hoverPreviewLastPointerScreen = pointer;
+        BeginHoverPreview(border, item, pointer);
+    }
+
+    private void Thumbnail_PointerExited(object? sender, PointerEventArgs e)
+    {
+        if (sender is Border border && border.DataContext == _hoverPreviewCandidate)
+            ScheduleHoverPreviewClose();
+    }
+
+    private void BeginHoverPreview(Border source, ImageViewItem item, PixelPoint anchor)
+    {
+        StopHoverPreviewCloseTimer();
+        if (_hoverPreviewCandidate == item && ReferenceEquals(_hoverPreviewSource, source))
+            return;
+
+        CloseHoverPreview();
+        _hoverPreviewCandidate = item;
+        _hoverPreviewSource = source;
+        _hoverPreviewSourceRect = GetScreenRect(source);
+        _hoverPreviewAnchor = anchor;
+        _hoverPreviewLastPointerScreen = anchor;
+        _hoverPreviewTimer.Start();
+    }
+
+    private void UpdatePendingHoverPreviewAnchor(Border source, ImageViewItem item, PixelPoint anchor)
+    {
+        if (_hoverPreviewCandidate != item || !ReferenceEquals(_hoverPreviewSource, source) ||
+            _hoverPreview?.IsVisible == true)
+            return;
+
+        _hoverPreviewAnchor = anchor;
+        _hoverPreviewLastPointerScreen = anchor;
+        _hoverPreviewSourceRect = GetScreenRect(source);
+        _hoverPreviewTimer.Stop();
+
+        // Movement during an in-flight decode starts a fresh stillness session.
+        // The completed old request is discarded by the request version check.
+        var cts = _hoverPreviewCts;
+        _hoverPreviewCts = null;
+        if (cts != null)
+        {
+            _hoverPreviewRequestVersion++;
+            cts.Cancel();
+        }
+
+        _hoverPreviewTimer.Start();
+    }
+
+    private void OnHoverPreviewTimerTick(object? sender, EventArgs e)
+    {
+        _hoverPreviewTimer.Stop();
+        if (_hoverPreviewCandidate is not { } item || !FileTypeConstants.IsImageFile(item.FilePath))
+            return;
+
+        var cts = new CancellationTokenSource();
+        _hoverPreviewCts = cts;
+        var requestVersion = ++_hoverPreviewRequestVersion;
+        _ = ShowHoverPreviewAsync(item, _hoverPreviewAnchor, requestVersion, cts);
+    }
+
+    private async Task ShowHoverPreviewAsync(
+        ImageViewItem item,
+        PixelPoint anchor,
+        int requestVersion,
+        CancellationTokenSource cts)
+    {
+        try
+        {
+            var maxPreviewSize = GetHoverPreviewMaxSize();
+            var result = await Task.Run(() =>
+            {
+                cts.Token.ThrowIfCancellationRequested();
+                var (width, height) = ThumbnailGenerator.GetDimensions(item.FilePath);
+                if (width <= 0 || height <= 0)
+                    return (Pixels: (byte[]?)null, DecodedWidth: 0, DecodedHeight: 0, OriginalWidth: 0, OriginalHeight: 0, FileSize: 0L);
+
+                var scale = Math.Min(1d, Math.Min(maxPreviewSize / (double)width, maxPreviewSize / (double)height));
+                var decodeWidth = Math.Max(1, (int)Math.Round(width * scale));
+                var (pixels, decodedWidth, decodedHeight) = ThumbnailGenerator.DecodeRawPixels(item.FilePath, decodeWidth);
+                cts.Token.ThrowIfCancellationRequested();
+                long fileSize = new FileInfo(item.FilePath).Length;
+                return (Pixels: pixels, DecodedWidth: decodedWidth, DecodedHeight: decodedHeight,
+                    OriginalWidth: width, OriginalHeight: height, FileSize: fileSize);
+            }, cts.Token);
+
+            if (cts.Token.IsCancellationRequested || requestVersion != _hoverPreviewRequestVersion ||
+                _hoverPreviewCandidate != item || result.Pixels == null)
+                return;
+
+            ReleaseHoverPreviewPopup();
+            var popup = CreateHoverPreviewPopup();
+            _hoverPreview = popup;
+
+            popup.MaxPreviewWidth = maxPreviewSize;
+            popup.MaxPreviewHeight = maxPreviewSize;
+            var sourceRect = GetScreenRect(_hoverPreviewSource!);
+            _hoverPreviewSourceRect = sourceRect;
+            popup.Present(
+                result.Pixels,
+                result.DecodedWidth,
+                result.DecodedHeight,
+                item.FileName,
+                result.OriginalWidth,
+                result.OriginalHeight,
+                result.FileSize,
+                this,
+                anchor,
+                sourceRect);
+        }
+        catch (OperationCanceledException)
+        {
+            // Pointer movement and view changes intentionally cancel pending reads.
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"悬停预览加载失败: {Path.GetFileName(item.FilePath)}: {ex.Message}");
+        }
+        finally
+        {
+            if (ReferenceEquals(_hoverPreviewCts, cts))
+                _hoverPreviewCts = null;
+            cts.Dispose();
+        }
+    }
+
+    private void OnHoverPreviewPointerEntered(object? sender, EventArgs e)
+    {
+        StopHoverPreviewCloseTimer();
+    }
+
+    private void OnHoverPreviewPointerExited(object? sender, EventArgs e)
+    {
+        ScheduleHoverPreviewClose();
+    }
+
+    private PixelRect GetScreenRect(Border source)
+    {
+        var topLeft = source.PointToScreen(new Point(0, 0));
+        var bottomRight = source.PointToScreen(new Point(source.Bounds.Width, source.Bounds.Height));
+        return new PixelRect(
+            topLeft.X,
+            topLeft.Y,
+            Math.Max(1, bottomRight.X - topLeft.X),
+            Math.Max(1, bottomRight.Y - topLeft.Y));
+    }
+
+    private bool TryGetCursorScreenPoint(out PixelPoint point)
+    {
+        if (OperatingSystem.IsWindows() && GetCursorPos(out var nativePoint))
+        {
+            point = new PixelPoint(nativePoint.X, nativePoint.Y);
+            _hoverPreviewLastPointerScreen = point;
+            return true;
+        }
+
+        if (_hoverPreviewLastPointerScreen is { } lastPoint)
+        {
+            point = lastPoint;
+            return true;
+        }
+
+        point = default;
+        return false;
+    }
+
+    private bool IsCursorInActiveHoverSession()
+    {
+        if (_hoverPreviewCandidate == null || !TryGetCursorScreenPoint(out var cursor))
+            return false;
+
+        var sourceRect = _hoverPreviewSource != null
+            ? GetScreenRect(_hoverPreviewSource)
+            : _hoverPreviewSourceRect;
+        if (sourceRect is { } source && ContainsExpanded(source, cursor, 8))
+            return true;
+
+        if (_hoverPreview?.CurrentScreenRect is { } popup && ContainsExpanded(popup, cursor, 8))
+            return true;
+
+        return false;
+    }
+
+    private static bool ContainsExpanded(PixelRect rect, PixelPoint point, int padding)
+    {
+        return point.X >= rect.X - padding && point.X <= rect.Right + padding &&
+               point.Y >= rect.Y - padding && point.Y <= rect.Bottom + padding;
+    }
+
+    private void ScheduleHoverPreviewClose()
+    {
+        _hoverPreviewTimer.Stop();
+        StopHoverPreviewCloseTimer();
+        CreateHoverPreviewCloseTimer();
+        _hoverPreviewCloseTimer.Start();
+    }
+
+    private void CloseHoverPreviewIfPointerLeftHoverSession()
+    {
+        if (IsCursorInActiveHoverSession())
+        {
+            StopHoverPreviewCloseTimer();
+            return;
+        }
+
+        CloseHoverPreview();
+    }
+
+    private void CloseHoverPreview()
+    {
+        _hoverPreviewTimer.Stop();
+        StopHoverPreviewCloseTimer();
+        _hoverPreviewCandidate = null;
+        _hoverPreviewSource = null;
+        _hoverPreviewSourceRect = null;
+        _hoverPreviewLastPointerScreen = null;
+        _hoverPreviewRequestVersion++;
+
+        var cts = _hoverPreviewCts;
+        _hoverPreviewCts = null;
+        if (cts != null)
+        {
+            cts.Cancel();
+        }
+        _hoverPreview?.ResetPreviewSurface();
+    }
+
+    private void OnViewModelPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(MainWindowViewModel.Images))
+            CloseHoverPreview();
+    }
+
+    private void ThumbnailContextMenu_Opened(object? sender, RoutedEventArgs e) => CloseHoverPreview();
+
     private async void Thumbnail_PointerMoved(object? sender, Avalonia.Input.PointerEventArgs e)
     {
         if (sender is not Avalonia.Controls.Border border) return;
@@ -834,9 +1157,18 @@ public partial class MainWindow : Window
 
         _lastHoveredItem = item;
         _pendingClick = null; // movement cancels deferred single-select
-
         var point = e.GetCurrentPoint(border);
+        var pointer = this.PointToScreen(e.GetPosition(this));
+        if (!point.Properties.IsLeftButtonPressed)
+        {
+            if (_hoverPreviewCandidate != item || !ReferenceEquals(_hoverPreviewSource, border))
+                BeginHoverPreview(border, item, pointer);
+            else
+                UpdatePendingHoverPreviewAnchor(border, item, pointer);
+        }
+
         if (!point.Properties.IsLeftButtonPressed) return;
+        CloseHoverPreview();
         if (_dragPressArgs == null) return;
 
         // Ensure the dragged item is selected
@@ -900,6 +1232,7 @@ public partial class MainWindow : Window
 
     private async void Thumbnail_DoubleTapped(object? sender, Avalonia.Input.TappedEventArgs e)
     {
+        CloseHoverPreview();
         if (sender is not Avalonia.Controls.Border border) return;
         if (border.DataContext is not ImageViewItem item) return;
         if (!File.Exists(item.FilePath)) return;
@@ -1158,77 +1491,8 @@ public partial class MainWindow : Window
             return;
         }
 
-        var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
-        if (!controller.IsModelLoaded)
-        {
-            Vm.StatusText = "正在加载打标模型...";
-            try { await controller.LoadModelAsync(); }
-            catch (Exception ex) { Vm.StatusText = $"模型加载失败: {ex.Message}"; return; }
-        }
-
-        var settings = Vm.AppSettings;
-        controller.Configure(
-            (Core.Services.TagMode)settings.TagMode,
-            settings.SingleModelMinConfidence, 75,
-            settings.EnsemblePixaiMinConfidence,
-            settings.ArtistMatchThreshold,
-            settings.EnableCharacterRecognition,
-            settings.CharacterMatchThreshold,
-            settings.CharacterMaxMatchesPerImage,
-            settings.DeepSeekApiKey);
-
         var filePaths = selected.Select(i => i.FilePath).Distinct().ToList();
-        Vm.StatusText = "正在准备...";
-
-        _ = Task.Run(async () =>
-        {
-            var repo = App.Services.GetRequiredService<Core.Services.IImageMetaRepository>();
-            var actualPaths = new List<string>();
-            foreach (var p in filePaths)
-            {
-                var m = await repo.GetByPathAsync(p);
-                if (m?.AutoTagStatus == 1) continue;
-                actualPaths.Add(p);
-            }
-            if (actualPaths.Count == 0)
-            {
-                await App.UI.InvokeAsync(() =>
-                    Vm.StatusText = "所选图片均已打标，跳过");
-                return;
-            }
-
-            await App.UI.InvokeAsync(() =>
-                Vm.StatusText = $"正在推理 {actualPaths.Count} 张图片...");
-
-            try
-            {
-                for (int idx = 0; idx < actualPaths.Count; idx++)
-                {
-                    var path = actualPaths[idx];
-                    await App.UI.InvokeAsync(() =>
-                        Vm.StatusText = $"推理中 ({idx + 1}/{actualPaths.Count}): {System.IO.Path.GetFileName(path)}");
-
-                    var items = await controller.RunSingleImageAsync(path);
-                    if (items.Count > 0)
-                        await controller.SaveMappingsAndTagsAsync(path, items);
-                    await repo.SetAutoTagStatusByPathAsync(path, 1);
-                }
-
-                await App.UI.InvokeAsync(async () =>
-                {
-                    foreach (var path in actualPaths)
-                        await Vm.RefreshImageTagsAsync(path);
-                    await Vm.RefreshTagCountsAsync(forceRefresh: true);
-                    AppLogger.Info($"SelectedAutoTag tag counts refreshed count={actualPaths.Count}");
-                    Vm.StatusText = $"打标完成 ({actualPaths.Count} 张)";
-                });
-            }
-            catch (Exception ex)
-            {
-                await App.UI.InvokeAsync(() =>
-                    Vm.StatusText = $"打标失败: {ex.Message}");
-            }
-        });
+        await RunAutoTagAsync(null, filePaths, false);
     }
 
     private async void MenuCopyImage_Click(object? sender, RoutedEventArgs e)
@@ -1566,8 +1830,9 @@ public partial class MainWindow : Window
             }
 
             // Return focus to search box so Enter triggers search, not another cycle
-            TxtTagSearch.Focus();
-            TxtTagSearch.CaretIndex = TxtTagSearch.Text?.Length ?? 0;
+            var searchBox = Vm.IsSearchToolbarLayoutC ? TxtTagSearchC : TxtTagSearchA;
+            searchBox.Focus();
+            searchBox.CaretIndex = searchBox.Text?.Length ?? 0;
         }
     }
 
@@ -1624,158 +1889,172 @@ public partial class MainWindow : Window
         return _rightClickedFolder ?? LstFolders.SelectedItem as ViewModels.FolderTreeNode;
     }
 
-    private async void MenuRenameFolder_Click(object? sender, RoutedEventArgs e)
+    private FolderTreeNode? CaptureContextMenuFolder(object? sender)
     {
         var folder = GetContextMenuFolder(sender);
-        if (folder == null) return;
-
-        var alias = await ShowFolderAliasDialogAsync(folder.DisplayName);
-        if (alias == null) return; // cancelled
-
-        await Vm.UpdateFolderAliasAsync(folder.Path, string.IsNullOrWhiteSpace(alias) ? null! : alias);
+        return folder == null ? null : new FolderTreeNode
+        {
+            Path = folder.Path, DisplayName = folder.DisplayName, Alias = folder.Alias, DbId = folder.DbId
+        };
     }
 
-    private async void MenuClearFolderAlias_Click(object? sender, RoutedEventArgs e)
-    {
-        var folder = GetContextMenuFolder(sender);
-        if (folder == null) return;
+    private void FolderContextMenu_Opened(object? sender, RoutedEventArgs e) => RefreshFolderMenuState();
 
-        await Vm.UpdateFolderAliasAsync(folder.Path, null);
+    private void RefreshFolderMenuState()
+    {
+        if (DataContext is not MainWindowViewModel vm) return;
+        FolderAutoTagMenu.IsEnabled = !vm.IsAutoTagRunning;
+        FolderCharacterMenu.IsEnabled = _characterMatchScope == null;
+        FolderClearTagsMenu.IsEnabled = _clearTagsScope == null;
+        var videoRunning = Volatile.Read(ref _videoOriginalFrameBatchRunning) != 0;
+        FolderVideoMenu.IsEnabled = !videoRunning;
+        FolderStopVideoMenu.IsVisible = videoRunning;
+        FolderStopVideoMenu.IsEnabled = _videoOriginalFrameBatchCts?.IsCancellationRequested == false;
+        FolderStopVideoMenu.Header = $"停止视频原始帧生成：{_videoOriginalFrameTargetName}";
+        ToolTip.SetTip(FolderStopVideoMenu, _videoOriginalFrameTargetPath);
+    }
+
+    private bool IsBlockedByTagClear(FolderOperationScope scope)
+    {
+        if (_clearTagsScope?.Overlaps(scope) != true) return false;
+        Vm.StatusText = "目标范围正在清空标签，请等待完成后再开始。";
+        return true;
+    }
+
+    private async void MenuRenameFolder_Click(object? sender, RoutedEventArgs e)
+    {
+        var folder = CaptureContextMenuFolder(sender);
+        if (folder == null) return;
+        var alias = await Settings.FolderActionDialog.ShowAliasAsync(
+            this, folder.DisplayName, folder.Path, folder.Alias);
+        if (alias == null) return;
+        try
+        {
+            await Vm.UpdateFolderAliasAsync(folder.Path, string.IsNullOrWhiteSpace(alias) ? null : alias);
+        }
+        catch (Exception ex)
+        {
+            Vm.StatusText = $"保存显示名称失败：{ex.Message}";
+            AppLogger.Error($"Folder alias failed: {ex}");
+        }
     }
 
     private async void MenuComputeAutoTags_Click(object? sender, RoutedEventArgs e)
     {
-        var folder = GetContextMenuFolder(sender);
-        if (folder == null) return;
-        var files = await GetImageFilesInFolderAsync(folder.Path);
-        if (files.Count == 0) { Vm.StatusText = "文件夹无图片"; return; }
-        await RunAutoTagAsync(folder, files);
+        var folder = CaptureContextMenuFolder(sender);
+        if (folder == null || Vm.IsAutoTagRunning) return;
+        var recursive = await Settings.FolderActionDialog.ShowScopeAsync(
+            this, "自动打标", folder.DisplayName, folder.Path,
+            "为所选范围内的图片计算标签，自动跳过已打标图片。", "开始打标", _lastAutoTagRecursive);
+        if (recursive == null) return;
+        _lastAutoTagRecursive = recursive.Value;
+        await RunAutoTagAsync(folder, null, recursive.Value);
     }
 
-    private async void MenuRecomputeFailedHashes_Click(object? sender, RoutedEventArgs e)
+    private async void MenuComputeHashes_Click(object? sender, RoutedEventArgs e)
     {
-        var folder = GetContextMenuFolder(sender);
+        var folder = CaptureContextMenuFolder(sender);
         if (folder == null) return;
-        await Vm.RecomputeFailedHashesForFolderAsync(folder);
+        var failedOnly = await Settings.FolderActionDialog.ShowHashModeAsync(this, folder.DisplayName, folder.Path);
+        if (failedOnly == null) return;
+        try
+        {
+            if (failedOnly.Value) await Vm.RecomputeFailedHashesForFolderAsync(folder);
+            else await Vm.ComputeHashesIncrementallyForFolderAsync(folder);
+        }
+        catch (Exception ex)
+        {
+            Vm.StatusText = $"计算图片指纹失败：{ex.Message}";
+            AppLogger.Error($"Folder fingerprints failed: {ex}");
+        }
     }
 
     private async void MenuClearFolderTags_Click(object? sender, RoutedEventArgs e)
     {
-        var folder = GetContextMenuFolder(sender);
-        if (folder == null) { Vm.StatusText = "未找到文件夹"; return; }
-        AppLogger.Info($"ClearTags: folder={folder.Path}");
-
-        var result = await ShowClearTagsDialogAsync();
-        if (result == null) { AppLogger.Info("ClearTags: cancelled"); return; }
-
-        bool recursive = result.Value;
-        AppLogger.Info($"ClearTags: recursive={recursive}");
-        var files = recursive
-            ? await GetImageFilesRecursiveAsync(folder.Path)
-            : await GetImageFilesInFolderAsync(folder.Path);
-        AppLogger.Info($"ClearTags: found {files.Count} files");
-        if (files.Count == 0) { Vm.StatusText = "文件夹无图片"; return; }
-
-        Vm.StatusText = $"正在清空 {files.Count} 张图片的标签...";
-        var clearRepo = App.Services.GetRequiredService<Core.Services.IImageMetaRepository>();
-        await Task.Run(() =>
-            clearRepo.ClearTagsAndStatusBatchAsync(files));
-        AppLogger.Info($"ClearTags: done cleared={files.Count}");
-        foreach (var path in files)
-            Vm.ClearTagCacheForPath(path);
-        if (string.Equals(Vm.CurrentFolder, folder.Path, StringComparison.OrdinalIgnoreCase))
+        var folder = CaptureContextMenuFolder(sender);
+        if (folder == null || _clearTagsScope != null) return;
+        var recursive = await Settings.FolderActionDialog.ShowScopeAsync(
+            this, "清空标签", folder.DisplayName, folder.Path,
+            "将删除所选范围内的全部标签（包括手动和自动标签），并重置打标状态。图片和视频文件不会被删除。此操作无法撤销。",
+            "清空标签");
+        if (recursive == null) return;
+        var scope = FolderOperationScope.ForFolder(folder.Path, recursive.Value);
+        if (_clearTagsScope != null || _autoTagScope?.Overlaps(scope) == true || _characterMatchScope?.Overlaps(scope) == true)
         {
-            Vm.InvalidatePageCache();
-            await Vm.ShowPageAsync(Vm.CurrentPage);
+            Vm.StatusText = "目标范围正在打标、匹配角色标签或清空标签，请等待完成后重试。";
+            return;
         }
-        await Vm.RefreshTagCountsAsync(forceRefresh: true);
-        AppLogger.Info($"ClearFolderTags tag counts refreshed count={files.Count} recursive={recursive}");
-        Vm.StatusText = $"已清空 {files.Count} 张图片的标签";
-    }
-
-    private Task<bool?> ShowClearTagsDialogAsync()
-    {
-        var tcs = new TaskCompletionSource<bool?>();
-        var dialog = new Window
+        _clearTagsScope = scope;
+        RefreshFolderMenuState();
+        try
         {
-            Title = "清空图片标签",
-            Width = 400, Height = 180,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner
-        };
-        var panel = new StackPanel { Margin = new Avalonia.Thickness(16) };
-        panel.Children.Add(new TextBlock
+            var files = recursive.Value
+                ? await GetImageFilesRecursiveAsync(folder.Path)
+                : await GetImageFilesInFolderAsync(folder.Path);
+            if (files.Count == 0) { Vm.StatusText = "所选范围内没有图片或视频。"; return; }
+            Vm.StatusText = $"正在清空 {files.Count} 个文件的标签…";
+            var repository = App.Services.GetRequiredService<IImageMetaRepository>();
+            await Task.Run(() => repository.ClearTagsAndStatusBatchAsync(files));
+            Vm.InvalidatePageCache();
+            await Vm.RefreshTagsAfterExternalWriteAsync(files);
+            AppLogger.Info($"ClearFolderTags: folder={folder.Path}, recursive={recursive}, files={files.Count}");
+            Vm.StatusText = $"已清空 {files.Count} 个文件的标签。";
+        }
+        catch (Exception ex)
         {
-            Text = "选择清空范围：", TextWrapping = Avalonia.Media.TextWrapping.Wrap,
-            Margin = new Avalonia.Thickness(0, 0, 0, 12)
-        });
-        var btnPanel = new StackPanel
+            Vm.StatusText = $"清空标签失败：{ex.Message}";
+            AppLogger.Error($"ClearFolderTags failed: {ex}");
+        }
+        finally
         {
-            Orientation = Avalonia.Layout.Orientation.Horizontal,
-            HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Center,
-            Spacing = 10
-        };
-        var currentBtn = new Button { Content = "仅当前文件夹", Width = 140 };
-        var recursiveBtn = new Button { Content = "包含所有子文件夹", Width = 140 };
-        var cancelBtn = new Button { Content = "取消", Width = 80 };
-
-        currentBtn.Click += (_, _) => { tcs.TrySetResult(false); dialog.Close(); };
-        recursiveBtn.Click += (_, _) => { tcs.TrySetResult(true); dialog.Close(); };
-        cancelBtn.Click += (_, _) => { tcs.TrySetResult(null); dialog.Close(); };
-        dialog.Closed += (_, _) => tcs.TrySetResult(null);
-
-        btnPanel.Children.Add(currentBtn);
-        btnPanel.Children.Add(recursiveBtn);
-        panel.Children.Add(btnPanel);
-        panel.Children.Add(cancelBtn);
-        dialog.Content = panel;
-        _ = dialog.ShowDialog(this);
-        return tcs.Task;
-    }
-
-    private async void MenuComputeAutoTagsRecursive_Click(object? sender, RoutedEventArgs e)
-    {
-        var folder = GetContextMenuFolder(sender);
-        if (folder == null) return;
-        var files = await GetImageFilesRecursiveAsync(folder.Path);
-        if (files.Count == 0) { Vm.StatusText = "文件夹及子文件夹无图片"; return; }
-        await RunAutoTagAsync(folder, files);
+            _clearTagsScope = null;
+            RefreshFolderMenuState();
+        }
     }
 
     private async void MenuMatchCharacterEmbeddingsRecursive_Click(object? sender, RoutedEventArgs e)
     {
-        var folder = GetContextMenuFolder(sender);
-        if (folder == null) return;
-        await RunCharacterEmbeddingMatchAsync(folder.Path);
+        var folder = CaptureContextMenuFolder(sender);
+        if (folder == null || _characterMatchScope != null) return;
+        if (!await Settings.FolderActionDialog.ShowConfirmAsync(
+            this, "匹配角色标签", folder.DisplayName, folder.Path,
+            "将处理当前文件夹及所有子文件夹，使用已有图片向量与角色库匹配并添加角色标签。缺少向量的图片会跳过；请先准备图片向量和角色库。",
+            "开始匹配")) return;
+        var scope = FolderOperationScope.ForFolder(folder.Path, true);
+        if (_characterMatchScope != null || IsBlockedByTagClear(scope)) return;
+        _characterMatchScope = scope;
+        RefreshFolderMenuState();
+        try { await RunCharacterEmbeddingMatchAsync(folder.Path); }
+        finally
+        {
+            _characterMatchScope = null;
+            RefreshFolderMenuState();
+        }
     }
 
     private void MenuStopVideoOriginalFrames_Click(object? sender, RoutedEventArgs e)
     {
-        var cts = Volatile.Read(ref _videoOriginalFrameBatchCts);
-        if (Volatile.Read(ref _videoOriginalFrameBatchRunning) == 0 || cts == null)
-        {
-            Vm.StatusText = "当前没有视频原始帧计算任务";
-            return;
-        }
-
+        var cts = _videoOriginalFrameBatchCts;
+        if (_videoOriginalFrameBatchRunning == 0 || cts == null) return;
         cts.Cancel();
-        Vm.StatusText = "正在停止视频原始帧计算...";
+        Vm.StatusText = $"正在停止视频原始帧生成：{_videoOriginalFrameTargetName}…";
+        RefreshFolderMenuState();
     }
 
-    private void MenuComputeVideoOriginalFramesRecursive_Click(object? sender, RoutedEventArgs e)
+    private async void MenuComputeVideoOriginalFramesRecursive_Click(object? sender, RoutedEventArgs e)
     {
-        var folder = GetContextMenuFolder(sender);
-        if (folder == null) return;
-
-        if (Interlocked.CompareExchange(ref _videoOriginalFrameBatchRunning, 1, 0) != 0)
-        {
-            Vm.StatusText = "视频原始帧计算正在进行中";
-            return;
-        }
-
+        var folder = CaptureContextMenuFolder(sender);
+        if (folder == null || _videoOriginalFrameBatchRunning != 0) return;
+        if (!await Settings.FolderActionDialog.ShowConfirmAsync(
+            this, "生成视频原始帧", folder.DisplayName, folder.Path,
+            "将处理当前文件夹及所有子文件夹中的视频，跳过已有原始帧缓存的视频。运行中可在文件夹菜单中停止。", "开始生成")) return;
+        if (Interlocked.CompareExchange(ref _videoOriginalFrameBatchRunning, 1, 0) != 0) return;
         var batchCts = new CancellationTokenSource();
-        var oldCts = Interlocked.Exchange(ref _videoOriginalFrameBatchCts, batchCts);
-        oldCts?.Dispose();
-        _ = RunVideoOriginalFrameBatchAsync(folder.Path, batchCts);
+        _videoOriginalFrameBatchCts = batchCts;
+        _videoOriginalFrameTargetName = folder.DisplayName;
+        _videoOriginalFrameTargetPath = folder.Path;
+        RefreshFolderMenuState();
+        await RunVideoOriginalFrameBatchAsync(folder.Path, batchCts);
     }
 
     private async Task RunVideoOriginalFrameBatchAsync(string rootPath, CancellationTokenSource batchCts)
@@ -1915,9 +2194,15 @@ public partial class MainWindow : Window
         }
         finally
         {
-            Interlocked.Exchange(ref _videoOriginalFrameBatchRunning, 0);
-            Interlocked.CompareExchange(ref _videoOriginalFrameBatchCts, null, batchCts);
-            batchCts.Dispose();
+            await App.UI.InvokeAsync(() =>
+            {
+                _videoOriginalFrameBatchRunning = 0;
+                _videoOriginalFrameBatchCts = null;
+                _videoOriginalFrameTargetName = null;
+                _videoOriginalFrameTargetPath = null;
+                batchCts.Dispose();
+                RefreshFolderMenuState();
+            });
         }
     }
 
@@ -2080,7 +2365,7 @@ public partial class MainWindow : Window
         catch { return new List<string>(); }
     }
 
-    private async Task RunAutoTagAsync(ViewModels.FolderTreeNode folder, List<string> filePaths)
+    private async Task RunAutoTagAsync(ViewModels.FolderTreeNode? folder, List<string>? filePaths, bool recursive)
     {
         if (Vm.IsAutoTagRunning)
         {
@@ -2088,21 +2373,12 @@ public partial class MainWindow : Window
             return;
         }
 
-        var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
+        var scope = folder != null
+            ? FolderOperationScope.ForFolder(folder.Path, recursive)
+            : FolderOperationScope.ForFiles(filePaths ?? []);
+        if (IsBlockedByTagClear(scope)) return;
 
-        if (!controller.IsModelLoaded)
-        {
-            Vm.StatusText = "正在加载打标模型...";
-            try { await controller.LoadModelAsync(); }
-            catch (Exception ex)
-            {
-                var fullDetail = ex.ToString();
-                while (ex.InnerException != null) { ex = ex.InnerException; }
-                AppLogger.Error($"模型加载失败: {fullDetail}");
-                Vm.StatusText = $"模型加载失败: {ex.Message}";
-                return;
-            }
-        }
+        var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
 
         var settings = Vm.AppSettings;
         controller.Configure(
@@ -2118,57 +2394,82 @@ public partial class MainWindow : Window
         var messenger = App.Services.GetRequiredService<IMessenger>();
         // 用唯一 token 替代 this，避免旧 Task.Run 的 finally 误删新 handler
         var msgToken = new object();
+        var terminalMessage = 0;
         messenger.Register<AutoTagProgressMessage>(msgToken, (r, m) =>
         {
+            if (m.Phase is "Done" or "Stopped" or "Error")
+                Interlocked.Exchange(ref terminalMessage, 1);
             App.UI.Post(() =>
-                Vm.StatusText = $"[{m.Phase}] {m.StatusText}");
+            {
+                Vm.StatusText = m.StatusText;
+            });
         });
 
         var runVersion = Interlocked.Increment(ref _autoTagRunVersion);
         Vm.IsAutoTagRunning = true;
-        Vm.StatusText = $"正在推理 {filePaths.Count} 张图片...";
-        _ = Task.Run(async () =>
+        _autoTagScope = scope;
+        RefreshFolderMenuState();
+        Vm.StatusText = "正在准备自动打标...";
+        try
         {
+            if (folder != null)
+            {
+                await controller.RunFolderAsync(folder.DbId, folder.Path, recursive);
+            }
+            else
+            {
+                await controller.RunSelectedImagesAsync(filePaths ?? new List<string>());
+            }
+
+            var processed = controller.LastProcessedPaths?.ToList() ?? new List<string>();
+            await App.UI.InvokeAsync(async () =>
+            {
+                if (processed.Count > 0)
+                {
+                    await Vm.RefreshTagsAfterExternalWriteAsync(processed);
+                    AppLogger.Info($"AutoTag tag counts refreshed processed={processed.Count}");
+                }
+
+                if (Volatile.Read(ref terminalMessage) == 0)
+                {
+                    var total = (filePaths?.Count ?? 0);
+                    Vm.StatusText = controller.LastRunCancelled
+                        ? "自动打标已停止"
+                        : processed.Count > 0
+                            ? $"打标完成 ({processed.Count}/{(total > 0 ? total : processed.Count)} 张)"
+                            : controller.LastPreparationFailed > 0
+                                ? $"打标完成（准备失败 {controller.LastPreparationFailed} 张，跳过 {controller.LastSkippedCount} 张）"
+                                : $"打标完成（跳过 {controller.LastSkippedCount} 张）";
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            await App.UI.InvokeAsync(() =>
+            {
+                Vm.StatusText = $"打标失败: {ex.Message}";
+                AppLogger.Error($"AutoTag UI failed: {ex}");
+            });
+        }
+        finally
+        {
+            try { messenger.Unregister<AutoTagProgressMessage>(msgToken); }
+            catch (Exception ex) { AppLogger.Warn($"AutoTag unregister failed: {ex.Message}"); }
+
             try
             {
-                await controller.RunPipelineAsync(folder.DbId, folder.Path, filePaths, "Start");
-                var processed = controller.LastProcessedPaths;
-                await App.UI.InvokeAsync(async () =>
+                await App.UI.InvokeAsync(() =>
                 {
-                    if (!Vm.StatusText.Contains("已停止"))
-                        Vm.StatusText = processed.Count > 0
-                            ? $"打标完成 ({processed.Count}/{filePaths.Count} 张)"
-                            : $"打标完成 ({filePaths.Count} 张，全部已跳过)";
-                    foreach (var path in processed)
-                        await Vm.RefreshImageTagsAsync(path);
-                    if (processed.Count > 0)
+                    if (runVersion == Volatile.Read(ref _autoTagRunVersion))
                     {
-                        await Vm.RefreshTagCountsAsync(forceRefresh: true);
-                        AppLogger.Info($"AutoTag tag counts refreshed processed={processed.Count}");
+                        Vm.IsAutoTagRunning = false;
+                        _autoTagScope = null;
+                        RefreshFolderMenuState();
                     }
                 });
             }
-            catch (Exception ex)
-            {
-                await App.UI.InvokeAsync(() =>
-                    Vm.StatusText = $"打标失败: {ex.Message}");
-            }
-            finally
-            {
-                try { messenger.Unregister<AutoTagProgressMessage>(msgToken); }
-                catch (Exception ex) { AppLogger.Warn($"AutoTag unregister failed: {ex.Message}"); }
-
-                try
-                {
-                    await App.UI.InvokeAsync(() =>
-                    {
-                        if (runVersion == Volatile.Read(ref _autoTagRunVersion))
-                            Vm.IsAutoTagRunning = false;
-                    });
-                }
-                catch (Exception ex) { AppLogger.Warn($"AutoTag reset IsRunning failed: {ex.Message}"); }
-            }
-        });
+            catch (Exception ex) { AppLogger.Warn($"AutoTag reset IsRunning failed: {ex.Message}"); }
+        }
     }
 
     private async Task ShowInfoDialogAsync(string message)
@@ -2215,57 +2516,6 @@ public partial class MainWindow : Window
         return await tcs.Task;
     }
 
-    private async Task<string?> ShowFolderAliasDialogAsync(string currentText)
-    {
-        var tcs = new TaskCompletionSource<string?>();
-
-        var dialog = new Window
-        {
-            Title = "重命名显示名称",
-            Width = 420,
-            Height = 150,
-            WindowStartupLocation = WindowStartupLocation.CenterOwner,
-            CanResize = false,
-            ShowInTaskbar = false
-        };
-
-        var textBox = new TextBox
-        {
-            Text = currentText,
-            Margin = new Thickness(14, 14, 14, 8)
-        };
-
-        var btnPanel = new StackPanel
-        {
-            Orientation = Avalonia.Layout.Orientation.Horizontal,
-            HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right,
-            Margin = new Thickness(14, 0),
-            Spacing = 10
-        };
-        var cancelBtn = new Button { Content = "取消", Width = 80 };
-        var okBtn = new Button { Content = "确定", Width = 80 };
-
-        btnPanel.Children.Add(cancelBtn);
-        btnPanel.Children.Add(okBtn);
-
-        var panel = new StackPanel();
-        panel.Children.Add(textBox);
-        panel.Children.Add(btnPanel);
-
-        dialog.Content = panel;
-
-        cancelBtn.Click += (_, _) => { tcs.TrySetResult(null); dialog.Close(); };
-        okBtn.Click += (_, _) => { tcs.TrySetResult(textBox.Text); dialog.Close(); };
-        dialog.Closed += (_, _) => tcs.TrySetResult(null);
-
-        if (this.IsVisible)
-            await dialog.ShowDialog(this);
-        else
-            dialog.Show();
-
-        return await tcs.Task;
-    }
-
     // ==================== Tag Settings ====================
 
     private void MenuTagSettings_Click(object? sender, RoutedEventArgs e)
@@ -2282,9 +2532,11 @@ public partial class MainWindow : Window
     {
         var vm = new AppearanceSettingViewModel(
             Vm.AppSettings.ThemeVariant,
-            theme =>
+            Vm.AppSettings.SearchToolbarLayout,
+            (theme, layout) =>
             {
                 Vm.AppSettings.ThemeVariant = theme;
+                Vm.SetSearchToolbarLayout(layout);
                 App.ApplyColors(!string.Equals(theme, "Light", StringComparison.OrdinalIgnoreCase));
                 _ = Vm.SaveSettingsAsync();
             });
@@ -2405,6 +2657,9 @@ public partial class MainWindow : Window
 
     private void Window_Closing(object? sender, Avalonia.Controls.WindowClosingEventArgs e)
     {
+        Vm.PropertyChanged -= OnViewModelPropertyChanged;
+        CloseHoverPreview();
+        ReleaseHoverPreviewPopup();
         Vm.ScrollRestoreRequested -= OnScrollRestore;
         Vm.ScrollToSelectedRequested -= OnScrollToSelected;
         Vm.ScrollSearchResultsToTopRequested -= OnScrollSearchResultsToTop;

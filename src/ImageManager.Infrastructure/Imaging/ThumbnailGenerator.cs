@@ -296,6 +296,18 @@ public static class ThumbnailGenerator
         }
     }
 
+    /// <summary>Reads actual header dimensions; unreadable inputs remain unknown, not a synthetic square.</summary>
+    public static (int Width, int Height) GetDimensionsOrUnknown(string filePath)
+    {
+        try
+        {
+            using var stream = File.OpenRead(filePath);
+            using var codec = SKCodec.Create(stream);
+            return codec == null ? (0, 0) : (codec.Info.Width, codec.Info.Height);
+        }
+        catch { return (0, 0); }
+    }
+
     /// <summary>Get image dimensions from byte array (no disk I/O)</summary>
     public static (int Width, int Height) GetDimensions(byte[] data)
     {
