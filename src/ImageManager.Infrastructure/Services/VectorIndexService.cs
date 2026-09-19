@@ -158,7 +158,7 @@ public sealed class VectorIndexService : IVectorIndexService
         CancellationToken ct = default)
     {
         if (Interlocked.CompareExchange(ref _running, 1, 0) != 0)
-            throw new InvalidOperationException("宸叉湁绱㈠紩鎴栨寚绾逛换鍔℃鍦ㄨ繍琛�");
+            throw new InvalidOperationException("已有向量索引或图片指纹任务正在运行");
 
         lock (_stateLock)
         {

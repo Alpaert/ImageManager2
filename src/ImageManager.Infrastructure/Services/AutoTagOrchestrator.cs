@@ -295,6 +295,9 @@ public class AutoTagOrchestrator : IDisposable
     {
         var activeTagService = _factory.Create(_currentMode);
         var result = await activeTagService.PredictWithSourcesAsync(filePath, ct);
+        if (result.Rating is >= SystemRating.General and <= SystemRating.Explicit)
+            await _metaRepo.SetSystemRatingByPathAsync(filePath, (int)result.Rating);
+
         var predictions = result.MergedTags;
         var filtered = predictions
             .Where(p => p.Confidence >= 0.1)

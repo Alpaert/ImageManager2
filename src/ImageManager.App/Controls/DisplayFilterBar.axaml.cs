@@ -16,6 +16,10 @@ public partial class DisplayFilterBar : UserControl
     private readonly ComboBox _type;
     private readonly ComboBox _orientation;
     private readonly CheckBox _unknown;
+    private readonly CheckBox _generalRating;
+    private readonly CheckBox _sensitiveRating;
+    private readonly CheckBox _questionableRating;
+    private readonly CheckBox _explicitRating;
     private readonly TextBlock _hint;
     private readonly TextBlock _unknownCount;
     private readonly Flyout _flyout;
@@ -39,6 +43,10 @@ public partial class DisplayFilterBar : UserControl
         _orientation.Classes.Set("toolbar-compact", true);
         _unknown = new CheckBox { Content = "尺寸未知的文件也显示", IsChecked = true };
         _unknown.Classes.Set("toolbar-compact", true);
+        _generalRating = CreateRatingCheckBox("全年龄");
+        _sensitiveRating = CreateRatingCheckBox("敏感");
+        _questionableRating = CreateRatingCheckBox("大尺度");
+        _explicitRating = CreateRatingCheckBox("R-18");
         _hint = new TextBlock { FontSize = 12, TextWrapping = Avalonia.Media.TextWrapping.Wrap };
         _unknownCount = new TextBlock { FontSize = 12, Opacity = 0.75 };
         _type.SelectionChanged += (_, _) => UpdateDimensionState();
@@ -58,6 +66,11 @@ public partial class DisplayFilterBar : UserControl
         panel.Children.Add(_orientation);
         panel.Children.Add(_hint);
         panel.Children.Add(_unknown);
+        panel.Children.Add(new TextBlock { Text = "年龄分级" });
+        panel.Children.Add(_generalRating);
+        panel.Children.Add(_sensitiveRating);
+        panel.Children.Add(_questionableRating);
+        panel.Children.Add(_explicitRating);
         panel.Children.Add(_unknownCount);
         panel.Children.Add(new StackPanel
         {
@@ -101,6 +114,10 @@ public partial class DisplayFilterBar : UserControl
         _type.SelectedIndex = Math.Max(0, _types.FindIndex(x => x.Id == options.TypeId));
         _orientation.SelectedIndex = (int)options.Orientation;
         _unknown.IsChecked = options.IncludeUnknownDimensions;
+        _generalRating.IsChecked = options.ContentRatings.HasFlag(ContentRatingFilter.General);
+        _sensitiveRating.IsChecked = options.ContentRatings.HasFlag(ContentRatingFilter.Sensitive);
+        _questionableRating.IsChecked = options.ContentRatings.HasFlag(ContentRatingFilter.Questionable);
+        _explicitRating.IsChecked = options.ContentRatings.HasFlag(ContentRatingFilter.Explicit);
         _unknownCount.Text = _vm?.DisplayFilterUnknownText;
         _unknownCount.IsVisible = !string.IsNullOrEmpty(_unknownCount.Text);
         UpdateDimensionState();
@@ -113,7 +130,8 @@ public partial class DisplayFilterBar : UserControl
         var options = new DisplayFilterOptions(type?.Id,
             type?.SupportsDimensions == false ? MediaOrientation.All
                 : (MediaOrientation)Math.Max(0, _orientation.SelectedIndex),
-            _unknown.IsChecked == true);
+            _unknown.IsChecked == true,
+            GetSelectedContentRatings());
         _flyout.Hide();
         await _vm.ApplyDisplayFilterAsync(options);
     }
@@ -137,4 +155,21 @@ public partial class DisplayFilterBar : UserControl
     private static List<TypeChoice> BuildTypes() => new[] { new TypeChoice(null, "全部类型", true) }
         .Concat(FileTypeConstants.SupportedTypes.Select(t => new TypeChoice(t.Id, t.DisplayName, t.SupportsDimensions)))
         .ToList();
+
+    private static CheckBox CreateRatingCheckBox(string content)
+    {
+        var checkBox = new CheckBox { Content = content, IsChecked = true };
+        checkBox.Classes.Set("toolbar-compact", true);
+        return checkBox;
+    }
+
+    private ContentRatingFilter GetSelectedContentRatings()
+    {
+        var ratings = ContentRatingFilter.None;
+        if (_generalRating.IsChecked == true) ratings |= ContentRatingFilter.General;
+        if (_sensitiveRating.IsChecked == true) ratings |= ContentRatingFilter.Sensitive;
+        if (_questionableRating.IsChecked == true) ratings |= ContentRatingFilter.Questionable;
+        if (_explicitRating.IsChecked == true) ratings |= ContentRatingFilter.Explicit;
+        return ratings;
+    }
 }

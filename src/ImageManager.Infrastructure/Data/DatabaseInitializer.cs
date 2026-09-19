@@ -129,6 +129,7 @@ public static class DatabaseInitializer
             ALTER TABLE ImageMeta ADD COLUMN Duration REAL DEFAULT NULL;
             ALTER TABLE ImageMeta ADD COLUMN ThumbnailTimestamp REAL DEFAULT NULL;
             """);
+        BackfillSystemRatingsFromLegacyTags(conn);
     }
 
     private static void CreateIndexes(SqliteConnection conn)
@@ -139,6 +140,55 @@ public static class DatabaseInitializer
             CREATE INDEX IF NOT EXISTS idx_imagemeta_filepath_nocase ON ImageMeta(FilePath COLLATE NOCASE);
             CREATE INDEX IF NOT EXISTS idx_suppressedcharactertag_image
                 ON SuppressedCharacterTag(ImageMetaId);
+            """;
+        cmd.ExecuteNonQuery();
+    }
+
+    private static void BackfillSystemRatingsFromLegacyTags(SqliteConnection conn)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            WITH RatingCandidates AS (
+                SELECT im.Id, 0 AS Rating
+                FROM ImageMeta im
+                WHERE im.SystemRating = -1 AND EXISTS (
+                    SELECT 1 FROM ImageTag it INNER JOIN Tag t ON t.Id = it.TagId
+                    WHERE it.ImageMetaId = im.Id AND t.Name COLLATE NOCASE IN ('general', '全年龄')
+                )
+                UNION ALL
+                SELECT im.Id, 1
+                FROM ImageMeta im
+                WHERE im.SystemRating = -1 AND EXISTS (
+                    SELECT 1 FROM ImageTag it INNER JOIN Tag t ON t.Id = it.TagId
+                    WHERE it.ImageMetaId = im.Id AND t.Name COLLATE NOCASE IN ('sensitive', '敏感')
+                )
+                UNION ALL
+                SELECT im.Id, 2
+                FROM ImageMeta im
+                WHERE im.SystemRating = -1 AND EXISTS (
+                    SELECT 1 FROM ImageTag it INNER JOIN Tag t ON t.Id = it.TagId
+                    WHERE it.ImageMetaId = im.Id AND t.Name COLLATE NOCASE IN ('questionable', '大尺度')
+                )
+                UNION ALL
+                SELECT im.Id, 3
+                FROM ImageMeta im
+                WHERE im.SystemRating = -1 AND EXISTS (
+                    SELECT 1 FROM ImageTag it INNER JOIN Tag t ON t.Id = it.TagId
+                    WHERE it.ImageMetaId = im.Id AND t.Name COLLATE NOCASE IN ('explicit', 'r18', 'r-18')
+                )
+            ),
+            UnambiguousRatings AS (
+                SELECT Id, MIN(Rating) AS Rating
+                FROM RatingCandidates
+                GROUP BY Id
+                HAVING COUNT(*) = 1
+            )
+            UPDATE ImageMeta
+            SET SystemRating = (
+                SELECT Rating FROM UnambiguousRatings WHERE UnambiguousRatings.Id = ImageMeta.Id
+            )
+            WHERE SystemRating = -1
+              AND Id IN (SELECT Id FROM UnambiguousRatings);
             """;
         cmd.ExecuteNonQuery();
     }

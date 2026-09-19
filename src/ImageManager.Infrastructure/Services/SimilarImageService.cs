@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Numerics;
+using System.Globalization;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
@@ -158,45 +159,27 @@ public sealed class SimilarImageService : ISimilarImageService
         if (files.Count == 0)
             return [];
         AppLogger.Info($"PerceptualSearch candidates={files.Count} base={Path.GetFileName(baseFilePath)}");
-        var hashCache = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        ct.ThrowIfCancellationRequested();
         var hashes = await _metaRepository.GetPerceptualHashesByPathsAsync(files);
-        foreach (var pair in hashes)
+        var hashCache = await Task.Run(() =>
         {
-            if (!string.IsNullOrEmpty(pair.Value) && pair.Value.Split('|').Length >= 4)
-                hashCache[pair.Key] = pair.Value;
-        }
+            var parsed = new Dictionary<string, ParsedPerceptualHash>(StringComparer.OrdinalIgnoreCase);
+            foreach (var pair in hashes)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (TryParsePerceptualHash(pair.Value, out var hash))
+                    parsed[pair.Key] = hash;
+            }
+            return parsed;
+        }, ct);
 
-        // Database hashes may be missing for older or interrupted indexing runs.
-        // Compute those candidates on demand so a stale HashStatus cannot make the
-        // entire perceptual search return no results.
-        var missing = files
-            .Where(path => !hashCache.ContainsKey(path) && File.Exists(path))
-            .ToList();
-        if (missing.Count > 0)
-        {
-            AppLogger.Info($"PerceptualSearch computing missing hashes: {missing.Count}");
-            await Task.Run(() => Parallel.ForEach(
-                missing,
-                new ParallelOptions
-                {
-                    CancellationToken = ct,
-                    MaxDegreeOfParallelism = Math.Max(1, Math.Min(Environment.ProcessorCount, 4))
-                },
-                path =>
-                {
-                    var hash = HashService.ComputeCombinedPerceptualHashFromFile(path);
-                    if (!string.IsNullOrEmpty(hash) && hash.Split('|').Length >= 4)
-                        hashCache[path] = hash;
-                }), ct);
-        }
-
-        var baseHash = await Task.Run(() => HashService.ComputeCombinedPerceptualHashFromFile(baseFilePath), ct);
-        if (string.IsNullOrEmpty(baseHash))
+        var baseHashValue = await Task.Run(() => HashService.ComputeCombinedPerceptualHashFromFile(baseFilePath), ct);
+        if (!TryParsePerceptualHash(baseHashValue, out var baseHash))
         {
             AppLogger.Warn($"PerceptualSearch base hash failed: {baseFilePath}");
             return [];
         }
-        AppLogger.Info($"PerceptualSearch usableHashes={hashCache.Count} baseHashLength={baseHash.Length}");
+        AppLogger.Info($"PerceptualSearch usableHashes={hashCache.Count} baseHashLength={baseHashValue.Length}");
         var results = new ConcurrentBag<SimilaritySearchResult>();
         await Task.Run(() => Parallel.ForEach(files, new ParallelOptions
         {
@@ -223,18 +206,13 @@ public sealed class SimilarImageService : ISimilarImageService
     }
 
     private static (float Score, bool IsStrict) ScorePerceptualMatch(
-        string baseHash,
-        string candidateHash)
+        in ParsedPerceptualHash baseHash,
+        in ParsedPerceptualHash candidateHash)
     {
-        var baseParts = baseHash.Split('|');
-        var candidateParts = candidateHash.Split('|');
-        if (baseParts.Length < 4 || candidateParts.Length < 4)
-            return (0, false);
-
-        var averageDistance = HammingDistance(baseParts[0], candidateParts[0]);
-        var differenceDistance = HammingDistance(baseParts[1], candidateParts[1]);
-        var perceptualDistance = HammingDistance(baseParts[2], candidateParts[2]);
-        var histogramSimilarity = (float)HashService.CompareHistograms(baseParts[3], candidateParts[3]);
+        var averageDistance = BitOperations.PopCount(baseHash.Average ^ candidateHash.Average);
+        var differenceDistance = BitOperations.PopCount(baseHash.Difference ^ candidateHash.Difference);
+        var perceptualDistance = BitOperations.PopCount(baseHash.Perceptual ^ candidateHash.Perceptual);
+        var histogramSimilarity = CompareHistograms(baseHash.Histogram, candidateHash.Histogram);
         var votes = 0;
         if (averageDistance <= AThreshold) votes++;
         if (differenceDistance <= DThreshold) votes++;
@@ -251,18 +229,65 @@ public sealed class SimilarImageService : ISimilarImageService
         return (score, isStrict);
     }
 
-    private static int HammingDistance(string left, string right)
+    private static bool TryParsePerceptualHash(string? value, out ParsedPerceptualHash hash)
+    {
+        hash = default;
+        if (string.IsNullOrEmpty(value))
+            return false;
+
+        var parts = value.Split('|');
+        if (parts.Length < 4 ||
+            !TryParseBinaryHash(parts[0], out var average) ||
+            !TryParseBinaryHash(parts[1], out var difference) ||
+            !TryParseBinaryHash(parts[2], out var perceptual))
+            return false;
+
+        var histogramParts = parts[3].Split(',');
+        if (histogramParts.Length == 0)
+            return false;
+
+        var histogram = new double[histogramParts.Length];
+        for (var index = 0; index < histogramParts.Length; index++)
+        {
+            if (!double.TryParse(histogramParts[index], NumberStyles.Float, CultureInfo.InvariantCulture, out histogram[index]))
+                return false;
+        }
+
+        hash = new ParsedPerceptualHash(average, difference, perceptual, histogram);
+        return true;
+    }
+
+    private static bool TryParseBinaryHash(string value, out ulong hash)
+    {
+        hash = 0;
+        if (value.Length != 64)
+            return false;
+
+        foreach (var bit in value)
+        {
+            if (bit is not ('0' or '1'))
+                return false;
+            hash = (hash << 1) | (uint)(bit - '0');
+        }
+        return true;
+    }
+
+    private static float CompareHistograms(ReadOnlySpan<double> left, ReadOnlySpan<double> right)
     {
         if (left.Length != right.Length)
-            return int.MaxValue;
-        var distance = 0;
+            return 0;
+
+        double intersection = 0;
         for (var index = 0; index < left.Length; index++)
-        {
-            if (left[index] != right[index])
-                distance++;
-        }
-        return distance;
+            intersection += Math.Min(left[index], right[index]);
+        return (float)intersection;
     }
+
+    private readonly record struct ParsedPerceptualHash(
+        ulong Average,
+        ulong Difference,
+        ulong Perceptual,
+        double[] Histogram);
 
     private static (string ModelKey, string ModelVersion) GetModel(SimilaritySearchMode mode) => mode switch
     {

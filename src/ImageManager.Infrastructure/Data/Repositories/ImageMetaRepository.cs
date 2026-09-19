@@ -704,7 +704,9 @@ public class ImageMetaRepository : IImageMetaRepository
         foreach (var chunk in filePaths.Chunk(900))
         {
             var rows = await conn.QueryAsync<(string FilePath, string PerceptualHash)>(@"
-                SELECT FilePath, PerceptualHash FROM ImageMeta WHERE FilePath COLLATE NOCASE IN @Paths",
+                SELECT FilePath, PerceptualHash FROM ImageMeta
+                WHERE FilePath COLLATE NOCASE IN @Paths
+                  AND HashStatus = 1",
                 new { Paths = chunk });
 
             foreach (var (path, hash) in rows)
@@ -730,6 +732,58 @@ public class ImageMetaRepository : IImageMetaRepository
                 result[path] = (w, h);
         }
         return result;
+    }
+
+    public async Task<Dictionary<string, int>> GetSystemRatingsByPathsAsync(List<string> filePaths)
+    {
+        var result = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (filePaths.Count == 0) return result;
+
+        using var conn = _dbFactory.CreateConnection();
+        foreach (var chunk in filePaths.Chunk(900))
+        {
+            var rows = await conn.QueryAsync<(string FilePath, int SystemRating)>(@"
+                SELECT im.FilePath,
+                    CASE
+                        WHEN im.SystemRating BETWEEN 0 AND 3 THEN im.SystemRating
+                        WHEN EXISTS (
+                            SELECT 1 FROM ImageTag it INNER JOIN Tag t ON t.Id = it.TagId
+                            WHERE it.ImageMetaId = im.Id AND t.Name COLLATE NOCASE IN ('general', '全年龄')
+                        ) THEN 0
+                        WHEN EXISTS (
+                            SELECT 1 FROM ImageTag it INNER JOIN Tag t ON t.Id = it.TagId
+                            WHERE it.ImageMetaId = im.Id AND t.Name COLLATE NOCASE IN ('sensitive', '敏感')
+                        ) THEN 1
+                        WHEN EXISTS (
+                            SELECT 1 FROM ImageTag it INNER JOIN Tag t ON t.Id = it.TagId
+                            WHERE it.ImageMetaId = im.Id AND t.Name COLLATE NOCASE IN ('questionable', '大尺度')
+                        ) THEN 2
+                        WHEN EXISTS (
+                            SELECT 1 FROM ImageTag it INNER JOIN Tag t ON t.Id = it.TagId
+                            WHERE it.ImageMetaId = im.Id AND t.Name COLLATE NOCASE IN ('explicit', 'r18', 'r-18')
+                        ) THEN 3
+                        ELSE -1
+                    END AS SystemRating
+                FROM ImageMeta im WHERE im.FilePath COLLATE NOCASE IN @Paths",
+                new { Paths = chunk });
+            foreach (var (path, rating) in rows)
+                result[path] = rating;
+        }
+        return result;
+    }
+
+    public async Task SetSystemRatingByPathAsync(string filePath, int rating)
+    {
+        if (rating is < 0 or > 3)
+            throw new ArgumentOutOfRangeException(nameof(rating));
+
+        using var writer = await MetadataWriteCoordinator.EnterAsync(_dbFactory);
+        using var conn = _dbFactory.CreateConnection();
+        await conn.ExecuteAsync(@"
+            UPDATE ImageMeta
+            SET SystemRating = @Rating, UpdatedAt = @UpdatedAt
+            WHERE FilePath COLLATE NOCASE = @FilePath",
+            new { FilePath = filePath, Rating = rating, UpdatedAt = DateTime.UtcNow });
     }
 
     public async Task<Dictionary<string, string>> GetFileHashesByPathsAsync(List<string> filePaths)
@@ -763,7 +817,7 @@ public class ImageMetaRepository : IImageMetaRepository
                 WHERE FilePath COLLATE NOCASE IN @Paths
                   AND HashStatus = 1
                   AND PerceptualHash IS NOT NULL
-                  AND PerceptualHash <> ''",
+                  AND length(PerceptualHash) = 642",
                 new { Paths = chunk });
             foreach (var path in rows)
                 result.Add(path);

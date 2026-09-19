@@ -23,8 +23,9 @@ public partial class MainWindowViewModel
     public bool HasDisplayFilter => DisplayFilter.IsActive;
     public bool HasTypeFilter => DisplayFilter.TypeId != null;
     public bool HasOrientationFilter => DisplayFilter.Orientation != MediaOrientation.All;
+    public bool HasContentRatingFilter => !DisplayFilter.IncludesAllContentRatings;
     public string DisplayFilterButtonText => HasDisplayFilter
-        ? $"显示筛选 ({(HasTypeFilter ? 1 : 0) + (HasOrientationFilter ? 1 : 0)}) ▾" : "显示筛选 ▾";
+        ? $"显示筛选 ({(HasTypeFilter ? 1 : 0) + (HasOrientationFilter ? 1 : 0) + (HasContentRatingFilter ? 1 : 0)}) ▾" : "显示筛选 ▾";
     public string TypeFilterText => "类型：" + (FileTypeConstants.SupportedTypes
         .FirstOrDefault(t => t.Id == DisplayFilter.TypeId)?.DisplayName ?? "全部") + " ×";
     public string OrientationFilterText => "方向：" + (DisplayFilter.Orientation switch
@@ -32,6 +33,13 @@ public partial class MainWindowViewModel
         MediaOrientation.Landscape => "横向", MediaOrientation.Portrait => "竖向",
         MediaOrientation.Square => "正方形", _ => "不限"
     }) + (DisplayFilter.IncludeUnknownDimensions ? "（含尺寸未知）" : "") + " ×";
+    public string ContentRatingFilterText => "年龄分级：" + string.Join("、", new[]
+    {
+        (ContentRatingFilter.General, "全年龄"),
+        (ContentRatingFilter.Sensitive, "敏感"),
+        (ContentRatingFilter.Questionable, "大尺度"),
+        (ContentRatingFilter.Explicit, "R-18")
+    }.Where(entry => DisplayFilter.ContentRatings.HasFlag(entry.Item1)).Select(entry => entry.Item2)) + " ×";
     public string DisplayFilterCountText => IsDisplayFilterBusy ? "正在筛选…"
         : $"显示 {ActiveFileList.Count} / {DisplayFilterSourceCount} 个文件";
     public string DisplayFilterUnknownText => HasOrientationFilter
@@ -43,9 +51,11 @@ public partial class MainWindowViewModel
         OnPropertyChanged(nameof(HasDisplayFilter));
         OnPropertyChanged(nameof(HasTypeFilter));
         OnPropertyChanged(nameof(HasOrientationFilter));
+        OnPropertyChanged(nameof(HasContentRatingFilter));
         OnPropertyChanged(nameof(DisplayFilterButtonText));
         OnPropertyChanged(nameof(TypeFilterText));
         OnPropertyChanged(nameof(OrientationFilterText));
+        OnPropertyChanged(nameof(ContentRatingFilterText));
         OnPropertyChanged(nameof(DisplayFilterCountText));
         OnPropertyChanged(nameof(DisplayFilterUnknownText));
         OnPropertyChanged(nameof(IsDisplayFilterEmpty));
@@ -71,6 +81,9 @@ public partial class MainWindowViewModel
     [RelayCommand]
     public Task RemoveOrientationFilterAsync() => ApplyDisplayFilterAsync(DisplayFilter with
         { Orientation = MediaOrientation.All, IncludeUnknownDimensions = true });
+    [RelayCommand]
+    public Task RemoveContentRatingFilterAsync() => ApplyDisplayFilterAsync(DisplayFilter with
+        { ContentRatings = ContentRatingFilter.All });
 
     private void CancelDisplayFilter()
     {
@@ -110,7 +123,19 @@ public partial class MainWindowViewModel
                                 dimensions[entry.Key] = entry.Value;
                         }
                         return dimensions;
-                    }, ThumbnailGenerator.GetDimensionsOrUnknown, token), token);
+                    },
+                    async (candidates, ct) =>
+                    {
+                        var ratings = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                        foreach (var batch in candidates.Chunk(500))
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            foreach (var entry in await _metaRepo.GetSystemRatingsByPathsAsync(batch.ToList()))
+                                ratings[entry.Key] = entry.Value;
+                        }
+                        return ratings;
+                    },
+                    ThumbnailGenerator.GetDimensionsOrUnknown, token), token);
 
             var result = await Filter(source);
             var navigation = navigationSource.Length == 0 ? new DisplayFilterResult(new(), 0)

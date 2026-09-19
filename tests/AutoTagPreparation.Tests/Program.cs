@@ -14,6 +14,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Database initialization is idempotent and NOCASE lookup uses its index", DatabaseInitializationIsIdempotentAsync),
     ("Prepare skips 20,000 tagged missing files without opening them and reports NOCASE lookup timing", PrepareSkipsTaggedMissingFilesAsync),
     ("Repository treats path casing and duplicate registration as one image", CaseInsensitiveAndDuplicateRegistrationAsync),
+    ("Repository persists known content ratings without accepting unknown", SystemRatingPersistenceAsync),
+    ("Database migration backfills unambiguous legacy rating tags only", LegacyRatingMigrationAsync),
     ("Prepare registers new files and records disappeared files as failures", PrepareRegistersAndSkipsDisappearedFilesAsync),
     ("Prepare moves matching missing metadata without losing identity, status, or tags", PrepareMovesExistingMetadataAsync),
     ("Concurrent registration preserves existing metadata and does not duplicate paths", ConcurrentRegistrationDoesNotDuplicateOrOverwriteAsync),
@@ -177,6 +179,61 @@ static async Task CaseInsensitiveAndDuplicateRegistrationAsync()
     Assert(rows.Count == 1, "Case variants created more than one metadata row.");
     Assert((string)rows[0]["FileHash"]! == "case-hash" && Convert.ToInt64(rows[0]["FolderId"]) == 9,
         "Existing metadata was overwritten by duplicate registration.");
+}
+
+static async Task SystemRatingPersistenceAsync()
+{
+    await using var scope = await TestScope.CreateAsync();
+    const string path = "C:/Ratings/Example.PNG";
+    await scope.Repository.RegisterAutoTagFilesAsync(new[] { Registration(path, "rating-hash") });
+
+    await scope.Repository.SetSystemRatingByPathAsync("c:/ratings/example.png", 3);
+    var ratings = await scope.Repository.GetSystemRatingsByPathsAsync(new List<string> { path });
+    Assert(ratings.TryGetValue(path, out var rating) && rating == 3,
+        "Known rating was not persisted with a case-insensitive path match.");
+
+    try
+    {
+        await scope.Repository.SetSystemRatingByPathAsync(path, -1);
+        throw new InvalidOperationException("Unknown rating must not be persisted through the known-rating API.");
+    }
+    catch (ArgumentOutOfRangeException) { }
+
+    ratings = await scope.Repository.GetSystemRatingsByPathsAsync(new List<string> { path });
+    Assert(ratings[path] == 3, "Rejected unknown rating overwrote the existing known rating.");
+}
+
+static async Task LegacyRatingMigrationAsync()
+{
+    await using var scope = await TestScope.CreateAsync();
+    var generalId = await scope.Repository.UpsertAsync(new ImageMeta { FilePath = "C:/Ratings/general.png" });
+    var explicitId = await scope.Repository.UpsertAsync(new ImageMeta { FilePath = "C:/Ratings/explicit.png" });
+    var conflictId = await scope.Repository.UpsertAsync(new ImageMeta { FilePath = "C:/Ratings/conflict.png" });
+    var preservedId = await scope.Repository.UpsertAsync(new ImageMeta { FilePath = "C:/Ratings/preserved.png" });
+    var unknownId = await scope.Repository.UpsertAsync(new ImageMeta { FilePath = "C:/Ratings/unknown.png" });
+
+    await scope.Repository.SetTagsAsync(generalId, new List<string> { "全年龄", "general" });
+    await scope.Repository.SetTagsAsync(explicitId, new List<string> { "R-18" });
+    await scope.Repository.SetTagsAsync(conflictId, new List<string> { "敏感", "大尺度" });
+    await scope.Repository.SetTagsAsync(preservedId, new List<string> { "全年龄" });
+    await scope.Repository.SetSystemRatingByPathAsync("C:/Ratings/preserved.png", 3);
+
+    using (var conn = scope.Factory.CreateConnection())
+    {
+        DatabaseInitializer.Initialize(conn);
+        DatabaseInitializer.Initialize(conn);
+    }
+
+    var rows = await QueryRowsAsync(scope, "SELECT FilePath, SystemRating FROM ImageMeta ORDER BY FilePath");
+    var ratings = rows.ToDictionary(
+        row => (string)row["FilePath"]!,
+        row => Convert.ToInt32(row["SystemRating"]),
+        StringComparer.OrdinalIgnoreCase);
+    Assert(ratings["C:/Ratings/general.png"] == 0, "General legacy tags were not backfilled.");
+    Assert(ratings["C:/Ratings/explicit.png"] == 3, "Explicit legacy tag was not backfilled.");
+    Assert(ratings["C:/Ratings/conflict.png"] == -1, "Conflicting legacy rating tags must remain unknown.");
+    Assert(ratings["C:/Ratings/preserved.png"] == 3, "Existing SystemRating must not be overwritten.");
+    Assert(ratings["C:/Ratings/unknown.png"] == -1, "Images without legacy rating tags must remain unknown.");
 }
 
 static async Task PrepareRegistersAndSkipsDisappearedFilesAsync()

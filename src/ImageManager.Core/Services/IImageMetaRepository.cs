@@ -43,7 +43,7 @@ public interface IImageMetaRepository
     Task<Dictionary<string, List<string>>> GetTagMapByPathsAsync(List<string> filePaths);
     Task<List<TagCount>> GetCoOccurringTagsAsync(List<string> filePaths, List<string>? excludeNames = null, string? nameFilter = null);
 
-    /// <summary>Batch-load perceptual hashes for a specific set of file paths (lightweight, no tags)</summary>
+    /// <summary>Batch-load valid perceptual hashes for a specific set of file paths (lightweight, no tags)</summary>
     Task<Dictionary<string, string>> GetPerceptualHashesByPathsAsync(List<string> filePaths);
 
     /// <summary>Batch-load FileHash for a set of file paths.</summary>
@@ -83,6 +83,12 @@ public interface IImageMetaRepository
 
     /// <summary>Batch-load Width/Height for a set of file paths. Only returns entries with non-zero dimensions.</summary>
     Task<Dictionary<string, (int Width, int Height)>> GetDimensionsByPathsAsync(List<string> filePaths);
+
+    /// <summary>Batch-load content ratings, falling back to legacy rating tags when metadata is unknown.</summary>
+    Task<Dictionary<string, int>> GetSystemRatingsByPathsAsync(List<string> filePaths);
+
+    /// <summary>Persist a known content rating for an image path.</summary>
+    Task SetSystemRatingByPathAsync(string filePath, int rating);
 
     // Batch tag operations
     Task<Dictionary<string, long>> GetIdsByPathsAsync(List<string> filePaths);

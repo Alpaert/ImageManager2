@@ -11,6 +11,9 @@ var tests = new (string Name, Func<Task> Run)[]
     ("dimensions require positive width and height", DimensionsMustBePositive),
     ("image fallback is used but video fallback is not", ImageFallbackAndVideoNoFallback),
     ("unknown dimensions honor include and exclude", UnknownDimensionsHonorOption),
+    ("default content ratings retain all files without reading ratings", DefaultContentRatingsSkipMetadata),
+    ("content rating selection filters known ratings and excludes unknown", ContentRatingSelectionFiltersKnownRatings),
+    ("content rating intersects with orientation", ContentRatingIntersectsWithOrientation),
     ("cancellation before and during metadata is deterministic", CancellationBeforeAndDuringMetadata),
     ("cancellation during image fallback is observed", CancellationDuringFallback),
     ("empty source returns an empty result", EmptySource)
@@ -44,9 +47,11 @@ static async Task<DisplayFilterResult> Apply(
     DisplayFilterOptions options,
     Func<List<string>, CancellationToken, Task<Dictionary<string, (int Width, int Height)>>>? load = null,
     Func<string, (int Width, int Height)>? fallback = null,
+    Func<List<string>, CancellationToken, Task<Dictionary<string, int>>>? ratings = null,
     CancellationToken token = default)
     => await DisplayFileFilter.ApplyAsync(source, options,
         load ?? ((_, _) => Task.FromResult(new Dictionary<string, (int, int)>())),
+        ratings ?? ((_, _) => Task.FromResult(new Dictionary<string, int>())),
         fallback ?? (_ => throw new InvalidOperationException("unexpected image header read")), token);
 
 static async Task ClassifiesExtensions()
@@ -130,6 +135,51 @@ static async Task UnknownDimensionsHonorOption()
     Assert(included.UnknownDimensionsCount == 1 && excluded.UnknownDimensionsCount == 1, "unknown count is reported either way");
 }
 
+static async Task DefaultContentRatingsSkipMetadata()
+{
+    var ratingCalls = 0;
+    var result = await Apply(new[] { "general.jpg", "unknown.jpg" }, new(),
+        ratings: (_, _) =>
+        {
+            ratingCalls++;
+            throw new InvalidOperationException("default ratings should not be read");
+        });
+    AssertSequence(result.Files, "general.jpg", "unknown.jpg");
+    Assert(ratingCalls == 0, "default content ratings performed metadata I/O");
+}
+
+static async Task ContentRatingSelectionFiltersKnownRatings()
+{
+    var selected = ContentRatingFilter.General | ContentRatingFilter.Explicit;
+    var result = await Apply(new[] { "general.jpg", "sensitive.jpg", "explicit.jpg", "unknown.jpg" },
+        new(ContentRatings: selected),
+        ratings: (_, _) => Task.FromResult(new Dictionary<string, int>
+        {
+            ["general.jpg"] = 0,
+            ["sensitive.jpg"] = 1,
+            ["explicit.jpg"] = 3
+        }));
+    AssertSequence(result.Files, "general.jpg", "explicit.jpg");
+}
+
+static async Task ContentRatingIntersectsWithOrientation()
+{
+    var result = await Apply(new[] { "general-landscape.jpg", "general-portrait.jpg", "explicit-landscape.jpg" },
+        new(null, MediaOrientation.Landscape, true, ContentRatingFilter.General),
+        (_, _) => Task.FromResult(new Dictionary<string, (int, int)>
+        {
+            ["general-landscape.jpg"] = (4, 2),
+            ["general-portrait.jpg"] = (2, 4)
+        }),
+        ratings: (_, _) => Task.FromResult(new Dictionary<string, int>
+        {
+            ["general-landscape.jpg"] = 0,
+            ["general-portrait.jpg"] = 0,
+            ["explicit-landscape.jpg"] = 3
+        }));
+    AssertSequence(result.Files, "general-landscape.jpg");
+}
+
 static async Task CancellationBeforeAndDuringMetadata()
 {
     using var before = new CancellationTokenSource();
@@ -156,7 +206,7 @@ static async Task CancellationDuringFallback()
     using var cts = new CancellationTokenSource();
     var result = Apply(new[] { "a.jpg", "b.jpg" }, new(null, MediaOrientation.Landscape),
         (_, _) => Task.FromResult(new Dictionary<string, (int, int)> { ["a.jpg"] = (0, 0), ["b.jpg"] = (0, 0) }),
-        _ => { cts.Cancel(); throw new InvalidOperationException("fallback failed"); }, cts.Token);
+        _ => { cts.Cancel(); throw new InvalidOperationException("fallback failed"); }, token: cts.Token);
     await AssertCanceled(result);
 }
 

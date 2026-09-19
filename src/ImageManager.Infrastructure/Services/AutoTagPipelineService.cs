@@ -115,7 +115,7 @@ public class AutoTagPipelineService : IDisposable
             await _stateRepo.UpsertStateAsync(state);
         }
 
-        var channel = Channel.CreateBounded<(long ImageId, string FilePath, List<TagPrediction> Predictions, float[]? Embedding)>(
+        var channel = Channel.CreateBounded<(long ImageId, string FilePath, List<TagPrediction> Predictions, float[]? Embedding, SystemRating Rating)>(
             new BoundedChannelOptions(16) { SingleWriter = true, SingleReader = true,
                 FullMode = BoundedChannelFullMode.Wait });
 
@@ -163,11 +163,13 @@ public class AutoTagPipelineService : IDisposable
                     {
                         List<TagPrediction> predictions;
                         float[]? embedding = null;
+                        var rating = SystemRating.Unknown;
                         if (activeTagService is IEnsembleTagService ensemble)
                         {
                             var result = await ensemble.PredictWithSourcesAsync(meta.FilePath, ct);
                             predictions = result.MergedTags;
                             embedding = result.Embedding;
+                            rating = result.Rating;
                         }
                         else
                         {
@@ -178,7 +180,7 @@ public class AutoTagPipelineService : IDisposable
                             .Where(p => p.Confidence >= _confidenceThreshold)
                             .Take(_maxTagsPerImage)
                             .ToList();
-                        await channel.Writer.WriteAsync((meta.Id, meta.FilePath, filtered, embedding), ct);
+                        await channel.Writer.WriteAsync((meta.Id, meta.FilePath, filtered, embedding, rating), ct);
                     }
                     catch (OperationCanceledException) { break; }
                     catch (OutOfMemoryException ex)
@@ -211,6 +213,9 @@ public class AutoTagPipelineService : IDisposable
                 {
                     try
                     {
+                        if (item.Rating is >= SystemRating.General and <= SystemRating.Explicit)
+                            await _metaRepo.SetSystemRatingByPathAsync(item.FilePath, (int)item.Rating);
+
                         if (item.Predictions.Count > 0)
                         {
                             var suppressed = await _suppressionRepo.GetSuppressedTagsAsync(item.ImageId);

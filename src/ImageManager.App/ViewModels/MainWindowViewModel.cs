@@ -812,7 +812,7 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         if (folder == null || string.IsNullOrWhiteSpace(folder.Path) || !Directory.Exists(folder.Path))
         {
-            StatusText = "鏂囦欢澶逛笉瀛樺湪";
+            StatusText = "文件夹不存在";
             return;
         }
 
@@ -825,13 +825,13 @@ public partial class MainWindowViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
-            StatusText = $"璇诲彇鏂囦欢澶辫触: {ex.Message}";
+            StatusText = $"读取文件夹失败: {ex.Message}";
             return;
         }
 
         if (files.Count == 0)
         {
-            StatusText = "鏂囦欢澶规棤鍥剧墖";
+            StatusText = "文件夹中没有图片";
             return;
         }
 
@@ -839,18 +839,18 @@ public partial class MainWindowViewModel : ViewModelBase
         try
         {
             var folderInfo = await _folderRepo.GetByPathAsync(folder.Path);
-            StatusText = $"姝ｅ湪璁＄畻 {files.Count} 寮犲浘鐗囩殑鎸囩汗...";
+            StatusText = $"正在计算 {files.Count} 张图片的指纹...";
             await PrecomputeHashesAsync(folderWorkToken, folderInfo?.Id ?? (folder.DbId > 0 ? folder.DbId : null), files);
-            StatusText = $"澧炴湁璁＄畻瀹屾垚: {files.Count} 寮犲浘鐗�";
+            StatusText = $"增量计算完成: {files.Count} 张图片";
         }
         catch (OperationCanceledException)
         {
-            StatusText = "鎸囩汗璁＄畻宸插彇娑�";
+            StatusText = "指纹计算已取消";
         }
         catch (Exception ex)
         {
             AppLogger.Warn($"Incremental hash failed: {folder.Path} | {ex.Message}");
-            StatusText = $"鎸囩汗璁＄畻澶辫触: {ex.Message}";
+            StatusText = $"指纹计算失败: {ex.Message}";
         }
     }
 
@@ -2430,6 +2430,17 @@ partial void OnCornerRadiusDipChanged(double value)
                 results,
                 mode,
                 () => IsCurrentSearchRequest(requestVersion, requestCts));
+            if (mode == SimilaritySearchMode.Perceptual)
+            {
+                var searchPaths = candidates.ToArray();
+                RunBackgroundSafe("similar-search-hash-repair", CurrentFolderWorkToken,
+                    async token =>
+                    {
+                        await AutoTagRuntimeState.WaitForIdleAsync(token);
+                        token.ThrowIfCancellationRequested();
+                        await PrecomputeHashesAsync(token, paths: searchPaths);
+                    });
+            }
         }
         catch (OperationCanceledException)
         {

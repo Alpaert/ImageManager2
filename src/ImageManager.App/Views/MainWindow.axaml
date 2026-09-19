@@ -291,6 +291,8 @@
                             Command="{Binding RemoveTypeFilterCommand}" ToolTip.Tip="移除此类型筛选"/>
                     <Button Content="{Binding OrientationFilterText}" Classes="toolbar-chip" IsVisible="{Binding HasOrientationFilter}"
                             Command="{Binding RemoveOrientationFilterCommand}" ToolTip.Tip="移除此方向筛选"/>
+                    <Button Content="{Binding ContentRatingFilterText}" Classes="toolbar-chip" IsVisible="{Binding HasContentRatingFilter}"
+                            Command="{Binding RemoveContentRatingFilterCommand}" ToolTip.Tip="移除年龄分级筛选"/>
                     <TextBlock Text="{Binding DisplayFilterCountText}" VerticalAlignment="Center" FontSize="12"/>
                     <TextBlock Text="没有符合当前筛选的文件" IsVisible="{Binding IsDisplayFilterEmpty}" VerticalAlignment="Center"/>
                     <Button Content="重置" Classes="toolbar-compact" Command="{Binding ResetDisplayFilterCommand}" IsVisible="{Binding IsDisplayFilterEmpty}"/>
@@ -382,6 +384,8 @@
                             Command="{Binding RemoveTypeFilterCommand}" ToolTip.Tip="移除此类型筛选"/>
                     <Button Content="{Binding OrientationFilterText}" Classes="toolbar-chip" IsVisible="{Binding HasOrientationFilter}"
                             Command="{Binding RemoveOrientationFilterCommand}" ToolTip.Tip="移除此方向筛选"/>
+                    <Button Content="{Binding ContentRatingFilterText}" Classes="toolbar-chip" IsVisible="{Binding HasContentRatingFilter}"
+                            Command="{Binding RemoveContentRatingFilterCommand}" ToolTip.Tip="移除年龄分级筛选"/>
                     <TextBlock Text="{Binding DisplayFilterCountText}" VerticalAlignment="Center" FontSize="12"/>
                     <TextBlock Text="没有符合当前筛选的文件" IsVisible="{Binding IsDisplayFilterEmpty}" VerticalAlignment="Center"/>
                     <Button Content="重置" Classes="toolbar-compact" Command="{Binding ResetDisplayFilterCommand}" IsVisible="{Binding IsDisplayFilterEmpty}"/>
