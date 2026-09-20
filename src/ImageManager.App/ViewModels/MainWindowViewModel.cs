@@ -3112,13 +3112,15 @@ partial void OnCornerRadiusDipChanged(double value)
         if (IsShowingSearchResult)
         {
             IsShowingSearchResult = false;
-            await RebuildDisplayFilterAsync();
+            await RebuildDisplayFilterAsync(renderPage: false);
             if (!isCurrentSearch())
                 return;
         }
         else
         {
-            await RebuildDisplayFilterAsync(CurrentPage);
+            // Publish the filtered snapshot without rendering the old page.
+            // NavigateToResultAsync will render the target page exactly once.
+            await RebuildDisplayFilterAsync(renderPage: false);
             if (!isCurrentSearch()) return;
         }
 
@@ -3374,6 +3376,17 @@ partial void OnCornerRadiusDipChanged(double value)
         // result. Keep navigation path-based so both display modes can locate
         // the target before its container exists.
         ReplaceSelectedFiles(new[] { targetPath });
+
+        if (DisplayMode == ImageDisplayMode.Continuous)
+        {
+            // ApplyDisplayModeAsync has already published the geometry and
+            // positioned the virtualized panel at the target index. Dispatch
+            // the selection notification immediately; fixed sleeps only delay
+            // continuous navigation and do not improve panel readiness.
+            await _dispatcher.InvokeAsync(
+                () => { ScrollToSelectedRequested?.Invoke(); });
+            return;
+        }
 
         // 跨文件夹首次跳转时 Images 集合刚被 PageChanged 替换为新实例，
         // Avalonia 的 ItemsControl 需要至少一次 layout pass 才能创建 child 容器。

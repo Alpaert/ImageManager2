@@ -186,7 +186,7 @@ public partial class MainWindowViewModel
         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
     }
 
-    private async Task RebuildDisplayFilterAsync(int? preferredPage = null)
+    private async Task RebuildDisplayFilterAsync(int? preferredPage = null, bool renderPage = true)
     {
         if (!await UpdateDisplayFilterAsync()) return;
         _pageManager.CancelCurrentLoads();
@@ -201,9 +201,16 @@ public partial class MainWindowViewModel
             LoadedInfoText = "";
             StatusText = HasDisplayFilter ? "没有符合当前筛选的文件" : "没有可显示的文件";
         }
-        else
+        else if (renderPage)
         {
             await ShowPageAsync(Math.Clamp(preferredPage ?? 0, 0, TotalPages - 1));
+            StatusText = DisplayFilterCountText;
+        }
+        else
+        {
+            // Search jump navigation publishes the new file snapshot first,
+            // then renders the target page once. Rendering the old page here
+            // causes a visible refresh before the actual jump.
             StatusText = DisplayFilterCountText;
         }
     }
