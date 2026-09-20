@@ -4,7 +4,7 @@
         x:Class="ImageManager.App.Views.Settings.ThumbnailSettingWindow"
         x:DataType="vm:ThumbnailSettingViewModel"
         Title="缩略图选项"
-        Width="480" Height="460"
+        Width="480" Height="520"
         CanResize="False">
 
     <Grid RowDefinitions="*,Auto" Margin="16">
@@ -58,6 +58,24 @@
                                        Foreground="{DynamicResource MutedFgBrush}" FontSize="12"
                                        VerticalAlignment="Center"/>
                         </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <!-- 分页设置 -->
+                <Border Padding="12" Background="{DynamicResource SurfaceBrush}"
+                        BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="8">
+                    <StackPanel Spacing="6">
+                        <TextBlock Text="分页" FontWeight="SemiBold" FontSize="14"/>
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <TextBlock Text="每页图片数:" VerticalAlignment="Center"
+                                       Foreground="{DynamicResource SecondaryFgBrush}" FontSize="13"/>
+                            <TextBox Text="{Binding ImagesPerPageText}" Width="80"/>
+                            <TextBlock Text="张（100~500）"
+                                       Foreground="{DynamicResource MutedFgBrush}" FontSize="12"
+                                       VerticalAlignment="Center"/>
+                        </StackPanel>
+                        <TextBlock Text="仅影响分页显示模式。"
+                                   Foreground="{DynamicResource MutedFgBrush}" FontSize="12"/>
                     </StackPanel>
                 </Border>
 

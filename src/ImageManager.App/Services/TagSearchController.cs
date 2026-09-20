@@ -132,7 +132,7 @@ public class TagSearchController
                 return;
             }
 
-            var everyTotalPages = (SearchResultFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
+            var everyTotalPages = (SearchResultFiles.Count + ImagePaging.Default - 1) / ImagePaging.Default;
             SearchCompleted?.Invoke(new TagSearchResult
             {
                 ResultFiles = SearchResultFiles,
@@ -196,7 +196,7 @@ public class TagSearchController
             _coTagMode = true;
             _lastSearchText = raw;
 
-            var pureTotalPages = (SearchResultFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
+            var pureTotalPages = (SearchResultFiles.Count + ImagePaging.Default - 1) / ImagePaging.Default;
             var exclDesc = excludeIsAnd ? string.Join(" 且 ", excludeTags) : string.Join(" 或 ", excludeTags);
             SearchCompleted?.Invoke(new TagSearchResult
             {
@@ -310,7 +310,7 @@ public class TagSearchController
         _coTagMode = true;
         _lastSearchText = raw;
 
-        var totalPages = (SearchResultFiles.Count + PageManager.PageSize - 1) / PageManager.PageSize;
+        var totalPages = (SearchResultFiles.Count + ImagePaging.Default - 1) / ImagePaging.Default;
         SearchCompleted?.Invoke(new TagSearchResult
         {
             ResultFiles = SearchResultFiles,

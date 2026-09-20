@@ -21,6 +21,7 @@ public partial class ThumbnailSettingViewModel : ViewModelBase
     [ObservableProperty] private string _backgroundColor = "#CCFFFFFF";
     [ObservableProperty] private string _opacityText = "1";
     [ObservableProperty] private string _hoverPreviewMaxSizeText = "840";
+    [ObservableProperty] private string _imagesPerPageText = ImagePaging.Default.ToString();
 
     public string[] WaterfallModes { get; } = { "None", "Vertical", "Horizontal" };
 
@@ -53,6 +54,7 @@ public partial class ThumbnailSettingViewModel : ViewModelBase
         BackgroundColor = data.ThumbnailBackgroundColor;
         OpacityText = data.ThumbnailOpacity.ToString("0.##");
         HoverPreviewMaxSizeText = NormalizeHoverPreviewMaxSize(data.HoverPreviewMaxSize).ToString();
+        ImagesPerPageText = ImagePaging.Clamp(data.ImagesPerPage).ToString();
     }
 
     [RelayCommand]
@@ -81,7 +83,17 @@ public partial class ThumbnailSettingViewModel : ViewModelBase
             HoverPreviewMaxSizeText,
             _data.HoverPreviewMaxSize);
 
+        _data.ImagesPerPage = ParseImagesPerPage(ImagesPerPageText, _data.ImagesPerPage);
+
         _onChanged();
+    }
+
+    private static int ParseImagesPerPage(string text, int fallback)
+    {
+        if (!int.TryParse(text, out var value))
+            value = fallback;
+
+        return ImagePaging.Clamp(value);
     }
 
     private static int ParseHoverPreviewMaxSize(string text, int fallback)

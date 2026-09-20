@@ -24,6 +24,7 @@ public class AppSettings
     public string SearchToolbarLayout { get; set; } = "A";
     /// <summary>Image result projection: Paged or Continuous.</summary>
     public string ImageDisplayMode { get; set; } = "Paged";
+    public int ImagesPerPage { get; set; } = ImagePaging.Default;
     public string WaterfallMode { get; set; } = "None";
     public double GridZoomLevel { get; set; } = 1;
     public double VerticalZoomLevel { get; set; } = 1;

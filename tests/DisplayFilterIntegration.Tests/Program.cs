@@ -14,15 +14,27 @@ var repository = DispatchProxy.Create<IImageMetaRepository, MetadataProxy>();
 var fake = (MetadataProxy)(object)repository;
 var cache = new ThumbnailCacheService(null!, Path.Combine(Path.GetTempPath(), "ImageManager-FilterTests"));
 var page = new PageManager(cache, null!);
-var search = new TagSearchEngine(repository, messenger, PageManager.PageSize);
+var search = new TagSearchEngine(repository, messenger, ImagePaging.Default);
 var vm = new MainWindowViewModel(null!, null!, repository, null!, null!, null!, null!, cache, page,
     search, null!, null!, null!, messenger, new ImmediateDispatcher());
 
-var firstPage = ImageDisplayRange.ForPage(0, PageManager.PageSize, 401);
-var lastPage = ImageDisplayRange.ForPage(2, PageManager.PageSize, 401);
+var firstPage = ImageDisplayRange.ForPage(0, ImagePaging.Default, 401);
+var lastPage = ImageDisplayRange.ForPage(2, ImagePaging.Default, 401);
 Require(firstPage == new ImageDisplayRange(0, 200), "first page range must be bounded by page size");
 Require(lastPage == new ImageDisplayRange(400, 1), "last page range must be bounded by result count");
-Require(ImageDisplayRange.ForPage(3, PageManager.PageSize, 401).IsEmpty, "out-of-range page must stay empty");
+Require(ImageDisplayRange.ForPage(3, ImagePaging.Default, 401).IsEmpty, "out-of-range page must stay empty");
+Require(ImagePaging.Clamp(99) == ImagePaging.Min &&
+        ImagePaging.Clamp(501) == ImagePaging.Max &&
+        ImagePaging.Clamp(0) == ImagePaging.Default &&
+        ImagePaging.Clamp(-1) == ImagePaging.Default,
+    "paging clamp must enforce the configured bounds");
+Require(ImageDisplayRange.ForPage(0, 500, 401).Count == 401 &&
+        ImageDisplayRange.ForPage(1, 500, 401).IsEmpty &&
+        ImageDisplayRange.ForPage(0, 100, 401).Count == 100 &&
+        ImageDisplayRange.ForPage(4, 100, 401).Count == 1 &&
+        ImageDisplayRange.ForPage(5, 100, 401).IsEmpty,
+    "configurable page size must produce correct page boundaries");
+Console.WriteLine("PASS configurable paging bounds");
 Require(vm.DisplayMode == ImageDisplayMode.Paged && vm.IsPagedDisplay, "paged display must remain the default");
 Require(await vm.TrySetDisplayModeAsync(ImageDisplayMode.Continuous), "continuous mode must activate after virtualization is available");
 Require(vm.DisplayMode == ImageDisplayMode.Continuous && !vm.IsPagedDisplay, "continuous mode must hide paged state");

@@ -11,6 +11,7 @@ using ImageManager.App.Services;
 using ImageManager.App.ViewModels;
 using ImageManager.App.Views;
 using ImageManager.Core.Services;
+using ImageManager.Core.Models;
 using ImageManager.Infrastructure.Caching;
 using ImageManager.Infrastructure.Services;
 using CommunityToolkit.Mvvm.Messaging;
@@ -74,7 +75,7 @@ var dispatcher = new ImageManager.App.Helpers.AvaloniaDispatcher();
 typeof(ImageManager.App.App).GetProperty("Services")!.SetValue(null, new ServiceCollection().AddSingleton(page).BuildServiceProvider());
 typeof(ImageManager.App.App).GetProperty("UI")!.SetValue(null, dispatcher);
 var vm = new MainWindowViewModel(null!, null!, repo, null!, null!, null!, null!, cache, page,
-    new TagSearchEngine(repo, messenger, PageManager.PageSize), null!, null!, null!, messenger, dispatcher);
+    new TagSearchEngine(repo, messenger, ImagePaging.Default), null!, null!, null!, messenger, dispatcher);
 vm.WaterfallMode = "Horizontal";
 typeof(MainWindowViewModel).GetField("_displayFilteredFiles", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(vm, paths.ToList());
 var main = new TestMainWindow { DataContext = vm, ShowInTaskbar = false };

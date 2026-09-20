@@ -782,6 +782,8 @@ public partial class MainWindowViewModel : ViewModelBase
         AppSettings = await _settingsRepo.LoadAsync();
 
         _pageManager.InitializeDecodeWidth(0);
+        AppSettings.ImagesPerPage = ImagePaging.Clamp(AppSettings.ImagesPerPage);
+        _pageManager.PageSize = AppSettings.ImagesPerPage;
 
         // Sync: if DB was recovered fresh, settings default may not match actual cache dir
         if (string.IsNullOrWhiteSpace(AppSettings.DiskCacheDirectory)
@@ -995,7 +997,7 @@ public partial class MainWindowViewModel : ViewModelBase
             var preferredIndex = ActiveFileList.FindIndex(f =>
                 string.Equals(f, preferredFilePath, StringComparison.OrdinalIgnoreCase));
             if (preferredIndex >= 0)
-                return preferredIndex / PageManager.PageSize;
+                return preferredIndex / _pageManager.PageSize;
         }
 
         return lastPage.HasValue && lastPage.Value < TotalPages ? lastPage.Value : 0;
@@ -1979,6 +1981,43 @@ public partial class MainWindowViewModel : ViewModelBase
 
     // ==================== Paging ====================
 
+    public async Task ApplyThumbnailSettingsAsync()
+    {
+        var oldPageSize = _pageManager.PageSize;
+        var pageSize = ImagePaging.Clamp(AppSettings.ImagesPerPage);
+        AppSettings.ImagesPerPage = pageSize;
+        _pageManager.PageSize = pageSize;
+        SyncUISettingsFromAppData();
+
+        if (DisplayMode == ImageDisplayMode.Paged)
+        {
+            var anchorIndex = SelectedFilePaths
+                .Select(path => ActiveFileList.FindIndex(file =>
+                    string.Equals(file, path, StringComparison.OrdinalIgnoreCase)))
+                .FirstOrDefault(index => index >= 0);
+
+            if (anchorIndex < 0)
+                anchorIndex = CurrentPage * oldPageSize;
+
+            if (ActiveFileList.Count == 0)
+            {
+                _isNavigating = true;
+                CurrentPage = 0;
+                _isNavigating = false;
+                Images = new();
+                LoadedInfoText = string.Empty;
+            }
+            else
+            {
+                anchorIndex = Math.Clamp(anchorIndex, 0, ActiveFileList.Count - 1);
+                SetDisplayPaging();
+                await ShowPageAsync(anchorIndex / pageSize);
+            }
+        }
+
+        await SaveSettingsAsync();
+    }
+
     [RelayCommand]
     private async Task PrevPageAsync() { if (CurrentPage > 0) await ShowPageAsync(CurrentPage - 1); }
 
@@ -2007,7 +2046,7 @@ public partial class MainWindowViewModel : ViewModelBase
         switch (DisplayMode)
         {
             case ImageDisplayMode.Paged:
-                await ShowPagedDisplayAsync(preferredIndex / PageManager.PageSize);
+                await ShowPagedDisplayAsync(preferredIndex / _pageManager.PageSize);
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(DisplayMode), DisplayMode, null);
@@ -2020,7 +2059,7 @@ public partial class MainWindowViewModel : ViewModelBase
     /// </summary>
     public Task ShowPageAsync(int pageIndex)
     {
-        var range = ImageDisplayRange.ForPage(pageIndex, PageManager.PageSize, ActiveFileList.Count);
+        var range = ImageDisplayRange.ForPage(pageIndex, _pageManager.PageSize, ActiveFileList.Count);
         return RefreshImageDisplayAsync(range.StartIndex);
     }
 
@@ -2039,7 +2078,7 @@ public partial class MainWindowViewModel : ViewModelBase
         DisplayMode = mode;
         OnPropertyChanged(nameof(IsPagedDisplay));
 
-        await RefreshImageDisplayAsync(preferredIndex ?? CurrentPage * PageManager.PageSize);
+        await RefreshImageDisplayAsync(preferredIndex ?? CurrentPage * _pageManager.PageSize);
 
         return true;
     }
@@ -2054,7 +2093,7 @@ public partial class MainWindowViewModel : ViewModelBase
         CurrentPage = pageIndex;
         _isNavigating = false;
         // Preload tag cache for the current page's files (subfolder files especially)
-        var pageFiles = ActiveFileList.Skip(pageIndex * PageManager.PageSize).Take(PageManager.PageSize).ToList();
+        var pageFiles = ActiveFileList.Skip(pageIndex * _pageManager.PageSize).Take(_pageManager.PageSize).ToList();
         if (pageFiles.Count > 0) _ = PreloadTagsForFilesAsync(pageFiles);
         await _pageManager.ShowPageAsync(pageIndex, TotalPages,
             ActiveFileList, GetTagsForFile, IsShowingSearchResult, CurrentFolder);
@@ -2734,7 +2773,7 @@ partial void OnCornerRadiusDipChanged(double value)
         NotifyDisplayFilterState();
         // Recalculate paging
         var files = ActiveFileList;
-        TotalPages = files.Count == 0 ? 0 : (files.Count + PageManager.PageSize - 1) / PageManager.PageSize;
+        TotalPages = files.Count == 0 ? 0 : (files.Count + _pageManager.PageSize - 1) / _pageManager.PageSize;
         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
 
         // Clamp current page
@@ -2757,10 +2796,10 @@ partial void OnCornerRadiusDipChanged(double value)
         }
 
         // Build gap-fill file paths from ActiveFileList that aren't already in Images
-        int pageStart = CurrentPage * PageManager.PageSize;
+        int pageStart = CurrentPage * _pageManager.PageSize;
         var existingPaths = new HashSet<string>(Images.Select(i => i.FilePath), StringComparer.OrdinalIgnoreCase);
         var gapPaths = new List<string>();
-        for (int i = 0; i < PageManager.PageSize && gapPaths.Count < removedIndices.Count; i++)
+        for (int i = 0; i < _pageManager.PageSize && gapPaths.Count < removedIndices.Count; i++)
         {
             int idx = pageStart + i;
             if (idx >= files.Count) break;
@@ -3270,7 +3309,7 @@ partial void OnCornerRadiusDipChanged(double value)
         }
 
         // 切换到目标页
-        int targetPage = indexInList / PageManager.PageSize;
+        int targetPage = indexInList / _pageManager.PageSize;
         if (forcePageReload || targetPage != CurrentPage)
         {
             await ShowPageAsync(targetPage);

@@ -182,7 +182,7 @@ public partial class MainWindowViewModel
 
     private void SetDisplayPaging()
     {
-        TotalPages = (ActiveFileList.Count + PageManager.PageSize - 1) / PageManager.PageSize;
+        TotalPages = (ActiveFileList.Count + _pageManager.PageSize - 1) / _pageManager.PageSize;
         PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
     }
 

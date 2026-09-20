@@ -4,6 +4,7 @@ using ImageManager.App.ViewModels;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
+using ImageManager.Core.Models;
 using ImageManager.Infrastructure.Caching;
 using ImageManager.Infrastructure.Helpers;
 using ImageManager.Infrastructure.Imaging;
@@ -25,7 +26,7 @@ public readonly record struct PageChangedEventArgs(
 
 public class PageManager : IDisposable
 {
-    public const int PageSize = 200;
+    public const int DefaultPageSize = ImagePaging.Default;
     private const int MaxCachedPages = 3;
     private const int MaxConcurrentThumbnailLoads = 6;
     private const int MaxNonViewportThumbnailLoads = MaxConcurrentThumbnailLoads - 1;
@@ -38,6 +39,7 @@ public class PageManager : IDisposable
     private readonly Dictionary<int, List<ImageViewItem>> _pageCache = new();
     private readonly object _pageCacheLock = new();
     private int _activePageIndex;
+    private int _pageSize = DefaultPageSize;
 
     private int? _preSearchPageIndex;
 
@@ -72,6 +74,30 @@ public class PageManager : IDisposable
         CancellationToken ParentToken);
 
     public event Action<PageChangedEventArgs>? PageChanged;
+
+    public int PageSize
+    {
+        get => _pageSize;
+        set
+        {
+            var normalized = ImagePaging.Clamp(value);
+            if (_pageSize == normalized)
+                return;
+
+            _pageSize = normalized;
+            _preSearchPageIndex = null;
+            CancelPageLoad();
+            lock (_preloadStateLock)
+                CancelPreloadLocked(clearLastRequest: true);
+            lock (_pageCacheLock)
+            {
+                foreach (var page in _pageCache.Values)
+                    foreach (var item in page)
+                        ResetThumbnailState(item);
+                _pageCache.Clear();
+            }
+        }
+    }
 
     public PageManager(
         ThumbnailCacheService thumbCache,
@@ -1238,7 +1264,9 @@ public class PageManager : IDisposable
                 }
 
                 int? preloadPrev = null, preloadNext = null;
-                if (request.CurrentPage - 1 >= 0 &&
+                var preloadPrevious = PageSize <= 200;
+                var preloadFollowing = PageSize <= 400;
+                if (preloadPrevious && request.CurrentPage - 1 >= 0 &&
                     await EnsurePreloadPageAsync(
                         request.CurrentPage - 1, request.TotalPages,
                         request.ActiveFileList, request.GetTagsForFile, ct).ConfigureAwait(false))
@@ -1247,7 +1275,7 @@ public class PageManager : IDisposable
                 }
                 if (!IsCurrentPreload(generation, ct, request)) return;
 
-                if (request.CurrentPage + 1 < request.TotalPages &&
+                if (preloadFollowing && request.CurrentPage + 1 < request.TotalPages &&
                     await EnsurePreloadPageAsync(
                         request.CurrentPage + 1, request.TotalPages,
                         request.ActiveFileList, request.GetTagsForFile, ct).ConfigureAwait(false))
@@ -1350,14 +1378,21 @@ public class PageManager : IDisposable
         }
     }
 
-    private static int RecommendedCachedPages()
+    private int RecommendedCachedPages()
     {
+        var normalPageCount = PageSize switch
+        {
+            <= 200 => 3,
+            <= 400 => 2,
+            _ => 1
+        };
+
         return MemoryPressureMonitor.Current switch
         {
             MemoryPressureMonitor.PressureLevel.Critical => 1,
             MemoryPressureMonitor.PressureLevel.High => 1,
             MemoryPressureMonitor.PressureLevel.Medium => 2,
-            _ => MaxCachedPages
+            _ => Math.Min(MaxCachedPages, normalPageCount)
         };
     }
 }

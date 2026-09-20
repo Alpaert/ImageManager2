@@ -3052,11 +3052,9 @@ public partial class MainWindow : Window
     {
         var vm = new ThumbnailSettingViewModel(Vm.AppSettings, () =>
         {
-            _ = Vm.SaveSettingsAsync();
-            Vm.SyncUISettingsFromAppData();
+            _ = Vm.ApplyThumbnailSettingsAsync();
             var cache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
             _ = cache.ClearAsync();
-            _ = Vm.ShowPageAsync(Vm.CurrentPage);
         });
 
         var win = new Settings.ThumbnailSettingWindow { DataContext = vm };
