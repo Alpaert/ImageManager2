@@ -1,10 +1,29 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Helpers;
 
 namespace ImageManager.Infrastructure.Caching;
+
+public enum ThumbnailCacheSource
+{
+    Memory,
+    Disk,
+    Generated,
+    Missing
+}
+
+public readonly record struct ThumbnailCacheLoadResult(
+    byte[]? Data,
+    int Width,
+    int Height,
+    ThumbnailCacheSource Source,
+    long CacheLookupMilliseconds,
+    long GenerateMilliseconds,
+    long WriteMilliseconds,
+    long LruMilliseconds);
 
 public class ThumbnailCacheService : IThumbnailCacheService
 {
@@ -93,8 +112,17 @@ public class ThumbnailCacheService : IThumbnailCacheService
         int decodeWidth,
         CancellationToken ct = default)
     {
+        var result = await GetOrCreateThumbnailWithDiagnosticsAsync(filePath, decodeWidth, ct);
+        return (result.Data, result.Width, result.Height);
+    }
+
+    public async Task<ThumbnailCacheLoadResult> GetOrCreateThumbnailWithDiagnosticsAsync(
+        string filePath,
+        int decodeWidth,
+        CancellationToken ct = default)
+    {
         if (string.IsNullOrWhiteSpace(filePath))
-            return (null, 0, 0);
+            return new(null, 0, 0, ThumbnailCacheSource.Missing, 0, 0, 0, 0);
 
         var isVideo = FileTypeConstants.IsVideoFile(filePath);
 
@@ -108,11 +136,19 @@ public class ThumbnailCacheService : IThumbnailCacheService
             && node.Value.Data != null
             && node.Value.DecodeWidth == decodeWidth)
         {
+            var lookup = Stopwatch.StartNew();
             PromoteToFront(node);
-            return (node.Value.Data, node.Value.Width, node.Value.Height);
+            var lookupMs = lookup.ElapsedMilliseconds;
+            LogSlow("memory", lookupMs, 5);
+            return new(node.Value.Data, node.Value.Width, node.Value.Height,
+                ThumbnailCacheSource.Memory, lookupMs, 0, 0, 0);
         }
 
+        var diskRead = Stopwatch.StartNew();
         var cached = _diskCache.Load(filePath);
+        var diskReadMs = diskRead.ElapsedMilliseconds;
+        if (cached != null)
+            LogSlow("disk", diskReadMs, 50);
         if (cached != null)
         {
             if (isVideo) PerfLogger.Log($"[Cache] DISK HIT {Path.GetFileName(filePath)}");
@@ -125,46 +161,60 @@ public class ThumbnailCacheService : IThumbnailCacheService
             }
             else if (meta.HasValue)
             {
-                AddToMemory(filePath, cached, decodeWidth, meta.Value.Width, meta.Value.Height);
-                return (cached, meta.Value.Width, meta.Value.Height);
+                var lruMs = AddToMemory(filePath, cached, decodeWidth, meta.Value.Width, meta.Value.Height);
+                return new(cached, meta.Value.Width, meta.Value.Height,
+                    ThumbnailCacheSource.Disk, diskReadMs, 0, 0, lruMs);
             }
             else
             {
                 var (w, h) = ParseJpegDimensions(cached);
                 if (w > 0 && h > 0)
                 {
+                    var metaWrite = Stopwatch.StartNew();
                     _diskCache.SaveMeta(filePath, w, h);
-                    AddToMemory(filePath, cached, decodeWidth, w, h);
-                    return (cached, w, h);
+                    var metaWriteMs = metaWrite.ElapsedMilliseconds;
+                    LogSlow("write", metaWriteMs, 50);
+                    var metaLruMs = AddToMemory(filePath, cached, decodeWidth, w, h);
+                    return new(cached, w, h, ThumbnailCacheSource.Disk, diskReadMs, 0, metaWriteMs, metaLruMs);
                 }
 
                 if (!File.Exists(filePath))
-                    return (cached, 0, 0);
+                    return new(cached, 0, 0, ThumbnailCacheSource.Disk, diskReadMs, 0, 0, 0);
 
                 var processor = _factory.GetProcessor(filePath);
                 (w, h) = processor.GetDimensions(filePath);
+                var write = Stopwatch.StartNew();
                 _diskCache.SaveMeta(filePath, w, h);
-                AddToMemory(filePath, cached, decodeWidth, w, h);
-                return (cached, w, h);
+                var writeMs = write.ElapsedMilliseconds;
+                LogSlow("write", writeMs, 50);
+                var lruMs = AddToMemory(filePath, cached, decodeWidth, w, h);
+                return new(cached, w, h, ThumbnailCacheSource.Disk, diskReadMs, 0, writeMs, lruMs);
             }
         }
 
         if (!isVideo && !File.Exists(filePath))
-            return (null, 0, 0);
+            return new(null, 0, 0, ThumbnailCacheSource.Missing, diskReadMs, 0, 0, 0);
 
         if (isVideo) PerfLogger.Log($"[Cache] GENERATE start {Path.GetFileName(filePath)}");
         var processorGen = _factory.GetProcessor(filePath);
+        var generation = Stopwatch.StartNew();
         var result = await processorGen.ExtractThumbnailAsync(filePath, decodeWidth, ct);
+        var generationMs = generation.ElapsedMilliseconds;
+        LogSlow("generate", generationMs, 150);
 
         if (result != null && result.Data.Length > 0)
         {
-            AddToMemory(filePath, result.Data, decodeWidth, result.Width, result.Height);
+            var lruMs = AddToMemory(filePath, result.Data, decodeWidth, result.Width, result.Height);
+            var write = Stopwatch.StartNew();
             _diskCache.Save(filePath, result.Data);
             _diskCache.SaveMeta(filePath, result.Width, result.Height);
-            return (result.Data, result.Width, result.Height);
+            var writeMs = write.ElapsedMilliseconds;
+            LogSlow("write", writeMs, 50);
+            return new(result.Data, result.Width, result.Height,
+                ThumbnailCacheSource.Generated, diskReadMs, generationMs, writeMs, lruMs);
         }
 
-        return (null, 0, 0);
+        return new(null, 0, 0, ThumbnailCacheSource.Missing, diskReadMs, generationMs, 0, 0);
     }
 
     public (byte[]? Data, int Width, int Height) TryGetCachedThumbnail(string filePath, int decodeWidth)
@@ -233,6 +283,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
 
     public void Trim(long maxBytes, string? protectedKey = null)
     {
+        var sw = Stopwatch.StartNew();
         lock (_lruLock)
         {
             var node = _lruList.Last;
@@ -256,6 +307,8 @@ public class ThumbnailCacheService : IThumbnailCacheService
 
         if (Interlocked.Read(ref _totalBytes) < 0)
             Interlocked.Exchange(ref _totalBytes, 0);
+
+        LogSlow("lru", sw.ElapsedMilliseconds, 10);
     }
 
     public void TrimForPressure()
@@ -271,8 +324,9 @@ public class ThumbnailCacheService : IThumbnailCacheService
         Trim(limit);
     }
 
-    private void AddToMemory(string filePath, byte[] data, int decodeWidth, int width, int height)
+    private long AddToMemory(string filePath, byte[] data, int decodeWidth, int width, int height)
     {
+        var sw = Stopwatch.StartNew();
         var newNode = new LruNode(filePath)
         {
             Data = data,
@@ -306,6 +360,16 @@ public class ThumbnailCacheService : IThumbnailCacheService
                 tail.Value.Data = Array.Empty<byte>();
             }
         }
+
+        var elapsedMs = sw.ElapsedMilliseconds;
+        LogSlow("lru", elapsedMs, 10);
+        return elapsedMs;
+    }
+
+    private static void LogSlow(string stage, long elapsedMs, long thresholdMs)
+    {
+        if (elapsedMs > thresholdMs)
+            AppLogger.Info($"Thumb.Cache.Slow stage={stage} elapsedMs={elapsedMs} thresholdMs={thresholdMs}");
     }
 
     private void PromoteToFront(LinkedListNode<LruNode> node)

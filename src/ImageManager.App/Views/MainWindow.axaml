@@ -13,6 +13,120 @@
 	<Window.Resources>
 		<conv:ByteArrayToBitmapConverter x:Key="BytesToBitmap"/>
 		<conv:HexToBrushConverter x:Key="HexToBrush"/>
+		<DataTemplate x:Key="ThumbnailItemTemplate" x:DataType="vm:ImageViewItem">
+			<!-- 此处margin数值是缩略框之间间距 -->
+			<Border Margin="5" Padding="0"
+					BorderThickness="{Binding $parent[Window].DataContext.ThumbnailBorderThickness}"
+					CornerRadius="{Binding $parent[Window].DataContext.ThumbnailCornerRadius}"
+					BorderBrush="{Binding $parent[Window].DataContext.ThumbnailBorderColor, Converter={StaticResource HexToBrush}}"
+					Background="{Binding $parent[Window].DataContext.ThumbnailBackgroundColor, Converter={StaticResource HexToBrush}}"
+					Opacity="{Binding $parent[Window].DataContext.ThumbnailOpacity}"
+					PointerPressed="Thumbnail_PointerPressed"
+					PointerEntered="Thumbnail_PointerEntered"
+					PointerExited="Thumbnail_PointerExited"
+					PointerMoved="Thumbnail_PointerMoved"
+					PointerReleased="Thumbnail_PointerReleased"
+					DoubleTapped="Thumbnail_DoubleTapped">
+				<Border.ContextMenu>
+					<ContextMenu Opened="ThumbnailContextMenu_Opened">
+						<MenuItem Header="编辑 Tag" Click="MenuEditTag_Click"/>
+						<MenuItem Header="自动打标" Click="MenuAutoTag_Click"/>
+						<MenuItem Header="清空选中图片的标签" Click="MenuClearSelectedTags_Click"/>
+						<MenuItem Header="复制图片到剪贴板" Click="MenuCopyImage_Click"/>
+						<MenuItem Header="查找相似图片">
+							<MenuItem Header="感知相似" Tag="0" Click="MenuFindSimilar_Click"/>
+							<MenuItem Header="语义相似" Tag="1" Click="MenuFindSimilar_Click"/>
+							<MenuItem Header="氛围相似" Tag="2" Click="MenuFindSimilar_Click"/>
+							<MenuItem Header="颜色相似" Tag="3" Click="MenuFindSimilar_Click"/>
+						</MenuItem>
+						<Separator/>
+						<MenuItem Header="在线搜图">
+							<MenuItem Header="不要来回切换ip地址，容易被搜图网站ban"/>
+							<MenuItem Header="搜图网站比较慢，打开网页可能时间较久"/>
+							<MenuItem Header="Multi（大杂烩搜图）" Click="MenuSearchOnline_Click" Tag="iqdb"/>
+							<MenuItem Header="SauceNAO（P站推特）" Click="MenuSearchOnline_Click" Tag="saucenao"/>
+							<MenuItem Header="yande.re（第三方图库）" Click="MenuSearchOnline_Click" Tag="yandere"/>
+							<MenuItem Header="百度搜图" Click="MenuSearchOnline_Click" Tag="baidu"/>
+							<MenuItem Header="ascii2d（p站推特）" Click="MenuSearchOnline_Click" Tag="ascii2d"/>
+							<MenuItem Header="Trace（动画搜图）" Click="MenuSearchOnline_Click" Tag="tracemoe"/>
+							<MenuItem Header="Yande" Click="MenuSearchOnline_Click" Tag="yandex"/>
+							<MenuItem Header="Google" Click="MenuSearchOnline_Click" Tag="google"/>
+							<MenuItem Header="Soutubot（本子）" Click="MenuSearchOnline_Click" Tag="soutubot"/>
+							<MenuItem Header="Danbooru IQDB" Click="MenuSearchOnline_Click" Tag="danbooru_iqdb"/>
+						</MenuItem>
+						<MenuItem Header="重新生成缩略图" Click="MenuRegenerateThumbnail_Click"/>
+						<MenuItem Header="在资源管理器中打开" Click="MenuOpenInExplorer_Click"/>
+						<Separator/>
+						<MenuItem Header="删除该图片文件" Click="MenuDeleteFile_Click"/>
+						<Separator/>
+						<MenuItem Header="复制到其他文件夹..." Click="MenuCopyFileToFolder_Click"/>
+						<MenuItem Header="移动到其他文件夹..." Click="MenuMoveFileToFolder_Click"/>
+						<Separator/>
+						<MenuItem Header="刷新当前文件夹" Click="MenuRefreshFolder_Click"/>
+					</ContextMenu>
+				</Border.ContextMenu>
+				<Grid>
+					<!-- Content layer -->
+					<Border Margin="{Binding $parent[Window].DataContext.ThumbnailPadding}"
+							CornerRadius="{Binding $parent[Window].DataContext.ThumbnailInnerCornerRadius}"
+							ClipToBounds="True">
+						<Grid MinHeight="80">
+							<!-- Placeholder color background while loading -->
+							<Border Background="{Binding PlaceholderColor, Converter={StaticResource HexToBrush}}"
+									IsVisible="{Binding IsNotLoaded}"
+									CornerRadius="2"/>
+							<!-- Main image — fills entire thumbnail box -->
+							<Image Width="{Binding $self.(controls:SmartWaterfallPanel.ItemWidth)}"
+									Height="{Binding $parent[Window].DataContext.GridThumbnailHeight}"
+									Source="{Binding ThumbnailData, Converter={StaticResource BytesToBitmap}}"
+									Stretch="{Binding $parent[Window].DataContext.ThumbnailImageStretch}"/>
+							<!-- Text overlay floating at bottom — does NOT affect image dimensions -->
+							<Border VerticalAlignment="Bottom"
+									Background="#AA000000" Padding="4,2"
+									IsVisible="{Binding $parent[Window].DataContext.ShowAnyThumbnailText}">
+								<StackPanel>
+									<TextBlock Text="{Binding FileName}"
+											IsVisible="{Binding $parent[Window].DataContext.ShowFileName}"
+											FontSize="11" TextTrimming="CharacterEllipsis"
+											Foreground="White" HorizontalAlignment="Center"
+											MaxWidth="{Binding $parent[Window].DataContext.ThumbnailBaseWidth}"/>
+									<TextBlock Text="{Binding StatusText}"
+											IsVisible="{Binding $parent[Window].DataContext.ShowTags}"
+											FontSize="10" Foreground="#CCCCCC"
+											HorizontalAlignment="Center"/>
+									<TextBlock Text="{Binding OrientationText}"
+											IsVisible="{Binding $parent[Window].DataContext.ShowOrientation}"
+											FontSize="10" Foreground="#CCCCCC"
+											HorizontalAlignment="Center"/>
+								</StackPanel>
+							</Border>
+							<!-- Video play icon overlay -->
+							<Panel IsVisible="{Binding IsVideo}"
+									IsHitTestVisible="False">
+								<Border Width="48" Height="48"
+										Background="#80000000"
+										CornerRadius="24"
+										HorizontalAlignment="Right"
+										VerticalAlignment="Bottom"
+										Margin="0,0,8,8">
+										<Path Fill="White"
+												Width="24" Height="24"
+												Data="M8 5v14l11-7z"
+												Stretch="Uniform"
+												HorizontalAlignment="Center"
+												VerticalAlignment="Center"/>
+									</Border>
+							</Panel>
+						</Grid>
+					</Border>
+					<!-- Selection highlight overlay -->
+					<Border BorderBrush="#FF3D7FFF" BorderThickness="4"
+							CornerRadius="{Binding $parent[Window].DataContext.ThumbnailSelectionCornerRadius}"
+							IsVisible="{Binding IsSelected}"
+							IsHitTestVisible="False"/>
+				</Grid>
+			</Border>
+		</DataTemplate>
 	</Window.Resources>
 	<Window.Styles>
 		<Style Selector="TreeViewItem">
@@ -113,6 +227,7 @@
                             <MenuItem x:Name="FolderStopVideoMenu" Header="停止视频原始帧生成" IsVisible="False" Click="MenuStopVideoOriginalFrames_Click"/>
                             <Separator/>
                             <MenuItem Header="设置显示名称…" Click="MenuRenameFolder_Click"/>
+                            <MenuItem Header="归档文件夹" Click="MenuArchiveFolder_Click"/>
                             <MenuItem x:Name="FolderClearTagsMenu" Header="清空标签…" Click="MenuClearFolderTags_Click"/>
                         </ContextMenu>
                     </TreeView.ContextMenu>
@@ -144,6 +259,7 @@
                     <MenuItem Header="缓存与 AI 设置" Click="MenuMemorySettings_Click"/>
                     <MenuItem Header="搜索设置" Click="MenuSearchSettings_Click"/>
                     <MenuItem Header="相似搜索向量索引" Click="MenuVectorIndexSettings_Click"/>
+                    <MenuItem Header="归档文件夹" Click="MenuArchivedFolders_Click"/>
                     <Separator/>
                     <MenuItem Header="快捷键设置" Click="MenuShortcutSettings_Click"/>
                 </MenuItem>
@@ -398,7 +514,8 @@
                 Margin="5,1,5,2" Padding="6,2"
                 BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1" CornerRadius="6">
             <Grid ColumnDefinitions="*,Auto" VerticalAlignment="Center">
-                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center"
+                            IsVisible="{Binding IsPagedDisplay}">
                     <Button Content="上一页" Classes="toolbar-compact" Margin="0,0,5,0"
                             VerticalAlignment="Center"
                             Command="{Binding PrevPageCommand}"/>
@@ -447,7 +564,8 @@
                   PointerPressed="ImagePanelHost_PointerPressed"
                   PointerMoved="ImagePanelHost_PointerMoved"
                   PointerReleased="ImagePanelHost_PointerReleased">
-                <ItemsControl x:Name="ItemsImages" ItemsSource="{Binding Images}">
+                <ItemsControl x:Name="ItemsImages" ItemsSource="{Binding Images}"
+                              ItemTemplate="{StaticResource ThumbnailItemTemplate}">
                 <ItemsControl.ItemsPanel>
                     <ItemsPanelTemplate>
                         <controls:SmartWaterfallPanel
@@ -455,124 +573,20 @@
                             ColumnWidth="{Binding $parent[Window].DataContext.ThumbnailBaseWidth}"/>
                     </ItemsPanelTemplate>
                 </ItemsControl.ItemsPanel>
-
-                <ItemsControl.ItemTemplate>
-                    <DataTemplate x:DataType="vm:ImageViewItem">
-						<!-- 此处margin数值是缩略框之间间距 -->
-                        <Border Margin="5" Padding="0"
-                                BorderThickness="{Binding $parent[Window].DataContext.ThumbnailBorderThickness}"
-                                CornerRadius="{Binding $parent[Window].DataContext.ThumbnailCornerRadius}"
-                                BorderBrush="{Binding $parent[Window].DataContext.ThumbnailBorderColor, Converter={StaticResource HexToBrush}}"
-                                Background="{Binding $parent[Window].DataContext.ThumbnailBackgroundColor, Converter={StaticResource HexToBrush}}"
-                                Opacity="{Binding $parent[Window].DataContext.ThumbnailOpacity}"
-                                PointerPressed="Thumbnail_PointerPressed"
-                                PointerEntered="Thumbnail_PointerEntered"
-                                PointerExited="Thumbnail_PointerExited"
-                                PointerMoved="Thumbnail_PointerMoved"
-                                PointerReleased="Thumbnail_PointerReleased"
-                                DoubleTapped="Thumbnail_DoubleTapped">
-                            <Border.ContextMenu>
-                                <ContextMenu Opened="ThumbnailContextMenu_Opened">
-                                    <MenuItem Header="编辑 Tag" Click="MenuEditTag_Click"/>
-                                    <MenuItem Header="自动打标" Click="MenuAutoTag_Click"/>
-                                    <MenuItem Header="清空选中图片的标签" Click="MenuClearSelectedTags_Click"/>
-                                    <MenuItem Header="复制图片到剪贴板" Click="MenuCopyImage_Click"/>
-                                    <MenuItem Header="查找相似图片">
-                                        <MenuItem Header="感知相似" Tag="0" Click="MenuFindSimilar_Click"/>
-                                        <MenuItem Header="语义相似" Tag="1" Click="MenuFindSimilar_Click"/>
-                                        <MenuItem Header="氛围相似" Tag="2" Click="MenuFindSimilar_Click"/>
-                                        <MenuItem Header="颜色相似" Tag="3" Click="MenuFindSimilar_Click"/>
-                                    </MenuItem>
-                                    <Separator/>
-                                    <MenuItem Header="在线搜图">
-										<MenuItem Header="不要来回切换ip地址，容易被搜图网站ban"/>
-										<MenuItem Header="搜图网站比较慢，打开网页可能时间较久"/>
-										<MenuItem Header="Multi（大杂烩搜图）" Click="MenuSearchOnline_Click" Tag="iqdb"/>
-										<MenuItem Header="SauceNAO（P站推特）" Click="MenuSearchOnline_Click" Tag="saucenao"/>
-										<MenuItem Header="yande.re（第三方图库）" Click="MenuSearchOnline_Click" Tag="yandere"/>
-										<MenuItem Header="百度搜图" Click="MenuSearchOnline_Click" Tag="baidu"/>
-										<MenuItem Header="ascii2d（p站推特）" Click="MenuSearchOnline_Click" Tag="ascii2d"/>
-                                        <MenuItem Header="Trace（动画搜图）" Click="MenuSearchOnline_Click" Tag="tracemoe"/>
-                                        <MenuItem Header="Yande" Click="MenuSearchOnline_Click" Tag="yandex"/>
-                                        <MenuItem Header="Google" Click="MenuSearchOnline_Click" Tag="google"/>
-                                        <MenuItem Header="Soutubot（本子）" Click="MenuSearchOnline_Click" Tag="soutubot"/>
-                                        <MenuItem Header="Danbooru IQDB" Click="MenuSearchOnline_Click" Tag="danbooru_iqdb"/>
-                                    </MenuItem>
-                                    <MenuItem Header="重新生成缩略图" Click="MenuRegenerateThumbnail_Click"/>
-                                    <MenuItem Header="在资源管理器中打开" Click="MenuOpenInExplorer_Click"/>
-                                    <Separator/>
-                                    <MenuItem Header="删除该图片文件" Click="MenuDeleteFile_Click"/>
-                                    <Separator/>
-                                    <MenuItem Header="复制到其他文件夹..." Click="MenuCopyFileToFolder_Click"/>
-                                    <MenuItem Header="移动到其他文件夹..." Click="MenuMoveFileToFolder_Click"/>
-                                    <Separator/>
-                                    <MenuItem Header="刷新当前文件夹" Click="MenuRefreshFolder_Click"/>
-                                </ContextMenu>
-                            </Border.ContextMenu>
-                            <Grid>
-                                <!-- Content layer -->
-                                <Border Margin="{Binding $parent[Window].DataContext.ThumbnailPadding}"
-                                        CornerRadius="{Binding $parent[Window].DataContext.ThumbnailInnerCornerRadius}"
-                                        ClipToBounds="True">
-                                    <Grid MinHeight="80">
-                                        <!-- Placeholder color background while loading -->
-                                        <Border Background="{Binding PlaceholderColor, Converter={StaticResource HexToBrush}}"
-                                                IsVisible="{Binding IsNotLoaded}"
-                                                CornerRadius="2"/>
-                                        <!-- Main image — fills entire thumbnail box -->
-                                        <Image Width="{Binding $self.(controls:SmartWaterfallPanel.ItemWidth)}"
-                                               Height="{Binding $parent[Window].DataContext.GridThumbnailHeight}"
-                                               Source="{Binding ThumbnailData, Converter={StaticResource BytesToBitmap}}"
-                                               Stretch="{Binding $parent[Window].DataContext.ThumbnailImageStretch}"/>
-                                        <!-- Text overlay floating at bottom — does NOT affect image dimensions -->
-                                        <Border VerticalAlignment="Bottom"
-                                                Background="#AA000000" Padding="4,2"
-                                                IsVisible="{Binding $parent[Window].DataContext.ShowAnyThumbnailText}">
-                                            <StackPanel>
-                                            <TextBlock Text="{Binding FileName}"
-                                                       IsVisible="{Binding $parent[Window].DataContext.ShowFileName}"
-                                                       FontSize="11" TextTrimming="CharacterEllipsis"
-                                                       Foreground="White" HorizontalAlignment="Center"
-                                                       MaxWidth="{Binding $parent[Window].DataContext.ThumbnailBaseWidth}"/>
-                                            <TextBlock Text="{Binding StatusText}"
-                                                       IsVisible="{Binding $parent[Window].DataContext.ShowTags}"
-                                                       FontSize="10" Foreground="#CCCCCC"
-                                                       HorizontalAlignment="Center"/>
-                                            <TextBlock Text="{Binding OrientationText}"
-                                                       IsVisible="{Binding $parent[Window].DataContext.ShowOrientation}"
-                                                       FontSize="10" Foreground="#CCCCCC"
-                                                       HorizontalAlignment="Center"/>
-                                            </StackPanel>
-                                        </Border>
-                                        <!-- Video play icon overlay -->
-                                        <Panel IsVisible="{Binding IsVideo}"
-                                               IsHitTestVisible="False">
-                                            <Border Width="48" Height="48"
-                                                    Background="#80000000"
-                                                    CornerRadius="24"
-                                                    HorizontalAlignment="Right"
-                                                    VerticalAlignment="Bottom"
-                                                    Margin="0,0,8,8">
-                                                <Path Fill="White"
-                                                      Width="24" Height="24"
-                                                      Data="M8 5v14l11-7z"
-                                                      Stretch="Uniform"
-                                                      HorizontalAlignment="Center"
-                                                      VerticalAlignment="Center"/>
-                                            </Border>
-                                        </Panel>
-                                    </Grid>
-                                </Border>
-                                <!-- Selection highlight overlay -->
-                                <Border BorderBrush="#FF3D7FFF" BorderThickness="4"
-                                        CornerRadius="{Binding $parent[Window].DataContext.ThumbnailSelectionCornerRadius}"
-                                        IsVisible="{Binding IsSelected}"
-                                        IsHitTestVisible="False"/>
-                            </Grid>
-                        </Border>
-                    </DataTemplate>
-                </ItemsControl.ItemTemplate>
             </ItemsControl>
+
+                <ItemsControl x:Name="ContinuousItemsImages"
+                              ItemsSource="{Binding ContinuousImageItemSource}"
+                              ItemTemplate="{StaticResource ThumbnailItemTemplate}"
+                              IsVisible="False">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <controls:VirtualizingWaterfallPanel
+                                GeometryIndex="{Binding $parent[Window].DataContext.ContinuousDisplayGeometryIndex}"
+                                ViewportBuffer="800"/>
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                </ItemsControl>
 
                 <!-- Selection rectangle overlay -->
                 <Rectangle x:Name="SelectionRectangle"

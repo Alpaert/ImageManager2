@@ -4,6 +4,8 @@ namespace ImageManager.Core.Services;
 
 public interface ISimilarImageService
 {
+    void InvalidateVectorSnapshots();
+
     Task<List<SimilaritySearchResult>> SearchByImageAsync(
         string baseFilePath,
         IEnumerable<string> candidates,

@@ -10,6 +10,36 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace ImageManager.App.Controls;
 
+/// <summary>
+/// Keeps scroll diagnostics off the UI thread. Diagnostics are best-effort: when the
+/// bounded queue is full, dropping a record is preferable to delaying rendering.
+/// </summary>
+internal static class ScrollDiagnosticsLogger
+{
+    private const int QueueCapacity = 256;
+    private static readonly System.Threading.Channels.Channel<string> Messages =
+        System.Threading.Channels.Channel.CreateBounded<string>(
+            new System.Threading.Channels.BoundedChannelOptions(QueueCapacity)
+            {
+                FullMode = System.Threading.Channels.BoundedChannelFullMode.DropWrite,
+                SingleReader = true,
+                SingleWriter = false
+            });
+
+    static ScrollDiagnosticsLogger()
+    {
+        _ = Task.Run(DrainAsync);
+    }
+
+    public static void Log(string message) => Messages.Writer.TryWrite(message);
+
+    private static async Task DrainAsync()
+    {
+        await foreach (var message in Messages.Reader.ReadAllAsync().ConfigureAwait(false))
+            AppLogger.Info(message);
+    }
+}
+
 public class SmartWaterfallPanel : Panel
 {
     public static readonly StyledProperty<string> ModeProperty =
@@ -26,8 +56,16 @@ public class SmartWaterfallPanel : Panel
 
     static SmartWaterfallPanel()
     {
-        ModeProperty.Changed.AddClassHandler<SmartWaterfallPanel>((x, e) => x.InvalidateMeasure());
-        ColumnWidthProperty.Changed.AddClassHandler<SmartWaterfallPanel>((x, e) => x.InvalidateMeasure());
+        ModeProperty.Changed.AddClassHandler<SmartWaterfallPanel>((x, e) =>
+        {
+            x.InvalidateHorizontalGeometry();
+            x.InvalidateMeasure();
+        });
+        ColumnWidthProperty.Changed.AddClassHandler<SmartWaterfallPanel>((x, e) =>
+        {
+            x.InvalidateHorizontalGeometry();
+            x.InvalidateMeasure();
+        });
     }
 
     public string Mode
@@ -45,18 +83,37 @@ public class SmartWaterfallPanel : Panel
     // ==================== Viewport-aware layout fields ====================
     private ScrollViewer? _scrollViewer;
     private EventHandler<ScrollChangedEventArgs>? _scrollHandler;
+    private DispatcherTimer? _scrollIdleTimer;
     private double _viewportHeight;
     private double _scrollOffsetY;
     private bool _scrollWired;
+    private bool _scrollActive;
+    private bool _lifecycleSyncPending;
     private bool _arrangePending;
 
     private readonly Dictionary<Control, double> _childWidths = new();
     private readonly List<RowInfo> _rows = new();
+    private readonly List<Control> _horizontalGeometryChildren = new();
+    private bool _horizontalGeometryValid;
+    private double _horizontalGeometryWidth;
+    private double _horizontalMeasuredHeight;
+    private int _horizontalGeometryVersion;
+    private int _appliedHorizontalGeometryVersion = -1;
+    private double _lastHorizontalArrangeWidth;
+    private bool _hasLastHorizontalArrangeSize;
+    // Arrange diagnostics. They are reset for each layout pass and reported by ArrangeOverride.
+    private bool _lastArrangeGeometryReused;
+    private int _lastArrangeRows;
+    private int _lastArrangeVisibilityRowsChanged;
+    private bool _lastArrangeVisibilityDeferred;
 
     // Bitmap lifecycle: track which controls had their bitmaps released
     private readonly HashSet<Control> _bitmapFreed = new();
     private int _lastVisibleStartRow = -1;
     private int _lastVisibleEndRow = -1;
+    private bool _visibleRangeChanged;
+    private int _lastVerticalRowsCount;
+    private long _lastVerticalRowsBuildMs;
     private PageManager? _cachedPageManager;
     private Control? _firstTrackedChild; // detect ItemsSource reset (page flip)
 
@@ -65,6 +122,15 @@ public class SmartWaterfallPanel : Panel
         public double Y;
         public double Height;
         public List<Control> Children = new();
+        public List<Rect> Bounds = new();
+    }
+
+    private void InvalidateHorizontalGeometry()
+    {
+        _horizontalGeometryValid = false;
+        _horizontalGeometryChildren.Clear();
+        _appliedHorizontalGeometryVersion = -1;
+        _hasLastHorizontalArrangeSize = false;
     }
 
     private void EnsureScrollViewer()
@@ -74,12 +140,15 @@ public class SmartWaterfallPanel : Panel
         _scrollViewer = this.FindAncestorOfType<ScrollViewer>();
         if (_scrollViewer != null)
         {
+            _scrollIdleTimer = new DispatcherTimer(TimeSpan.FromMilliseconds(350), DispatcherPriority.Background,
+                (_, _) => EndScrollActivity());
             _scrollOffsetY = _scrollViewer.Offset.Y;
             _viewportHeight = _scrollViewer.Viewport.Height;
             _scrollHandler = (_, _) =>
             {
                 _scrollOffsetY = _scrollViewer.Offset.Y;
                 _viewportHeight = _scrollViewer.Viewport.Height;
+                BeginScrollActivity();
                 // 节流：合并同一帧内的多次 scroll 事件，最多每帧重排一次
                 if (!_arrangePending)
                 {
@@ -95,6 +164,30 @@ public class SmartWaterfallPanel : Panel
         }
     }
 
+    private void BeginScrollActivity()
+    {
+        _scrollActive = true;
+        _lifecycleSyncPending = true;
+        _scrollIdleTimer?.Stop();
+        _scrollIdleTimer?.Start();
+    }
+
+    private void EndScrollActivity()
+    {
+        _scrollIdleTimer?.Stop();
+        if (!_scrollActive) return;
+        _scrollActive = false;
+        if (_lifecycleSyncPending)
+        {
+            _lifecycleSyncPending = false;
+            // Force the deferred pass even if the user returned to the range that
+            // was visible before scrolling began.
+            _lastVisibleStartRow = -1;
+            _lastVisibleEndRow = -1;
+            InvalidateArrange();
+        }
+    }
+
     protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
     {
         base.OnDetachedFromVisualTree(e);
@@ -103,6 +196,10 @@ public class SmartWaterfallPanel : Panel
             _scrollViewer.ScrollChanged -= _scrollHandler;
             _scrollHandler = null;
         }
+        _scrollIdleTimer?.Stop();
+        _scrollIdleTimer = null;
+        _scrollActive = false;
+        _lifecycleSyncPending = false;
         _scrollWired = false;
         _scrollViewer = null;
     }
@@ -120,6 +217,9 @@ public class SmartWaterfallPanel : Panel
     /// </summary>
     private void ManageBitmapLifecycle(List<RowInfo> rows)
     {
+        var lifecycleStopwatch = Stopwatch.StartNew();
+        int previousVisibleStart = _lastVisibleStartRow;
+        int previousVisibleEnd = _lastVisibleEndRow;
         // Find visible row range
         int visibleStart = -1, visibleEnd = -1;
         for (int i = 0; i < rows.Count; i++)
@@ -135,16 +235,31 @@ public class SmartWaterfallPanel : Panel
         visibleStart = Math.Max(0, visibleStart - 1);
         visibleEnd = Math.Min(rows.Count - 1, visibleEnd + 1);
 
+        if (_scrollActive)
+        {
+            // Keep off-screen bitmaps until the scroll settles, but restore items that
+            // were freed during a previous idle period before they re-enter the viewport.
+            RestoreFreedVisibleBitmaps(rows, visibleStart, visibleEnd);
+            _lifecycleSyncPending = true;
+            return;
+        }
+
         // Only process if visible range changed
         if (visibleStart == _lastVisibleStartRow && visibleEnd == _lastVisibleEndRow)
             return;
         _lastVisibleStartRow = visibleStart;
         _lastVisibleEndRow = visibleEnd;
+        _visibleRangeChanged = true;
 
         // Release bitmaps for rows outside visible range
+        int released = 0;
+        int reloadRequested = 0;
+        int visibleItems = 0;
         for (int i = 0; i < rows.Count; i++)
         {
             bool isVisible = i >= visibleStart && i <= visibleEnd;
+            if (isVisible)
+                visibleItems += rows[i].Children.Count;
             foreach (var child in rows[i].Children)
             {
                 if (child.DataContext is ImageViewItem item)
@@ -154,6 +269,7 @@ public class SmartWaterfallPanel : Panel
                         item.ThumbnailData = null; // release byte[], GC reclaims Bitmap
                         item.IsLoaded = false;     // mark as unloaded so page-revisit path reloads it
                         _bitmapFreed.Add(child);
+                        released++;
                     }
                     else if (isVisible && _bitmapFreed.Contains(child))
                     {
@@ -162,8 +278,32 @@ public class SmartWaterfallPanel : Panel
                         // Trigger PageManager to reload this thumbnail (cached to avoid service locator in hot path)
                         _cachedPageManager ??= App.Services.GetRequiredService<PageManager>();
                         _cachedPageManager.LoadThumbnailsForItems(new List<ImageViewItem> { item });
+                        reloadRequested++;
                     }
                 }
+            }
+        }
+
+        lifecycleStopwatch.Stop();
+        ScrollDiagnosticsLogger.Log(
+            $"ThumbViewport.Range mode={Mode} range={previousVisibleStart}-{previousVisibleEnd}" +
+            $"=>{visibleStart}-{visibleEnd} rows={rows.Count} visibleItems={visibleItems} " +
+            $"released={released} reloadRequested={reloadRequested} lifecycleMs={lifecycleStopwatch.ElapsedMilliseconds} " +
+            $"offsetY={_scrollOffsetY:F0} viewportH={_viewportHeight:F0}");
+    }
+
+    private void RestoreFreedVisibleBitmaps(List<RowInfo> rows, int visibleStart, int visibleEnd)
+    {
+        for (int i = visibleStart; i <= visibleEnd; i++)
+        {
+            foreach (var child in rows[i].Children)
+            {
+                if (!_bitmapFreed.Remove(child) || child.DataContext is not ImageViewItem item)
+                    continue;
+
+                item.NotifyThumbnailNeeded();
+                _cachedPageManager ??= App.Services.GetRequiredService<PageManager>();
+                _cachedPageManager.LoadThumbnailsForItems(new List<ImageViewItem> { item });
             }
         }
     }
@@ -202,6 +342,7 @@ public class SmartWaterfallPanel : Panel
         _bitmapFreed.Clear();
         _lastVisibleStartRow = -1;
         _lastVisibleEndRow = -1;
+        _visibleRangeChanged = false;
     }
 
     protected override Size MeasureOverride(Size availableSize)
@@ -227,8 +368,10 @@ public class SmartWaterfallPanel : Panel
             "Horizontal" => MeasureHorizontal(availableSize),
             _ => MeasureDefault(availableSize)
         };
-        if (sw.ElapsedMilliseconds > 5)
-            PerfLogger.Log($"[Layout] MeasureOverride mode={Mode} children={Children.Count} elapsed={sw.ElapsedMilliseconds}ms");
+        if (sw.ElapsedMilliseconds > 4)
+            ScrollDiagnosticsLogger.Log(
+                $"ScrollLayout.Measure mode={Mode} children={Children.Count} rows={GetLayoutRowCount()} " +
+                $"available={availableSize.Width:F0}x{availableSize.Height:F0} elapsedMs={sw.ElapsedMilliseconds}");
         return result;
     }
 
@@ -236,6 +379,10 @@ public class SmartWaterfallPanel : Panel
     {
         if (Children.Count == 0) return finalSize;
         var sw = Stopwatch.StartNew();
+        _lastArrangeGeometryReused = false;
+        _lastArrangeRows = 0;
+        _lastArrangeVisibilityRowsChanged = 0;
+        _lastArrangeVisibilityDeferred = false;
         EnsureScrollViewer();
         var result = Mode switch
         {
@@ -243,10 +390,21 @@ public class SmartWaterfallPanel : Panel
             "Horizontal" => ArrangeHorizontal(finalSize),
             _ => ArrangeDefault(finalSize)
         };
-        if (sw.ElapsedMilliseconds > 5)
-            PerfLogger.Log($"[Layout] ArrangeOverride mode={Mode} children={Children.Count} elapsed={sw.ElapsedMilliseconds}ms");
+        bool visibleRangeChanged = _visibleRangeChanged;
+        _visibleRangeChanged = false;
+        if (sw.ElapsedMilliseconds > 4 || visibleRangeChanged)
+            ScrollDiagnosticsLogger.Log(
+                $"ScrollLayout.Arrange mode={Mode} children={Children.Count} rows={GetLayoutRowCount()} " +
+                $"visibleRows={_lastVisibleStartRow}-{_lastVisibleEndRow} " +
+                $"verticalRowsBuildMs={_lastVerticalRowsBuildMs} final={finalSize.Width:F0}x{finalSize.Height:F0} " +
+                $"geometryReused={_lastArrangeGeometryReused} arrangedRows={_lastArrangeRows} " +
+                $"visibilityRowsChanged={_lastArrangeVisibilityRowsChanged} " +
+                $"visibilityDeferred={_lastArrangeVisibilityDeferred} " +
+                $"elapsedMs={sw.ElapsedMilliseconds}");
         return result;
     }
+
+    private int GetLayoutRowCount() => Mode == "Vertical" ? _lastVerticalRowsCount : _rows.Count;
 
     #region Vertical (Masonry)
 
@@ -289,12 +447,15 @@ public class SmartWaterfallPanel : Panel
     private Size ArrangeVertical(Size finalSize)
     {
         // Build row list for bitmap lifecycle management
+        var rowBuildStopwatch = Stopwatch.StartNew();
         var rows = new List<RowInfo>();
         foreach (var group in _verticalLayout.GroupBy(l => l.Y))
         {
             var row = new RowInfo { Y = group.Key, Height = group.Max(l => l.H), Children = group.Select(l => l.Child).ToList() };
             rows.Add(row);
         }
+        _lastVerticalRowsCount = rows.Count;
+        _lastVerticalRowsBuildMs = rowBuildStopwatch.ElapsedMilliseconds;
         ManageBitmapLifecycle(rows);
 
         foreach (var (child, x, y, w, h) in _verticalLayout)
@@ -323,21 +484,25 @@ public class SmartWaterfallPanel : Panel
         double rowHeight = TargetRowHeight;
         double containerWidth = double.IsInfinity(availableSize.Width) ? 1000 : availableSize.Width;
         SetValue(ItemWidthProperty, double.NaN);
+
+        // Visibility changes can cause Avalonia to ask us to measure again. Reuse the
+        // justified geometry when the actual layout inputs did not change, otherwise a
+        // single scroll boundary crossing would turn back into a full layout pass.
+        if (CanReuseHorizontalGeometry(containerWidth, rowHeight))
+            return new Size(containerWidth, _horizontalMeasuredHeight);
+
         _childWidths.Clear();
         _rows.Clear();
+        _horizontalGeometryChildren.Clear();
 
         double currentRowW = 0;
         var currentRow = new List<Control>();
 
         foreach (Control child in Children)
         {
-            double childWidth;
-            if (child is Control ctrl && ctrl.DataContext is ImageViewItem item
-                && item.Width > 0 && item.Height > 0)
-                childWidth = rowHeight * (double)item.Width / item.Height + 10;
-            else
-                childWidth = rowHeight * 0.75;
+            double childWidth = GetHorizontalChildWidth(child, rowHeight);
             _childWidths[child] = childWidth;
+            _horizontalGeometryChildren.Add(child);
 
             if (currentRowW + childWidth > containerWidth && currentRow.Count > 0)
             {
@@ -352,7 +517,37 @@ public class SmartWaterfallPanel : Panel
             FlushRow(currentRow, ref currentRowW, containerWidth, rowHeight);
 
         double totalHeight = _rows.Count > 0 ? _rows[^1].Y + _rows[^1].Height : 0;
+        _horizontalGeometryWidth = containerWidth;
+        _horizontalMeasuredHeight = totalHeight;
+        _horizontalGeometryValid = true;
+        _horizontalGeometryVersion++;
+        _appliedHorizontalGeometryVersion = -1;
         return new Size(containerWidth, totalHeight);
+    }
+
+    private bool CanReuseHorizontalGeometry(double containerWidth, double rowHeight)
+    {
+        if (!_horizontalGeometryValid || _horizontalGeometryWidth != containerWidth
+            || _horizontalGeometryChildren.Count != Children.Count)
+            return false;
+
+        for (int i = 0; i < Children.Count; i++)
+        {
+            var child = Children[i];
+            if (!ReferenceEquals(_horizontalGeometryChildren[i], child)
+                || !_childWidths.TryGetValue(child, out var existingWidth)
+                || Math.Abs(existingWidth - GetHorizontalChildWidth(child, rowHeight)) > 0.01)
+                return false;
+        }
+
+        return true;
+    }
+
+    private static double GetHorizontalChildWidth(Control child, double rowHeight)
+    {
+        if (child.DataContext is ImageViewItem item && item.Width > 0 && item.Height > 0)
+            return rowHeight * (double)item.Width / item.Height + 10;
+        return rowHeight * 0.75;
     }
 
     private void FlushRow(List<Control> row, ref double rowWidth, double containerWidth, double rowHeight)
@@ -368,70 +563,90 @@ public class SmartWaterfallPanel : Panel
     {
         ManageBitmapLifecycle(_rows);
 
-        for (int rowIdx = 0; rowIdx < _rows.Count; rowIdx++)
+        bool geometryReused = _appliedHorizontalGeometryVersion == _horizontalGeometryVersion
+            && _hasLastHorizontalArrangeSize
+            && _lastHorizontalArrangeWidth == finalSize.Width;
+        _lastArrangeGeometryReused = geometryReused;
+
+        if (!geometryReused)
         {
-            var row = _rows[rowIdx];
-
-            // 视口裁剪：不可见行隐藏，保留在视觉树中以确保绑定正常
-            if (!IsRowVisible(row.Y, row.Height))
+            for (int rowIdx = 0; rowIdx < _rows.Count; rowIdx++)
             {
-                foreach (var child in row.Children)
-                    child.IsVisible = false;
-                continue;
+                var row = _rows[rowIdx];
+                CacheHorizontalRowBounds(rowIdx, row, finalSize);
+                // Horizontal mode relies on the ScrollViewer's clip for off-screen
+                // content. Toggling IsVisible as a row crosses the viewport forces a
+                // costly subtree layout, especially for wide rows. A geometry rebuild
+                // is the one place where every child is made visible and arranged.
+                if (SetRowVisibility(row, true))
+                    _lastArrangeVisibilityRowsChanged++;
+                ArrangeHorizontalRow(row);
             }
 
-            foreach (var child in row.Children)
-                child.IsVisible = true;
-
-            bool isLast = rowIdx == _rows.Count - 1;
-
-            if (isLast)
-            {
-                double rowHeight = _rows.Count > 1 ? _rows[_rows.Count - 2].Height : TargetRowHeight;
-
-                // 先算总宽度，若超出窗口则等比缩小行高
-                double totalW = 0;
-                foreach (var child in row.Children)
-                {
-                    if (child is Control ctrl && ctrl.DataContext is ImageViewItem item
-                        && item.Width > 0 && item.Height > 0)
-                        totalW += rowHeight * (double)item.Width / item.Height + 10;
-                    else
-                        totalW += rowHeight * 0.75;
-                }
-                if (totalW > finalSize.Width && totalW > 0)
-                    rowHeight *= finalSize.Width / totalW;
-
-                double x = 0;
-                foreach (var child in row.Children)
-                {
-                    double w;
-                    if (child is Control ctrl && ctrl.DataContext is ImageViewItem item
-                        && item.Width > 0 && item.Height > 0)
-                        w = rowHeight * (double)item.Width / item.Height + 10;
-                    else
-                        w = rowHeight * 0.75;
-                    child.Arrange(new Rect(x, row.Y, w, rowHeight));
-                    x += w;
-                }
-            }
-            else
-            {
-                double totalW = 0;
-                foreach (var c in row.Children)
-                    totalW += _childWidths.TryGetValue(c, out double cw) ? cw : 100;
-                double ratio = finalSize.Width / totalW;
-                double actualHeight = row.Height;
-                double x = 0;
-                foreach (var child in row.Children)
-                {
-                    double w = (_childWidths.TryGetValue(child, out double cw) ? cw : 100) * ratio;
-                    child.Arrange(new Rect(x, row.Y, w, actualHeight));
-                    x += w;
-                }
-            }
+            _appliedHorizontalGeometryVersion = _horizontalGeometryVersion;
+            _lastHorizontalArrangeWidth = finalSize.Width;
+            _hasLastHorizontalArrangeSize = true;
         }
+        else
+        {
+            // Keep cached child bounds and visibility untouched while scrolling.
+            // Bitmap lifecycle still evaluates its independent buffered viewport.
+            _lastArrangeVisibilityDeferred = _scrollActive;
+        }
+
         return finalSize;
+    }
+
+    private void CacheHorizontalRowBounds(int rowIdx, RowInfo row, Size finalSize)
+    {
+        row.Bounds.Clear();
+        bool isLast = rowIdx == _rows.Count - 1;
+        double rowHeight = row.Height;
+
+        if (isLast)
+        {
+            rowHeight = _rows.Count > 1 ? _rows[^2].Height : TargetRowHeight;
+            double totalW = row.Children.Sum(child => GetHorizontalChildWidth(child, rowHeight));
+            if (totalW > finalSize.Width && totalW > 0)
+                rowHeight *= finalSize.Width / totalW;
+        }
+
+        double totalWidth = isLast
+            ? 0
+            : row.Children.Sum(child => _childWidths.TryGetValue(child, out var width) ? width : 100);
+        double widthRatio = !isLast && totalWidth > 0 ? finalSize.Width / totalWidth : 1;
+        double x = 0;
+        foreach (var child in row.Children)
+        {
+            double width = isLast
+                ? GetHorizontalChildWidth(child, rowHeight)
+                : (_childWidths.TryGetValue(child, out var cachedWidth) ? cachedWidth : 100) * widthRatio;
+            row.Bounds.Add(new Rect(x, row.Y, width, rowHeight));
+            x += width;
+        }
+    }
+
+    private bool SetRowVisibility(RowInfo row, bool isVisible)
+    {
+        bool changed = false;
+        foreach (var child in row.Children)
+        {
+            if (child.IsVisible == isVisible)
+                continue;
+            child.IsVisible = isVisible;
+            changed = true;
+        }
+        return changed;
+    }
+
+    private void ArrangeHorizontalRow(RowInfo row)
+    {
+        if (row.Bounds.Count != row.Children.Count)
+            return;
+
+        for (int i = 0; i < row.Children.Count; i++)
+            row.Children[i].Arrange(row.Bounds[i]);
+        _lastArrangeRows++;
     }
 
     #endregion

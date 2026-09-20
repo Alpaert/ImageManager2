@@ -22,6 +22,8 @@ public class AppSettings
     public string ThemeVariant { get; set; } = "Dark";
     /// <summary>Top search toolbar layout: A (layered) or C (command bar).</summary>
     public string SearchToolbarLayout { get; set; } = "A";
+    /// <summary>Image result projection: Paged or Continuous.</summary>
+    public string ImageDisplayMode { get; set; } = "Paged";
     public string WaterfallMode { get; set; } = "None";
     public double GridZoomLevel { get; set; } = 1;
     public double VerticalZoomLevel { get; set; } = 1;

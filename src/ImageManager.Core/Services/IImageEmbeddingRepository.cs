@@ -6,7 +6,9 @@ public sealed record ImageEmbeddingRecord(
     long ImageMetaId,
     string FilePath,
     string? FileHash,
-    float[] Embedding);
+    float[] Embedding,
+    long SourceFileSize = 0,
+    long SourceLastWriteTicks = 0);
 
 public sealed record SearchIndexCandidate(
     long ImageMetaId,

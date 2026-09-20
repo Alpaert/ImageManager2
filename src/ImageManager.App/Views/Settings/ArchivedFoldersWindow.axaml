@@ -1,0 +1,50 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:ImageManager.App.ViewModels"
+        xmlns:models="using:ImageManager.Core.Models"
+        x:Class="ImageManager.App.Views.Settings.ArchivedFoldersWindow"
+        x:DataType="vm:ArchivedFoldersViewModel"
+        Title="归档文件夹"
+        Width="700" Height="520"
+        WindowStartupLocation="CenterOwner">
+    <Grid RowDefinitions="Auto,*,Auto" Margin="16">
+        <StackPanel Grid.Row="0" Spacing="4" Margin="0,0,0,10">
+            <TextBlock Text="归档文件夹" FontSize="20" FontWeight="SemiBold"/>
+            <TextBlock Text="已归档的文件夹不会显示在左侧目录中，数据仍会保留。"
+                       Opacity="0.75" TextWrapping="Wrap"/>
+        </StackPanel>
+
+        <Grid Grid.Row="1">
+            <ListBox ItemsSource="{Binding ArchivedFolders}"
+                     IsEnabled="{Binding !IsLoading}">
+                <ListBox.ItemTemplate>
+                    <DataTemplate x:DataType="models:FolderInfo">
+                        <Border Padding="10,8" Margin="0,2"
+                                Background="{DynamicResource CtrlBgBrush}" CornerRadius="4">
+                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                                <StackPanel Grid.Column="0" Spacing="2">
+                                    <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold"/>
+                                    <TextBlock Text="{Binding Path}" FontSize="12"
+                                               Opacity="0.7" TextWrapping="Wrap"/>
+                                </StackPanel>
+                                <Button Grid.Column="1" Content="恢复显示"
+                                        Command="{Binding $parent[Window].DataContext.RestoreCommand}"
+                                        CommandParameter="{Binding}"
+                                        VerticalAlignment="Center"/>
+                            </Grid>
+                        </Border>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+
+            <TextBlock Text="暂无已归档文件夹" IsVisible="{Binding HasNoArchivedFolders}"
+                       HorizontalAlignment="Center" VerticalAlignment="Center" Opacity="0.65"/>
+            <ProgressBar IsVisible="{Binding IsLoading}" IsIndeterminate="True"
+                         Width="180" Height="8" HorizontalAlignment="Center"
+                         VerticalAlignment="Center"/>
+        </Grid>
+
+        <TextBlock Grid.Row="2" Text="{Binding StatusText}" Margin="0,10,0,0"
+                   FontSize="12" Opacity="0.75"/>
+    </Grid>
+</Window>

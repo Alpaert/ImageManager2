@@ -11,6 +11,7 @@ public interface IFolderRepository
     Task RemoveAsync(string path);
     Task SetLastPageIndexAsync(string path, int pageIndex);
     Task<int?> GetLastPageIndexAsync(string path);
+    Task SetArchivedAsync(long folderId, bool archived);
 
     /// <summary>Update folder path and all contained image paths after external rename/move</summary>
     Task RelocateFolderAsync(long folderId, string newFolderPath);

@@ -14,6 +14,7 @@ using Avalonia.Media.Imaging;
 using System.Runtime.InteropServices;
 using ImageManager.App.Controls;
 using ImageManager.App.Helpers;
+using ImageManager.App.Models;
 using ImageManager.App.Services;
 using ImageManager.App.ViewModels;
 using ImageManager.Common.Constants;
@@ -38,6 +39,16 @@ public partial class MainWindow : Window
     private MainWindowViewModel Vm => (MainWindowViewModel)DataContext!;
 
     private CancellationTokenSource? _scrollAnimCts;
+    private CancellationTokenSource? _scrollActivityCts;
+    private CancellationTokenSource? _continuousModeCts;
+    private CancellationTokenSource? _continuousReflowCts;
+    private readonly DispatcherTimer _continuousResizeTimer;
+    private VirtualizingWaterfallPanel? _continuousWaterfallPanel;
+    private ImageDisplayRange _continuousVisibleRange;
+    private ContinuousScrollDirection _continuousScrollDirection;
+    private int _continuousResizeAnchorIndex;
+    private double _continuousResizeRequestedWidth;
+    private int _scrollAnimationId;
     private int _autoTagRunVersion;
     private bool _lastAutoTagRecursive;
     // Accessed only on the UI thread; reserve before the first await and release in finally.
@@ -52,6 +63,11 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        _continuousResizeTimer = new DispatcherTimer(
+            TimeSpan.FromMilliseconds(16),
+            DispatcherPriority.Background,
+            OnContinuousResizeTimerTick);
+        SizeChanged += OnWindowSizeChanged;
         _hoverPreviewTimer = new DispatcherTimer(
             TimeSpan.FromMilliseconds(600),
             DispatcherPriority.Background,
@@ -60,6 +76,7 @@ public partial class MainWindow : Window
         AddHandler(InputElement.KeyDownEvent, OnWindowKeyDown, RoutingStrategies.Tunnel);
         ThumbnailScrollViewer.AddHandler(ScrollViewer.PointerWheelChangedEvent,
             OnThumbnailScrollWheel, RoutingStrategies.Tunnel);
+        ContinuousItemsImages.LayoutUpdated += OnContinuousItemsImagesLayoutUpdated;
         LstFolders.AddHandler(TreeViewItem.ExpandedEvent,
             (_, e) =>
             {
@@ -135,21 +152,22 @@ public partial class MainWindow : Window
         await tcs.Task;
     }
 
-    private async Task DeleteSelectedFilesAsync(List<ImageViewItem> items)
+    private async Task DeleteSelectedFilesAsync(IEnumerable<string> filePaths)
     {
         var deletedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         int successCount = 0;
         var thumbCache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
 
         Vm.SuppressDeletedEvent();
-        foreach (var item in items)
+        foreach (var filePath in filePaths.Where(path => !string.IsNullOrWhiteSpace(path))
+                     .Distinct(StringComparer.OrdinalIgnoreCase))
         {
-            if (string.IsNullOrEmpty(item.FilePath) || !File.Exists(item.FilePath)) continue;
+            if (!File.Exists(filePath)) continue;
             try
             {
-                File.Delete(item.FilePath);
-                thumbCache.InvalidateThumbnail(item.FilePath);
-                deletedPaths.Add(item.FilePath);
+                File.Delete(filePath);
+                thumbCache.InvalidateThumbnail(filePath);
+                deletedPaths.Add(filePath);
                 successCount++;
             }
             catch { }
@@ -167,15 +185,15 @@ public partial class MainWindow : Window
         var topLevel = TopLevel.GetTopLevel(this);
         if (topLevel == null) return;
 
-        var selected = Vm.Images.Where(i => i.IsSelected).ToList();
-        if (selected.Count == 0) return;
+        var selectedPaths = GetSelectedFilePaths();
+        if (selectedPaths.Count == 0) return;
 
         try
         {
             var storageFiles = new List<Avalonia.Platform.Storage.IStorageFile>();
-            foreach (var item in selected)
+            foreach (var filePath in selectedPaths)
             {
-                var sf = await topLevel.StorageProvider.TryGetFileFromPathAsync(item.FilePath);
+                var sf = await topLevel.StorageProvider.TryGetFileFromPathAsync(filePath);
                 if (sf != null)
                     storageFiles.Add(sf);
             }
@@ -214,8 +232,9 @@ public partial class MainWindow : Window
     protected override async void OnLoaded(RoutedEventArgs e)
     {
         base.OnLoaded(e);
-        await Vm.InitializeAsync();
         Vm.PropertyChanged += OnViewModelPropertyChanged;
+        Vm.ContinuousDisplayRefreshRequested += ApplyDisplayModeAsync;
+        await Vm.InitializeAsync();
 
         OnlineSearchHelper.SetTempDir(Path.Combine(Vm.AppSettings.DiskCacheDirectory, "search_temp"));
         OnlineSearchHelper.CleanupOldTempFiles();
@@ -224,6 +243,7 @@ public partial class MainWindow : Window
         Vm.ScrollToSelectedRequested += OnScrollToSelected;
         Vm.ScrollSearchResultsToTopRequested += OnScrollSearchResultsToTop;
         Vm.TreeScrollToNodeRequested += OnTreeScrollToNode;
+        AttachContinuousWaterfallPanelWhenAvailable();
 
         // Restore startup size
         if (Vm.AppSettings.StartupWidth > 0) Width = Vm.AppSettings.StartupWidth;
@@ -266,9 +286,9 @@ public partial class MainWindow : Window
         if (e.Key == Key.Delete && e.KeyModifiers == KeyModifiers.None)
         {
             e.Handled = true;
-            var selected = Vm.Images.Where(i => i.IsSelected).ToList();
-            if (selected.Count > 0)
-                await DeleteSelectedFilesAsync(selected);
+            var selectedPaths = GetSelectedFilePaths();
+            if (selectedPaths.Count > 0)
+                await DeleteSelectedFilesAsync(selectedPaths);
             return;
         }
 
@@ -276,8 +296,8 @@ public partial class MainWindow : Window
         if (e.Key == Key.A && e.KeyModifiers == KeyModifiers.Control)
         {
             e.Handled = true;
-            foreach (var img in Vm.Images)
-                img.IsSelected = true;
+            // Preserve paged-mode behavior: Ctrl+A selects the current page only.
+            Vm.ReplaceSelectedFiles(Vm.Images.Select(img => img.FilePath));
             return;
         }
 
@@ -314,7 +334,7 @@ public partial class MainWindow : Window
         // Find target image: hovered > first selected
         var target = _lastHoveredItem;
         if (target == null)
-            target = Vm.Images.FirstOrDefault(i => i.IsSelected);
+            target = CreateTemporaryImageItems(GetSelectedFilePaths()).FirstOrDefault();
         if (target == null)
             return;
 
@@ -324,6 +344,7 @@ public partial class MainWindow : Window
     private async void OnThumbnailScrollWheel(object? sender, PointerWheelEventArgs e)
     {
         CloseHoverPreview();
+        BeginScrollActivity();
         // Ctrl+Wheel = zoom
         if (e.KeyModifiers.HasFlag(KeyModifiers.Control))
         {
@@ -353,16 +374,84 @@ public partial class MainWindow : Window
         const int duration = 120;
         const int steps = 10;
         const int interval = duration / steps;
+        int animationId = ++_scrollAnimationId;
+        int executedSteps = 0;
+        int late20 = 0;
+        int late33 = 0;
+        int lateLogCount = 0;
+        long worstGapMs = 0;
+        long totalStepGapMs = 0;
+        bool completed = false;
+        var animationStopwatch = Stopwatch.StartNew();
+        long previousStepTimestamp = animationStopwatch.ElapsedMilliseconds;
 
         try
         {
             for (int i = 1; i <= steps; i++)
             {
-                if (ct.IsCancellationRequested) return;
+                if (ct.IsCancellationRequested) break;
+
+                long currentTimestamp = animationStopwatch.ElapsedMilliseconds;
+                long gapMs = currentTimestamp - previousStepTimestamp;
+                previousStepTimestamp = currentTimestamp;
+                worstGapMs = Math.Max(worstGapMs, gapMs);
+                if (i > 1)
+                {
+                    totalStepGapMs += gapMs;
+                    if (gapMs > 20)
+                    {
+                        late20++;
+                        if (gapMs > 33) late33++;
+                        if (lateLogCount++ < 2)
+                            ScrollDiagnosticsLogger.Log($"ScrollAnim.Late id={animationId} step={i} gapMs={gapMs}");
+                    }
+                }
+
                 double t = EaseOutQuad((double)i / steps);
                 sv.Offset = new Vector(sv.Offset.X, startY + (targetY - startY) * t);
+                executedSteps++;
                 await Task.Delay(interval, ct);
             }
+            completed = !ct.IsCancellationRequested && executedSteps == steps;
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            long elapsedMs = animationStopwatch.ElapsedMilliseconds;
+            double averageStepMs = executedSteps > 1 ? (double)totalStepGapMs / (executedSteps - 1) : 0;
+            ScrollDiagnosticsLogger.Log(
+                $"ScrollAnim.End id={animationId} status={(completed ? "completed" : "canceled")} " +
+                $"steps={executedSteps}/{steps} elapsedMs={elapsedMs} avgStepMs={averageStepMs:F1} " +
+                $"worstStepMs={worstGapMs} late20={late20} late33={late33} " +
+                $"offset={startY:F0}->{sv.Offset.Y:F0} target={targetY:F0} " +
+                $"viewport={sv.Viewport.Width:F0}x{sv.Viewport.Height:F0} " +
+                $"extent={sv.Extent.Width:F0}x{sv.Extent.Height:F0}");
+        }
+    }
+
+    private void BeginScrollActivity()
+    {
+        _scrollActivityCts?.Cancel();
+        _scrollActivityCts?.Dispose();
+        _scrollActivityCts = new CancellationTokenSource();
+        var ct = _scrollActivityCts.Token;
+        App.Services.GetRequiredService<PageManager>().SetScrollActivity(true);
+        _ = EndScrollActivityWhenIdleAsync(ct);
+    }
+
+    private async Task EndScrollActivityWhenIdleAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(350, cancellationToken);
+            if (cancellationToken.IsCancellationRequested) return;
+            await Dispatcher.UIThread.InvokeAsync(
+                () =>
+                {
+                    if (!cancellationToken.IsCancellationRequested)
+                        App.Services.GetRequiredService<PageManager>().SetScrollActivity(false);
+                },
+                DispatcherPriority.Background);
         }
         catch (OperationCanceledException) { }
     }
@@ -672,6 +761,41 @@ public partial class MainWindow : Window
         win.Show(this);
     }
 
+    private int FindActiveFileIndex(string filePath) =>
+        Vm.ActiveFileList.FindIndex(path => string.Equals(path, filePath, StringComparison.OrdinalIgnoreCase));
+
+    private void SetLastSelectedIndex(string filePath)
+    {
+        var index = FindActiveFileIndex(filePath);
+        if (index >= 0)
+            _lastSelectedIndex = index;
+    }
+
+    private IEnumerable<(ImageViewItem Item, Control Container)> GetVisibleThumbnailContainers()
+    {
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var item in Vm.Images)
+        {
+            if (ItemsImages.ContainerFromItem(item) is Control container && paths.Add(item.FilePath))
+                yield return (item, container);
+        }
+
+        // Inspect realized controls only. The lazy continuous source must never be enumerated.
+        foreach (var control in ContinuousItemsImages.GetVisualDescendants().OfType<Control>())
+        {
+            if (control.DataContext is not ImageViewItem item ||
+                ContinuousItemsImages.ContainerFromItem(item) is not Control container ||
+                !ReferenceEquals(control, container) ||
+                !paths.Add(item.FilePath))
+            {
+                continue;
+            }
+
+            yield return (item, container);
+        }
+    }
+
     // ==================== Box Selection ====================
 
     private bool _isDraggingSelection;
@@ -700,9 +824,8 @@ public partial class MainWindow : Window
         e.Pointer.Capture(ImagePanelHost);
         _selectionStartPoint = e.GetPosition(ImagePanelHost);
 
-        // Clear existing selection
-        foreach (var img in Vm.Images)
-            img.IsSelected = false;
+        // Clear the canonical selection; recycled continuous items project this on realization.
+        Vm.ReplaceSelectedFiles(Array.Empty<string>());
 
         SelectionRectangle.IsVisible = true;
         SelectionRectangle.Width = 0;
@@ -727,12 +850,10 @@ public partial class MainWindow : Window
 
         var selRect = new Rect(x, y, w, h);
 
-        // Hit-test each visible thumbnail
-        foreach (var img in Vm.Images)
+        // Hit-test only realized containers. Do not enumerate the continuous item source.
+        var selectedPaths = new List<string>();
+        foreach (var (img, container) in GetVisibleThumbnailContainers())
         {
-            var container = ItemsImages.ContainerFromItem(img) as Avalonia.Controls.Control;
-            if (container == null) continue;
-
             try
             {
                 var transform = container.TransformToVisual(ImagePanelHost);
@@ -740,11 +861,12 @@ public partial class MainWindow : Window
                 var topLeft = transform.Value.Transform(new Point(0, 0));
                 var itemRect = new Rect(topLeft, new Size(container.Bounds.Width, container.Bounds.Height));
                 bool intersect = selRect.Intersects(itemRect);
-                if (img.IsSelected != intersect)
-                    img.IsSelected = intersect;
+                if (intersect)
+                    selectedPaths.Add(img.FilePath);
             }
             catch { }
         }
+        Vm.ReplaceSelectedFiles(selectedPaths);
 
         e.Handled = true;
     }
@@ -780,9 +902,9 @@ public partial class MainWindow : Window
         // Middle mouse button: open tag editor for this image
         if (point.Properties.IsMiddleButtonPressed)
         {
-            var selected = Vm.Images.Where(i => i.IsSelected).ToList();
-            if (selected.Count > 1 && selected.Contains(item))
-                await EditTagsForItemsAsync(selected);
+            var selectedPaths = GetSelectedFilePaths();
+            if (selectedPaths.Count > 1 && Vm.IsFileSelected(item.FilePath))
+                await EditTagsForItemsAsync(await CreateTemporaryImageItemsAsync(selectedPaths, loadTags: true));
             else
                 await EditTagForItemAsync(item);
             return;
@@ -796,33 +918,30 @@ public partial class MainWindow : Window
         if (ctrl)
         {
             // Toggle selection
-            item.IsSelected = !item.IsSelected;
-            _lastSelectedIndex = Vm.Images.IndexOf(item);
+            Vm.SetFileSelected(item.FilePath, !Vm.IsFileSelected(item.FilePath));
+            SetLastSelectedIndex(item.FilePath);
         }
         else if (shift && _lastSelectedIndex >= 0)
         {
             // Shift range selection from anchor to clicked item
-            int clickedIdx = Vm.Images.IndexOf(item);
+            int clickedIdx = FindActiveFileIndex(item.FilePath);
             if (clickedIdx < 0) return;
             int start = Math.Min(_lastSelectedIndex, clickedIdx);
             int end = Math.Max(_lastSelectedIndex, clickedIdx);
-            for (int i = 0; i < Vm.Images.Count; i++)
-                Vm.Images[i].IsSelected = i >= start && i <= end;
+            Vm.ReplaceSelectedFiles(Vm.ActiveFileList.Skip(start).Take(end - start + 1));
         }
         else
         {
-            bool multiSelected = Vm.Images.Count(i => i.IsSelected) > 1;
-            if (multiSelected && item.IsSelected)
+            bool multiSelected = Vm.SelectedFilePaths.Count > 1;
+            if (multiSelected && Vm.IsFileSelected(item.FilePath))
             {
                 // Defer single-select to pointer release (allow drag to cancel)
                 _pendingClick = item;
             }
             else
             {
-                foreach (var img in Vm.Images)
-                    img.IsSelected = false;
-                item.IsSelected = true;
-                _lastSelectedIndex = Vm.Images.IndexOf(item);
+                Vm.ReplaceSelectedFiles(new[] { item.FilePath });
+                SetLastSelectedIndex(item.FilePath);
             }
         }
     }
@@ -834,9 +953,8 @@ public partial class MainWindow : Window
         if (border.DataContext is not ImageViewItem item) return;
         if (item != _pendingClick) return;
 
-        foreach (var img in Vm.Images)
-            img.IsSelected = img == item;
-        _lastSelectedIndex = Vm.Images.IndexOf(item);
+        Vm.ReplaceSelectedFiles(new[] { item.FilePath });
+        SetLastSelectedIndex(item.FilePath);
         _pendingClick = null;
     }
 
@@ -1146,6 +1264,192 @@ public partial class MainWindow : Window
     {
         if (e.PropertyName == nameof(MainWindowViewModel.Images))
             CloseHoverPreview();
+
+        if (e.PropertyName == nameof(MainWindowViewModel.ContinuousDisplayGeometrySnapshot))
+            AttachContinuousWaterfallPanelWhenAvailable();
+
+        if (e.PropertyName == nameof(MainWindowViewModel.DisplayMode) && Vm.IsPagedDisplay)
+            _ = ApplyDisplayModeAsync(0);
+
+        if (Vm.DisplayMode == ImageDisplayMode.Continuous &&
+            e.PropertyName is nameof(MainWindowViewModel.WaterfallMode) or nameof(MainWindowViewModel.ThumbnailBaseWidth))
+            _ = ApplyDisplayModeAsync(GetContinuousAnchorIndex());
+    }
+
+    private int GetContinuousAnchorIndex() => Math.Max(0, _continuousVisibleRange.StartIndex);
+
+    private void OnWindowSizeChanged(object? sender, SizeChangedEventArgs e)
+    {
+        if (DataContext is not MainWindowViewModel viewModel ||
+            viewModel.DisplayMode != ImageDisplayMode.Continuous)
+        {
+            return;
+        }
+
+        var width = GetContinuousContainerWidth();
+        if (width <= 0 || (viewModel.ContinuousDisplayGeometryIndex is { } geometry &&
+            Math.Abs(width - geometry.Options.ContainerWidth) < 1))
+            return;
+
+        // Keep the current leading item visible. This is a fixed-rate throttle,
+        // not a trailing debounce, so reflow stays visually coupled to dragging.
+        _continuousResizeAnchorIndex = GetContinuousAnchorIndex();
+        _continuousResizeRequestedWidth = width;
+        if (!_continuousResizeTimer.IsEnabled)
+            _continuousResizeTimer.Start();
+    }
+
+    private void OnContinuousResizeTimerTick(object? sender, EventArgs e)
+    {
+        _continuousResizeTimer.Stop();
+        if (DataContext is not MainWindowViewModel viewModel ||
+            viewModel.DisplayMode != ImageDisplayMode.Continuous)
+        {
+            return;
+        }
+
+        var width = _continuousResizeRequestedWidth;
+        if (width <= 0)
+            width = GetContinuousContainerWidth();
+        if (width <= 0)
+            return;
+
+        if (viewModel.ContinuousDisplayGeometryIndex is { } geometry)
+        {
+            if (Math.Abs(width - geometry.Options.ContainerWidth) >= 1)
+            {
+                // Do not cancel work that is already arranging the previous frame.
+                // Constant cancellation while the user drags makes the view appear
+                // frozen; when it completes, the latest requested width is queued.
+                if (_continuousReflowCts is not null)
+                    return;
+
+                _continuousReflowCts = new CancellationTokenSource();
+                _ = ReflowContinuousDisplayAsync(width, _continuousResizeAnchorIndex, _continuousReflowCts);
+            }
+            return;
+        }
+
+        // A resize before first geometry publication still needs the full initial
+        // build; all later resize work follows the CPU-only reflow path above.
+        _ = ApplyDisplayModeAsync(_continuousResizeAnchorIndex);
+    }
+
+    private double GetContinuousContainerWidth()
+    {
+        var width = ThumbnailScrollViewer.Viewport.Width;
+        return width > 0 ? width : ImagePanelHost.Bounds.Width;
+    }
+
+    private async Task ReflowContinuousDisplayAsync(
+        double width,
+        int preferredIndex,
+        CancellationTokenSource cts)
+    {
+        try
+        {
+            if (!await Vm.ReflowContinuousDisplayGeometryAsync(width, cts.Token) ||
+                cts.IsCancellationRequested ||
+                Vm.DisplayMode != ImageDisplayMode.Continuous)
+            {
+                return;
+            }
+
+            // Reflow keeps the old source and thumbnail cache alive. Updating layout
+            // before scrolling publishes the new extent and prevents offset clamping.
+            ContinuousItemsImages.UpdateLayout();
+            _continuousWaterfallPanel?.ScrollToIndex(Math.Clamp(preferredIndex, 0, Vm.ActiveFileList.Count - 1));
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+            // A later resize superseded this calculation.
+        }
+        finally
+        {
+            var completedCurrentReflow = ReferenceEquals(_continuousReflowCts, cts);
+            var wasCancelled = cts.IsCancellationRequested;
+            if (completedCurrentReflow)
+                _continuousReflowCts = null;
+            cts.Dispose();
+
+            // Coalesce all size notifications that arrived while this CPU-only
+            // layout was running into one follow-up frame at the newest width.
+            if (completedCurrentReflow && !wasCancelled &&
+                Vm.DisplayMode == ImageDisplayMode.Continuous &&
+                Vm.ContinuousDisplayGeometryIndex is { } geometry &&
+                Math.Abs(GetContinuousContainerWidth() - geometry.Options.ContainerWidth) >= 1 &&
+                !_continuousResizeTimer.IsEnabled)
+            {
+                _continuousResizeRequestedWidth = GetContinuousContainerWidth();
+                _continuousResizeTimer.Start();
+            }
+        }
+    }
+
+    private async Task ApplyDisplayModeAsync(int preferredIndex)
+    {
+        _continuousReflowCts?.Cancel();
+        _continuousReflowCts = null;
+        _continuousModeCts?.Cancel();
+        _continuousModeCts?.Dispose();
+        _continuousModeCts = new CancellationTokenSource();
+        var token = _continuousModeCts.Token;
+
+        if (Vm.DisplayMode == ImageDisplayMode.Paged)
+        {
+            _continuousResizeTimer.Stop();
+            ContinuousItemsImages.IsVisible = false;
+            ItemsImages.IsVisible = true;
+            return;
+        }
+
+        ItemsImages.IsVisible = false;
+        ContinuousItemsImages.IsVisible = true;
+        await Dispatcher.UIThread.InvokeAsync(() => ContinuousItemsImages.UpdateLayout());
+        if (token.IsCancellationRequested || Vm.DisplayMode != ImageDisplayMode.Continuous)
+            return;
+        var width = GetContinuousContainerWidth();
+        if (!await Vm.PrepareContinuousDisplayGeometryAsync(width, token) || token.IsCancellationRequested)
+            return;
+
+        AttachContinuousWaterfallPanelWhenAvailable();
+        // Publish the new scroll extent before setting Offset, otherwise the
+        // ScrollViewer clamps a requested anchor to the previous (often zero) extent.
+        ContinuousItemsImages.UpdateLayout();
+        _continuousWaterfallPanel?.ScrollToIndex(Math.Clamp(preferredIndex, 0, Vm.ActiveFileList.Count - 1));
+    }
+
+    private void AttachContinuousWaterfallPanelWhenAvailable()
+    {
+        if (_continuousWaterfallPanel != null)
+            return;
+
+        if (ContinuousItemsImages.ItemsPanelRoot is not VirtualizingWaterfallPanel panel)
+            return;
+
+        _continuousWaterfallPanel = panel;
+        panel.VisibleRangeChanged += OnContinuousVisibleRangeChanged;
+        panel.RetainedRangeChanged += OnContinuousRetainedRangeChanged;
+        ContinuousItemsImages.LayoutUpdated -= OnContinuousItemsImagesLayoutUpdated;
+        _continuousVisibleRange = panel.CurrentVisibleRange;
+        Vm.UpdateContinuousDisplayViewport(
+            panel.CurrentVisibleRange,
+            panel.CurrentRetainedRange);
+    }
+
+    private void OnContinuousItemsImagesLayoutUpdated(object? sender, EventArgs e) =>
+        AttachContinuousWaterfallPanelWhenAvailable();
+
+    private void OnContinuousVisibleRangeChanged(object? sender, ImageDisplayRange range)
+    {
+        _continuousVisibleRange = range;
+        _continuousScrollDirection = _continuousWaterfallPanel?.CurrentScrollDirection
+            ?? ContinuousScrollDirection.None;
+    }
+
+    private void OnContinuousRetainedRangeChanged(object? sender, ImageDisplayRange range)
+    {
+        Vm.UpdateContinuousDisplayViewport(_continuousVisibleRange, range, _continuousScrollDirection);
     }
 
     private void ThumbnailContextMenu_Opened(object? sender, RoutedEventArgs e) => CloseHoverPreview();
@@ -1172,16 +1476,12 @@ public partial class MainWindow : Window
         if (_dragPressArgs == null) return;
 
         // Ensure the dragged item is selected
-        var selected = Vm.Images.Where(i => i.IsSelected).ToList();
-        if (!selected.Contains(item))
+        if (!Vm.IsFileSelected(item.FilePath))
         {
-            foreach (var img in Vm.Images) img.IsSelected = false;
-            item.IsSelected = true;
-            selected = new List<ImageViewItem> { item };
+            Vm.ReplaceSelectedFiles(new[] { item.FilePath });
         }
 
-        var filePaths = selected.Select(i => i.FilePath).Where(File.Exists)
-            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        var filePaths = GetSelectedFilePaths().Where(File.Exists).ToList();
         if (filePaths.Count == 0) return;
 
         try
@@ -1267,24 +1567,68 @@ public partial class MainWindow : Window
     private static ImageViewItem? GetCtxItem(object? sender) =>
         (sender as Avalonia.Controls.MenuItem)?.DataContext as ImageViewItem;
 
-    /// <summary>If the right-clicked item is in a multi-selection, operate on all selected; otherwise just the clicked one</summary>
-    private List<ImageViewItem> GetTargetItemsForContextMenu(ImageViewItem clickedItem)
+    private List<string> GetSelectedFilePaths() =>
+        Vm.SelectedFilePaths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    /// <summary>
+    /// Creates lightweight items only for APIs that still require ImageViewItem.
+    /// This deliberately never walks ContinuousImageItemSource, whose uncached
+    /// entries must remain unmaterialized in continuous mode.
+    /// </summary>
+    private List<ImageViewItem> CreateTemporaryImageItems(IEnumerable<string> filePaths) =>
+        filePaths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(path => new ImageViewItem
+            {
+                FilePath = path,
+                FileName = Path.GetFileName(path)
+            })
+            .ToList();
+
+    private async Task<List<ImageViewItem>> CreateTemporaryImageItemsAsync(
+        IEnumerable<string> filePaths, bool loadTags)
     {
-        var selected = Vm.Images.Where(i => i.IsSelected).ToList();
-        return selected.Count > 1 && selected.Contains(clickedItem) ? selected : new List<ImageViewItem> { clickedItem };
+        var items = CreateTemporaryImageItems(filePaths);
+        if (!loadTags || items.Count == 0)
+            return items;
+
+        var tagsByPath = await Vm.EnsureTagsLoadedAsync(items.Select(item => item.FilePath).ToList());
+        foreach (var item in items)
+        {
+            if (tagsByPath.TryGetValue(item.FilePath, out var tags))
+                item.Tags = new List<string>(tags);
+        }
+
+        return items;
+    }
+
+    /// <summary>If the right-clicked item is in a multi-selection, operate on all selected paths; otherwise just the clicked path.</summary>
+    private List<string> GetTargetFilePathsForContextMenu(ImageViewItem clickedItem)
+    {
+        var selectedPaths = GetSelectedFilePaths();
+        return selectedPaths.Count > 1 && Vm.IsFileSelected(clickedItem.FilePath)
+            ? selectedPaths
+            : new List<string> { clickedItem.FilePath };
     }
 
     private async void MenuEditTag_Click(object? sender, RoutedEventArgs e)
     {
-        var selected = Vm.Images.Where(i => i.IsSelected).ToList();
-        if (selected.Count <= 1)
+        var clicked = GetCtxItem(sender);
+        if (clicked == null)
+            return;
+
+        var targetPaths = GetTargetFilePathsForContextMenu(clicked);
+        if (targetPaths.Count <= 1)
         {
-            var item = GetCtxItem(sender);
-            if (item != null) await EditTagForItemAsync(item);
+            await EditTagForItemAsync(clicked);
         }
         else
         {
-            await EditTagsForItemsAsync(selected);
+            await EditTagsForItemsAsync(await CreateTemporaryImageItemsAsync(targetPaths, loadTags: true));
         }
     }
 
@@ -1293,7 +1637,7 @@ public partial class MainWindow : Window
         var clicked = GetCtxItem(sender);
         if (clicked == null) return;
 
-        var items = GetTargetItemsForContextMenu(clicked);
+        var items = CreateTemporaryImageItems(GetTargetFilePathsForContextMenu(clicked));
         await App.Services.GetRequiredService<PageManager>().RegenerateThumbnailsAsync(items);
         Vm.StatusText = $"已重新生成 {items.Count} 个缩略图";
     }
@@ -1441,57 +1785,29 @@ public partial class MainWindow : Window
 
     private async void MenuClearSelectedTags_Click(object? sender, RoutedEventArgs e)
     {
-        var selected = Vm.Images.Where(i => i.IsSelected).ToList();
-        if (selected.Count == 0) { Vm.StatusText = "未选中图片"; return; }
+        var selectedPaths = GetSelectedFilePaths();
+        if (selectedPaths.Count == 0) { Vm.StatusText = "未选中图片"; return; }
 
-        var ok = await ShowConfirmDialogAsync($"确定要清空 {selected.Count} 张选中图片的所有标签？");
+        var ok = await ShowConfirmDialogAsync($"确定要清空 {selectedPaths.Count} 张选中图片的所有标签？");
         if (!ok) return;
-        AppLogger.Warn($"ClearSelectedTags confirmed count={selected.Count}");
-
-        var repo = App.Services.GetRequiredService<Core.Services.IImageMetaRepository>();
-        await Task.Run(async () =>
-        {
-            foreach (var item in selected)
-            {
-                try
-                {
-                    var meta = await repo.GetByPathAsync(item.FilePath);
-                    if (meta != null)
-                    {
-                        await repo.SetTagsAsync(meta.Id, new List<string>());
-                        await repo.SetAutoTagStatusByPathAsync(item.FilePath, 0);
-                    }
-                }
-                catch { }
-            }
-        });
-
-        foreach (var item in selected)
-        {
-            Vm.ClearTagCacheForPath(item.FilePath);
-            item.Tags.Clear();
-            item.NotifyAll();
-        }
-        await Vm.RefreshTagCountsAsync(forceRefresh: true);
-        AppLogger.Info($"ClearSelectedTags tag counts refreshed count={selected.Count}");
-        Vm.StatusText = $"已清空 {selected.Count} 张图片的标签";
+        AppLogger.Warn($"ClearSelectedTags confirmed count={selectedPaths.Count}");
+        await Vm.ClearTagsFromImagesBatchAsync(selectedPaths);
+        AppLogger.Info($"ClearSelectedTags tag counts refreshed count={selectedPaths.Count}");
+        Vm.StatusText = $"已清空 {selectedPaths.Count} 张图片的标签";
     }
 
     private async void MenuAutoTag_Click(object? sender, RoutedEventArgs e)
     {
-        // 获取选中的图片（含右键点击的那张）
-        var selected = Vm.Images.Where(i => i.IsSelected).ToList();
         var ctxItem = GetCtxItem(sender);
-        if (selected.Count == 0 && ctxItem != null)
-            selected.Add(ctxItem);
-
-        if (selected.Count == 0)
+        var filePaths = ctxItem is null
+            ? GetSelectedFilePaths()
+            : GetTargetFilePathsForContextMenu(ctxItem);
+        if (filePaths.Count == 0)
         {
             Vm.StatusText = "未找到图片";
             return;
         }
 
-        var filePaths = selected.Select(i => i.FilePath).Distinct().ToList();
         await RunAutoTagAsync(null, filePaths, false);
     }
 
@@ -1560,16 +1876,16 @@ public partial class MainWindow : Window
     {
         var clicked = GetCtxItem(sender);
         if (clicked == null) return;
-        var items = GetTargetItemsForContextMenu(clicked);
-        if (items.Count > 0)
-            await DeleteSelectedFilesAsync(items);
+        var filePaths = GetTargetFilePathsForContextMenu(clicked);
+        if (filePaths.Count > 0)
+            await DeleteSelectedFilesAsync(filePaths);
     }
 
     private async void MenuCopyFileToFolder_Click(object? sender, RoutedEventArgs e)
     {
         var clicked = GetCtxItem(sender);
         if (clicked == null) return;
-        var items = GetTargetItemsForContextMenu(clicked);
+        var filePaths = GetTargetFilePathsForContextMenu(clicked);
 
         var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
         {
@@ -1583,14 +1899,14 @@ public partial class MainWindow : Window
         await Task.Run(() =>
         {
             Directory.CreateDirectory(targetDir);
-            foreach (var item in items)
+            foreach (var filePath in filePaths)
             {
-                if (!File.Exists(item.FilePath)) continue;
+                if (!File.Exists(filePath)) continue;
                 try
                 {
                     var destPath = Common.Helpers.PathHelper.GetNonConflictingPath(
-                        Path.Combine(targetDir, Path.GetFileName(item.FilePath)));
-                    File.Copy(item.FilePath, destPath);
+                        Path.Combine(targetDir, Path.GetFileName(filePath)));
+                    File.Copy(filePath, destPath);
                     Interlocked.Increment(ref success);
                 }
                 catch { }
@@ -1609,7 +1925,7 @@ public partial class MainWindow : Window
     {
         var clicked = GetCtxItem(sender);
         if (clicked == null) return;
-        var items = GetTargetItemsForContextMenu(clicked);
+        var filePaths = GetTargetFilePathsForContextMenu(clicked);
 
         var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
         {
@@ -1625,10 +1941,10 @@ public partial class MainWindow : Window
         {
             var thumbCache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
             Directory.CreateDirectory(targetDir);
-            foreach (var item in items)
+            foreach (var filePath in filePaths)
             {
-                if (!File.Exists(item.FilePath)) continue;
-                var srcDir = Path.GetDirectoryName(item.FilePath) ?? "";
+                if (!File.Exists(filePath)) continue;
+                var srcDir = Path.GetDirectoryName(filePath) ?? "";
                 if (string.Equals(Path.GetFullPath(srcDir).TrimEnd('\\', '/'),
                         Path.GetFullPath(targetDir).TrimEnd('\\', '/'),
                         StringComparison.OrdinalIgnoreCase))
@@ -1636,8 +1952,8 @@ public partial class MainWindow : Window
                 try
                 {
                     var destPath = Common.Helpers.PathHelper.GetNonConflictingPath(
-                        Path.Combine(targetDir, Path.GetFileName(item.FilePath)));
-                    var oldPath = item.FilePath;
+                        Path.Combine(targetDir, Path.GetFileName(filePath)));
+                    var oldPath = filePath;
                     File.Move(oldPath, destPath);
                     thumbCache.MoveDiskCache(oldPath, destPath);
                     Interlocked.Increment(ref success);
@@ -1937,6 +2253,30 @@ public partial class MainWindow : Window
             Vm.StatusText = $"保存显示名称失败：{ex.Message}";
             AppLogger.Error($"Folder alias failed: {ex}");
         }
+    }
+
+    private async void MenuArchiveFolder_Click(object? sender, RoutedEventArgs e)
+    {
+        var folder = GetContextMenuFolder(sender);
+        if (folder == null) return;
+        if (!await Settings.FolderActionDialog.ShowConfirmAsync(
+            this, "归档文件夹", folder.DisplayName, folder.Path,
+            "归档后文件夹不会显示在左侧目录中，数据仍会保留，可在设置中恢复显示。", "归档"))
+            return;
+
+        LstFolders.SelectedItem = folder;
+        await Vm.ArchiveFolderCommand.ExecuteAsync(null);
+    }
+
+    private async void MenuArchivedFolders_Click(object? sender, RoutedEventArgs e)
+    {
+        var repo = App.Services.GetRequiredService<IFolderRepository>();
+        var window = new Settings.ArchivedFoldersWindow
+        {
+            DataContext = new ArchivedFoldersViewModel(repo)
+        };
+        await window.ShowDialog(this);
+        await Vm.RefreshFolderTreeAsync();
     }
 
     private async void MenuComputeAutoTags_Click(object? sender, RoutedEventArgs e)
@@ -2533,16 +2873,24 @@ public partial class MainWindow : Window
         var vm = new AppearanceSettingViewModel(
             Vm.AppSettings.ThemeVariant,
             Vm.AppSettings.SearchToolbarLayout,
-            (theme, layout) =>
+            Vm.DisplayMode,
+            (theme, layout, displayMode) =>
             {
                 Vm.AppSettings.ThemeVariant = theme;
                 Vm.SetSearchToolbarLayout(layout);
                 App.ApplyColors(!string.Equals(theme, "Light", StringComparison.OrdinalIgnoreCase));
-                _ = Vm.SaveSettingsAsync();
+                _ = ApplyAppearanceDisplayModeAsync(displayMode);
             });
 
         var win = new Settings.AppearanceSettingWindow { DataContext = vm };
         await win.ShowDialog(this);
+    }
+
+    private async Task ApplyAppearanceDisplayModeAsync(ImageDisplayMode displayMode)
+    {
+        await Vm.TrySetDisplayModeAsync(displayMode);
+        Vm.AppSettings.ImageDisplayMode = Vm.DisplayMode.ToString();
+        await Vm.SaveSettingsAsync();
     }
 
     private async void MenuSearchSettings_Click(object? sender, RoutedEventArgs e)
@@ -2572,6 +2920,18 @@ public partial class MainWindow : Window
 
     private async void OnScrollToSelected()
     {
+        if (Vm.DisplayMode == ImageDisplayMode.Continuous)
+        {
+            var selectedPath = Vm.SelectedFilePaths.FirstOrDefault();
+            var index = selectedPath is null ? -1 : Vm.ActiveFileList.FindIndex(path =>
+                string.Equals(path, selectedPath, StringComparison.OrdinalIgnoreCase));
+            if (index >= 0 && _continuousWaterfallPanel?.ScrollToIndex(index) == true)
+                return;
+
+            System.Diagnostics.Debug.WriteLine("[ImageScroll] FAILED continuous target unavailable");
+            return;
+        }
+
         // SmartWaterfallPanel 对视口外 child 跳过 Arrange，Bounds 为空，BringIntoView 失效。
         // 改为先从 Panel 查询目标行 Y、直接驱动 ScrollViewer.Offset，再用 BringIntoView 微调。
         // 跨文件夹首次跳转时 Images 集合刚被替换为新 ObservableCollection，ItemsControl 需要
@@ -2584,7 +2944,7 @@ public partial class MainWindow : Window
         {
             var scrolled = await App.UI.InvokeAsync(() =>
             {
-                var selected = Vm.Images.FirstOrDefault(i => i.IsSelected);
+                var selected = Vm.GetSelectedRealizedItems().FirstOrDefault();
                 if (selected == null) { failReason = "no-selected"; return true; }
 
                 // 强制 ItemsControl 与 Panel 完整跑一次 Measure
@@ -2618,7 +2978,7 @@ public partial class MainWindow : Window
                 await Task.Delay(delayMs);
                 await App.UI.InvokeAsync(() =>
                 {
-                    var selected = Vm.Images.FirstOrDefault(i => i.IsSelected);
+                    var selected = Vm.GetSelectedRealizedItems().FirstOrDefault();
                     if (selected != null && ItemsImages.ContainerFromItem(selected) is Control c)
                         c.BringIntoView();
                 });
@@ -2657,7 +3017,27 @@ public partial class MainWindow : Window
 
     private void Window_Closing(object? sender, Avalonia.Controls.WindowClosingEventArgs e)
     {
+        _scrollActivityCts?.Cancel();
+        _scrollActivityCts?.Dispose();
+        _scrollActivityCts = null;
+        _continuousModeCts?.Cancel();
+        _continuousModeCts?.Dispose();
+        _continuousModeCts = null;
+        _continuousReflowCts?.Cancel();
+        _continuousReflowCts = null;
+        _continuousResizeTimer.Stop();
+        SizeChanged -= OnWindowSizeChanged;
+        App.Services.GetRequiredService<PageManager>().SetScrollActivity(false);
         Vm.PropertyChanged -= OnViewModelPropertyChanged;
+        Vm.ContinuousDisplayRefreshRequested -= ApplyDisplayModeAsync;
+        ContinuousItemsImages.LayoutUpdated -= OnContinuousItemsImagesLayoutUpdated;
+        if (_continuousWaterfallPanel != null)
+        {
+            _continuousWaterfallPanel.VisibleRangeChanged -= OnContinuousVisibleRangeChanged;
+            _continuousWaterfallPanel.RetainedRangeChanged -= OnContinuousRetainedRangeChanged;
+            _continuousWaterfallPanel = null;
+            _continuousVisibleRange = default;
+        }
         CloseHoverPreview();
         ReleaseHoverPreviewPopup();
         Vm.ScrollRestoreRequested -= OnScrollRestore;

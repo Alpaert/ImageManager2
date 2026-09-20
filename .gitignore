@@ -379,11 +379,11 @@ libffmpeg/
 # AI 记忆文件 - 不推送
 /MEMORY.md
 
-# 文档默认不推送，仅保留项目 Agent 工作流方案
-/docs/*
-!/docs/plans/
-/docs/plans/*
-!/docs/plans/subagent-workflow.md
+# 文档目录 - 不推送
+/docs/
+
+# 本地 Agent 指令 - 不推送
+/AGENTS.md
 
 # cc-connect 运行时文件
 .cc-connect-data/

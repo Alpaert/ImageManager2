@@ -84,6 +84,9 @@ public interface IImageMetaRepository
     /// <summary>Batch-load Width/Height for a set of file paths. Only returns entries with non-zero dimensions.</summary>
     Task<Dictionary<string, (int Width, int Height)>> GetDimensionsByPathsAsync(List<string> filePaths);
 
+    /// <summary>Persists verified display dimensions without replacing tags, hashes, or other image metadata.</summary>
+    Task UpdateDimensionsByPathsAsync(IReadOnlyDictionary<string, (int Width, int Height)> dimensions);
+
     /// <summary>Batch-load content ratings, falling back to legacy rating tags when metadata is unknown.</summary>
     Task<Dictionary<string, int>> GetSystemRatingsByPathsAsync(List<string> filePaths);
 

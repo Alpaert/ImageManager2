@@ -63,6 +63,14 @@ public class FolderRepository : IFolderRepository
             new { Path = path });
     }
 
+    public async Task SetArchivedAsync(long folderId, bool archived)
+    {
+        using var conn = _dbFactory.CreateConnection();
+        await conn.ExecuteAsync(
+            "UPDATE Folder SET IsArchived = @IsArchived WHERE Id = @Id",
+            new { Id = folderId, IsArchived = archived ? 1 : 0 });
+    }
+
     public async Task RelocateFolderAsync(long folderId, string newFolderPath)
     {
         using var conn = _dbFactory.CreateConnection();

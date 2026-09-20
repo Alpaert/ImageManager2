@@ -1,9 +1,22 @@
 using System.Globalization;
+using System.Text.RegularExpressions;
 
 namespace ImageManager.Infrastructure.Video;
 
 public static class VideoMetadataExtractor
 {
+    private static readonly Regex VideoResolutionPattern = new(
+        @"^\s*Stream\s+#\d+(?::\d+)?(?:\[[^\]]+\])?(?:\([^\)]*\))?:\s+Video:.*?(?<width>\d{2,5})x(?<height>\d{2,5})",
+        RegexOptions.Multiline | RegexOptions.CultureInvariant);
+
+    private static readonly Regex DisplayMatrixRotationPattern = new(
+        @"displaymatrix:\s*rotation\s+of\s+(?<degrees>[+-]?\d+(?:\.\d+)?)\s+degrees",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex RotateTagPattern = new(
+        @"(?:^|\r?\n)\s*rotate\s*:\s*(?<degrees>[+-]?\d+(?:\.\d+)?)",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
     /// <summary>
     /// Extract video width, height, and duration using ffmpeg
     /// </summary>
@@ -25,16 +38,25 @@ public static class VideoMetadataExtractor
             int width = 0, height = 0;
             double duration = 0;
 
-            // Parse resolution from stderr
-            var resMatch = System.Text.RegularExpressions.Regex.Match(error, @"(\d{2,5})x(\d{2,5})");
+            // Restrict resolution parsing to the video stream. ffmpeg output can contain
+            // unrelated dimensions from attached artwork or other streams.
+            var resMatch = VideoResolutionPattern.Match(error);
             if (resMatch.Success)
             {
-                width = int.Parse(resMatch.Groups[1].Value);
-                height = int.Parse(resMatch.Groups[2].Value);
+                width = int.Parse(resMatch.Groups["width"].Value, CultureInfo.InvariantCulture);
+                height = int.Parse(resMatch.Groups["height"].Value, CultureInfo.InvariantCulture);
+
+                // The encoded frame is commonly landscape even when the display matrix
+                // declares a portrait presentation. Persist display dimensions so every
+                // consumer, including continuous layout, receives the visible aspect ratio.
+                if (HasQuarterTurnRotation(error))
+                {
+                    (width, height) = (height, width);
+                }
             }
 
             // Parse duration from stderr: "Duration: 00:24:00.09"
-            var durMatch = System.Text.RegularExpressions.Regex.Match(error, @"Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})");
+            var durMatch = Regex.Match(error, @"Duration: (\d{2}):(\d{2}):(\d{2}\.\d{2})", RegexOptions.CultureInvariant);
             if (durMatch.Success)
             {
                 int hours = int.Parse(durMatch.Groups[1].Value);
@@ -58,5 +80,23 @@ public static class VideoMetadataExtractor
         {
             return null;
         }
+    }
+
+    private static bool HasQuarterTurnRotation(string ffmpegOutput)
+    {
+        var rotationMatch = DisplayMatrixRotationPattern.Match(ffmpegOutput);
+        if (!rotationMatch.Success)
+        {
+            rotationMatch = RotateTagPattern.Match(ffmpegOutput);
+        }
+
+        if (!rotationMatch.Success ||
+            !double.TryParse(rotationMatch.Groups["degrees"].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var degrees))
+        {
+            return false;
+        }
+
+        var normalized = ((degrees % 360) + 360) % 360;
+        return Math.Abs(normalized - 90) < 1 || Math.Abs(normalized - 270) < 1;
     }
 }

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using ImageManager.App.Controls;
 using ImageManager.App.ViewModels;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
@@ -26,10 +27,13 @@ public class PageManager : IDisposable
 {
     public const int PageSize = 200;
     private const int MaxCachedPages = 3;
+    private const int MaxConcurrentThumbnailLoads = 6;
+    private const int MaxNonViewportThumbnailLoads = MaxConcurrentThumbnailLoads - 1;
     private static readonly double[] ZoomLevels = { 160, 183, 213, 256, 284, 320, 366, 427, 512, 640 };
 
     private readonly ThumbnailCacheService _thumbCache;
     private readonly IFolderRepository _folderRepo;
+    private readonly IImageMetaRepository? _metaRepo;
 
     private readonly Dictionary<int, List<ImageViewItem>> _pageCache = new();
     private readonly object _pageCacheLock = new();
@@ -37,7 +41,10 @@ public class PageManager : IDisposable
 
     private int? _preSearchPageIndex;
 
-    private readonly SemaphoreSlim _thumbnailLoadSemaphore = new(6);
+    private readonly SemaphoreSlim _thumbnailLoadSemaphore = new(MaxConcurrentThumbnailLoads);
+    // Page and preload work leave one global image decode slot available for
+    // an image that becomes visible while background loading is in progress.
+    private readonly SemaphoreSlim _nonViewportThumbnailLoadSemaphore = new(MaxNonViewportThumbnailLoads);
     private readonly SemaphoreSlim _videoLoadSemaphore = new(2);
     private int _thumbnailDecodeWidth = 200;
     private int _currentZoomLevel;
@@ -46,13 +53,34 @@ public class PageManager : IDisposable
     private CancellationTokenSource? _zoomDebounceCts;
     private CancellationTokenSource? _pageLoadCts;
     private CancellationTokenSource? _preloadCts;
+    private readonly object _preloadStateLock = new();
+    private PreloadRequest? _lastPreloadRequest;
+    private long _preloadGeneration;
+    private bool _scrollActive;
+    private bool _disposed;
+    private readonly object _viewportMetricsLock = new();
+    private ThumbnailBatchMetrics? _viewportMetrics;
+    private int _activePageThumbnailLoads;
+    private int _activePreloadThumbnailLoads;
+    private int _activeViewportThumbnailLoads;
+
+    private sealed record PreloadRequest(
+        int CurrentPage,
+        int TotalPages,
+        List<string> ActiveFileList,
+        Func<string, List<string>> GetTagsForFile,
+        CancellationToken ParentToken);
 
     public event Action<PageChangedEventArgs>? PageChanged;
 
-    public PageManager(ThumbnailCacheService thumbCache, IFolderRepository folderRepo)
+    public PageManager(
+        ThumbnailCacheService thumbCache,
+        IFolderRepository folderRepo,
+        IImageMetaRepository? metaRepo = null)
     {
         _thumbCache = thumbCache;
         _folderRepo = folderRepo;
+        _metaRepo = metaRepo;
     }
 
     // ==================== Public API ====================
@@ -78,18 +106,12 @@ public class PageManager : IDisposable
 
         _activePageIndex = pageIndex;
 
-        List<ImageViewItem> pageItems;
-        bool needsLoad;
-        lock (_pageCacheLock)
-        {
-            if (!_pageCache.TryGetValue(pageIndex, out pageItems!))
-            {
-                pageItems = CreatePlaceholderItems(pageIndex, totalPages, activeFileList, getTagsForFile);
-                _pageCache[pageIndex] = pageItems;
-                PerfLogger.Log($"[PageMgr] CreatePlaceholders {pageItems.Count} items elapsed={sw.ElapsedMilliseconds}ms");
-            }
-            needsLoad = !pageItems.TrueForAll(i => i.IsLoaded);
-        }
+        var pageItems = await GetOrCreatePageItemsAsync(
+            pageIndex, totalPages, activeFileList, getTagsForFile, loadCt);
+        if (pageItems == null || loadCt.IsCancellationRequested)
+            return;
+
+        bool needsLoad = !pageItems.TrueForAll(i => i.IsLoaded);
 
         if (needsLoad)
         {
@@ -136,11 +158,41 @@ public class PageManager : IDisposable
             _pageLoadCts.Dispose();
             _pageLoadCts = null;
         }
-        if (_preloadCts != null)
+        lock (_preloadStateLock)
+            CancelPreloadLocked(clearLastRequest: true);
+    }
+
+    /// <summary>
+    /// Pauses adjacent-page preloading while a scroll animation is active.
+    /// The latest request is retained and resumed with the normal preload delay
+    /// when scrolling becomes idle again.
+    /// </summary>
+    public void SetScrollActivity(bool active)
+    {
+        lock (_preloadStateLock)
         {
-            _preloadCts.Cancel();
-            _preloadCts.Dispose();
-            _preloadCts = null;
+            if (_disposed || _scrollActive == active)
+                return;
+
+            _scrollActive = active;
+            if (active)
+            {
+                CancelPreloadLocked(clearLastRequest: false);
+                return;
+            }
+
+            var request = _lastPreloadRequest;
+            if (request != null && !request.ParentToken.IsCancellationRequested)
+                StartPreloadLocked(request);
+        }
+    }
+
+    public bool IsScrollActive
+    {
+        get
+        {
+            lock (_preloadStateLock)
+                return _scrollActive;
         }
     }
 
@@ -155,15 +207,68 @@ public class PageManager : IDisposable
         var toLoad = items.Where(i => !i.IsLoaded).ToList();
         // Use current page's CancellationToken so page flip instantly cancels scroll-triggered loads
         var ct = _pageLoadCts?.Token ?? default;
+        if (toLoad.Count == 0) return;
+
         foreach (var item in toLoad)
-            _ = LoadSingleThumbnailAsync(item, ct);
+            QueueViewportThumbnail(item, ct);
+    }
+
+    public void LoadViewportThumbnailsForItems(
+        IEnumerable<ImageViewItem>? items,
+        CancellationToken cancellationToken)
+    {
+        if (items == null || cancellationToken.IsCancellationRequested)
+            return;
+
+        var queuedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in items)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return;
+
+            if (item == null || item.IsLoaded || string.IsNullOrWhiteSpace(item.FilePath))
+                continue;
+
+            if (!queuedPaths.Add(item.FilePath))
+                continue;
+
+            QueueThumbnail(item, cancellationToken, ThumbnailLoadSource.Viewport);
+        }
+    }
+
+    /// <summary>
+    /// Warms a small adjacent continuous-display range. It shares cancellation
+    /// with the viewport request and uses the background concurrency budget so
+    /// a newly visible image keeps a decode slot.
+    /// </summary>
+    public void LoadPrefetchThumbnailsForItems(
+        IEnumerable<ImageViewItem>? items,
+        CancellationToken cancellationToken)
+    {
+        if (items == null || cancellationToken.IsCancellationRequested)
+            return;
+
+        var queuedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in items)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return;
+
+            if (item == null || item.IsLoaded || string.IsNullOrWhiteSpace(item.FilePath))
+                continue;
+
+            if (!queuedPaths.Add(item.FilePath))
+                continue;
+
+            QueueThumbnail(item, cancellationToken, ThumbnailLoadSource.Preload);
+        }
     }
 
     public async Task LoadThumbnailsForItemsAsync(List<ImageViewItem> items)
     {
         var toLoad = items.Where(i => !i.IsLoaded).ToList();
         foreach (var item in toLoad)
-            await LoadSingleThumbnailAsync(item);
+            await LoadSingleThumbnailAsync(item, default, source: ThumbnailLoadSource.Viewport);
     }
 
     public async Task RegenerateThumbnailsAsync(List<ImageViewItem> items)
@@ -179,7 +284,7 @@ public class PageManager : IDisposable
 
         foreach (var item in items.DistinctBy(i => i.FilePath))
         {
-            await LoadSingleThumbnailAsync(item);
+            await LoadSingleThumbnailAsync(item, source: ThumbnailLoadSource.Viewport);
             PostLoadedItems(new[] { item });
         }
     }
@@ -319,10 +424,21 @@ public class PageManager : IDisposable
 
     public void Dispose()
     {
-        _thumbnailLoadSemaphore.Dispose();
-        _videoLoadSemaphore.Dispose();
-        _zoomDebounceCts?.Dispose();
+        lock (_preloadStateLock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            CancelPreloadLocked(clearLastRequest: true);
+        }
         CancelPageLoad();
+        _zoomDebounceCts?.Cancel();
+        _zoomDebounceCts?.Dispose();
+
+        // Page work is fire-and-forget and can still be unwinding from an
+        // awaited gate after cancellation. These tiny process-lifetime gates
+        // must remain valid until those continuations have observed cancel.
+        // Disposing them here can turn normal shutdown into an
+        // ObjectDisposedException or skip a reservation release.
     }
 
     public void InvalidateCache()
@@ -395,10 +511,83 @@ public class PageManager : IDisposable
 
     // ==================== Private Methods ====================
 
+    private async Task<List<ImageViewItem>?> GetOrCreatePageItemsAsync(
+        int pageIndex,
+        int totalPages,
+        List<string> activeFileList,
+        Func<string, List<string>> getTagsForFile,
+        CancellationToken ct)
+    {
+        lock (_pageCacheLock)
+        {
+            // InvalidateCache cancels page work before acquiring this same lock. Recheck
+            // here so a stale dimension query cannot repopulate a newly-cleared cache.
+            if (ct.IsCancellationRequested || _disposed)
+                return null;
+
+            if (_pageCache.TryGetValue(pageIndex, out var cachedItems))
+                return cachedItems;
+        }
+
+        // Repository queries can perform synchronous SQLite work before their Task yields.
+        // Keep that work off the UI thread, but resume this caller's context so PageChanged
+        // continues to update the bound collection on the dispatcher thread.
+        var dimensions = await GetPageDimensionsAsync(pageIndex, activeFileList, ct);
+        if (ct.IsCancellationRequested)
+            return null;
+
+        lock (_pageCacheLock)
+        {
+            // Cancellation and cache invalidation can happen while the SQLite query is
+            // running. Recheck while serializing the cache write to reject that stale page.
+            if (ct.IsCancellationRequested || _disposed)
+                return null;
+
+            if (_pageCache.TryGetValue(pageIndex, out var cachedItems))
+                return cachedItems;
+
+            var pageItems = CreatePlaceholderItems(
+                pageIndex, totalPages, activeFileList, getTagsForFile, dimensions);
+            _pageCache[pageIndex] = pageItems;
+            PerfLogger.Log($"[PageMgr] CreatePlaceholders {pageItems.Count} items dimensions={dimensions.Count} page={pageIndex}");
+            return pageItems;
+        }
+    }
+
+    private async Task<Dictionary<string, (int Width, int Height)>> GetPageDimensionsAsync(
+        int pageIndex,
+        List<string> activeFileList,
+        CancellationToken ct)
+    {
+        if (_metaRepo == null)
+            return new Dictionary<string, (int Width, int Height)>(StringComparer.OrdinalIgnoreCase);
+
+        int start = pageIndex * PageSize;
+        int count = Math.Min(PageSize, activeFileList.Count - start);
+        if (count <= 0)
+            return new Dictionary<string, (int Width, int Height)>(StringComparer.OrdinalIgnoreCase);
+
+        var paths = activeFileList.GetRange(start, count);
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            var dimensions = await Task.Run(
+                () => _metaRepo.GetDimensionsByPathsAsync(paths), ct).ConfigureAwait(false);
+            PerfLogger.Log($"[PageMgr] LoadDimensions page={pageIndex} requested={paths.Count} found={dimensions.Count} elapsed={sw.ElapsedMilliseconds}ms");
+            return dimensions;
+        }
+        catch (Exception ex)
+        {
+            PerfLogger.Log($"[PageMgr] LoadDimensions FAIL page={pageIndex} elapsed={sw.ElapsedMilliseconds}ms error={ex.GetType().Name}");
+            return new Dictionary<string, (int Width, int Height)>(StringComparer.OrdinalIgnoreCase);
+        }
+    }
+
     private List<ImageViewItem> CreatePlaceholderItems(
         int pageIndex, int totalPages,
         List<string> activeFileList,
-        Func<string, List<string>> getTagsForFile)
+        Func<string, List<string>> getTagsForFile,
+        IReadOnlyDictionary<string, (int Width, int Height)> dimensions)
     {
         int start = pageIndex * PageSize;
         int count = Math.Min(PageSize, activeFileList.Count - start);
@@ -408,11 +597,15 @@ public class PageManager : IDisposable
         {
             var file = activeFileList[start + i];
             var tags = getTagsForFile(file);
+            var hasDimensions = dimensions.TryGetValue(file, out var size) &&
+                                size.Width > 0 && size.Height > 0;
             list.Add(new ImageViewItem
             {
                 FilePath = file,
                 FileName = System.IO.Path.GetFileName(file),
                 Tags = tags,
+                Width = hasDimensions ? size.Width : 1,
+                Height = hasDimensions ? size.Height : 1,
                 IsLoading = true
             });
         }
@@ -432,6 +625,11 @@ public class PageManager : IDisposable
             if (!_pageCache.TryGetValue(pageIndex, out pageItems!)) return;
         }
 
+        var source = cacheOnlyVideos ? ThumbnailLoadSource.Preload : ThumbnailLoadSource.Page;
+        var metrics = new ThumbnailBatchMetrics(source, pageIndex, _thumbnailDecodeWidth, GetActiveLoadSummary);
+        var sw = Stopwatch.StartNew();
+        try
+        {
         var unloaded = pageItems.Where(i => !i.IsLoaded).ToList();
         if (unloaded.Count == 0) return;
         var imageItems = unloaded.Where(i => !FileTypeConstants.IsVideoFile(i.FilePath)).ToList();
@@ -442,7 +640,6 @@ public class PageManager : IDisposable
 
         ThreadPool.GetAvailableThreads(out var w, out var io);
         ThreadPool.GetMaxThreads(out var mw, out var mio);
-        var sw = Stopwatch.StartNew();
         var pressure = MemoryPressureMonitor.Current;
         PerfLogger.Log($"[PageMgr] LoadThumbnails unloaded={unloaded.Count} images={imageItems.Count} videos={videoItems.Count} skippedVideos={skippedVideos} ThreadPool={mw-w}/{mw}");
         AppLogger.Memory($"Page.Thumb.Start page={pageIndex} unloaded={unloaded.Count} images={imageItems.Count} videos={videoItems.Count} skippedVideos={skippedVideos} pressure={pressure} thumbCacheMB={_thumbCache.EstimatedMemoryBytes / 1048576.0:F1}");
@@ -453,19 +650,20 @@ public class PageManager : IDisposable
             ct.ThrowIfCancellationRequested();
 
             var batch = imageItems.Skip(batchStart).Take(batchSize).ToList();
-            var parallelism = RecommendedThumbnailParallelism();
+            var parallelism = Math.Min(RecommendedThumbnailParallelism(), MaxNonViewportThumbnailLoads);
             for (int i = 0; i < batch.Count; i += parallelism)
             {
                 ct.ThrowIfCancellationRequested();
                 var slice = batch.Skip(i).Take(parallelism).ToList();
-                await Task.WhenAll(slice.Select(item => LoadSingleThumbnailAsync(item, ct)));
-                PostLoadedItems(slice);
+                await Task.WhenAll(slice.Select(item => LoadSingleThumbnailAsync(item, ct, source, metrics)));
+                PostLoadedItems(slice, metrics);
             }
             _thumbCache.TrimForPressure();
 
             // Only dispatch if we're still the active page load
             if (ct.IsCancellationRequested)
             {
+                metrics.RequestLog("cancel", sw.ElapsedMilliseconds);
                 AppLogger.Memory($"Page.Thumb.Cancel page={pageIndex} elapsedMs={sw.ElapsedMilliseconds}");
                 return;
             }
@@ -474,23 +672,34 @@ public class PageManager : IDisposable
         {
             ct.ThrowIfCancellationRequested();
             if (cacheOnlyVideos)
-                await LoadSingleThumbnailCacheOnlyAsync(item, ct);
+                await LoadSingleThumbnailCacheOnlyAsync(item, ct, source, metrics);
             else
-                await LoadSingleThumbnailAsync(item, ct);
-            PostLoadedItems(new[] { item });
+                await LoadSingleThumbnailAsync(item, ct, source, metrics);
+            PostLoadedItems(new[] { item }, metrics);
             _thumbCache.TrimForPressure();
         }
 
+        metrics.RequestLog("end", sw.ElapsedMilliseconds);
         AppLogger.Memory($"Page.Thumb.End page={pageIndex} loaded={unloaded.Count(i => i.IsLoaded)}/{unloaded.Count} videosLoaded={videoItems.Count(i => i.IsLoaded)}/{videoItems.Count} skippedVideos={skippedVideos} pressure={MemoryPressureMonitor.Current} thumbCacheMB={_thumbCache.EstimatedMemoryBytes / 1048576.0:F1} elapsedMs={sw.ElapsedMilliseconds}");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            metrics.RequestLog("cancel", sw.ElapsedMilliseconds);
+            AppLogger.Memory($"Page.Thumb.Cancel page={pageIndex} elapsedMs={sw.ElapsedMilliseconds}");
+            throw;
+        }
     }
 
-    private static void PostLoadedItems(IEnumerable<ImageViewItem> items)
+    private static void PostLoadedItems(IEnumerable<ImageViewItem> items, ThumbnailBatchMetrics? metrics = null)
     {
         var loadedItems = items.Where(i => i.IsLoaded).ToList();
         if (loadedItems.Count == 0) return;
 
+        metrics?.RegisterUiPost();
+        var queuedAt = Stopwatch.GetTimestamp();
         Dispatcher.UIThread.Post(() =>
         {
+            metrics?.CompleteUiPost(Stopwatch.GetElapsedTime(queuedAt).TotalMilliseconds);
             foreach (var loadedItem in loadedItems)
             {
                 loadedItem.IsLoading = false;
@@ -510,35 +719,380 @@ public class PageManager : IDisposable
         };
     }
 
-    private async Task LoadSingleThumbnailAsync(ImageViewItem item, CancellationToken ct = default)
+    private void QueueViewportThumbnail(ImageViewItem item, CancellationToken ct) =>
+        QueueThumbnail(item, ct, ThumbnailLoadSource.Viewport);
+
+    private void QueueThumbnail(
+        ImageViewItem item,
+        CancellationToken ct,
+        ThumbnailLoadSource source)
+    {
+        ThumbnailBatchMetrics? metrics = null;
+        if (source == ThumbnailLoadSource.Viewport)
+        {
+            lock (_viewportMetricsLock)
+            {
+                if (_viewportMetrics == null)
+                {
+                    _viewportMetrics = new ThumbnailBatchMetrics(
+                        ThumbnailLoadSource.Viewport, _activePageIndex, _thumbnailDecodeWidth, GetActiveLoadSummary);
+                    _ = FlushViewportMetricsAsync(_viewportMetrics);
+                }
+
+                metrics = _viewportMetrics;
+                metrics.RecordRequested();
+            }
+        }
+
+        _ = LoadQueuedThumbnailAsync(item, ct, source, metrics);
+    }
+
+    private async Task LoadQueuedThumbnailAsync(
+        ImageViewItem item,
+        CancellationToken ct,
+        ThumbnailLoadSource source,
+        ThumbnailBatchMetrics? metrics)
+    {
+        try
+        {
+            await LoadSingleThumbnailAsync(
+                item, ct, source, metrics, requestAlreadyRecorded: metrics is not null);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Viewport work is deliberately fire-and-forget. Cancellation while
+            // waiting for a decode slot is expected when the viewport moves.
+        }
+    }
+
+    private async Task FlushViewportMetricsAsync(ThumbnailBatchMetrics metrics)
+    {
+        await Task.Delay(250).ConfigureAwait(false);
+        lock (_viewportMetricsLock)
+        {
+            if (ReferenceEquals(_viewportMetrics, metrics))
+            {
+                _viewportMetrics = null;
+                metrics.SealRequests();
+            }
+        }
+
+        await metrics.WaitForRequestsAsync().ConfigureAwait(false);
+        PostLoadedItems(metrics.TakeLoadedItems(), metrics);
+        metrics.RequestLog("end", metrics.ElapsedMilliseconds);
+    }
+
+    private void EnterThumbnailLoad(ThumbnailLoadSource source)
+    {
+        switch (source)
+        {
+            case ThumbnailLoadSource.Page:
+                Interlocked.Increment(ref _activePageThumbnailLoads);
+                break;
+            case ThumbnailLoadSource.Preload:
+                Interlocked.Increment(ref _activePreloadThumbnailLoads);
+                break;
+            case ThumbnailLoadSource.Viewport:
+                Interlocked.Increment(ref _activeViewportThumbnailLoads);
+                break;
+        }
+    }
+
+    private void ExitThumbnailLoad(ThumbnailLoadSource source)
+    {
+        switch (source)
+        {
+            case ThumbnailLoadSource.Page:
+                Interlocked.Decrement(ref _activePageThumbnailLoads);
+                break;
+            case ThumbnailLoadSource.Preload:
+                Interlocked.Decrement(ref _activePreloadThumbnailLoads);
+                break;
+            case ThumbnailLoadSource.Viewport:
+                Interlocked.Decrement(ref _activeViewportThumbnailLoads);
+                break;
+        }
+    }
+
+    private string GetActiveLoadSummary() =>
+        $"page={Volatile.Read(ref _activePageThumbnailLoads)} viewport={Volatile.Read(ref _activeViewportThumbnailLoads)} preload={Volatile.Read(ref _activePreloadThumbnailLoads)}";
+
+    private static bool IsNonViewportThumbnailLoad(ThumbnailLoadSource source) =>
+        source is ThumbnailLoadSource.Page or ThumbnailLoadSource.Preload;
+
+    private enum ThumbnailLoadSource
+    {
+        Page,
+        Preload,
+        Viewport
+    }
+
+    private sealed class ThumbnailBatchMetrics
+    {
+        private readonly ThumbnailLoadSource _source;
+        private readonly int _pageIndex;
+        private readonly int _decodeWidth;
+        private readonly Func<string> _activeLoads;
+        private readonly Stopwatch _stopwatch = Stopwatch.StartNew();
+        private readonly TaskCompletionSource _requestsCompleted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly object _requestGate = new();
+        private readonly object _loadedItemsLock = new();
+        private readonly List<ImageViewItem> _loadedItems = new();
+        private int _requested;
+        private int _completed;
+        private int _failed;
+        private int _canceled;
+        private int _memoryHits;
+        private int _diskHits;
+        private int _cacheOnlyHits;
+        private int _generated;
+        private int _inFlight;
+        private bool _requestsSealed;
+        private long _inFlightMax;
+        private int _pendingUiPosts;
+        private int _logRequested;
+        private int _logged;
+        private string? _outcome;
+        private long _elapsedMs;
+        private long _queueMaxMs;
+        private long _completeMaxMs;
+        private long _uiPostDelayMaxMs;
+
+        public ThumbnailBatchMetrics(
+            ThumbnailLoadSource source,
+            int pageIndex,
+            int decodeWidth,
+            Func<string> activeLoads)
+        {
+            _source = source;
+            _pageIndex = pageIndex;
+            _decodeWidth = decodeWidth;
+            _activeLoads = activeLoads;
+        }
+
+        public void RecordRequested()
+        {
+            lock (_requestGate)
+            {
+                Interlocked.Increment(ref _requested);
+                var inFlight = Interlocked.Increment(ref _inFlight);
+                Max(ref _inFlightMax, inFlight);
+            }
+        }
+
+        public void RecordResult(ThumbnailCacheLoadResult result, double elapsedMs)
+        {
+            Interlocked.Increment(ref _completed);
+            Max(ref _completeMaxMs, (long)Math.Ceiling(elapsedMs));
+            switch (result.Source)
+            {
+                case ThumbnailCacheSource.Memory:
+                    Interlocked.Increment(ref _memoryHits);
+                    break;
+                case ThumbnailCacheSource.Disk:
+                    Interlocked.Increment(ref _diskHits);
+                    break;
+                case ThumbnailCacheSource.Generated:
+                    Interlocked.Increment(ref _generated);
+                    break;
+                case ThumbnailCacheSource.Missing:
+                    Interlocked.Increment(ref _failed);
+                    break;
+            }
+            CompleteRequest();
+        }
+
+        public void RecordCacheOnlyHit(double elapsedMs)
+        {
+            Interlocked.Increment(ref _completed);
+            Interlocked.Increment(ref _cacheOnlyHits);
+            Max(ref _completeMaxMs, (long)Math.Ceiling(elapsedMs));
+            CompleteRequest();
+        }
+
+        public void RecordFailed()
+        {
+            Interlocked.Increment(ref _failed);
+            CompleteRequest();
+        }
+
+        public void RecordCanceled()
+        {
+            Interlocked.Increment(ref _canceled);
+            CompleteRequest();
+        }
+        public void RecordQueueDelay(double elapsedMs) => Max(ref _queueMaxMs, (long)Math.Ceiling(elapsedMs));
+        public void RegisterUiPost() => Interlocked.Increment(ref _pendingUiPosts);
+
+        public void CompleteUiPost(double elapsedMs)
+        {
+            Max(ref _uiPostDelayMaxMs, (long)Math.Ceiling(elapsedMs));
+            Interlocked.Decrement(ref _pendingUiPosts);
+            TryLog();
+        }
+
+        public void RecordLoadedItem(ImageViewItem item)
+        {
+            lock (_loadedItemsLock)
+                _loadedItems.Add(item);
+        }
+
+        public List<ImageViewItem> TakeLoadedItems()
+        {
+            lock (_loadedItemsLock)
+            {
+                var result = new List<ImageViewItem>(_loadedItems);
+                _loadedItems.Clear();
+                return result;
+            }
+        }
+
+        public Task WaitForRequestsAsync()
+        {
+            return _requestsCompleted.Task;
+        }
+
+        public void SealRequests()
+        {
+            lock (_requestGate)
+            {
+                _requestsSealed = true;
+                if (Volatile.Read(ref _inFlight) == 0)
+                    _requestsCompleted.TrySetResult();
+            }
+        }
+
+        public long ElapsedMilliseconds => _stopwatch.ElapsedMilliseconds;
+
+        public void RequestLog(string outcome, long elapsedMs)
+        {
+            _outcome = outcome;
+            _elapsedMs = elapsedMs;
+            Interlocked.Exchange(ref _logRequested, 1);
+            TryLog();
+        }
+
+        private void TryLog()
+        {
+            if (Volatile.Read(ref _logRequested) == 0 ||
+                Volatile.Read(ref _inFlight) != 0 ||
+                Volatile.Read(ref _pendingUiPosts) != 0 ||
+                Interlocked.Exchange(ref _logged, 1) != 0)
+                return;
+
+            var prefix = _source switch
+            {
+                ThumbnailLoadSource.Preload => "Thumb.Preload.Batch",
+                ThumbnailLoadSource.Viewport => "ThumbViewport.Batch",
+                _ => "Thumb.Batch"
+            };
+            ScrollDiagnosticsLogger.Log(
+                $"{prefix}.End source={_source} page={_pageIndex} width={_decodeWidth} outcome={_outcome} " +
+                $"requested={Volatile.Read(ref _requested)} completed={Volatile.Read(ref _completed)} " +
+                $"failed={Volatile.Read(ref _failed)} canceled={Volatile.Read(ref _canceled)} " +
+                $"memHit={Volatile.Read(ref _memoryHits)} diskHit={Volatile.Read(ref _diskHits)} cacheOnlyHit={Volatile.Read(ref _cacheOnlyHits)} generated={Volatile.Read(ref _generated)} " +
+                $"inFlightMax={Volatile.Read(ref _inFlightMax)} " +
+                $"queueMaxMs={Volatile.Read(ref _queueMaxMs)} completeMaxMs={Volatile.Read(ref _completeMaxMs)} " +
+                $"uiPostDelayMaxMs={Volatile.Read(ref _uiPostDelayMaxMs)} active={_activeLoads()} elapsedMs={_elapsedMs}");
+        }
+
+        private void CompleteRequest()
+        {
+            lock (_requestGate)
+            {
+                if (Interlocked.Decrement(ref _inFlight) == 0 && _requestsSealed)
+                    _requestsCompleted.TrySetResult();
+            }
+            TryLog();
+        }
+
+        private static void Max(ref long target, long value)
+        {
+            long current;
+            do
+            {
+                current = Volatile.Read(ref target);
+                if (value <= current) return;
+            }
+            while (Interlocked.CompareExchange(ref target, value, current) != current);
+        }
+    }
+
+    private async Task LoadSingleThumbnailAsync(
+        ImageViewItem item,
+        CancellationToken ct = default,
+        ThumbnailLoadSource source = ThumbnailLoadSource.Page,
+        ThumbnailBatchMetrics? metrics = null,
+        bool requestAlreadyRecorded = false)
     {
         bool isVideo = FileTypeConstants.IsVideoFile(item.FilePath);
         if (isVideo) PerfLogger.Log($"[Thumb] VIDEO start {Path.GetFileName(item.FilePath)}");
         var sw = isVideo ? Stopwatch.StartNew() : null;
 
         var semaphore = isVideo ? _videoLoadSemaphore : _thumbnailLoadSemaphore;
+        var nonViewportSemaphore = !isVideo && IsNonViewportThumbnailLoad(source)
+            ? _nonViewportThumbnailLoadSemaphore
+            : null;
 
-        await semaphore.WaitAsync(ct).ConfigureAwait(false);
+        var queuedAt = Stopwatch.GetTimestamp();
+        if (!requestAlreadyRecorded)
+            metrics?.RecordRequested();
+        EnterThumbnailLoad(source);
+        bool acquiredSemaphore = false;
+        bool acquiredNonViewportSemaphore = false;
         try
         {
-            var (data, w, h) = await Task.Run(() =>
-                _thumbCache.GetOrCreateThumbnailAsync(item.FilePath, _thumbnailDecodeWidth, ct), ct
-            ).ConfigureAwait(false);
-
-            if (data != null)
+            if (nonViewportSemaphore != null)
             {
-                item.ThumbnailData = data;
-                item.Width = w > 0 ? w : 1920;
-                item.Height = h > 0 ? h : 1080;
-                item.IsLoaded = true;
+                await nonViewportSemaphore.WaitAsync(ct).ConfigureAwait(false);
+                acquiredNonViewportSemaphore = true;
             }
+            await semaphore.WaitAsync(ct).ConfigureAwait(false);
+            acquiredSemaphore = true;
+            metrics?.RecordQueueDelay(Stopwatch.GetElapsedTime(queuedAt).TotalMilliseconds);
         }
         catch (OperationCanceledException)
         {
+            if (acquiredSemaphore)
+                semaphore.Release();
+            if (acquiredNonViewportSemaphore)
+                nonViewportSemaphore!.Release();
+            metrics?.RecordCanceled();
+            ExitThumbnailLoad(source);
+            throw;
+        }
+        try
+        {
+            var result = await Task.Run(() =>
+                _thumbCache.GetOrCreateThumbnailWithDiagnosticsAsync(item.FilePath, _thumbnailDecodeWidth, ct), ct
+            ).ConfigureAwait(false);
+            if (result.Data != null)
+            {
+                item.ThumbnailData = result.Data;
+                SetDecodedDimensionsIfUnknown(item, result.Width, result.Height);
+                item.IsLoaded = true;
+                metrics?.RecordLoadedItem(item);
+            }
+            metrics?.RecordResult(result, Stopwatch.GetElapsedTime(queuedAt).TotalMilliseconds);
+        }
+        catch (OperationCanceledException)
+        {
+            metrics?.RecordCanceled();
             // Page changed — discard silently
         }
-        catch { if (isVideo) PerfLogger.Log($"[Thumb] VIDEO FAIL {Path.GetFileName(item.FilePath)}"); }
-        finally { semaphore.Release(); }
+        catch
+        {
+            metrics?.RecordFailed();
+            if (isVideo) PerfLogger.Log($"[Thumb] VIDEO FAIL {Path.GetFileName(item.FilePath)}");
+        }
+        finally
+        {
+            if (acquiredSemaphore)
+                semaphore.Release();
+            if (acquiredNonViewportSemaphore)
+                nonViewportSemaphore!.Release();
+            ExitThumbnailLoad(source);
+        }
 
         if (!item.IsLoaded && ct.IsCancellationRequested)
             return;
@@ -555,12 +1109,44 @@ public class PageManager : IDisposable
         if (isVideo) PerfLogger.Log($"[Thumb] VIDEO done {Path.GetFileName(item.FilePath)} elapsed={sw!.ElapsedMilliseconds}ms");
     }
 
-    private async Task LoadSingleThumbnailCacheOnlyAsync(ImageViewItem item, CancellationToken ct = default)
+    private async Task LoadSingleThumbnailCacheOnlyAsync(
+        ImageViewItem item,
+        CancellationToken ct = default,
+        ThumbnailLoadSource source = ThumbnailLoadSource.Page,
+        ThumbnailBatchMetrics? metrics = null)
     {
         bool isVideo = FileTypeConstants.IsVideoFile(item.FilePath);
         var semaphore = isVideo ? _videoLoadSemaphore : _thumbnailLoadSemaphore;
+        var nonViewportSemaphore = !isVideo && IsNonViewportThumbnailLoad(source)
+            ? _nonViewportThumbnailLoadSemaphore
+            : null;
 
-        await semaphore.WaitAsync(ct).ConfigureAwait(false);
+        metrics?.RecordRequested();
+        EnterThumbnailLoad(source);
+        var queuedAt = Stopwatch.GetTimestamp();
+        bool acquiredSemaphore = false;
+        bool acquiredNonViewportSemaphore = false;
+        try
+        {
+            if (nonViewportSemaphore != null)
+            {
+                await nonViewportSemaphore.WaitAsync(ct).ConfigureAwait(false);
+                acquiredNonViewportSemaphore = true;
+            }
+            await semaphore.WaitAsync(ct).ConfigureAwait(false);
+            acquiredSemaphore = true;
+            metrics?.RecordQueueDelay(Stopwatch.GetElapsedTime(queuedAt).TotalMilliseconds);
+        }
+        catch (OperationCanceledException)
+        {
+            if (acquiredSemaphore)
+                semaphore.Release();
+            if (acquiredNonViewportSemaphore)
+                nonViewportSemaphore!.Release();
+            metrics?.RecordCanceled();
+            ExitThumbnailLoad(source);
+            throw;
+        }
         try
         {
             var (data, w, h) = await Task.Run(() =>
@@ -570,17 +1156,34 @@ public class PageManager : IDisposable
             if (data != null)
             {
                 item.ThumbnailData = data;
-                item.Width = w > 0 ? w : 1920;
-                item.Height = h > 0 ? h : 1080;
+                SetDecodedDimensionsIfUnknown(item, w, h);
                 item.IsLoaded = true;
+                metrics?.RecordCacheOnlyHit(Stopwatch.GetElapsedTime(queuedAt).TotalMilliseconds);
             }
             else
             {
                 item.IsLoading = false;
+                metrics?.RecordFailed();
             }
         }
-        catch (OperationCanceledException) { }
-        finally { semaphore.Release(); }
+        catch (OperationCanceledException) { metrics?.RecordCanceled(); }
+        finally
+        {
+            if (acquiredSemaphore)
+                semaphore.Release();
+            if (acquiredNonViewportSemaphore)
+                nonViewportSemaphore!.Release();
+            ExitThumbnailLoad(source);
+        }
+    }
+
+    private static void SetDecodedDimensionsIfUnknown(ImageViewItem item, int width, int height)
+    {
+        if (item.Width != 1 || item.Height != 1)
+            return;
+
+        item.Width = width > 0 ? width : 1920;
+        item.Height = height > 0 ? height : 1080;
     }
 
     private void PreloadAdjacentPages(
@@ -596,45 +1199,112 @@ public class PageManager : IDisposable
             return;
         }
 
-        // Cancel previous preload
-        _preloadCts?.Cancel();
-        _preloadCts?.Dispose();
-        _preloadCts = new CancellationTokenSource();
-        var ct = _preloadCts.Token;
+        var request = new PreloadRequest(
+            currentPage,
+            totalPages,
+            activeFileList.ToList(),
+            getTagsForFile,
+            parentCt);
+
+        lock (_preloadStateLock)
+        {
+            // The page load can finish after a newer page has already canceled its token.
+            // Do not let that stale continuation replace the latest deferred preload request.
+            if (_disposed || parentCt.IsCancellationRequested) return;
+            _lastPreloadRequest = request;
+            if (_scrollActive) return;
+            StartPreloadLocked(request);
+        }
+    }
+
+    private void StartPreloadLocked(PreloadRequest request)
+    {
+        CancelPreloadLocked(clearLastRequest: false);
+        var cts = new CancellationTokenSource();
+        _preloadCts = cts;
+        var ct = cts.Token;
+        var generation = ++_preloadGeneration;
 
         _ = Task.Run(async () =>
         {
-            await Task.Delay(2000, ct);
-            if (ct.IsCancellationRequested) return;
-            if (MemoryPressureMonitor.Current != MemoryPressureMonitor.PressureLevel.Low)
+            try
             {
-                AppLogger.Memory($"Page.Preload.Skip page={currentPage} reason=delayed-pressure level={MemoryPressureMonitor.Current}");
-                return;
-            }
+                await Task.Delay(2000, ct).ConfigureAwait(false);
+                if (!IsCurrentPreload(generation, ct, request)) return;
+                if (MemoryPressureMonitor.Current != MemoryPressureMonitor.PressureLevel.Low)
+                {
+                    AppLogger.Memory($"Page.Preload.Skip page={request.CurrentPage} reason=delayed-pressure level={MemoryPressureMonitor.Current}");
+                    return;
+                }
 
-            int? preloadPrev = null, preloadNext = null;
-            lock (_pageCacheLock)
-            {
-                if (currentPage - 1 >= 0 && !_pageCache.ContainsKey(currentPage - 1))
+                int? preloadPrev = null, preloadNext = null;
+                if (request.CurrentPage - 1 >= 0 &&
+                    await EnsurePreloadPageAsync(
+                        request.CurrentPage - 1, request.TotalPages,
+                        request.ActiveFileList, request.GetTagsForFile, ct).ConfigureAwait(false))
                 {
-                    _pageCache[currentPage - 1] = CreatePlaceholderItems(
-                        currentPage - 1, totalPages, activeFileList, getTagsForFile);
-                    preloadPrev = currentPage - 1;
+                    preloadPrev = request.CurrentPage - 1;
                 }
-                if (currentPage + 1 < totalPages && !_pageCache.ContainsKey(currentPage + 1))
+                if (!IsCurrentPreload(generation, ct, request)) return;
+
+                if (request.CurrentPage + 1 < request.TotalPages &&
+                    await EnsurePreloadPageAsync(
+                        request.CurrentPage + 1, request.TotalPages,
+                        request.ActiveFileList, request.GetTagsForFile, ct).ConfigureAwait(false))
                 {
-                    _pageCache[currentPage + 1] = CreatePlaceholderItems(
-                        currentPage + 1, totalPages, activeFileList, getTagsForFile);
-                    preloadNext = currentPage + 1;
+                    preloadNext = request.CurrentPage + 1;
                 }
+                if (!IsCurrentPreload(generation, ct, request)) return;
+                AppLogger.Memory($"Page.Preload.Start page={request.CurrentPage} prev={preloadPrev?.ToString() ?? "-"} next={preloadNext?.ToString() ?? "-"} cached={CachedPageCount}");
+                if (preloadPrev.HasValue)
+                    _ = LoadPageThumbnailsAsync(preloadPrev.Value, ct, includeVideos: true, cacheOnlyVideos: true);
+                if (preloadNext.HasValue)
+                    _ = LoadPageThumbnailsAsync(preloadNext.Value, ct, includeVideos: true, cacheOnlyVideos: true);
             }
-            if (ct.IsCancellationRequested) return;
-            AppLogger.Memory($"Page.Preload.Start page={currentPage} prev={preloadPrev?.ToString() ?? "-"} next={preloadNext?.ToString() ?? "-"} cached={CachedPageCount}");
-            if (preloadPrev.HasValue)
-                _ = LoadPageThumbnailsAsync(preloadPrev.Value, ct, includeVideos: true, cacheOnlyVideos: true);
-            if (preloadNext.HasValue)
-                _ = LoadPageThumbnailsAsync(preloadNext.Value, ct, includeVideos: true, cacheOnlyVideos: true);
+            catch (OperationCanceledException)
+            {
+                // Expected when scrolling starts or the current page changes.
+            }
         }, ct);
+    }
+
+    private async Task<bool> EnsurePreloadPageAsync(
+        int pageIndex,
+        int totalPages,
+        List<string> activeFileList,
+        Func<string, List<string>> getTagsForFile,
+        CancellationToken ct)
+    {
+        var pageItems = await GetOrCreatePageItemsAsync(
+            pageIndex, totalPages, activeFileList, getTagsForFile, ct).ConfigureAwait(false);
+        return pageItems?.Any(item => !item.IsLoaded) == true;
+    }
+
+    private bool IsCurrentPreload(long generation, CancellationToken token, PreloadRequest request)
+    {
+        lock (_preloadStateLock)
+            return IsCurrentPreloadLocked(generation, token, request);
+    }
+
+    private bool IsCurrentPreloadLocked(long generation, CancellationToken token, PreloadRequest request)
+    {
+        return !_disposed && !_scrollActive &&
+               generation == _preloadGeneration &&
+               ReferenceEquals(_lastPreloadRequest, request) &&
+               _preloadCts?.Token == token &&
+               !token.IsCancellationRequested &&
+               !request.ParentToken.IsCancellationRequested;
+    }
+
+    private void CancelPreloadLocked(bool clearLastRequest)
+    {
+        ++_preloadGeneration;
+        var cts = _preloadCts;
+        _preloadCts = null;
+        if (clearLastRequest)
+            _lastPreloadRequest = null;
+        cts?.Cancel();
+        cts?.Dispose();
     }
 
     private static (int Width, int Height) ParseJpegDimensions(byte[] jpeg)

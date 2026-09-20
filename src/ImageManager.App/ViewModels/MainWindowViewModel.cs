@@ -8,6 +8,7 @@ using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using CommunityToolkit.Mvvm.Messaging;
+using ImageManager.App.Models;
 using ImageManager.App.Services;
 using ImageManager.Common.Constants;
 using ImageManager.Core.Models;
@@ -17,6 +18,7 @@ using ImageManager.Common.Helpers;
 using ImageManager.Infrastructure.Hashing;
 using ImageManager.Infrastructure.Helpers;
 using ImageManager.Infrastructure.Imaging;
+using ImageManager.Infrastructure.Video;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace ImageManager.App.ViewModels;
@@ -75,6 +77,7 @@ public partial class MainWindowViewModel : ViewModelBase
     public void SyncUISettingsFromAppData()
     {
         AppSettings.SearchToolbarLayout = NormalizeSearchToolbarLayout(AppSettings.SearchToolbarLayout);
+        AppSettings.ImageDisplayMode = NormalizeImageDisplayMode(AppSettings.ImageDisplayMode);
         SearchToolbarLayout = AppSettings.SearchToolbarLayout;
         WaterfallMode = AppSettings.WaterfallMode;
         // Restore zoom for the current mode
@@ -92,6 +95,8 @@ public partial class MainWindowViewModel : ViewModelBase
         ThumbnailOpacity = AppSettings.ThumbnailOpacity;
         KeepPadding = AppSettings.ThumbnailNoTextKeepPadding;
         CornerRadiusDip = AppSettings.ThumbnailCornerRadius;
+        DisplayMode = Enum.Parse<ImageDisplayMode>(AppSettings.ImageDisplayMode);
+        OnPropertyChanged(nameof(IsPagedDisplay));
     }
 
     public bool IsSearchToolbarLayoutA => string.Equals(SearchToolbarLayout, "A", StringComparison.OrdinalIgnoreCase);
@@ -115,6 +120,12 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private static string NormalizeSearchToolbarLayout(string? layout) =>
         string.Equals(layout, "C", StringComparison.OrdinalIgnoreCase) ? "C" : "A";
+
+    private string NormalizeImageDisplayMode(string? mode) =>
+        IsContinuousDisplayAvailable &&
+        string.Equals(mode, nameof(ImageDisplayMode.Continuous), StringComparison.OrdinalIgnoreCase)
+            ? nameof(ImageDisplayMode.Continuous)
+            : nameof(ImageDisplayMode.Paged);
 
     partial void OnSearchToolbarLayoutChanged(string value)
     {
@@ -247,9 +258,324 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private int _currentPage;
     [ObservableProperty] private int _totalPages;
     [ObservableProperty] private ObservableCollection<int> _pageNumbers = new();
+    [ObservableProperty] private ImageDisplayMode _displayMode = ImageDisplayMode.Paged;
+
+    /// <summary>
+    /// Continuous mode remains disabled until it can create only a bounded
+    /// viewport window of controls and thumbnail requests.
+    /// </summary>
+    public bool IsContinuousDisplayAvailable => true;
+    public bool IsPagedDisplay => DisplayMode == ImageDisplayMode.Paged;
 
     /// <summary>Published display snapshot, shared by paging and selection.</summary>
     public List<string> ActiveFileList => _displayFilteredFiles;
+
+    // Continuous display keeps a complete lightweight geometry snapshot, but it
+    // must never turn that snapshot into a full set of view items or thumbnails.
+    // The UI integration will request this explicitly once its virtualizing panel
+    // is ready.
+    private readonly ContinuousDisplayGeometryBuilder _continuousDisplayGeometryBuilder = new();
+    private CancellationTokenSource? _continuousDisplayGeometryCts;
+    private CancellationTokenSource? _continuousViewportThumbnailCts;
+    private ContinuousImageItemSource? _continuousViewportSource;
+    private ImageDisplayRange _continuousVisibleRange;
+    private ImageDisplayRange _continuousPrefetchRange;
+    private int _continuousDisplayGeometryVersion;
+    [ObservableProperty] private ContinuousDisplayGeometrySnapshot? _continuousDisplayGeometrySnapshot;
+    [ObservableProperty] private ImageDisplayGeometryIndex? _continuousDisplayGeometryIndex;
+    [ObservableProperty] private ContinuousImageItemSource? _continuousImageItemSource;
+    [ObservableProperty] private bool _isContinuousGeometryBuilding;
+
+    /// <summary>
+    /// Builds a frozen, complete geometry snapshot for a future virtualized
+    /// continuous display. It intentionally does not create thumbnail work or
+    /// materialize all <see cref="ImageViewItem"/> instances.
+    /// </summary>
+    public async Task<bool> PrepareContinuousDisplayGeometryAsync(
+        double containerWidth,
+        CancellationToken cancellationToken = default)
+    {
+        return await _dispatcher.InvokeAsync(() =>
+            PrepareContinuousDisplayGeometryCoreAsync(containerWidth, cancellationToken));
+    }
+
+    /// <summary>
+    /// Reflows an already published continuous result for a new viewport width.
+    /// This intentionally reuses its frozen paths, sizes, and item source: a resize
+    /// must not clear visible thumbnails, query SQLite, or invoke video metadata.
+    /// </summary>
+    public async Task<bool> ReflowContinuousDisplayGeometryAsync(
+        double containerWidth,
+        CancellationToken cancellationToken = default)
+    {
+        var snapshot = ContinuousDisplayGeometrySnapshot;
+        var source = ContinuousImageItemSource;
+        if (snapshot is null || source is null || !double.IsFinite(containerWidth) || containerWidth <= 0)
+            return false;
+
+        var options = snapshot.GeometryIndex.Options with { ContainerWidth = containerWidth };
+        var geometry = await Task.Run(
+            () => ImageDisplayGeometryIndex.Build(snapshot.Sizes, options), cancellationToken)
+            .ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        return await _dispatcher.InvokeAsync(() =>
+        {
+            // Result, mode, or full geometry may have changed while the CPU-only
+            // reflow ran. Do not publish stale geometry into a different source.
+            if (!ReferenceEquals(snapshot, ContinuousDisplayGeometrySnapshot) ||
+                !ReferenceEquals(source, ContinuousImageItemSource))
+            {
+                return false;
+            }
+
+            ContinuousDisplayGeometryIndex = geometry;
+            return true;
+        });
+    }
+
+    // All coordinator state starts on the UI dispatcher. The expensive metadata and
+    // geometry work below deliberately resumes away from it until publication.
+    private async Task<bool> PrepareContinuousDisplayGeometryCoreAsync(
+        double containerWidth,
+        CancellationToken cancellationToken)
+    {
+        InvalidateContinuousDisplayGeometry();
+        if (ActiveFileList.Count == 0 || !double.IsFinite(containerWidth) || containerWidth <= 0)
+            return false;
+
+        var requestVersion = _continuousDisplayGeometryVersion;
+        var displayFilterVersion = _displayFilterVersion;
+        var sourcePaths = ActiveFileList.ToArray();
+        var options = new ImageDisplayGeometryOptions(
+            ToImageDisplayLayoutMode(WaterfallMode),
+            containerWidth,
+            ThumbnailBaseWidth,
+            AppSettings.ThumbnailAspectRatio);
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _continuousDisplayGeometryCts = cts;
+        IsContinuousGeometryBuilding = true;
+
+        try
+        {
+            var snapshot = await _continuousDisplayGeometryBuilder.BuildAsync(
+                sourcePaths,
+                options,
+                async (paths, token) =>
+                {
+                    token.ThrowIfCancellationRequested();
+                    var dimensions = await Task.Run(async () =>
+                    {
+                        token.ThrowIfCancellationRequested();
+                        var result = await _metaRepo.GetDimensionsByPathsAsync(paths).ConfigureAwait(false);
+                        var missingVideos = paths
+                            .Where(path => FileTypeConstants.IsVideoFile(path) && !result.ContainsKey(path))
+                            .ToArray();
+                        if (missingVideos.Length > 0)
+                        {
+                            var resolved = new ConcurrentDictionary<string, (int Width, int Height)>(StringComparer.OrdinalIgnoreCase);
+                            await Parallel.ForEachAsync(missingVideos,
+                                new ParallelOptions { MaxDegreeOfParallelism = 2, CancellationToken = token },
+                                async (path, cancellationToken) =>
+                                {
+                                    var size = await VideoThumbnailGenerator.TryGetDisplayDimensionsAsync(path, cancellationToken)
+                                        .ConfigureAwait(false);
+                                    if (size is { Width: > 0, Height: > 0 })
+                                        resolved[path] = size.Value;
+                                }).ConfigureAwait(false);
+
+                            foreach (var (path, size) in resolved)
+                                result[path] = size;
+
+                            // This one-time repair makes later continuous layouts and
+                            // paged placeholders agree without overwriting image hashes or tags.
+                            if (resolved.Count > 0)
+                                await _metaRepo.UpdateDimensionsByPathsAsync(resolved).ConfigureAwait(false);
+                        }
+                        token.ThrowIfCancellationRequested();
+                        return result;
+                    }, token).ConfigureAwait(false);
+                    token.ThrowIfCancellationRequested();
+                    return dimensions;
+                },
+                cts.Token).ConfigureAwait(false);
+
+            if (cts.IsCancellationRequested
+                || requestVersion != _continuousDisplayGeometryVersion
+                || displayFilterVersion != _displayFilterVersion)
+            {
+                return false;
+            }
+
+            return await _dispatcher.InvokeAsync(() =>
+            {
+                if (cts.IsCancellationRequested
+                    || requestVersion != _continuousDisplayGeometryVersion
+                    || displayFilterVersion != _displayFilterVersion)
+                {
+                    return false;
+                }
+
+                var previousSource = ContinuousImageItemSource;
+                ContinuousDisplayGeometrySnapshot = snapshot;
+                ContinuousDisplayGeometryIndex = snapshot.GeometryIndex;
+                ContinuousImageItemSource = new ContinuousImageItemSource(
+                    snapshot.Paths,
+                    snapshot.Sizes,
+                    GetTagsForFile);
+                previousSource?.ClearCache();
+                return true;
+            });
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"Continuous display geometry build failed: {ex}");
+            return false;
+        }
+        finally
+        {
+            await _dispatcher.InvokeAsync(() =>
+            {
+                if (ReferenceEquals(_continuousDisplayGeometryCts, cts)
+                    && requestVersion == _continuousDisplayGeometryVersion)
+                {
+                    _continuousDisplayGeometryCts = null;
+                    IsContinuousGeometryBuilding = false;
+                }
+            });
+
+            // The request that created the CTS is the only code path that disposes it.
+            cts.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Cancels outstanding geometry work and drops the lightweight snapshot. This
+    /// deliberately does not start a replacement build: the future virtualizing
+    /// view owns when a new container width is available.
+    /// </summary>
+    private void InvalidateContinuousDisplayGeometry()
+    {
+        ++_continuousDisplayGeometryVersion;
+        _continuousDisplayGeometryCts?.Cancel();
+        _continuousDisplayGeometryCts = null;
+        CancelContinuousViewportThumbnailLoad();
+        IsContinuousGeometryBuilding = false;
+
+        ContinuousImageItemSource?.ClearCache();
+        ContinuousImageItemSource = null;
+        ContinuousDisplayGeometrySnapshot = null;
+        ContinuousDisplayGeometryIndex = null;
+    }
+
+    /// <summary>
+    /// Coordinates state retained by the continuous panel. The panel has already
+    /// materialized its bounded range before reporting it, so visible thumbnail
+    /// work can only observe cached items and can never create a full result set.
+    /// This method is called on the UI thread by the window hosting that panel.
+    /// </summary>
+    public void UpdateContinuousDisplayViewport(
+        ImageDisplayRange visibleRange,
+        ImageDisplayRange retainedRange,
+        ContinuousScrollDirection scrollDirection = ContinuousScrollDirection.None)
+    {
+        var source = ContinuousImageItemSource;
+        if (source is null)
+            return;
+
+        var previousSource = _continuousViewportSource;
+        var previousVisibleRange = _continuousVisibleRange;
+        var prefetchRange = GetContinuousPrefetchRange(
+            ReferenceEquals(previousSource, source) ? previousVisibleRange : default,
+            visibleRange,
+            scrollDirection,
+            source.Count);
+        source.UpdateRetainedRange(CombineRanges(retainedRange, prefetchRange, source.Count));
+
+        if (ReferenceEquals(previousSource, source)
+            && previousVisibleRange == visibleRange
+            && _continuousPrefetchRange == prefetchRange)
+        {
+            return;
+        }
+
+        CancelContinuousViewportThumbnailLoad();
+        _continuousViewportSource = source;
+        _continuousVisibleRange = visibleRange;
+        _continuousPrefetchRange = prefetchRange;
+        if (visibleRange.IsEmpty)
+            return;
+
+        var cts = new CancellationTokenSource();
+        _continuousViewportThumbnailCts = cts;
+        var visibleItems = source.GetCachedItems(visibleRange);
+        var prefetchItems = source.GetOrCreateItems(prefetchRange);
+        _pageManager.LoadViewportThumbnailsForItems(visibleItems, cts.Token);
+        _pageManager.LoadPrefetchThumbnailsForItems(prefetchItems, cts.Token);
+    }
+
+    private void CancelContinuousViewportThumbnailLoad()
+    {
+        _continuousViewportThumbnailCts?.Cancel();
+        _continuousViewportThumbnailCts?.Dispose();
+        _continuousViewportThumbnailCts = null;
+        _continuousViewportSource = null;
+        _continuousVisibleRange = default;
+        _continuousPrefetchRange = default;
+    }
+
+    private static ImageDisplayRange GetContinuousPrefetchRange(
+        ImageDisplayRange previousVisibleRange,
+        ImageDisplayRange visibleRange,
+        ContinuousScrollDirection scrollDirection,
+        int totalCount)
+    {
+        if (visibleRange.IsEmpty || previousVisibleRange.IsEmpty || totalCount <= 0)
+            return default;
+
+        var count = Math.Max(1, (int)Math.Ceiling(visibleRange.Count * (2d / 3d)));
+        if (scrollDirection == ContinuousScrollDirection.Down)
+        {
+            var start = Math.Clamp(visibleRange.EndExclusive, 0, totalCount);
+            return new ImageDisplayRange(start, Math.Min(count, totalCount - start));
+        }
+
+        if (scrollDirection == ContinuousScrollDirection.Up)
+        {
+            var end = Math.Clamp(visibleRange.StartIndex, 0, totalCount);
+            var start = Math.Max(0, end - count);
+            return new ImageDisplayRange(start, end - start);
+        }
+
+        return default;
+    }
+
+    private static ImageDisplayRange CombineRanges(
+        ImageDisplayRange first,
+        ImageDisplayRange second,
+        int totalCount)
+    {
+        if (second.IsEmpty)
+            return first;
+        if (first.IsEmpty)
+            return second;
+
+        var start = Math.Max(0, Math.Min(first.StartIndex, second.StartIndex));
+        var end = Math.Min(totalCount, Math.Max(first.EndExclusive, second.EndExclusive));
+        return new ImageDisplayRange(start, Math.Max(0, end - start));
+    }
+
+    private static ImageDisplayLayoutMode ToImageDisplayLayoutMode(string? waterfallMode) =>
+        waterfallMode switch
+        {
+            "Vertical" => ImageDisplayLayoutMode.Vertical,
+            "Horizontal" => ImageDisplayLayoutMode.Horizontal,
+            _ => ImageDisplayLayoutMode.None
+        };
 
     public double PreSearchScrollOffset { get; set; }
     public event Action? ScrollRestoreRequested;
@@ -322,6 +648,49 @@ public partial class MainWindowViewModel : ViewModelBase
     private CancellationTokenSource? _widthDebounceCts;
     private int _resultNavigationVersion;
     private HashSet<string>? _pendingSelectionRestorePaths;
+    private readonly HashSet<string> _selectedFilePaths = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Canonical selection state for both paged and continuous display. UI items
+    /// are projections of these paths and may be recycled at any time.
+    /// </summary>
+    public IReadOnlyCollection<string> SelectedFilePaths => _selectedFilePaths;
+
+    public bool IsFileSelected(string? filePath) =>
+        !string.IsNullOrWhiteSpace(filePath) && _selectedFilePaths.Contains(filePath);
+
+    public void ReplaceSelectedFiles(IEnumerable<string> filePaths)
+    {
+        _selectedFilePaths.Clear();
+        foreach (var filePath in filePaths.Where(path => !string.IsNullOrWhiteSpace(path)))
+            _selectedFilePaths.Add(filePath);
+        ApplySelectionToRealizedItems();
+    }
+
+    public void SetFileSelected(string filePath, bool selected)
+    {
+        if (string.IsNullOrWhiteSpace(filePath))
+            return;
+        if (selected)
+            _selectedFilePaths.Add(filePath);
+        else
+            _selectedFilePaths.Remove(filePath);
+        ApplySelectionToRealizedItems();
+    }
+
+    public IReadOnlyList<ImageViewItem> GetSelectedRealizedItems() =>
+        Images.Where(item => IsFileSelected(item.FilePath)).ToList();
+
+    public void ApplySelectionToRealizedItems()
+    {
+        foreach (var item in Images)
+            item.IsSelected = IsFileSelected(item.FilePath);
+        if (ContinuousImageItemSource is not null)
+        {
+            foreach (var item in ContinuousImageItemSource.GetAllCachedItems())
+                item.IsSelected = IsFileSelected(item.FilePath);
+        }
+    }
 
     // 用于精确等待 Images 集合更新完成的信号
     private TaskCompletionSource<bool>? _imagesUpdatedTcs;
@@ -367,6 +736,7 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             Images = new ObservableCollection<ImageViewItem>(args.Items);
             RestorePendingSelection(Images);
+            ApplySelectionToRealizedItems();
             _isNavigating = true;
             CurrentPage = args.PageIndex;
             _isNavigating = false;
@@ -422,7 +792,7 @@ public partial class MainWindowViewModel : ViewModelBase
         _thumbCache.CacheDirectory = AppSettings.DiskCacheDirectory;
 
         var folders = await _folderRepo.GetAllAsync();
-        var nodes = folders.Select(f => new FolderTreeNode
+        var nodes = folders.Where(f => !f.IsArchived).Select(f => new FolderTreeNode
         {
             Path = f.Path, DisplayName = f.DisplayName, Alias = f.Alias, DbId = f.Id
         }).ToList();
@@ -505,6 +875,37 @@ public partial class MainWindowViewModel : ViewModelBase
         await _folderRepo.RemoveAsync(SelectedFolderNode.Path);
         FolderTree.Remove(SelectedFolderNode);
         await SaveSettingsAsync();
+    }
+
+    [RelayCommand]
+    private async Task ArchiveFolderAsync()
+    {
+        var folder = SelectedFolderNode;
+        if (folder == null || folder.DbId <= 0) return;
+
+        await _folderRepo.SetArchivedAsync(folder.DbId, true);
+        if (string.Equals(CurrentFolder, folder.Path, StringComparison.OrdinalIgnoreCase))
+        {
+            CurrentFolder = string.Empty;
+            Images.Clear();
+            _allFiles.Clear();
+            StatusText = "文件夹已归档";
+        }
+
+        FolderTree.Remove(folder);
+        SelectedFolderNode = null;
+        await SaveSettingsAsync();
+    }
+
+    public async Task RefreshFolderTreeAsync()
+    {
+        var folders = await _folderRepo.GetAllAsync();
+        var nodes = folders.Where(f => !f.IsArchived).Select(f => new FolderTreeNode
+        {
+            Path = f.Path, DisplayName = f.DisplayName, Alias = f.Alias, DbId = f.Id
+        }).ToList();
+        await Task.WhenAll(nodes.Select(n => n.EnsureExpanderVisibleAsync()));
+        FolderTree = new ObservableCollection<FolderTreeNode>(nodes);
     }
 
     [RelayCommand]
@@ -1474,7 +1875,26 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void OnIdleTimerTick(object? sender, EventArgs e)
     {
+        // A stopped timer can already have a queued dispatcher callback. Do not let it
+        // stop or replace a newer maintenance schedule.
+        if (sender is DispatcherTimer timer && !ReferenceEquals(timer, _idleTimer))
+        {
+            timer.Stop();
+            return;
+        }
+
         _idleTimer?.Stop();
+
+        // LOH compaction can block the UI thread long enough to visibly interrupt a
+        // scroll animation. Keep all idle maintenance deferred until scrolling ends.
+        if (_pageManager.IsScrollActive)
+        {
+            AppLogger.Memory("IdleMaintenance deferred by scroll activity");
+            _idleTimer = new DispatcherTimer(TimeSpan.FromSeconds(1), DispatcherPriority.Background, OnIdleTimerTick);
+            _idleTimer.Start();
+            return;
+        }
+
         var remaining = _deferMaintenanceUntilUtc - DateTime.UtcNow;
         if (remaining > TimeSpan.Zero)
         {
@@ -1565,7 +1985,66 @@ public partial class MainWindowViewModel : ViewModelBase
     [RelayCommand]
     private async Task NextPageAsync() { if (CurrentPage < TotalPages - 1) await ShowPageAsync(CurrentPage + 1); }
 
-    public async Task ShowPageAsync(int pageIndex)
+    /// <summary>The owning view rebuilds continuous layout using its viewport width.</summary>
+    public event Func<int, Task>? ContinuousDisplayRefreshRequested;
+
+    /// <summary>Refreshes either display mode at a global result index.</summary>
+    public async Task RefreshImageDisplayAsync(int preferredIndex)
+    {
+        if (DisplayMode == ImageDisplayMode.Continuous)
+        {
+            // The view supplies the actual viewport width, but every result-list
+            // refresh must request a rebuild, not just a display-mode change.
+            if (ContinuousDisplayRefreshRequested is { } refresh)
+                await refresh(Math.Clamp(preferredIndex, 0, Math.Max(0, ActiveFileList.Count - 1)));
+            return;
+        }
+
+        if (ActiveFileList.Count == 0)
+            return;
+
+        preferredIndex = Math.Clamp(preferredIndex, 0, ActiveFileList.Count - 1);
+        switch (DisplayMode)
+        {
+            case ImageDisplayMode.Paged:
+                await ShowPagedDisplayAsync(preferredIndex / PageManager.PageSize);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(DisplayMode), DisplayMode, null);
+        }
+    }
+
+    /// <summary>
+    /// Compatibility entry point for existing page navigation and UI event
+    /// handlers. All callers now pass through the display-mode dispatcher.
+    /// </summary>
+    public Task ShowPageAsync(int pageIndex)
+    {
+        var range = ImageDisplayRange.ForPage(pageIndex, PageManager.PageSize, ActiveFileList.Count);
+        return RefreshImageDisplayAsync(range.StartIndex);
+    }
+
+    public async Task<bool> TrySetDisplayModeAsync(ImageDisplayMode mode, int? preferredIndex = null)
+    {
+        if (mode == DisplayMode)
+            return true;
+
+        if (mode == ImageDisplayMode.Continuous && !IsContinuousDisplayAvailable)
+        {
+            StatusText = "连续显示模式正在准备，当前继续使用分页显示";
+            return false;
+        }
+
+        _pageManager.CancelCurrentLoads();
+        DisplayMode = mode;
+        OnPropertyChanged(nameof(IsPagedDisplay));
+
+        await RefreshImageDisplayAsync(preferredIndex ?? CurrentPage * PageManager.PageSize);
+
+        return true;
+    }
+
+    private async Task ShowPagedDisplayAsync(int pageIndex)
     {
         if (pageIndex < 0 || pageIndex >= TotalPages) return;
         var sw = Stopwatch.StartNew();
@@ -1617,12 +2096,17 @@ public partial class MainWindowViewModel : ViewModelBase
 
     partial void OnWaterfallModeChanged(string value)
     {
+        InvalidateContinuousDisplayGeometry();
         OnPropertyChanged(nameof(GridThumbnailHeight));
         _pageManager.UpdateUiState(new PageUiState(
             ThumbnailBaseWidth, WaterfallMode, AppSettings.ThumbnailAspectRatio));
         _ = _pageManager.RefreshDecodeWidthForCurrentModeAsync();
     }
-    partial void OnThumbnailBaseWidthChanged(double value) => OnPropertyChanged(nameof(GridThumbnailHeight));
+    partial void OnThumbnailBaseWidthChanged(double value)
+    {
+        InvalidateContinuousDisplayGeometry();
+        OnPropertyChanged(nameof(GridThumbnailHeight));
+    }
     partial void OnShowFileNameChanged(bool value) => OnPropertyChanged(nameof(ShowAnyThumbnailText));
     partial void OnShowTagsChanged(bool value) => OnPropertyChanged(nameof(ShowAnyThumbnailText));
     partial void OnShowOrientationChanged(bool value) => OnPropertyChanged(nameof(ShowAnyThumbnailText));
@@ -1716,6 +2200,8 @@ partial void OnCornerRadiusDipChanged(double value)
             .Select(i => i.FilePath)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
+        foreach (var path in selected)
+            _selectedFilePaths.Add(path);
         _pendingSelectionRestorePaths = selected.Count > 0 ? selected : null;
     }
 
@@ -1728,7 +2214,10 @@ partial void OnCornerRadiusDipChanged(double value)
         foreach (var item in items)
         {
             if (selectedPaths.Contains(item.FilePath))
+            {
+                _selectedFilePaths.Add(item.FilePath);
                 item.IsSelected = true;
+            }
         }
     }
 
@@ -2029,6 +2518,7 @@ partial void OnCornerRadiusDipChanged(double value)
     private int BeginFolderViewRequest()
     {
         CancelDisplayFilter();
+        InvalidateContinuousDisplayGeometry();
         Interlocked.Increment(ref _resultNavigationVersion);
         return Interlocked.Increment(ref _folderViewRequestVersion);
     }
@@ -2080,6 +2570,7 @@ partial void OnCornerRadiusDipChanged(double value)
     public void ShutdownBackgroundWork()
     {
         CancelDisplayFilter();
+        InvalidateContinuousDisplayGeometry();
         StopWatchingCurrentFolder();
         _idleTimer?.Stop();
         _pageManager.CancelCurrentLoads();
@@ -2227,6 +2718,8 @@ partial void OnCornerRadiusDipChanged(double value)
         _displayFilteredFiles.RemoveAll(p => deletedPaths.Contains(p));
         _filteredNavigationFiles.RemoveAll(p => deletedPaths.Contains(p));
         _allFiles.RemoveAll(p => deletedPaths.Contains(p));
+        _selectedFilePaths.RemoveWhere(deletedPaths.Contains);
+        InvalidateContinuousDisplayGeometry();
         if (_tagSearch.SearchResultFiles.Count > 0)
             _tagSearch.SearchResultFiles.RemoveAll(p => deletedPaths.Contains(p));
 

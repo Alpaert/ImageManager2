@@ -140,6 +140,7 @@ public sealed class VectorIndexService : IVectorIndexService
         }
         finally
         {
+            _similarImageService.InvalidateVectorSnapshots();
             if (kind == VectorIndexKind.Semantic)
                 _chineseClip.ReleaseImageSession();
             lock (_stateLock)

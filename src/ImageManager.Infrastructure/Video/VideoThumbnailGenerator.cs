@@ -279,4 +279,17 @@ public static class VideoThumbnailGenerator
         var meta = await VideoMetadataExtractor.ExtractMetadataAsync(filePath);
         return meta.HasValue ? (meta.Value.Width, meta.Value.Height) : (1920, 1080);
     }
+
+    /// <summary>
+    /// Returns verified display dimensions for layout repair. Unlike the legacy
+    /// compatibility method, metadata failure stays unknown rather than becoming a
+    /// synthetic landscape size that could be persisted as real data.
+    /// </summary>
+    public static async Task<(int Width, int Height)?> TryGetDisplayDimensionsAsync(
+        string filePath,
+        CancellationToken ct = default)
+    {
+        var meta = await VideoMetadataExtractor.ExtractMetadataAsync(filePath, ct).ConfigureAwait(false);
+        return meta.HasValue ? (meta.Value.Width, meta.Value.Height) : null;
+    }
 }

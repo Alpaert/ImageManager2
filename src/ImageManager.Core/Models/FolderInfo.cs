@@ -7,6 +7,7 @@ public class FolderInfo
     public string? Alias { get; set; }
     public int SortOrder { get; set; }
     public int? LastPageIndex { get; set; }
+    public bool IsArchived { get; set; }
 
     public string DisplayName => Alias ?? System.IO.Path.GetFileName(Path.TrimEnd('\\', '/'));
 }

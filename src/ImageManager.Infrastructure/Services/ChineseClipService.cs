@@ -98,8 +98,11 @@ public sealed class ChineseClipService : IDisposable
                     : session.InputMetadata.Keys.Skip(1).First();
                 var ids = NamedOnnxValue.CreateFromTensor(idsName, inputIds);
                 var mask = NamedOnnxValue.CreateFromTensor(maskName, attentionMask);
-                using var results = session.Run([ids, mask]);
-                return Normalize(results.First().AsTensor<float>().ToArray());
+                return await Task.Run(() =>
+                {
+                    using var results = session.Run([ids, mask]);
+                    return Normalize(results.First().AsTensor<float>().ToArray());
+                }, ct);
             }
             finally
             {

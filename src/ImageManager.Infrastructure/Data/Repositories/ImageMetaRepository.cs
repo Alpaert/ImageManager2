@@ -726,12 +726,41 @@ public class ImageMetaRepository : IImageMetaRepository
         {
             var rows = await conn.QueryAsync<(string FilePath, int Width, int Height)>(@"
                 SELECT FilePath, Width, Height FROM ImageMeta
-                WHERE FilePath COLLATE NOCASE IN @Paths AND Width > 0",
+                WHERE FilePath COLLATE NOCASE IN @Paths AND Width > 0 AND Height > 0",
                 new { Paths = chunk });
             foreach (var (path, w, h) in rows)
                 result[path] = (w, h);
         }
         return result;
+    }
+
+    public async Task UpdateDimensionsByPathsAsync(IReadOnlyDictionary<string, (int Width, int Height)> dimensions)
+    {
+        ArgumentNullException.ThrowIfNull(dimensions);
+        var valid = dimensions
+            .Where(entry => !string.IsNullOrWhiteSpace(entry.Key)
+                && entry.Value.Width > 0 && entry.Value.Height > 0)
+            .ToArray();
+        if (valid.Length == 0) return;
+
+        using var writer = await MetadataWriteCoordinator.EnterAsync(_dbFactory);
+        using var conn = _dbFactory.CreateConnection();
+        using var transaction = conn.BeginTransaction();
+        foreach (var entry in valid)
+        {
+            await conn.ExecuteAsync(@"
+                UPDATE ImageMeta
+                SET Width = @Width, Height = @Height, UpdatedAt = @UpdatedAt
+                WHERE FilePath = @FilePath COLLATE NOCASE",
+                new
+                {
+                    FilePath = entry.Key,
+                    entry.Value.Width,
+                    entry.Value.Height,
+                    UpdatedAt = DateTime.UtcNow
+                }, transaction);
+        }
+        transaction.Commit();
     }
 
     public async Task<Dictionary<string, int>> GetSystemRatingsByPathsAsync(List<string> filePaths)

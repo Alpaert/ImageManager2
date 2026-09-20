@@ -129,7 +129,8 @@ public sealed class ImageEmbeddingRepository : IImageEmbeddingRepository
 
         using var conn = _dbFactory.CreateConnection();
         var command = new CommandDefinition(@"
-            SELECT ie.ImageMetaId, im.FilePath, ie.FileHash, ie.EmbeddingDim, ie.EmbeddingBlob
+            SELECT ie.ImageMetaId, im.FilePath, ie.FileHash, ie.EmbeddingDim, ie.EmbeddingBlob,
+                   ie.SourceFileSize, ie.SourceLastWriteTicks
             FROM ImageEmbedding ie
             INNER JOIN ImageMeta im ON im.Id = ie.ImageMetaId
             WHERE ie.ModelKey = @ModelKey
@@ -144,7 +145,9 @@ public sealed class ImageEmbeddingRepository : IImageEmbeddingRepository
             string FilePath,
             string? FileHash,
             int EmbeddingDim,
-            byte[] EmbeddingBlob)>(command);
+            byte[] EmbeddingBlob,
+            long SourceFileSize,
+            long SourceLastWriteTicks)>(command);
 
         var result = new List<ImageEmbeddingRecord>();
         foreach (var row in rows)
@@ -152,7 +155,8 @@ public sealed class ImageEmbeddingRepository : IImageEmbeddingRepository
             ct.ThrowIfCancellationRequested();
             var embedding = FromBytes(row.EmbeddingBlob, row.EmbeddingDim);
             if (embedding.Length > 0)
-                result.Add(new ImageEmbeddingRecord(row.ImageMetaId, row.FilePath, row.FileHash, embedding));
+                result.Add(new ImageEmbeddingRecord(row.ImageMetaId, row.FilePath, row.FileHash, embedding,
+                    row.SourceFileSize, row.SourceLastWriteTicks));
         }
 
         return result;

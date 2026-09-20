@@ -143,6 +143,7 @@ public partial class MainWindowViewModel
             if (version != _displayFilterVersion || token.IsCancellationRequested) return false;
             _displayFilteredFiles = result.Files;
             _filteredNavigationFiles = navigation.Files;
+            InvalidateContinuousDisplayGeometry();
             DisplayFilterSourceCount = source.Length;
             DisplayFilterUnknownCount = result.UnknownDimensionsCount;
             if (!preserveNavigation) _currentResultIndex = 0;
@@ -155,6 +156,7 @@ public partial class MainWindowViewModel
             {
                 _displayFilteredFiles = new();
                 _filteredNavigationFiles = new();
+                InvalidateContinuousDisplayGeometry();
                 DisplayFilterSourceCount = source.Length;
                 DisplayFilterUnknownCount = 0;
                 _pageManager.CancelCurrentLoads();

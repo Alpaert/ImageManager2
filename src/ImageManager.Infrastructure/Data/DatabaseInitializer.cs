@@ -55,7 +55,8 @@ public static class DatabaseInitializer
                 Path          TEXT NOT NULL UNIQUE,
                 Alias         TEXT,
                 SortOrder     INTEGER DEFAULT 0,
-                LastPageIndex INTEGER DEFAULT 0
+                LastPageIndex INTEGER DEFAULT 0,
+                IsArchived    INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS FavoriteTag (
@@ -125,6 +126,7 @@ public static class DatabaseInitializer
         TryAddColumn(conn, "ALTER TABLE ImageMeta ADD COLUMN HashStatus INTEGER DEFAULT 0;");
         TryAddColumn(conn, "ALTER TABLE ImageEmbedding ADD COLUMN SourceFileSize INTEGER;");
         TryAddColumn(conn, "ALTER TABLE ImageEmbedding ADD COLUMN SourceLastWriteTicks INTEGER;");
+        TryAddColumn(conn, "ALTER TABLE Folder ADD COLUMN IsArchived INTEGER NOT NULL DEFAULT 0;");
         TryAddColumns(conn, """
             ALTER TABLE ImageMeta ADD COLUMN Duration REAL DEFAULT NULL;
             ALTER TABLE ImageMeta ADD COLUMN ThumbnailTimestamp REAL DEFAULT NULL;
