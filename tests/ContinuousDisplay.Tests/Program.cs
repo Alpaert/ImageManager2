@@ -135,6 +135,41 @@ try
         Console.WriteLine($"PASS {mode}: first/middle/last viewport contains decoded images; realized={actualPanel.RealizedCount}");
     }
 
+    // Search navigation stores its target as a path. Continuous mode must be
+    // able to locate that target before an ImageViewItem is materialized.
+    vm.ReplaceSelectedFiles(new[] { paths[5000] });
+    typeof(MainWindow).GetMethod("OnScrollToSelected", BindingFlags.Instance | BindingFlags.NonPublic)!
+        .Invoke(main, null);
+    WaitUntil(() => 5000 >= actualPanel.CurrentVisibleRange.StartIndex &&
+                    5000 < actualPanel.CurrentVisibleRange.EndExclusive);
+    if (!vm.IsFileSelected(paths[5000]))
+        throw new InvalidOperationException("Continuous path-based search navigation lost its selected target.");
+    Console.WriteLine("PASS continuous path-based search navigation");
+
+    // Scrollbar thumb dragging produces a burst of offset changes. The panel
+    // may coalesce intermediate positions, but must realize the final viewport.
+    var continuousViewer = main.FindControl<ScrollViewer>("ThumbnailScrollViewer")!;
+    var fastDragTargetY = Math.Max(0, continuousViewer.Extent.Height - continuousViewer.Viewport.Height - 1200);
+    for (var step = 1; step <= 40; step++)
+    {
+        continuousViewer.Offset = new Vector(
+            continuousViewer.Offset.X,
+            fastDragTargetY * step / 40d);
+        main.UpdateLayout();
+    }
+
+    var expectedFastDragRange = actualPanel.GeometryIndex!.QueryViewport(
+        fastDragTargetY,
+        continuousViewer.Viewport.Height);
+    WaitUntil(() => actualPanel.CurrentVisibleRange == expectedFastDragRange);
+    WaitForImages(actualPanel);
+    if (actualPanel.RealizedCount >= 200 || vm.ContinuousImageItemSource!.CachedItemCount >= 200)
+        throw new InvalidOperationException("Fast scrollbar dragging exceeds the bounded continuous window.");
+    Console.WriteLine($"PASS fast scrollbar drag: final={actualPanel.CurrentVisibleRange} realized={actualPanel.RealizedCount}");
+
+    actualPanel.ScrollToIndex(0);
+    Pump();
+    WaitForImages(actualPanel);
     var geometryWidthBeforeResize = actualPanel.GeometryIndex!.Options.ContainerWidth;
     var sourceBeforeResize = vm.ContinuousImageItemSource!;
     var retainedVisualBeforeResize = actualPanel.GetVisualDescendants().OfType<Border>().First();

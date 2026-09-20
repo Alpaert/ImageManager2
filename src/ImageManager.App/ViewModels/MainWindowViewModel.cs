@@ -3100,9 +3100,7 @@ partial void OnCornerRadiusDipChanged(double value)
         _currentResultIndex = 0;
         if (Images.Count > 0)
         {
-            foreach (var image in Images)
-                image.IsSelected = false;
-            Images[0].IsSelected = true;
+            ReplaceSelectedFiles(new[] { Images[0].FilePath });
         }
 
         OnPropertyChanged(nameof(SearchResultInfo));
@@ -3287,19 +3285,12 @@ partial void OnCornerRadiusDipChanged(double value)
     /// <summary>选中指定图片并滚动到可见区域</summary>
     private void SelectAndScrollToImage(string targetPath)
     {
-        var item = Images.FirstOrDefault(i =>
-            string.Equals(i.FilePath, targetPath, StringComparison.OrdinalIgnoreCase));
+        if (string.IsNullOrWhiteSpace(targetPath))
+            return;
 
-        if (item != null)
-        {
-            foreach (var img in Images)
-                img.IsSelected = false;
-
-            item.IsSelected = true;
-
-            _dispatcher.InvokeAsync(
-                () => ScrollToSelectedRequested?.Invoke());
-        }
+        ReplaceSelectedFiles(new[] { targetPath });
+        _dispatcher.InvokeAsync(
+            () => ScrollToSelectedRequested?.Invoke());
     }
 
     /// <summary>
@@ -3376,15 +3367,13 @@ partial void OnCornerRadiusDipChanged(double value)
     /// </summary>
     private async Task SelectAndScrollToImageAsync(string targetPath, Func<bool>? isCurrent = null)
     {
-        var item = Images.FirstOrDefault(i =>
-            string.Equals(i.FilePath, targetPath, StringComparison.OrdinalIgnoreCase));
+        if (string.IsNullOrWhiteSpace(targetPath))
+            return;
 
-        if (item == null) return;
-
-        foreach (var img in Images)
-            img.IsSelected = false;
-
-        item.IsSelected = true;
+        // Continuous display does not materialize an ImageViewItem for every
+        // result. Keep navigation path-based so both display modes can locate
+        // the target before its container exists.
+        ReplaceSelectedFiles(new[] { targetPath });
 
         // 跨文件夹首次跳转时 Images 集合刚被 PageChanged 替换为新实例，
         // Avalonia 的 ItemsControl 需要至少一次 layout pass 才能创建 child 容器。

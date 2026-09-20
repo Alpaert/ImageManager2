@@ -1,7 +1,9 @@
+using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Layout;
+using Avalonia.Threading;
 using Avalonia.VisualTree;
 using ImageManager.App.Models;
 using ImageManager.App.Services;
@@ -22,11 +24,25 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
 
     private readonly Dictionary<int, RealizedContainer> _realized = new();
     private readonly Dictionary<object, Stack<Control>> _recycled = new();
+    private readonly DispatcherTimer _effectiveViewportTimer;
     private Rect _effectiveViewport;
+    private Rect? _pendingEffectiveViewport;
     private int _publishedGeometryItemCount = -1;
     private double? _lastPublishedViewportY;
+    private long _lastEffectiveViewportEventTimestamp;
+
+    private static readonly TimeSpan ViewportUpdateInterval = TimeSpan.FromMilliseconds(16);
+    private static readonly TimeSpan HighFrequencyViewportInterval = TimeSpan.FromMilliseconds(50);
 
     private readonly record struct RealizedContainer(Control Control, object? RecycleKey, bool NeedsContainer);
+
+    public VirtualizingWaterfallPanel()
+    {
+        _effectiveViewportTimer = new DispatcherTimer(
+            ViewportUpdateInterval,
+            DispatcherPriority.Render,
+            OnEffectiveViewportTimerTick);
+    }
 
     static VirtualizingWaterfallPanel()
     {
@@ -36,8 +52,11 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
             // containers in that case so their decoded thumbnail visuals are not
             // removed for a white frame before the next Measure/Arrange pass.
             var count = panel.GeometryIndex?.Count ?? 0;
-            if (panel._publishedGeometryItemCount != count || panel.Items.Count != count)
+            if (panel.GeometryIndex is null || panel._publishedGeometryItemCount != count || panel.Items.Count != count)
+            {
+                panel.CancelPendingViewportUpdate(preserveLatestViewport: true);
                 panel.ClearRealizedContainers();
+            }
             panel._publishedGeometryItemCount = count;
             panel.InvalidateMeasure();
         });
@@ -96,6 +115,7 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
     protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
     {
         EffectiveViewportChanged -= OnEffectiveViewportChanged;
+        CancelPendingViewportUpdate(preserveLatestViewport: true);
         ClearRealizedContainers();
         _recycled.Clear();
         base.OnDetachedFromVisualTree(e);
@@ -103,7 +123,8 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
 
     protected override Size MeasureOverride(Size availableSize)
     {
-        EnsureRealizedForViewport(GetViewportForLayout(availableSize));
+        if (!HasPendingViewportUpdate)
+            EnsureRealizedForViewport(GetViewportForLayout(availableSize));
 
         var geometry = GeometryIndex;
         if (geometry is not null)
@@ -121,7 +142,8 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
 
     protected override Size ArrangeOverride(Size finalSize)
     {
-        EnsureRealizedForViewport(GetViewportForLayout(finalSize));
+        if (!HasPendingViewportUpdate)
+            EnsureRealizedForViewport(GetViewportForLayout(finalSize));
         var geometry = GeometryIndex;
         if (geometry is not null)
         {
@@ -145,6 +167,10 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
     protected override void OnItemsChanged(IReadOnlyList<object?> items,
         System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
     {
+        // The item source can change while a scrollbar drag has a coalesced
+        // viewport pending. Preserve that newest position so the replacement
+        // source is realized for the current scroll offset.
+        CancelPendingViewportUpdate(preserveLatestViewport: true);
         ClearRealizedContainers();
         base.OnItemsChanged(items, e);
         InvalidateMeasure();
@@ -182,6 +208,7 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
             viewer.Offset = new Vector(viewer.Offset.X, targetY);
         }
 
+        CancelPendingViewportUpdate();
         _effectiveViewport = new Rect(viewport.X, targetY, viewport.Width, viewport.Height);
         EnsureRealizedForViewport(_effectiveViewport);
         InvalidateMeasure();
@@ -213,9 +240,53 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
 
     private void OnEffectiveViewportChanged(object? sender, EffectiveViewportChangedEventArgs e)
     {
-        _effectiveViewport = e.EffectiveViewport;
-        EnsureRealizedForViewport(_effectiveViewport);
+        var now = Stopwatch.GetTimestamp();
+        var previousEvent = _lastEffectiveViewportEventTimestamp;
+        _lastEffectiveViewportEventTimestamp = now;
+
+        if (previousEvent != 0 && Stopwatch.GetElapsedTime(previousEvent, now) < HighFrequencyViewportInterval)
+        {
+            _pendingEffectiveViewport = e.EffectiveViewport;
+            if (!_effectiveViewportTimer.IsEnabled)
+                _effectiveViewportTimer.Start();
+            return;
+        }
+
+        StopPendingViewportTimer();
+        ProcessEffectiveViewport(e.EffectiveViewport);
+    }
+
+    private void OnEffectiveViewportTimerTick(object? sender, EventArgs e)
+    {
+        var viewport = _pendingEffectiveViewport;
+        _pendingEffectiveViewport = null;
+        _effectiveViewportTimer.Stop();
+        if (viewport is { } latestViewport)
+            ProcessEffectiveViewport(latestViewport);
+    }
+
+    private void ProcessEffectiveViewport(Rect viewport)
+    {
+        _effectiveViewport = viewport;
+        EnsureRealizedForViewport(viewport);
         InvalidateMeasure();
+    }
+
+    private bool HasPendingViewportUpdate =>
+        _effectiveViewportTimer.IsEnabled && _pendingEffectiveViewport.HasValue;
+
+    private void CancelPendingViewportUpdate(bool preserveLatestViewport = false)
+    {
+        if (preserveLatestViewport && _pendingEffectiveViewport is { } pendingViewport)
+            _effectiveViewport = pendingViewport;
+        StopPendingViewportTimer();
+        _lastEffectiveViewportEventTimestamp = 0;
+    }
+
+    private void StopPendingViewportTimer()
+    {
+        _effectiveViewportTimer.Stop();
+        _pendingEffectiveViewport = null;
     }
 
     private Rect GetViewportForLayout(Size availableSize)
@@ -270,6 +341,15 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
         var retained = geometry.QueryViewport(Math.Max(0, viewport.Y - buffer), viewport.Height + buffer * 2);
         if (retained.IsEmpty)
             retained = visible;
+
+        // During a fast scrollbar drag the effective viewport can move many
+        // times inside the same retained window. Keep the slider responsive by
+        // avoiding container churn until the virtualized source window changes.
+        if (visible == CurrentVisibleRange && retained == CurrentRetainedRange)
+        {
+            _effectiveViewport = viewport;
+            return;
+        }
 
         foreach (var index in _realized.Keys.Where(index => index < retained.StartIndex || index >= retained.EndExclusive).ToArray())
             Unrealize(index);
