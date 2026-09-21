@@ -270,6 +270,43 @@ public class ThumbnailCacheService : IThumbnailCacheService
         return (cached, w, h);
     }
 
+    /// <summary>
+    /// Reads dimensions from existing thumbnail or video-original-frame cache entries.
+    /// This method never generates thumbnails, invokes FFmpeg, or reads the source media.
+    /// </summary>
+    public (int Width, int Height) TryResolveCachedDimensions(string filePath, int decodeWidth)
+    {
+        if (string.IsNullOrWhiteSpace(filePath))
+            return (0, 0);
+
+        var isVideo = FileTypeConstants.IsVideoFile(filePath);
+        var dimensions = _diskCache.TryResolveCachedDimensions(filePath, decodeWidth, isVideo);
+        return dimensions is { Width: > 1, Height: > 1 }
+            ? dimensions.Value
+            : (0, 0);
+    }
+
+    /// <summary>
+    /// Resolves dimensions from existing cache entries for multiple media paths.
+    /// This is a read-only operation and never accesses source media or runs FFmpeg.
+    /// </summary>
+    public Task<Dictionary<string, (int Width, int Height)>> GetCachedDimensionsAsync(
+        IReadOnlyCollection<string> filePaths,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(filePaths);
+        var decodeWidth = DecodeWidth;
+
+        return Task.Run(() =>
+        {
+            return _diskCache.GetCachedDimensions(
+                filePaths,
+                decodeWidth,
+                FileTypeConstants.IsVideoFile,
+                ct);
+        }, ct);
+    }
+
     public Task ClearAsync()
     {
         lock (_lruLock)

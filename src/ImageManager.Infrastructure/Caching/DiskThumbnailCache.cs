@@ -125,6 +125,88 @@ public class DiskThumbnailCache
         catch { return null; }
     }
 
+    /// <summary>
+    /// Resolves intrinsic media dimensions from existing cache files without creating,
+    /// moving, or deleting any cache entry. The requested decode width is checked first.
+    /// </summary>
+    public (int Width, int Height)? TryResolveCachedDimensions(
+        string filePath,
+        int decodeWidth,
+        bool preferVideoOriginalFrame)
+    {
+        if (string.IsNullOrWhiteSpace(filePath))
+            return null;
+
+        var current = TryLoadMeta(filePath, decodeWidth);
+        if (IsUsableDimension(current))
+            return current;
+
+        // Some older cache entries predate the sidecar JSON. The thumbnail itself
+        // is still sufficient and must be reused before probing the source video.
+        var currentThumbnail = TryReadCachedJpegDimensions(filePath, Path.Combine(_cacheRoot, $"w{decodeWidth}"));
+        if (IsUsableDimension(currentThumbnail))
+            return currentThumbnail;
+
+        if (preferVideoOriginalFrame)
+        {
+            var originalFramePath = GetOriginalFramePath(filePath);
+            var originalDimensions = TryReadJpegDimensions(originalFramePath);
+            if (IsUsableDimension(originalDimensions))
+                return originalDimensions;
+        }
+
+        return TryResolveFromOtherWidths(filePath, decodeWidth, GetWidthDirectories());
+    }
+
+    /// <summary>
+    /// Resolves multiple cached dimensions while enumerating width directories only once.
+    /// </summary>
+    public Dictionary<string, (int Width, int Height)> GetCachedDimensions(
+        IReadOnlyCollection<string> filePaths,
+        int decodeWidth,
+        Func<string, bool> preferVideoOriginalFrame,
+        CancellationToken ct)
+    {
+        var widthDirectories = GetWidthDirectories();
+        var dimensions = new Dictionary<string, (int Width, int Height)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var filePath in filePaths)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (string.IsNullOrWhiteSpace(filePath))
+                continue;
+
+            var current = TryLoadMeta(filePath, decodeWidth);
+            if (IsUsableDimension(current))
+            {
+                dimensions[filePath] = current!.Value;
+                continue;
+            }
+
+            var currentThumbnail = TryReadCachedJpegDimensions(filePath, Path.Combine(_cacheRoot, $"w{decodeWidth}"));
+            if (IsUsableDimension(currentThumbnail))
+            {
+                dimensions[filePath] = currentThumbnail!.Value;
+                continue;
+            }
+
+            if (preferVideoOriginalFrame(filePath))
+            {
+                var original = TryReadJpegDimensions(GetOriginalFramePath(filePath));
+                if (IsUsableDimension(original))
+                {
+                    dimensions[filePath] = original!.Value;
+                    continue;
+                }
+            }
+
+            var other = TryResolveFromOtherWidths(filePath, decodeWidth, widthDirectories);
+            if (IsUsableDimension(other))
+                dimensions[filePath] = other!.Value;
+        }
+
+        return dimensions;
+    }
+
     public byte[]? Load(string filePath)
     {
         try
@@ -269,6 +351,157 @@ public class DiskThumbnailCache
         using var md5 = System.Security.Cryptography.MD5.Create();
         var hashBytes = md5.ComputeHash(System.Text.Encoding.UTF8.GetBytes(filePath.ToLowerInvariant()));
         return Convert.ToHexString(hashBytes).ToLowerInvariant() + ".jpg";
+    }
+
+    private (int Width, int Height)? TryLoadMeta(string filePath, int decodeWidth)
+    {
+        return TryLoadMeta(filePath, Path.Combine(_cacheRoot, $"w{decodeWidth}"));
+    }
+
+    private (int Width, int Height)? TryLoadMeta(string filePath, string cacheDirectory)
+    {
+        try
+        {
+            var hashName = GetCacheFileName(filePath);
+            var folderHash = GetFolderHash(filePath);
+            var metaPath = Path.ChangeExtension(Path.Combine(cacheDirectory, folderHash, hashName), ".json");
+            if (!File.Exists(metaPath))
+            {
+                metaPath = Path.ChangeExtension(Path.Combine(cacheDirectory, hashName), ".json");
+                if (!File.Exists(metaPath))
+                    return null;
+            }
+
+            using var stream = File.OpenRead(metaPath);
+            using var document = System.Text.Json.JsonDocument.Parse(stream);
+            var root = document.RootElement;
+            return (root.GetProperty("w").GetInt32(), root.GetProperty("h").GetInt32());
+        }
+        catch { return null; }
+    }
+
+    private (int Width, int Height)? TryReadCachedJpegDimensions(string filePath, string cacheDirectory)
+    {
+        var hashName = GetCacheFileName(filePath);
+        var folderHash = GetFolderHash(filePath);
+        var nested = TryReadJpegDimensions(Path.Combine(cacheDirectory, folderHash, hashName));
+        return IsUsableDimension(nested)
+            ? nested
+            : TryReadJpegDimensions(Path.Combine(cacheDirectory, hashName));
+    }
+
+    private string GetOriginalFramePath(string filePath)
+    {
+        return Path.Combine(_cacheRoot, "video_originals", GetFolderHash(filePath), GetCacheFileName(filePath));
+    }
+
+    private static bool IsUsableDimension((int Width, int Height)? dimensions)
+    {
+        return dimensions is { Width: > 1, Height: > 1 };
+    }
+
+    private (int Width, int Height)? TryResolveFromOtherWidths(
+        string filePath,
+        int decodeWidth,
+        IReadOnlyList<string> widthDirectories)
+    {
+        foreach (var directory in widthDirectories)
+        {
+            if (TryGetDecodeWidth(directory) == decodeWidth)
+                continue;
+
+            var dimensions = TryLoadMeta(filePath, directory);
+            if (IsUsableDimension(dimensions))
+                return dimensions;
+
+            var thumbnailDimensions = TryReadCachedJpegDimensions(filePath, directory);
+            if (IsUsableDimension(thumbnailDimensions))
+                return thumbnailDimensions;
+        }
+
+        return null;
+    }
+
+    private IReadOnlyList<string> GetWidthDirectories()
+    {
+        try
+        {
+            return Directory.Exists(_cacheRoot)
+                ? Directory.EnumerateDirectories(_cacheRoot, "w*").ToArray()
+                : Array.Empty<string>();
+        }
+        catch
+        {
+            return Array.Empty<string>();
+        }
+    }
+
+    private static int TryGetDecodeWidth(string directory)
+    {
+        var name = Path.GetFileName(directory);
+        return name.Length > 1 && name[0] == 'w' && int.TryParse(name.AsSpan(1), out var width)
+            ? width
+            : -1;
+    }
+
+    private static (int Width, int Height)? TryReadJpegDimensions(string filePath)
+    {
+        try
+        {
+            if (!File.Exists(filePath))
+                return null;
+
+            using var stream = File.OpenRead(filePath);
+            if (stream.ReadByte() != 0xFF || stream.ReadByte() != 0xD8)
+                return null;
+
+            while (stream.Position < stream.Length)
+            {
+                var markerPrefix = stream.ReadByte();
+                if (markerPrefix != 0xFF)
+                    return null;
+
+                int marker;
+                do { marker = stream.ReadByte(); } while (marker == 0xFF);
+                if (marker < 0 || marker == 0xD9 || marker == 0xDA)
+                    return null;
+
+                var lengthHigh = stream.ReadByte();
+                var lengthLow = stream.ReadByte();
+                var segmentLength = (lengthHigh << 8) | lengthLow;
+                if (lengthHigh < 0 || lengthLow < 0 || segmentLength < 2)
+                    return null;
+
+                if (IsStartOfFrameMarker(marker))
+                {
+                    if (segmentLength < 8 || stream.ReadByte() < 0)
+                        return null;
+                    var heightHigh = stream.ReadByte();
+                    var heightLow = stream.ReadByte();
+                    var widthHigh = stream.ReadByte();
+                    var widthLow = stream.ReadByte();
+                    if (heightHigh < 0 || heightLow < 0 || widthHigh < 0 || widthLow < 0)
+                        return null;
+
+                    var height = (heightHigh << 8) | heightLow;
+                    var width = (widthHigh << 8) | widthLow;
+                    return width > 0 && height > 0 ? (width, height) : null;
+                }
+
+                stream.Seek(segmentLength - 2, SeekOrigin.Current);
+            }
+        }
+        catch { }
+
+        return null;
+    }
+
+    private static bool IsStartOfFrameMarker(int marker)
+    {
+        return marker is >= 0xC0 and <= 0xC3
+            or >= 0xC5 and <= 0xC7
+            or >= 0xC9 and <= 0xCB
+            or >= 0xCD and <= 0xCF;
     }
 
     private static void MoveCacheFile(string sourcePath, string destinationPath)

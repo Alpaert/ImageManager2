@@ -18,6 +18,42 @@ var search = new TagSearchEngine(repository, messenger, ImagePaging.Default);
 var vm = new MainWindowViewModel(null!, null!, repository, null!, null!, null!, null!, cache, page,
     search, null!, null!, null!, messenger, new ImmediateDispatcher());
 
+var cacheFixtureDirectory = Path.Combine(Path.GetTempPath(), "ImageManager-CachedDimensions-" + Guid.NewGuid().ToString("N"));
+try
+{
+    const string cachedVideo = @"Z:\cache-fixture\video.mp4";
+    var dimensionCache = new ThumbnailCacheService(null!, cacheFixtureDirectory, 200);
+    var currentWidthCache = new DiskThumbnailCache(cacheFixtureDirectory, 200);
+    var otherWidthCache = new DiskThumbnailCache(cacheFixtureDirectory, 320);
+    var originalFrames = new VideoOriginalFrameCacheService(cacheFixtureDirectory);
+    var originalFramePath = originalFrames.GetOriginalFramePath(cachedVideo);
+    Directory.CreateDirectory(Path.GetDirectoryName(originalFramePath)!);
+    await File.WriteAllBytesAsync(originalFramePath, CreateJpegHeader(1920, 1080));
+
+    otherWidthCache.SaveMeta(cachedVideo, 3840, 2160);
+    currentWidthCache.SaveMeta(cachedVideo, 1, 1);
+    Require(dimensionCache.TryResolveCachedDimensions(cachedVideo, 200) == (1920, 1080),
+        "video original frame dimensions must win over invalid current and other-width metadata");
+
+    currentWidthCache.SaveMeta(cachedVideo, 1280, 720);
+    Require(dimensionCache.TryResolveCachedDimensions(cachedVideo, 200) == (1280, 720),
+        "requested width metadata must win over the video original frame");
+
+    File.Delete(Path.ChangeExtension(currentWidthCache.GetCacheFilePath(cachedVideo), ".json"));
+    currentWidthCache.Save(cachedVideo, CreateJpegHeader(640, 360));
+    Require(dimensionCache.TryResolveCachedDimensions(cachedVideo, 200) == (640, 360),
+        "a target thumbnail without JSON metadata must be reused before the video original frame");
+
+    var batchDimensions = await dimensionCache.GetCachedDimensionsAsync([cachedVideo]);
+    Require(batchDimensions.TryGetValue(cachedVideo, out var batchSize) && batchSize == (640, 360),
+        "batched cache resolution must inspect thumbnails without JSON metadata");
+    Console.WriteLine("PASS cached video dimensions reuse target metadata and original frames without source access");
+}
+finally
+{
+    try { Directory.Delete(cacheFixtureDirectory, recursive: true); } catch { }
+}
+
 var firstPage = ImageDisplayRange.ForPage(0, ImagePaging.Default, 401);
 var lastPage = ImageDisplayRange.ForPage(2, ImagePaging.Default, 401);
 Require(firstPage == new ImageDisplayRange(0, 200), "first page range must be bounded by page size");
@@ -345,6 +381,16 @@ Console.WriteLine("PASS delete reconciles a pending reset publication");
 Console.WriteLine("All 8 display-filter integration groups passed.");
 
 static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
+static byte[] CreateJpegHeader(int width, int height) =>
+[
+    0xFF, 0xD8,
+    0xFF, 0xC0,
+    0x00, 0x08,
+    0x08,
+    (byte)(height >> 8), (byte)height,
+    (byte)(width >> 8), (byte)width,
+    0x00
+];
 static void RequireThrows<TException>(Action action, string message) where TException : Exception
 {
     try { action(); }

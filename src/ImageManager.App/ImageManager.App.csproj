@@ -51,9 +51,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Copy ffmpeg binaries to output directory -->
+    <!-- Copy ffmpeg binaries to build and publish output directories. -->
     <None Include="..\..\libffmpeg\**\*.*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
       <Link>libffmpeg\%(RecursiveDir)%(Filename)%(Extension)</Link>
     </None>
   </ItemGroup>

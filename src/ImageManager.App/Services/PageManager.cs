@@ -599,6 +599,33 @@ public class PageManager : IDisposable
         {
             var dimensions = await Task.Run(
                 () => _metaRepo.GetDimensionsByPathsAsync(paths), ct).ConfigureAwait(false);
+            var invalidPaths = paths
+                .Where(path => !dimensions.TryGetValue(path, out var size) || !HasUsableDimensions(size))
+                .ToArray();
+
+            // A previous thumbnail/original-frame extraction already knows the source
+            // dimensions. Reuse that metadata before a thumbnail load can reach FFmpeg.
+            if (invalidPaths.Length > 0)
+            {
+                var cachedDimensions = await _thumbCache
+                    .GetCachedDimensionsAsync(invalidPaths, ct)
+                    .ConfigureAwait(false);
+                var repairs = cachedDimensions
+                    .Where(pair => HasUsableDimensions(pair.Value))
+                    .ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
+
+                foreach (var (path, size) in repairs)
+                    dimensions[path] = size;
+
+                if (repairs.Count > 0)
+                    await _metaRepo.UpdateDimensionsByPathsAsync(repairs).ConfigureAwait(false);
+            }
+
+            // Old video records commonly contain 0x0 or a placeholder 1x1. Neither
+            // represents a real media aspect ratio and must not become a layout input.
+            foreach (var path in paths.Where(path => dimensions.TryGetValue(path, out var size) && !HasUsableDimensions(size)).ToArray())
+                dimensions.Remove(path);
+
             PerfLogger.Log($"[PageMgr] LoadDimensions page={pageIndex} requested={paths.Count} found={dimensions.Count} elapsed={sw.ElapsedMilliseconds}ms");
             return dimensions;
         }
@@ -624,7 +651,7 @@ public class PageManager : IDisposable
             var file = activeFileList[start + i];
             var tags = getTagsForFile(file);
             var hasDimensions = dimensions.TryGetValue(file, out var size) &&
-                                size.Width > 0 && size.Height > 0;
+                                HasUsableDimensions(size);
             list.Add(new ImageViewItem
             {
                 FilePath = file,
@@ -1205,12 +1232,15 @@ public class PageManager : IDisposable
 
     private static void SetDecodedDimensionsIfUnknown(ImageViewItem item, int width, int height)
     {
-        if (item.Width != 1 || item.Height != 1)
+        if (item.Width > 1 && item.Height > 1)
             return;
 
         item.Width = width > 0 ? width : 1920;
         item.Height = height > 0 ? height : 1080;
     }
+
+    private static bool HasUsableDimensions((int Width, int Height) size) =>
+        size.Width > 1 && size.Height > 1;
 
     private void PreloadAdjacentPages(
         int currentPage, int totalPages,

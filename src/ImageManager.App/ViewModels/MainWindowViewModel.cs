@@ -276,6 +276,9 @@ public partial class MainWindowViewModel : ViewModelBase
     // is ready.
     private readonly ContinuousDisplayGeometryBuilder _continuousDisplayGeometryBuilder = new();
     private CancellationTokenSource? _continuousDisplayGeometryCts;
+    private CancellationTokenSource? _continuousDimensionRepairCts;
+    private readonly ConcurrentDictionary<string, (int Width, int Height)> _continuousResolvedDimensions =
+        new(StringComparer.OrdinalIgnoreCase);
     private CancellationTokenSource? _continuousViewportThumbnailCts;
     private ContinuousImageItemSource? _continuousViewportSource;
     private ImageDisplayRange _continuousVisibleRange;
@@ -355,6 +358,8 @@ public partial class MainWindowViewModel : ViewModelBase
         var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _continuousDisplayGeometryCts = cts;
         IsContinuousGeometryBuilding = true;
+        var cachedDimensionRepairs = new ConcurrentDictionary<string, (int Width, int Height)>(StringComparer.OrdinalIgnoreCase);
+        var unresolvedVideoPaths = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
 
         try
         {
@@ -368,29 +373,44 @@ public partial class MainWindowViewModel : ViewModelBase
                     {
                         token.ThrowIfCancellationRequested();
                         var result = await _metaRepo.GetDimensionsByPathsAsync(paths).ConfigureAwait(false);
-                        var missingVideos = paths
-                            .Where(path => FileTypeConstants.IsVideoFile(path) && !result.ContainsKey(path))
-                            .ToArray();
-                        if (missingVideos.Length > 0)
+                        foreach (var path in paths.Where(path => result.TryGetValue(path, out var size) && !HasUsableDimensions(size)).ToArray())
+                            result.Remove(path);
+
+                        // Dimensions discovered by the background repair remain usable
+                        // even when the database had no ImageMeta row to update.
+                        foreach (var path in paths)
                         {
-                            var resolved = new ConcurrentDictionary<string, (int Width, int Height)>(StringComparer.OrdinalIgnoreCase);
-                            await Parallel.ForEachAsync(missingVideos,
-                                new ParallelOptions { MaxDegreeOfParallelism = 2, CancellationToken = token },
-                                async (path, cancellationToken) =>
-                                {
-                                    var size = await VideoThumbnailGenerator.TryGetDisplayDimensionsAsync(path, cancellationToken)
-                                        .ConfigureAwait(false);
-                                    if (size is { Width: > 0, Height: > 0 })
-                                        resolved[path] = size.Value;
-                                }).ConfigureAwait(false);
+                            if ((!result.TryGetValue(path, out var existing) || !HasUsableDimensions(existing))
+                                && _continuousResolvedDimensions.TryGetValue(path, out var size)
+                                && HasUsableDimensions(size))
+                            result[path] = size;
+                        }
 
-                            foreach (var (path, size) in resolved)
+                        var missingPaths = paths
+                            .Where(path => !result.TryGetValue(path, out var size) || !HasUsableDimensions(size))
+                            .ToArray();
+                        if (missingPaths.Length > 0)
+                        {
+                            var cachedDimensions = await _thumbCache
+                                .GetCachedDimensionsAsync(missingPaths, token)
+                                .ConfigureAwait(false);
+                            foreach (var (path, size) in cachedDimensions.Where(pair => HasUsableDimensions(pair.Value)))
+                            {
                                 result[path] = size;
+                                cachedDimensionRepairs[path] = size;
+                            }
 
-                            // This one-time repair makes later continuous layouts and
-                            // paged placeholders agree without overwriting image hashes or tags.
-                            if (resolved.Count > 0)
-                                await _metaRepo.UpdateDimensionsByPathsAsync(resolved).ConfigureAwait(false);
+                            // Publish the geometry from database/cache data now. FFmpeg
+                            // probing is deliberately deferred so a large folder is not
+                            // blank while every uncached video is inspected.
+                            foreach (var path in missingPaths)
+                            {
+                                if (!FileTypeConstants.IsVideoFile(path))
+                                    continue;
+                                if (result.TryGetValue(path, out var size) && HasUsableDimensions(size))
+                                    continue;
+                                unresolvedVideoPaths.TryAdd(path, 0);
+                            }
                         }
                         token.ThrowIfCancellationRequested();
                         return result;
@@ -407,7 +427,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 return false;
             }
 
-            return await _dispatcher.InvokeAsync(() =>
+            var published = await _dispatcher.InvokeAsync(() =>
             {
                 if (cts.IsCancellationRequested
                     || requestVersion != _continuousDisplayGeometryVersion
@@ -426,6 +446,27 @@ public partial class MainWindowViewModel : ViewModelBase
                 previousSource?.ClearCache();
                 return true;
             });
+
+            if (!published)
+                return false;
+
+            if (cachedDimensionRepairs.Count > 0)
+                _ = PersistCachedDimensionsAsync(cachedDimensionRepairs);
+            if (unresolvedVideoPaths.Count > 0)
+            {
+                var repairPaths = unresolvedVideoPaths.Keys.ToArray();
+                await _dispatcher.InvokeAsync(() =>
+                {
+                    if (!cts.IsCancellationRequested
+                        && requestVersion == _continuousDisplayGeometryVersion
+                        && displayFilterVersion == _displayFilterVersion
+                        && DisplayMode == ImageDisplayMode.Continuous)
+                    {
+                        StartContinuousVideoDimensionRepair(repairPaths, requestVersion, displayFilterVersion);
+                    }
+                });
+            }
+            return true;
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
@@ -463,6 +504,8 @@ public partial class MainWindowViewModel : ViewModelBase
         ++_continuousDisplayGeometryVersion;
         _continuousDisplayGeometryCts?.Cancel();
         _continuousDisplayGeometryCts = null;
+        _continuousDimensionRepairCts?.Cancel();
+        _continuousDimensionRepairCts = null;
         CancelContinuousViewportThumbnailLoad();
         IsContinuousGeometryBuilding = false;
 
@@ -471,6 +514,98 @@ public partial class MainWindowViewModel : ViewModelBase
         ContinuousDisplayGeometrySnapshot = null;
         ContinuousDisplayGeometryIndex = null;
     }
+
+    private async Task PersistCachedDimensionsAsync(
+        IReadOnlyDictionary<string, (int Width, int Height)> dimensions)
+    {
+        try
+        {
+            await _metaRepo.UpdateDimensionsByPathsAsync(dimensions).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"Cached dimension persistence failed: {ex.Message}");
+        }
+    }
+
+    private void StartContinuousVideoDimensionRepair(
+        IReadOnlyCollection<string> paths,
+        long requestVersion,
+        long displayFilterVersion)
+    {
+        _continuousDimensionRepairCts?.Cancel();
+        var cts = new CancellationTokenSource();
+        _continuousDimensionRepairCts = cts;
+        _ = RepairContinuousVideoDimensionsAsync(paths, requestVersion, displayFilterVersion, cts);
+    }
+
+    private async Task RepairContinuousVideoDimensionsAsync(
+        IReadOnlyCollection<string> paths,
+        long requestVersion,
+        long displayFilterVersion,
+        CancellationTokenSource cts)
+    {
+        try
+        {
+            var resolved = new ConcurrentDictionary<string, (int Width, int Height)>(StringComparer.OrdinalIgnoreCase);
+            await Parallel.ForEachAsync(paths,
+                new ParallelOptions { MaxDegreeOfParallelism = 2, CancellationToken = cts.Token },
+                async (path, token) =>
+                {
+                    var size = await VideoThumbnailGenerator.TryGetDisplayDimensionsAsync(path, token)
+                        .ConfigureAwait(false);
+                    if (size is { Width: > 1, Height: > 1 })
+                        resolved[path] = size.Value;
+                }).ConfigureAwait(false);
+
+            if (resolved.Count == 0 || cts.IsCancellationRequested)
+                return;
+
+            foreach (var (path, size) in resolved)
+                _continuousResolvedDimensions[path] = size;
+            await _metaRepo.UpdateDimensionsByPathsAsync(resolved).ConfigureAwait(false);
+            if (cts.IsCancellationRequested ||
+                requestVersion != _continuousDisplayGeometryVersion ||
+                displayFilterVersion != _displayFilterVersion ||
+                DisplayMode != ImageDisplayMode.Continuous)
+            {
+                return;
+            }
+
+            await _dispatcher.InvokeAsync(async () =>
+            {
+                if (cts.IsCancellationRequested ||
+                    requestVersion != _continuousDisplayGeometryVersion ||
+                    displayFilterVersion != _displayFilterVersion ||
+                    DisplayMode != ImageDisplayMode.Continuous)
+                {
+                    return;
+                }
+
+                if (ContinuousDisplayRefreshRequested is { } refresh)
+                    await refresh(Math.Max(0, _continuousVisibleRange.StartIndex));
+            }).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"Continuous video dimension repair failed: {ex}");
+        }
+        finally
+        {
+            await _dispatcher.InvokeAsync(() =>
+            {
+                if (ReferenceEquals(_continuousDimensionRepairCts, cts))
+                    _continuousDimensionRepairCts = null;
+            });
+            cts.Dispose();
+        }
+    }
+
+    private static bool HasUsableDimensions((int Width, int Height) size) =>
+        size.Width > 1 && size.Height > 1;
 
     /// <summary>
     /// Coordinates state retained by the continuous panel. The panel has already
