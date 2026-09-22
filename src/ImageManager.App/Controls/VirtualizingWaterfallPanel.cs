@@ -205,7 +205,7 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
         var targetY = Math.Clamp(rect.Y - Math.Max(0, (viewport.Height - rect.Height) / 2), 0, maxY);
         if (viewer is not null)
         {
-            viewer.Offset = new Vector(viewer.Offset.X, targetY);
+            viewer.Offset = new Vector(viewer.Offset.X, GetContentOffsetY(viewer) + targetY);
         }
 
         CancelPendingViewportUpdate();
@@ -304,7 +304,7 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
         {
             return new Rect(
                 viewer.Offset.X,
-                viewer.Offset.Y,
+                Math.Max(0, viewer.Offset.Y - GetContentOffsetY(viewer)),
                 viewer.Viewport.Width,
                 viewer.Viewport.Height);
         }
@@ -314,6 +314,12 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
             : double.IsFinite(availableSize.Width) ? availableSize.Width : 0;
         var height = double.IsFinite(availableSize.Height) ? Math.Min(availableSize.Height, 900) : 900;
         return new Rect(0, 0, Math.Max(0, width), Math.Max(0, height));
+    }
+
+    private double GetContentOffsetY(ScrollViewer viewer)
+    {
+        var transform = this.TransformToVisual(viewer);
+        return transform?.Transform(default).Y + viewer.Offset.Y ?? 0;
     }
 
     private static void MeasureContainer(Control control, ImageDisplayItemRect rect)

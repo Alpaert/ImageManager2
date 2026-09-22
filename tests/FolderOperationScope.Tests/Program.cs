@@ -7,7 +7,10 @@ var tests = new (string Name, Action Run)[]
     ("different directories and similar prefixes do not overlap", DifferentDirectoriesDoNotOverlap),
     ("folder and file scopes honor casing, trailing separators, and selection mode", FolderAndFileScopes),
     ("Windows drive root handles descendants", DriveRootHandlesDescendants),
-    ("UNC share root handles descendants", UncRootHandlesDescendants)
+    ("UNC share root handles descendants", UncRootHandlesDescendants),
+    ("path helpers respect directory boundaries", PathHelpersRespectBoundaries),
+    ("media enumeration and counts honor recursion", MediaEnumerationAndCounts),
+    ("copy and move destinations reject source descendants", CopyMoveDestinationSafety)
 };
 
 var failures = new List<string>();
@@ -94,6 +97,44 @@ static void UncRootHandlesDescendants()
     const string share = @"\\server\share\";
     var child = share + @"folder\child";
     Assert(FolderOperationScope.ForFolder(share, true).Overlaps(FolderOperationScope.ForFolder(child, false)), "UNC share root recursive scope should include child");
+}
+
+static void PathHelpersRespectBoundaries()
+{
+    var parent = Path.Combine(Path.GetTempPath(), "ImageManagerScopeRegression");
+    Assert(FolderContentOperations.IsPathInside(Path.Combine(parent, "child"), parent), "child should be inside parent");
+    Assert(FolderContentOperations.IsPathInside(parent, parent), "same path should be inside itself");
+    Assert(!FolderContentOperations.IsPathInside(parent + "2", parent), "similar prefix must not be inside parent");
+}
+
+static void MediaEnumerationAndCounts()
+{
+    var root = Path.Combine(Path.GetTempPath(), "ImageManagerScopeRegression", Guid.NewGuid().ToString("N"));
+    var child = Path.Combine(root, "child");
+    Directory.CreateDirectory(child);
+    try
+    {
+        File.WriteAllText(Path.Combine(root, "a.JPG"), "image");
+        File.WriteAllText(Path.Combine(root, "notes.txt"), "text");
+        File.WriteAllText(Path.Combine(child, "b.MP4"), "video");
+
+        Assert(FolderContentOperations.GetDisplayCount(root) == 1, "nonrecursive count should include direct media only");
+        Assert(FolderContentOperations.GetDisplayCount(root, true) == 2, "recursive count should include descendants");
+        Assert(FolderContentOperations.EnumerateMediaFiles(root, true).Count == 2, "enumeration should find image and video");
+    }
+    finally
+    {
+        Directory.Delete(root, true);
+    }
+}
+
+static void CopyMoveDestinationSafety()
+{
+    var source = Path.Combine(Path.GetTempPath(), "ImageManagerScopeRegression", "source");
+    Assert(!FolderContentOperations.IsSafeCopyOrMoveDestination(source, source), "same path must be rejected");
+    Assert(!FolderContentOperations.IsSafeCopyOrMoveDestination(source, Path.Combine(source, "child")), "descendant must be rejected");
+    Assert(FolderContentOperations.IsSafeCopyOrMoveDestination(source, source + "2"), "similar prefix should be treated as a distinct path");
+    Assert(FolderContentOperations.IsSafeCopyOrMoveDestination(source, Path.Combine(Path.GetDirectoryName(source)!, "target")), "sibling should be allowed");
 }
 
 static void Assert(bool condition, string message)

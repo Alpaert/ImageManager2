@@ -1,6 +1,7 @@
 <Window xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:ImageManager.App.ViewModels"
+        xmlns:appmodels="using:ImageManager.App.Models"
         xmlns:models="using:ImageManager.Core.Models"
         xmlns:controls="using:ImageManager.App.Controls"
         xmlns:conv="using:ImageManager.App.Converters"
@@ -12,6 +13,7 @@
 
 	<Window.Resources>
 		<conv:ByteArrayToBitmapConverter x:Key="BytesToBitmap"/>
+		<conv:FolderByteArrayToBitmapConverter x:Key="FolderBytesToBitmap"/>
 		<conv:HexToBrushConverter x:Key="HexToBrush"/>
 		<DataTemplate x:Key="ThumbnailItemTemplate" x:DataType="vm:ImageViewItem">
 			<!-- 此处margin数值是缩略框之间间距 -->
@@ -124,6 +126,50 @@
 							CornerRadius="{Binding $parent[Window].DataContext.ThumbnailSelectionCornerRadius}"
 							IsVisible="{Binding IsSelected}"
 							IsHitTestVisible="False"/>
+				</Grid>
+			</Border>
+		</DataTemplate>
+
+		<!-- Folder cards use the shared FolderViewItem projection; the attached panel
+		     width keeps each card responsive while preserving a square cell. -->
+        <DataTemplate x:Key="FolderCardTemplate" x:DataType="appmodels:FolderViewItem">
+			<Border Width="{Binding $self.(controls:ResponsiveFolderGridPanel.ItemWidth)}"
+					Height="{Binding $self.(controls:ResponsiveFolderGridPanel.ItemWidth)}"
+					MinWidth="150" MinHeight="150" Margin="5" Padding="0"
+					Background="{DynamicResource SurfaceBrush}"
+					BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1"
+					CornerRadius="6"
+					PointerPressed="FolderCard_PointerPressed"
+					DoubleTapped="FolderCard_DoubleTapped">
+				<Border.ContextMenu>
+					<ContextMenu Opened="FolderCardContextMenu_Opened">
+						<!-- Folder-only actions intentionally omit image-only commands. -->
+						<MenuItem Header="清空所选图片/文件夹的标签…" Click="FolderCardClearTags_Click"/>
+						<MenuItem Header="重新生成缩略图" Click="FolderCardRegenerateThumbnail_Click"/>
+						<MenuItem Header="在资源管理器中打开" Click="FolderCardOpenInExplorer_Click"/>
+						<Separator/>
+						<MenuItem Header="删除文件夹" Click="FolderCardDelete_Click"/>
+						<Separator/>
+						<MenuItem Header="复制到其他文件夹…" Click="FolderCardCopy_Click"/>
+						<MenuItem Header="移动到其他文件夹…" Click="FolderCardMove_Click"/>
+					</ContextMenu>
+				</Border.ContextMenu>
+				<Grid RowDefinitions="*,Auto,Auto" MinHeight="150">
+					<Border Grid.Row="0" Margin="5" CornerRadius="4" ClipToBounds="True"
+							Background="{DynamicResource InputBgBrush}">
+						<Image Source="{ReflectionBinding ThumbnailData, Converter={StaticResource FolderBytesToBitmap}}"
+							   Stretch="UniformToFill"/>
+					</Border>
+							<TextBlock Grid.Row="1" Text="{ReflectionBinding DisplayName}"
+							   Margin="8,2,8,0" FontWeight="SemiBold"
+							   TextTrimming="CharacterEllipsis" HorizontalAlignment="Center"/>
+						<TextBlock Grid.Row="2" Text="{ReflectionBinding MediaCountText}"
+							   Margin="8,0,8,7" FontSize="11"
+							   Foreground="{DynamicResource MutedFgBrush}"
+							   HorizontalAlignment="Center"/>
+					<!-- Match media cards: selection is an overlay so it never changes card layout. -->
+					<Border Grid.RowSpan="3" BorderBrush="#FF3D7FFF" BorderThickness="4" CornerRadius="6"
+							IsVisible="{ReflectionBinding IsSelected}" IsHitTestVisible="False"/>
 				</Grid>
 			</Border>
 		</DataTemplate>
@@ -557,14 +603,69 @@
             </StackPanel>
         </Border>
 
-        <!-- Image Grid Area -->
-        <ScrollViewer x:Name="ThumbnailScrollViewer" Grid.Row="5" Grid.Column="1">
-            <Grid x:Name="ImagePanelHost"
+		<!-- The breadcrumb is deliberately outside the scrolling content so it remains
+		     visible while folders and media move beneath it. -->
+        <Grid Grid.Row="5" Grid.Column="1" RowDefinitions="Auto,*">
+			<Border x:Name="FolderBreadcrumbBar" Grid.Row="0" Margin="5,5,5,0"
+					Padding="6,4" Background="{DynamicResource SurfaceBrush}"
+					BorderBrush="{DynamicResource CtrlBorderBrush}" BorderThickness="1"
+					CornerRadius="4" IsVisible="{ReflectionBinding HasBreadcrumbs}">
+				<ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+					<StackPanel Orientation="Horizontal" Spacing="2" VerticalAlignment="Center">
+						<TextBlock Text="&#xE8B7;" FontFamily="Segoe MDL2 Assets" FontSize="15"
+								   Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center"
+								   Margin="2,0,4,0"/>
+						<ItemsControl ItemsSource="{ReflectionBinding FolderBreadcrumbs}">
+							<ItemsControl.ItemsPanel>
+								<ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate>
+							</ItemsControl.ItemsPanel>
+							<ItemsControl.ItemTemplate>
+								<DataTemplate>
+									<StackPanel Orientation="Horizontal" Spacing="2">
+										<TextBlock Text="&#xE76C;" FontFamily="Segoe MDL2 Assets" FontSize="11"
+												   Foreground="{DynamicResource MutedFgBrush}" VerticalAlignment="Center"/>
+										<Button Classes="toolbar-compact" Padding="5,2" Click="FolderBreadcrumb_Click"
+												ToolTip.Tip="{ReflectionBinding Path}">
+											<TextBlock Text="{ReflectionBinding DisplayName}" MaxWidth="180"
+													   TextTrimming="CharacterEllipsis"/>
+										</Button>
+									</StackPanel>
+								</DataTemplate>
+							</ItemsControl.ItemTemplate>
+						</ItemsControl>
+					</StackPanel>
+				</ScrollViewer>
+			</Border>
+
+			<!-- A single content surface: folders and media scroll together. -->
+        <ScrollViewer x:Name="ThumbnailScrollViewer" Grid.Row="1">
+            <Grid x:Name="ImagePanelHost" RowDefinitions="Auto,Auto,*"
                   Background="Transparent"
                   PointerPressed="ImagePanelHost_PointerPressed"
                   PointerMoved="ImagePanelHost_PointerMoved"
                   PointerReleased="ImagePanelHost_PointerReleased">
-                <ItemsControl x:Name="ItemsImages" ItemsSource="{Binding Images}"
+				<!-- Direct child folders share the current thumbnail zoom baseline. -->
+				<StackPanel Grid.Row="0" Margin="3,0,3,4" IsVisible="{ReflectionBinding ShowFolderSection}">
+					<TextBlock Text="文件夹" Margin="8,5,8,1" FontWeight="SemiBold"
+							   Foreground="{DynamicResource SecondaryFgBrush}"/>
+					<ItemsControl x:Name="ItemsFolders" ItemsSource="{ReflectionBinding FolderItems}"
+								  ItemTemplate="{StaticResource FolderCardTemplate}">
+							<ItemsControl.ItemsPanel>
+								<ItemsPanelTemplate>
+									<controls:ResponsiveFolderGridPanel
+										MinItemWidth="{Binding $parent[Window].DataContext.ThumbnailBaseWidth}"
+										ItemSpacing="10" ItemAspectRatio="1"/>
+								</ItemsPanelTemplate>
+							</ItemsControl.ItemsPanel>
+						</ItemsControl>
+				</StackPanel>
+
+				<Border Grid.Row="1" Margin="8,4,8,1" IsVisible="{ReflectionBinding ShowFolderSection}">
+					<TextBlock Text="媒体文件" FontWeight="SemiBold"
+							   Foreground="{DynamicResource SecondaryFgBrush}"/>
+				</Border>
+
+                <ItemsControl x:Name="ItemsImages" Grid.Row="2" ItemsSource="{Binding Images}"
                               ItemTemplate="{StaticResource ThumbnailItemTemplate}">
                 <ItemsControl.ItemsPanel>
                     <ItemsPanelTemplate>
@@ -575,7 +676,7 @@
                 </ItemsControl.ItemsPanel>
             </ItemsControl>
 
-                <ItemsControl x:Name="ContinuousItemsImages"
+                <ItemsControl x:Name="ContinuousItemsImages" Grid.Row="2"
                               ItemsSource="{Binding ContinuousImageItemSource}"
                               ItemTemplate="{StaticResource ThumbnailItemTemplate}"
                               IsVisible="False">
@@ -590,6 +691,7 @@
 
                 <!-- Selection rectangle overlay -->
                 <Rectangle x:Name="SelectionRectangle"
+					   Grid.RowSpan="3"
                            Stroke="#FF3D7FFF" StrokeThickness="1"
                            Fill="#403D7FFF"
                            IsVisible="False"
@@ -598,6 +700,7 @@
                            VerticalAlignment="Top"/>
             </Grid>
         </ScrollViewer>
+		</Grid>
 
     </Grid>
 </Window>

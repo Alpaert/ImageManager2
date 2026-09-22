@@ -1177,6 +1177,8 @@ public partial class MainWindowViewModel : ViewModelBase
         CurrentPage = 0;
         TotalPages = 0;
         CurrentFolder = folder;
+        _ = RefreshFolderItemsAsync(folderWorkToken);
+        OnPropertyChanged(nameof(FolderBreadcrumbs));
         StartWatchingCurrentFolder();
         PerfLogger.Log($"[LoadFolder] 1-cleanup done {sw.ElapsedMilliseconds}ms");
         AppLogger.Memory($"LoadFolder.Cleanup {Path.GetFileName(folder)}");
@@ -1439,14 +1441,14 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void OnFolderFileCreated(object sender, FileSystemEventArgs e)
     {
-        QueueFolderRefreshForWatcherEvent(e);
+        QueueFolderRefreshForWatcherEvent(e, force: Directory.Exists(e.FullPath));
     }
 
     private void OnFolderFileDeleted(object sender, FileSystemEventArgs e)
     {
         if (FileTypeConstants.IsMediaFile(e.FullPath))
             _thumbCache.InvalidateThumbnail(e.FullPath);
-        QueueFolderRefreshForWatcherEvent(e);
+        QueueFolderRefreshForWatcherEvent(e, force: Directory.Exists(e.FullPath) || !FileTypeConstants.IsMediaFile(e.FullPath));
     }
 
     private void OnFolderFileRenamed(object sender, RenamedEventArgs e)
@@ -1478,6 +1480,8 @@ public partial class MainWindowViewModel : ViewModelBase
             await _dispatcher.InvokeAsync(async () =>
             {
                 await RefreshCurrentFolderFromDiskAsync("watcher");
+                if (!ShowAllSubfolders)
+                    await RefreshFolderItemsAsync(token);
             });
         });
     }
@@ -2280,6 +2284,7 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         InvalidateContinuousDisplayGeometry();
         OnPropertyChanged(nameof(GridThumbnailHeight));
+        _ = RefreshFolderCardThumbnailsForCurrentScaleAsync();
     }
     partial void OnShowFileNameChanged(bool value) => OnPropertyChanged(nameof(ShowAnyThumbnailText));
     partial void OnShowTagsChanged(bool value) => OnPropertyChanged(nameof(ShowAnyThumbnailText));
@@ -2328,10 +2333,12 @@ partial void OnCornerRadiusDipChanged(double value)
     partial void OnShowAllSubfoldersChanged(bool value)
     {
         if (value) SearchScope = 1; // auto-switch to recursive
+        OnPropertyChanged(nameof(ShowFolderSection));
         if (string.IsNullOrEmpty(CurrentFolder)) return;
         var requestVersion = BeginFolderViewRequest();
         var folderWorkToken = BeginFolderWorkScope(CurrentFolder);
         var folder = CurrentFolder;
+        _ = RefreshFolderItemsAsync(folderWorkToken);
         _ = RebuildFileListAsync(requestVersion, folder, value, folderWorkToken);
     }
 
@@ -2446,10 +2453,14 @@ partial void OnCornerRadiusDipChanged(double value)
         // 1. 构建路径层级列表
         var parts = new List<string>();
         var current = targetPath;
-        while (!string.IsNullOrEmpty(current) && current.Length > 3)
+        while (!string.IsNullOrEmpty(current))
         {
             parts.Insert(0, current);
-            current = Path.GetDirectoryName(current) ?? "";
+            var parent = Path.GetDirectoryName(current);
+            if (string.IsNullOrEmpty(parent) ||
+                string.Equals(NormalizePath(parent), NormalizePath(current), StringComparison.OrdinalIgnoreCase))
+                break;
+            current = parent;
         }
 
         if (parts.Count == 0)
@@ -2564,20 +2575,10 @@ partial void OnCornerRadiusDipChanged(double value)
             // 2. syncSelection=true: 需要选中节点，滚动确保可见
             if (forceScroll || syncSelection)
             {
-                // Allow time for the TreeView to expand and render, especially when
-                // loading large sub-trees from DB for the first time.
-                await Task.Delay(200);
-                for (int retry = 0; retry < 5; retry++)
-                {
-                    if (isCurrent?.Invoke() == false)
-                        return currentNode;
-
-                    await _dispatcher.InvokeAsync(
-                        () => TreeScrollToNodeRequested?.Invoke(currentNode));
-
-                    if (retry < 4)
-                        await Task.Delay(200 * (retry + 1));  // 200, 400, 600, 800ms
-                }
+                // The view owns any container-materialization retries. Waiting here
+                // serialized folder navigation behind up to several seconds of UI
+                // delays before media loading could start.
+                await _dispatcher.InvokeAsync(() => TreeScrollToNodeRequested?.Invoke(currentNode));
             }
         }
 

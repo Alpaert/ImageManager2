@@ -30,7 +30,7 @@ internal sealed class FolderOperationScope
         : _recursive ? IsDescendant(file, _folder) : Same(Normalize(Path.GetDirectoryName(file)!), _folder);
 
     private static bool IsDescendant(string path, string folder) =>
-        path.StartsWith(folder + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+        FolderContentOperations.IsPathInside(path, folder) && !Same(path, folder);
 
     private static bool Same(string left, string right) => string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
     private static string Normalize(string path) => Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);

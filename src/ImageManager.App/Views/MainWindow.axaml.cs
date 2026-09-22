@@ -801,6 +801,24 @@ public partial class MainWindow : Window
     private bool _isDraggingSelection;
     private Point _selectionStartPoint;
 
+    private FolderViewItem? _selectedFolderCard;
+
+    private void ClearSelectedFolderCard()
+    {
+        if (_selectedFolderCard == null) return;
+        _selectedFolderCard.IsSelected = false;
+        _selectedFolderCard = null;
+    }
+
+    private void SelectFolderCard(FolderViewItem folder)
+    {
+        if (ReferenceEquals(_selectedFolderCard, folder)) return;
+        ClearSelectedFolderCard();
+        _selectedFolderCard = folder;
+        folder.IsSelected = true;
+        Vm.ReplaceSelectedFiles(Array.Empty<string>());
+    }
+
     private void ImagePanelHost_PointerPressed(object? sender, Avalonia.Input.PointerPressedEventArgs e)
     {
         CloseHoverPreview();
@@ -808,8 +826,9 @@ public partial class MainWindow : Window
         var source = e.Source as Avalonia.Controls.Control;
         while (source != null)
         {
-            if (source is Avalonia.Controls.Border b && b.DataContext is ImageViewItem)
-                return; // Clicked on a thumbnail — handled by Thumbnail_PointerPressed
+            if (source is Avalonia.Controls.Border b &&
+                (b.DataContext is ImageViewItem || b.DataContext is FolderViewItem))
+                return; // Thumbnail/folder card handlers own their pointer gestures.
             source = source.Parent as Avalonia.Controls.Control;
         }
 
@@ -826,6 +845,7 @@ public partial class MainWindow : Window
 
         // Clear the canonical selection; recycled continuous items project this on realization.
         Vm.ReplaceSelectedFiles(Array.Empty<string>());
+        ClearSelectedFolderCard();
 
         SelectionRectangle.IsVisible = true;
         SelectionRectangle.Width = 0;
@@ -886,6 +906,8 @@ public partial class MainWindow : Window
     {
         if (sender is not Avalonia.Controls.Border border) return;
         if (border.DataContext is not ImageViewItem item) return;
+
+        ClearSelectedFolderCard();
 
         CloseHoverPreview();
 
@@ -2200,6 +2222,249 @@ public partial class MainWindow : Window
 
     private ViewModels.FolderTreeNode? _rightClickedFolder;
 
+    // Folder cards are intentionally consumed through a small reflection-based
+    // adapter until FolderViewItem and its commands are part of the VM contract.
+    private string? _folderCardPath;
+    private string? _folderCardName;
+
+    private static string? GetObjectString(object? value, string propertyName)
+    {
+        if (value == null) return null;
+        try
+        {
+            return value.GetType().GetProperty(propertyName)?.GetValue(value)?.ToString();
+        }
+        catch { return null; }
+    }
+
+    private double GetMediaContentOffsetY()
+    {
+        var transform = ItemsImages.TransformToVisual(ThumbnailScrollViewer);
+        return transform?.Transform(default).Y + ThumbnailScrollViewer.Offset.Y ?? 0;
+    }
+
+    private async Task<bool> TryOpenFolderPathAsync(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        await Vm.OpenFolderFromCardAsync(path);
+        return true;
+    }
+
+    private FolderViewItem? CaptureFolderCard(object? source)
+    {
+        var control = source as Control;
+        var data = control?.DataContext;
+        // Menu items live in a popup, so their DataContext is not the card. Resolve
+        // the placement target every time a command is invoked instead of relying on
+        // an earlier pointer event (which can be stale after card virtualization).
+        for (var ancestor = control; data is not FolderViewItem && ancestor != null; ancestor = ancestor.Parent as Control)
+        {
+            if (ancestor is ContextMenu contextMenu)
+                data = contextMenu.PlacementTarget?.DataContext;
+        }
+
+        if (data is not FolderViewItem folder)
+            return null;
+
+        _folderCardPath = GetObjectString(data, "Path");
+        _folderCardName = GetObjectString(data, "DisplayName") ??
+                          (string.IsNullOrWhiteSpace(_folderCardPath) ? null : Path.GetFileName(_folderCardPath));
+        if (!string.IsNullOrWhiteSpace(_folderCardPath))
+        {
+            _rightClickedFolder = new FolderTreeNode
+            {
+                Path = _folderCardPath,
+                DisplayName = _folderCardName ?? _folderCardPath,
+                DbId = 0
+            };
+        }
+        return folder;
+    }
+
+    private async void FolderCard_DoubleTapped(object? sender, TappedEventArgs e)
+    {
+        CaptureFolderCard(sender);
+        if (await TryOpenFolderPathAsync(_folderCardPath))
+            e.Handled = true;
+    }
+
+    private void FolderCard_PointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (sender is not Control control) return;
+        var point = e.GetCurrentPoint(control);
+        var folder = CaptureFolderCard(sender);
+        if (folder == null) return;
+
+        if (point.Properties.IsLeftButtonPressed || point.Properties.IsRightButtonPressed)
+            SelectFolderCard(folder);
+    }
+
+    private async void FolderBreadcrumb_Click(object? sender, RoutedEventArgs e)
+    {
+        var item = (sender as Button)?.DataContext;
+        await TryOpenFolderPathAsync(GetObjectString(item, "Path"));
+    }
+
+    private void FolderCardContextMenu_Opened(object? sender, RoutedEventArgs e)
+    {
+        var folder = CaptureFolderCard((sender as ContextMenu)?.PlacementTarget);
+        if (folder != null)
+            SelectFolderCard(folder);
+    }
+
+    private void FolderCardClearTags_Click(object? sender, RoutedEventArgs e)
+    {
+        CaptureFolderCard(sender);
+        if (_rightClickedFolder == null) return;
+        MenuClearFolderTags_Click(sender, e);
+    }
+
+    private async void FolderCardRegenerateThumbnail_Click(object? sender, RoutedEventArgs e)
+    {
+        CaptureFolderCard(sender);
+        if (string.IsNullOrWhiteSpace(_folderCardPath)) return;
+        var recursive = await Settings.FolderActionDialog.ShowScopeAsync(
+            this, "重新生成缩略图", _folderCardName ?? "文件夹", _folderCardPath,
+            "选择要重新生成缩略图的文件夹范围。", "开始生成", true);
+        if (recursive == null) return;
+        var paths = FolderContentOperations.EnumerateMediaFiles(_folderCardPath, recursive.Value);
+        var items = CreateTemporaryImageItems(paths);
+        await App.Services.GetRequiredService<PageManager>().RegenerateThumbnailsAsync(items);
+        await Vm.RefreshFolderItemsAsync();
+        Vm.StatusText = $"已重新生成 {items.Count} 个缩略图";
+    }
+
+    private void FolderCardOpenInExplorer_Click(object? sender, RoutedEventArgs e)
+    {
+        CaptureFolderCard(sender);
+        if (!string.IsNullOrWhiteSpace(_folderCardPath) && Directory.Exists(_folderCardPath))
+            OpenInExplorer(_folderCardPath);
+    }
+
+    private async void FolderCardDelete_Click(object? sender, RoutedEventArgs e)
+    {
+        CaptureFolderCard(sender);
+        if (string.IsNullOrWhiteSpace(_folderCardPath) || !Directory.Exists(_folderCardPath)) return;
+        var ok = await Settings.FolderActionDialog.ShowConfirmAsync(
+            this, "删除文件夹", _folderCardName ?? "文件夹", _folderCardPath,
+            "将从磁盘删除该文件夹及其中的全部内容，此操作不可撤销。", "删除");
+        if (!ok) return;
+
+        var path = _folderCardPath;
+        try
+        {
+            Vm.SuppressDeletedEvent();
+            await Task.Run(() => Directory.Delete(path, recursive: true));
+            await Vm.RefreshFolderTreeAsync();
+            await Vm.RefreshFolderItemsAsync();
+            if (string.Equals(Vm.CurrentFolder, path, StringComparison.OrdinalIgnoreCase))
+                await Vm.LoadFolderAsync(Path.GetDirectoryName(path) ?? Vm.CurrentFolder);
+            else
+                await Vm.SyncCurrentFolderAsync();
+            Vm.StatusText = $"已删除文件夹：{Path.GetFileName(path)}";
+        }
+        catch (Exception ex)
+        {
+            Vm.StatusText = $"删除文件夹失败：{ex.Message}";
+        }
+        finally
+        {
+            Vm.RestoreDeletedEvent();
+        }
+    }
+
+    private async void FolderCardCopy_Click(object? sender, RoutedEventArgs e)
+    {
+        CaptureFolderCard(sender);
+        if (string.IsNullOrWhiteSpace(_folderCardPath) || !Directory.Exists(_folderCardPath)) return;
+        var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+        {
+            Title = "选择要复制到的目标文件夹", AllowMultiple = false
+        });
+        if (folders.Count == 0) return;
+        var targetRoot = folders[0].Path.LocalPath;
+        if (!FolderContentOperations.IsSafeCopyOrMoveDestination(_folderCardPath, targetRoot))
+        {
+            Vm.StatusText = "不能复制到文件夹自身或其子文件夹";
+            return;
+        }
+        var destination = Path.Combine(targetRoot, Path.GetFileName(_folderCardPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)));
+        try
+        {
+            await Task.Run(() => CopyDirectory(_folderCardPath, destination));
+            await Vm.RefreshFolderItemsAsync();
+            Vm.StatusText = $"已复制文件夹到：{targetRoot}";
+        }
+        catch (Exception ex) { Vm.StatusText = $"复制文件夹失败：{ex.Message}"; }
+    }
+
+    private async void FolderCardMove_Click(object? sender, RoutedEventArgs e)
+    {
+        CaptureFolderCard(sender);
+        if (string.IsNullOrWhiteSpace(_folderCardPath) || !Directory.Exists(_folderCardPath)) return;
+        var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+        {
+            Title = "选择要移动到的目标文件夹", AllowMultiple = false
+        });
+        if (folders.Count == 0) return;
+        var targetRoot = folders[0].Path.LocalPath;
+        if (!FolderContentOperations.IsSafeCopyOrMoveDestination(_folderCardPath, targetRoot))
+        {
+            Vm.StatusText = "不能移动到文件夹自身或其子文件夹";
+            return;
+        }
+        var destination = Path.Combine(targetRoot, Path.GetFileName(_folderCardPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)));
+        try
+        {
+            var sourcePath = _folderCardPath;
+            var movedPaths = FolderContentOperations.EnumerateMediaFiles(sourcePath, recursive: true)
+                .ToDictionary(
+                    oldPath => oldPath,
+                    oldPath => destination + oldPath[sourcePath.Length..],
+                    StringComparer.OrdinalIgnoreCase);
+            Vm.SuppressDeletedEvent();
+            await Task.Run(() => Directory.Move(sourcePath, destination));
+            try
+            {
+                await Vm.UpdateMovedMediaPathsAsync(movedPaths);
+            }
+            catch
+            {
+                await Task.Run(() => Directory.Move(destination, sourcePath));
+                throw;
+            }
+            await Vm.RefreshFolderTreeAsync();
+            await Vm.LoadFolderAsync(Vm.CurrentFolder);
+            Vm.StatusText = $"已移动文件夹到：{targetRoot}";
+        }
+        catch (Exception ex) { Vm.StatusText = $"移动文件夹失败：{ex.Message}"; }
+        finally { Vm.RestoreDeletedEvent(); }
+    }
+
+    private static void CopyDirectory(string source, string destination)
+    {
+        if ((File.GetAttributes(source) & FileAttributes.ReparsePoint) != 0)
+            throw new IOException("不支持复制包含目录联接或符号链接的文件夹");
+        Directory.CreateDirectory(destination);
+        foreach (var file in Directory.EnumerateFiles(source))
+            File.Copy(file, Path.Combine(destination, Path.GetFileName(file)), overwrite: false);
+        foreach (var directory in Directory.EnumerateDirectories(source))
+        {
+            if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) != 0)
+                throw new IOException("不支持复制包含目录联接或符号链接的文件夹");
+            CopyDirectory(directory, Path.Combine(destination, Path.GetFileName(directory)));
+        }
+    }
+
+    private async Task ShowFolderScopePlaceholderAsync(string title, string description, string action)
+    {
+        if (string.IsNullOrWhiteSpace(_folderCardPath)) return;
+        var recursive = await Settings.FolderActionDialog.ShowScopeAsync(
+            this, title, _folderCardName ?? "文件夹", _folderCardPath, description, action, true);
+        if (recursive != null)
+            Vm.StatusText = description;
+    }
+
     private ViewModels.FolderTreeNode? GetContextMenuFolder(object? sender)
     {
         return _rightClickedFolder ?? LstFolders.SelectedItem as ViewModels.FolderTreeNode;
@@ -2966,7 +3231,8 @@ public partial class MainWindow : Window
                 if (viewportH <= 0) { failReason = "no-viewport"; return false; }
 
                 var maxOffset = Math.Max(0, extentH - viewportH);
-                var target = Math.Max(0, Math.Min(maxOffset, y - (viewportH - h) / 2));
+                var target = Math.Max(0, Math.Min(maxOffset,
+                    GetMediaContentOffsetY() + y - (viewportH - h) / 2));
                 ThumbnailScrollViewer.Offset = new Vector(0, target);
                 System.Diagnostics.Debug.WriteLine(
                     $"[ImageScroll] OK attempt={attempt} y={y:F1} h={h:F1} target={target:F1} ext={extentH:F1} vp={viewportH:F1}");

@@ -208,7 +208,19 @@ public class SmartWaterfallPanel : Panel
     {
         if (_scrollViewer == null || _viewportHeight <= 0) return true;
         double buf = h * 2; // 2-row buffer zone
-        return y + h >= _scrollOffsetY - buf && y <= _scrollOffsetY + _viewportHeight + buf;
+        // The panel can begin after folder cards in a shared ScrollViewer.
+        // Convert the viewer's content offset into this panel's local space.
+        var localOffset = _scrollOffsetY - GetContentOffsetY();
+        return y + h >= localOffset - buf && y <= localOffset + _viewportHeight + buf;
+    }
+
+    private double GetContentOffsetY()
+    {
+        if (_scrollViewer == null)
+            return 0;
+
+        var transform = this.TransformToVisual(_scrollViewer);
+        return transform?.Transform(default).Y + _scrollViewer.Offset.Y ?? 0;
     }
 
     /// <summary>

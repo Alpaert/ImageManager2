@@ -125,13 +125,6 @@ public class ThumbnailCacheService : IThumbnailCacheService
             return new(null, 0, 0, ThumbnailCacheSource.Missing, 0, 0, 0, 0);
 
         var isVideo = FileTypeConstants.IsVideoFile(filePath);
-
-        if (decodeWidth != DecodeWidth)
-        {
-            DecodeWidth = decodeWidth;
-            _diskCache.DecodeWidth = decodeWidth;
-        }
-
         if (_index.TryGetValue(filePath, out var node)
             && node.Value.Data != null
             && node.Value.DecodeWidth == decodeWidth)
@@ -144,8 +137,13 @@ public class ThumbnailCacheService : IThumbnailCacheService
                 ThumbnailCacheSource.Memory, lookupMs, 0, 0, 0);
         }
 
+        // DiskThumbnailCache keeps its width as mutable state. A request-local
+        // instance prevents concurrent zoom/folder requests from writing to a
+        // different width directory after an awaited decode.
+        var diskCache = new DiskThumbnailCache(CacheDirectory, decodeWidth);
+
         var diskRead = Stopwatch.StartNew();
-        var cached = _diskCache.Load(filePath);
+        var cached = diskCache.Load(filePath);
         var diskReadMs = diskRead.ElapsedMilliseconds;
         if (cached != null)
             LogSlow("disk", diskReadMs, 50);
@@ -153,11 +151,11 @@ public class ThumbnailCacheService : IThumbnailCacheService
         {
             if (isVideo) PerfLogger.Log($"[Cache] DISK HIT {Path.GetFileName(filePath)}");
 
-            var meta = _diskCache.LoadMeta(filePath);
+            var meta = diskCache.LoadMeta(filePath);
             if (isVideo && IsLegacyVideoPlaceholder(cached, decodeWidth, meta))
             {
                 PerfLogger.Log($"[Cache] DROP legacy placeholder {Path.GetFileName(filePath)} w={decodeWidth}");
-                _diskCache.DeleteCurrentWidth(filePath);
+                diskCache.DeleteCurrentWidth(filePath);
             }
             else if (meta.HasValue)
             {
@@ -171,7 +169,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
                 if (w > 0 && h > 0)
                 {
                     var metaWrite = Stopwatch.StartNew();
-                    _diskCache.SaveMeta(filePath, w, h);
+                    diskCache.SaveMeta(filePath, w, h);
                     var metaWriteMs = metaWrite.ElapsedMilliseconds;
                     LogSlow("write", metaWriteMs, 50);
                     var metaLruMs = AddToMemory(filePath, cached, decodeWidth, w, h);
@@ -184,7 +182,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
                 var processor = _factory.GetProcessor(filePath);
                 (w, h) = processor.GetDimensions(filePath);
                 var write = Stopwatch.StartNew();
-                _diskCache.SaveMeta(filePath, w, h);
+                diskCache.SaveMeta(filePath, w, h);
                 var writeMs = write.ElapsedMilliseconds;
                 LogSlow("write", writeMs, 50);
                 var lruMs = AddToMemory(filePath, cached, decodeWidth, w, h);
@@ -206,8 +204,8 @@ public class ThumbnailCacheService : IThumbnailCacheService
         {
             var lruMs = AddToMemory(filePath, result.Data, decodeWidth, result.Width, result.Height);
             var write = Stopwatch.StartNew();
-            _diskCache.Save(filePath, result.Data);
-            _diskCache.SaveMeta(filePath, result.Width, result.Height);
+            diskCache.Save(filePath, result.Data);
+            diskCache.SaveMeta(filePath, result.Width, result.Height);
             var writeMs = write.ElapsedMilliseconds;
             LogSlow("write", writeMs, 50);
             return new(result.Data, result.Width, result.Height,
@@ -232,26 +230,22 @@ public class ThumbnailCacheService : IThumbnailCacheService
             return (node.Value.Data, node.Value.Width, node.Value.Height);
         }
 
-        if (decodeWidth != DecodeWidth)
-        {
-            DecodeWidth = decodeWidth;
-            _diskCache.DecodeWidth = decodeWidth;
-        }
+        var diskCache = new DiskThumbnailCache(CacheDirectory, decodeWidth);
 
-        if (!_diskCache.Exists(filePath))
+        if (!diskCache.Exists(filePath))
         {
             if (isVideo) PerfLogger.Log($"[Cache] WARM ONLY SKIP {Path.GetFileName(filePath)} w={decodeWidth}");
             return (null, 0, 0);
         }
 
-        var cached = _diskCache.Load(filePath);
+        var cached = diskCache.Load(filePath);
         if (cached == null)
             return (null, 0, 0);
 
-        var meta = _diskCache.LoadMeta(filePath);
+        var meta = diskCache.LoadMeta(filePath);
         if (isVideo && IsLegacyVideoPlaceholder(cached, decodeWidth, meta))
         {
-            _diskCache.DeleteCurrentWidth(filePath);
+            diskCache.DeleteCurrentWidth(filePath);
             return (null, 0, 0);
         }
 
@@ -265,7 +259,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
         if (w <= 0 || h <= 0)
             return (null, 0, 0);
 
-        _diskCache.SaveMeta(filePath, w, h);
+        diskCache.SaveMeta(filePath, w, h);
         AddToMemory(filePath, cached, decodeWidth, w, h);
         return (cached, w, h);
     }
