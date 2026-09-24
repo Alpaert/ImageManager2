@@ -19,7 +19,14 @@ public partial class MainWindowViewModel
     private ObservableCollection<FolderViewItem> _folderItems = new();
 
     public bool HasFolderItems => FolderItems.Count > 0;
-    public bool ShowFolderSection => !ShowAllSubfolders && HasFolderItems;
+    // Similarity jump navigation stays in the normal media view, so it cannot
+    // rely on IsShowingSearchResult alone to hide a potentially huge folder grid.
+    public bool ShowFolderSection =>
+        !IsShowingSearchResult && _similarityScores.Count == 0 &&
+        !ShowAllSubfolders && HasFolderItems;
+
+    private void NotifyFolderSectionSearchStateChanged() =>
+        OnPropertyChanged(nameof(ShowFolderSection));
 
     public IReadOnlyList<FolderTreeNode> FolderBreadcrumbs
     {

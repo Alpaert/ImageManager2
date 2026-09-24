@@ -2342,6 +2342,11 @@ partial void OnCornerRadiusDipChanged(double value)
         _ = RebuildFileListAsync(requestVersion, folder, value, folderWorkToken);
     }
 
+    partial void OnIsShowingSearchResultChanged(bool value)
+    {
+        NotifyFolderSectionSearchStateChanged();
+    }
+
     partial void OnFolderSearchTextChanged(string value)
     {
         FolderSearchSuggestions.Clear();
@@ -3070,6 +3075,7 @@ partial void OnCornerRadiusDipChanged(double value)
         _tagSearch.SearchResultFiles.Clear();
         _similarityScores.Clear();
         _similarityMatchKinds.Clear();
+        NotifyFolderSectionSearchStateChanged();
         await RebuildDisplayFilterAsync();
     }
 
@@ -3225,6 +3231,7 @@ partial void OnCornerRadiusDipChanged(double value)
             _similarityScores[result.FilePath] = result.Score;
             _similarityMatchKinds[result.FilePath] = result.MatchKind;
         }
+        NotifyFolderSectionSearchStateChanged();
         _tagSearch.SearchResultFiles = displayedResults.Select(result => result.FilePath).ToList();
         OnPropertyChanged(nameof(HasSearchResults));
         OnPropertyChanged(nameof(SearchResultInfo));
@@ -3583,6 +3590,7 @@ partial void OnCornerRadiusDipChanged(double value)
         _tagSearch.SearchResultFiles.Clear();
         _similarityScores.Clear();
         _similarityMatchKinds.Clear();
+        NotifyFolderSectionSearchStateChanged();
         OnPropertyChanged(nameof(HasSearchResults));
 
         var page = _pageManager.TryRestorePreSearchState(out var savedPage) ? savedPage : 0;
