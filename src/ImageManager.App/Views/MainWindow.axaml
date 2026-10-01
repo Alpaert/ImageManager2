@@ -31,18 +31,18 @@
 					DoubleTapped="Thumbnail_DoubleTapped">
 				<Border.ContextMenu>
 					<ContextMenu Opened="ThumbnailContextMenu_Opened">
-						<MenuItem Header="编辑 Tag" Click="MenuEditTag_Click"/>
-						<MenuItem Header="自动打标" Click="MenuAutoTag_Click"/>
-						<MenuItem Header="清空选中图片的标签" Click="MenuClearSelectedTags_Click"/>
-						<MenuItem Header="复制图片到剪贴板" Click="MenuCopyImage_Click"/>
-						<MenuItem Header="查找相似图片">
+						<MenuItem Header="编辑 Tag" Click="MenuEditTag_Click" IsVisible="{Binding ShowStandardContextMenuItems}"/>
+						<MenuItem Header="自动打标" Click="MenuAutoTag_Click" IsVisible="{Binding ShowStandardContextMenuItems}"/>
+						<MenuItem Header="清空选中图片的标签" Click="MenuClearSelectedTags_Click" IsVisible="{Binding ShowStandardContextMenuItems}"/>
+						<MenuItem Header="复制图片到剪贴板" Click="MenuCopyImage_Click" IsVisible="{Binding ShowStandardContextMenuItems}"/>
+						<MenuItem Header="查找相似图片" IsVisible="{Binding ShowStandardContextMenuItems}">
 							<MenuItem Header="感知相似" Tag="0" Click="MenuFindSimilar_Click"/>
 							<MenuItem Header="语义相似" Tag="1" Click="MenuFindSimilar_Click"/>
 							<MenuItem Header="氛围相似" Tag="2" Click="MenuFindSimilar_Click"/>
 							<MenuItem Header="颜色相似" Tag="3" Click="MenuFindSimilar_Click"/>
 						</MenuItem>
-						<Separator/>
-						<MenuItem Header="在线搜图">
+						<Separator IsVisible="{Binding ShowStandardContextMenuItems}"/>
+						<MenuItem Header="在线搜图" IsVisible="{Binding ShowStandardContextMenuItems}">
 							<MenuItem Header="不要来回切换ip地址，容易被搜图网站ban"/>
 							<MenuItem Header="搜图网站比较慢，打开网页可能时间较久"/>
 							<MenuItem Header="Multi（大杂烩搜图）" Click="MenuSearchOnline_Click" Tag="iqdb"/>
@@ -56,15 +56,16 @@
 							<MenuItem Header="Soutubot（本子）" Click="MenuSearchOnline_Click" Tag="soutubot"/>
 							<MenuItem Header="Danbooru IQDB" Click="MenuSearchOnline_Click" Tag="danbooru_iqdb"/>
 						</MenuItem>
-						<MenuItem Header="重新生成缩略图" Click="MenuRegenerateThumbnail_Click"/>
+						<MenuItem Header="重新生成缩略图" Click="MenuRegenerateThumbnail_Click" IsVisible="{Binding ShowStandardContextMenuItems}"/>
+						<MenuItem Header="重新读取封面并生成缩略图" Click="MenuRegenerateMusicCover_Click" IsVisible="{Binding IsMusic}"/>
 						<MenuItem Header="在资源管理器中打开" Click="MenuOpenInExplorer_Click"/>
-						<Separator/>
-						<MenuItem Header="删除该图片文件" Click="MenuDeleteFile_Click"/>
-						<Separator/>
+						<Separator IsVisible="{Binding ShowStandardContextMenuItems}"/>
+						<MenuItem Header="删除文件" Click="MenuDeleteFile_Click"/>
+						<Separator IsVisible="{Binding ShowStandardContextMenuItems}"/>
 						<MenuItem Header="复制到其他文件夹..." Click="MenuCopyFileToFolder_Click"/>
 						<MenuItem Header="移动到其他文件夹..." Click="MenuMoveFileToFolder_Click"/>
-						<Separator/>
-						<MenuItem Header="刷新当前文件夹" Click="MenuRefreshFolder_Click"/>
+						<Separator IsVisible="{Binding ShowStandardContextMenuItems}"/>
+						<MenuItem Header="刷新当前文件夹" Click="MenuRefreshFolder_Click" IsVisible="{Binding ShowStandardContextMenuItems}"/>
 					</ContextMenu>
 				</Border.ContextMenu>
 				<Grid>
@@ -82,6 +83,43 @@
 									Height="{Binding $parent[Window].DataContext.GridThumbnailHeight}"
 									Source="{Binding ThumbnailData, Converter={StaticResource BytesToBitmap}}"
 									Stretch="{Binding $parent[Window].DataContext.ThumbnailImageStretch}"/>
+							<!-- Music files without embedded artwork retain the card layout and show a clear in-place placeholder. -->
+							<Panel IsVisible="{Binding ShowMusicPlaceholder}"
+									IsHitTestVisible="False">
+								<Border Width="48" Height="48"
+										Background="#80000000"
+										CornerRadius="24"
+										HorizontalAlignment="Center"
+										VerticalAlignment="Center">
+									<Path Fill="White"
+											Width="26" Height="26"
+											Data="M17 3v13.55A4 4 0 1 0 19 20V7l8-2v9.55A4 4 0 1 0 29 18V2z"
+											Stretch="Uniform"
+											HorizontalAlignment="Center"
+											VerticalAlignment="Center"/>
+								</Border>
+							</Panel>
+							<!-- Media-type badges keep artwork thumbnails distinguishable from images. -->
+							<Border IsVisible="{Binding IsVideo}"
+									Width="24" Height="24" Margin="6"
+									Background="#A0000000" CornerRadius="12"
+									HorizontalAlignment="Right" VerticalAlignment="Top"
+									IsHitTestVisible="False"
+									ToolTip.Tip="视频">
+								<Path Fill="White" Width="14" Height="14"
+										Data="M4 6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2zm12 4 6-3v10l-6-3z"
+										Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+							</Border>
+							<Border IsVisible="{Binding IsMusic}"
+									Width="24" Height="24" Margin="6"
+									Background="#A0000000" CornerRadius="12"
+									HorizontalAlignment="Right" VerticalAlignment="Top"
+									IsHitTestVisible="False"
+									ToolTip.Tip="音乐">
+								<Path Fill="White" Width="14" Height="14"
+										Data="M10 4v10.55A4 4 0 1 0 12 18V8l8-2v8.55A4 4 0 1 0 22 18V3z"
+										Stretch="Uniform" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+							</Border>
 							<!-- Text overlay floating at bottom — does NOT affect image dimensions -->
 							<Border VerticalAlignment="Bottom"
 									Background="#AA000000" Padding="4,2"
@@ -102,15 +140,14 @@
 											HorizontalAlignment="Center"/>
 								</StackPanel>
 							</Border>
-							<!-- Video play icon overlay -->
+							<!-- Video play control stays prominent without competing with the type badge. -->
 							<Panel IsVisible="{Binding IsVideo}"
 									IsHitTestVisible="False">
 								<Border Width="48" Height="48"
 										Background="#80000000"
 										CornerRadius="24"
-										HorizontalAlignment="Right"
-										VerticalAlignment="Bottom"
-										Margin="0,0,8,8">
+										HorizontalAlignment="Center"
+										VerticalAlignment="Center">
 										<Path Fill="White"
 												Width="24" Height="24"
 												Data="M8 5v14l11-7z"
@@ -271,6 +308,8 @@
                             <MenuItem Header="计算图片指纹…" Click="MenuComputeHashes_Click"/>
                             <MenuItem x:Name="FolderVideoMenu" Header="生成视频原始帧…" Click="MenuComputeVideoOriginalFramesRecursive_Click"/>
                             <MenuItem x:Name="FolderStopVideoMenu" Header="停止视频原始帧生成" IsVisible="False" Click="MenuStopVideoOriginalFrames_Click"/>
+							<MenuItem x:Name="FolderPrewarmThumbnailsMenu" Header="递归预生成媒体缩略图…" Click="MenuPrewarmMediaThumbnails_Click"/>
+							<MenuItem x:Name="FolderStopPrewarmThumbnailsMenu" Header="停止媒体缩略图预生成" IsVisible="False" Click="MenuStopPrewarmMediaThumbnails_Click"/>
                             <Separator/>
                             <MenuItem Header="设置显示名称…" Click="MenuRenameFolder_Click"/>
                             <MenuItem Header="归档文件夹" Click="MenuArchiveFolder_Click"/>

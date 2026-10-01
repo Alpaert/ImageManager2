@@ -75,6 +75,16 @@ public class PageManager : IDisposable
 
     public event Action<PageChangedEventArgs>? PageChanged;
 
+    /// <summary>
+    /// Raised on the UI dispatcher after a debounced zoom invalidates decoded
+    /// thumbnails. Continuous display owns a separate, virtualized item cache
+    /// and uses this to refresh only its active ranges.
+    /// </summary>
+    public event Func<bool>? ThumbnailRefreshRequested;
+
+    /// <summary>Decode width captured by explicit cache-warming commands.</summary>
+    public int ThumbnailDecodeWidth => _thumbnailDecodeWidth;
+
     public int PageSize
     {
         get => _pageSize;
@@ -137,11 +147,11 @@ public class PageManager : IDisposable
         if (pageItems == null || loadCt.IsCancellationRequested)
             return;
 
-        bool needsLoad = !pageItems.TrueForAll(i => i.IsLoaded);
+        bool needsLoad = !pageItems.TrueForAll(i => i.IsLoaded && !i.IsRefreshingThumbnail);
 
         if (needsLoad)
         {
-            PerfLogger.Log($"[PageMgr] LoadThumbnails START unloaded={pageItems.Count(i => !i.IsLoaded)}");
+            PerfLogger.Log($"[PageMgr] LoadThumbnails START unloaded={pageItems.Count(i => !i.IsLoaded || i.IsRefreshingThumbnail)}");
             _ = LoadPageThumbnailsAsync(pageIndex, loadCt)
                 .ContinueWith(_ => PreloadAdjacentPages(pageIndex, totalPages, activeFileList, getTagsForFile, loadCt),
                     CancellationToken.None,
@@ -230,7 +240,7 @@ public class PageManager : IDisposable
 
     public void LoadThumbnailsForItems(List<ImageViewItem> items)
     {
-        var toLoad = items.Where(i => !i.IsLoaded).ToList();
+        var toLoad = items.Where(i => !i.IsLoaded || i.IsRefreshingThumbnail).ToList();
         // Use current page's CancellationToken so page flip instantly cancels scroll-triggered loads
         var ct = _pageLoadCts?.Token ?? default;
         if (toLoad.Count == 0) return;
@@ -252,7 +262,7 @@ public class PageManager : IDisposable
             if (cancellationToken.IsCancellationRequested)
                 return;
 
-            if (item == null || item.IsLoaded || string.IsNullOrWhiteSpace(item.FilePath))
+            if (item == null || (item.IsLoaded && !item.IsRefreshingThumbnail) || string.IsNullOrWhiteSpace(item.FilePath))
                 continue;
 
             if (!queuedPaths.Add(item.FilePath))
@@ -280,7 +290,7 @@ public class PageManager : IDisposable
             if (cancellationToken.IsCancellationRequested)
                 return;
 
-            if (item == null || item.IsLoaded || string.IsNullOrWhiteSpace(item.FilePath))
+            if (item == null || (item.IsLoaded && !item.IsRefreshingThumbnail) || string.IsNullOrWhiteSpace(item.FilePath))
                 continue;
 
             if (!queuedPaths.Add(item.FilePath))
@@ -292,26 +302,65 @@ public class PageManager : IDisposable
 
     public async Task LoadThumbnailsForItemsAsync(List<ImageViewItem> items)
     {
-        var toLoad = items.Where(i => !i.IsLoaded).ToList();
+        var toLoad = items.Where(i => !i.IsLoaded || i.IsRefreshingThumbnail).ToList();
         foreach (var item in toLoad)
             await LoadSingleThumbnailAsync(item, default, source: ThumbnailLoadSource.Viewport);
     }
 
     public async Task RegenerateThumbnailsAsync(List<ImageViewItem> items)
     {
-        foreach (var item in items.DistinctBy(i => i.FilePath))
+        var targetPaths = new HashSet<string>(
+            items.Where(item => !string.IsNullOrWhiteSpace(item.FilePath))
+                .Select(item => item.FilePath),
+            StringComparer.OrdinalIgnoreCase);
+        if (targetPaths.Count == 0)
+            return;
+
+        List<ImageViewItem> cachedItems;
+        lock (_pageCacheLock)
         {
-            _thumbCache.InvalidateThumbnail(item.FilePath);
+            cachedItems = _pageCache.Values
+                .SelectMany(page => page)
+                .Where(item => targetPaths.Contains(item.FilePath))
+                .ToList();
+        }
+
+        // Context commands may start with temporary items. Include every cached
+        // projection so a successful regeneration is visible immediately.
+        var affectedItems = new List<ImageViewItem>();
+        foreach (var item in items.Concat(cachedItems).Where(item => targetPaths.Contains(item.FilePath)))
+        {
+            if (!affectedItems.Any(existing => ReferenceEquals(existing, item)))
+                affectedItems.Add(item);
+        }
+
+        foreach (var path in targetPaths)
+            _thumbCache.InvalidateThumbnail(path);
+
+        foreach (var item in affectedItems)
+        {
             item.ThumbnailData = null;
+            item.HasNoPreview = false;
+            item.IsRefreshingThumbnail = false;
             item.IsLoaded = false;
             item.IsLoading = true;
             item.NotifyAll();
         }
 
-        foreach (var item in items.DistinctBy(i => i.FilePath))
+        foreach (var group in affectedItems.GroupBy(item => item.FilePath, StringComparer.OrdinalIgnoreCase))
         {
-            await LoadSingleThumbnailAsync(item, source: ThumbnailLoadSource.Viewport);
-            PostLoadedItems(new[] { item });
+            var primary = group.First();
+            await LoadSingleThumbnailAsync(primary, source: ThumbnailLoadSource.Viewport);
+            foreach (var item in group.Skip(1))
+            {
+                item.ThumbnailData = primary.ThumbnailData;
+                item.Width = primary.Width;
+                item.Height = primary.Height;
+                item.HasNoPreview = primary.HasNoPreview;
+                item.IsRefreshingThumbnail = primary.IsRefreshingThumbnail;
+                item.IsLoaded = primary.IsLoaded;
+            }
+            PostLoadedItems(group);
         }
     }
 
@@ -421,17 +470,31 @@ public class PageManager : IDisposable
                     {
                         _thumbCache.DecodeWidth = _thumbnailDecodeWidth;
                         await _thumbCache.ClearAsync();
-                        // Mark cached items as unloaded — reloads in-place without destroying page
+                        // Keep decoded bytes visible while the final-size thumbnails are rebuilt.
+                        // A failed replacement must not leave the viewport blank.
                         lock (_pageCacheLock)
                         {
                             foreach (var kv in _pageCache)
                                 foreach (var item in kv.Value)
                                 {
-                                    item.IsLoaded = false;
-                                    item.IsLoading = true;
+                                    if (item.ThumbnailData is { Length: > 0 })
+                                    {
+                                        item.IsRefreshingThumbnail = true;
+                                        item.IsLoading = false;
+                                    }
+                                    else if (!item.HasNoPreview)
+                                    {
+                                        item.IsLoaded = false;
+                                        item.IsLoading = true;
+                                    }
                                 }
                         }
-                        _ = LoadPageThumbnailsAsync(_activePageIndex);
+                        var handledByVirtualizedDisplay = ThumbnailRefreshRequested?
+                            .GetInvocationList()
+                            .OfType<Func<bool>>()
+                            .Any(handler => handler()) == true;
+                        if (!handledByVirtualizedDisplay)
+                            _ = LoadPageThumbnailsAsync(_activePageIndex);
                     });
                 }, token);
                 return (baseWidth, true);
@@ -530,6 +593,8 @@ public class PageManager : IDisposable
     private static void ResetThumbnailState(ImageViewItem item)
     {
         item.ThumbnailData = null;
+        item.HasNoPreview = false;
+        item.IsRefreshingThumbnail = false;
         item.IsLoaded = false;
         item.IsLoading = true;
         item.NotifyAll();
@@ -683,7 +748,7 @@ public class PageManager : IDisposable
         var sw = Stopwatch.StartNew();
         try
         {
-        var unloaded = pageItems.Where(i => !i.IsLoaded).ToList();
+        var unloaded = pageItems.Where(i => !i.IsLoaded || i.IsRefreshingThumbnail).ToList();
         if (unloaded.Count == 0) return;
         var imageItems = unloaded.Where(i => !FileTypeConstants.IsVideoFile(i.FilePath)).ToList();
         var videoItems = includeVideos
@@ -1122,9 +1187,33 @@ public class PageManager : IDisposable
             if (result.Data != null)
             {
                 item.ThumbnailData = result.Data;
+                item.HasNoPreview = false;
+                item.IsRefreshingThumbnail = false;
                 SetDecodedDimensionsIfUnknown(item, result.Width, result.Height);
                 item.IsLoaded = true;
                 metrics?.RecordLoadedItem(item);
+            }
+            else if (result.IsFinalWithoutThumbnail)
+            {
+                item.ThumbnailData = null;
+                item.HasNoPreview = true;
+                item.IsRefreshingThumbnail = false;
+                item.IsLoaded = true;
+                metrics?.RecordLoadedItem(item);
+            }
+            else if (FileTypeConstants.IsMusicFile(item.FilePath))
+            {
+                // An unreadable embedded cover is not negatively cached, but must still
+                // render as a music placeholder instead of an empty thumbnail.
+                item.ThumbnailData = null;
+                item.HasNoPreview = true;
+                item.IsRefreshingThumbnail = false;
+                item.IsLoaded = true;
+                metrics?.RecordLoadedItem(item);
+            }
+            else if (item.IsRefreshingThumbnail)
+            {
+                item.IsRefreshingThumbnail = false;
             }
             metrics?.RecordResult(result, Stopwatch.GetElapsedTime(queuedAt).TotalMilliseconds);
         }
@@ -1136,6 +1225,7 @@ public class PageManager : IDisposable
         catch
         {
             metrics?.RecordFailed();
+            item.IsRefreshingThumbnail = false;
             if (isVideo) PerfLogger.Log($"[Thumb] VIDEO FAIL {Path.GetFileName(item.FilePath)}");
         }
         finally
@@ -1335,7 +1425,7 @@ public class PageManager : IDisposable
     {
         var pageItems = await GetOrCreatePageItemsAsync(
             pageIndex, totalPages, activeFileList, getTagsForFile, ct).ConfigureAwait(false);
-        return pageItems?.Any(item => !item.IsLoaded) == true;
+        return pageItems?.Any(item => !item.IsLoaded || item.IsRefreshingThumbnail) == true;
     }
 
     private bool IsCurrentPreload(long generation, CancellationToken token, PreloadRequest request)

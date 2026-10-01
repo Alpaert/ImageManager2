@@ -14,12 +14,18 @@ public static class FileTypeConstants
         ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".m4v"
     };
 
+    public static readonly HashSet<string> MusicExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".wma", ".aiff", ".aif"
+    };
+
     public static readonly HashSet<string> AllMediaExtensions;
 
     public static IReadOnlyList<FileTypeDefinition> SupportedTypes { get; } =
     [
         new("image", "图片", ImageExtensions, true, true),
-        new("video", "视频", VideoExtensions, true, true)
+        new("video", "视频", VideoExtensions, true, true),
+        new("music", "音乐", MusicExtensions, false, true)
     ];
 
     public static FileTypeDefinition? GetFileType(string path)
@@ -39,6 +45,9 @@ public static class FileTypeConstants
 
     public static bool IsVideoFile(string path)
         => VideoExtensions.Contains(Path.GetExtension(path));
+
+    public static bool IsMusicFile(string path)
+        => MusicExtensions.Contains(Path.GetExtension(path));
 
     public static bool IsMediaFile(string path)
         => AllMediaExtensions.Contains(Path.GetExtension(path));

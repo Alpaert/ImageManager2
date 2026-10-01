@@ -1,4 +1,5 @@
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Audio;
 using ImageManager.Infrastructure.Imaging;
 using ImageManager.Infrastructure.Video;
 
@@ -14,7 +15,8 @@ public class MediaProcessorFactory : IMediaProcessorFactory
         _processors = new IMediaProcessor[]
         {
             new ImageMediaProcessor(),
-            new VideoMediaProcessor(originalFrames)
+            new VideoMediaProcessor(originalFrames),
+            new MusicMediaProcessor()
         };
     }
 

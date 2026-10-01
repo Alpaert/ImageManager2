@@ -167,6 +167,18 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
     protected override void OnItemsChanged(IReadOnlyList<object?> items,
         System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
     {
+        if (e.Action == System.Collections.Specialized.NotifyCollectionChangedAction.Remove &&
+            e.OldStartingIndex >= 0 && e.OldItems?.Count == 1 &&
+            TryApplyIncrementalRemoval(items, e.OldStartingIndex))
+        {
+            base.OnItemsChanged(items, e);
+            _publishedGeometryItemCount = items.Count;
+            CurrentVisibleRange = default;
+            CurrentRetainedRange = default;
+            InvalidateMeasure();
+            return;
+        }
+
         // The item source can change while a scrollbar drag has a coalesced
         // viewport pending. Preserve that newest position so the replacement
         // source is realized for the current scroll offset.
@@ -174,6 +186,65 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
         ClearRealizedContainers();
         base.OnItemsChanged(items, e);
         InvalidateMeasure();
+    }
+
+    private bool TryApplyIncrementalRemoval(IReadOnlyList<object?> items, int removedIndex)
+    {
+        if (removedIndex >= items.Count + 1)
+            return false;
+
+        CancelPendingViewportUpdate(preserveLatestViewport: true);
+        var generator = ItemContainerGenerator;
+        if (generator is null)
+            return false;
+
+        // The source shifts every cached entry after the removed index left by one.
+        // Move the corresponding controls too, rebinding each control to the same
+        // ImageViewItem instance so decoded thumbnails survive the deletion.
+        if (_realized.ContainsKey(removedIndex))
+            Unrealize(removedIndex);
+
+        // Move upward through the old keys. Moving downward would write key - 1
+        // over a container that has not been read yet, orphaning that visual.
+        foreach (var key in _realized.Keys.Where(key => key > removedIndex).OrderBy(key => key).ToArray())
+        {
+            var realized = _realized[key];
+            _realized.Remove(key);
+            var newIndex = key - 1;
+            if (newIndex >= items.Count)
+            {
+                RemoveRealizedContainer(realized);
+                continue;
+            }
+
+            if (realized.NeedsContainer)
+            {
+                generator.ClearItemContainer(realized.Control);
+                generator.PrepareItemContainer(realized.Control, items[newIndex], newIndex);
+                generator.ItemContainerPrepared(realized.Control, items[newIndex], newIndex);
+            }
+            _realized[newIndex] = realized;
+        }
+
+        return true;
+    }
+
+    private void RemoveRealizedContainer(RealizedContainer realized)
+    {
+        RemoveInternalChild(realized.Control);
+        if (!realized.NeedsContainer)
+            return;
+
+        var generator = ItemContainerGenerator;
+        if (generator is null)
+            return;
+        generator.ClearItemContainer(realized.Control);
+        if (realized.RecycleKey is null)
+            return;
+
+        if (!_recycled.TryGetValue(realized.RecycleKey, out var pool))
+            _recycled.Add(realized.RecycleKey, pool = new Stack<Control>());
+        pool.Push(realized.Control);
     }
 
     protected override Control? ContainerFromIndex(int index) =>
@@ -441,5 +512,11 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
     {
         foreach (var index in _realized.Keys.ToArray())
             Unrealize(index);
+
+        // An ItemsControl source reset can leave a child that is no longer
+        // represented in our index map. In particular, deleting the final item
+        // must still remove every old card even after the map is already empty.
+        foreach (var child in Children.ToArray())
+            RemoveInternalChild(child);
     }
 }

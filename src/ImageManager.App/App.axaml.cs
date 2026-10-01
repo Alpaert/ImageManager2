@@ -145,6 +145,7 @@ public partial class App : Application
                 cacheDir,
                 200));
         services.AddSingleton<IThumbnailCacheService>(sp => sp.GetRequiredService<ThumbnailCacheService>());
+        services.AddSingleton<IMediaThumbnailPrewarmService, MediaThumbnailPrewarmService>();
 
         // Existing WD service
         services.AddSingleton<OnnxTagService>();

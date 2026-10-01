@@ -21,11 +21,16 @@ public partial class ImageViewItem : ObservableObject
     [ObservableProperty] private bool _isSelected;
     [ObservableProperty] private bool _isLoading;
     [ObservableProperty] private bool _isLoaded;
+    [ObservableProperty] private bool _isRefreshingThumbnail;
+    [ObservableProperty] private bool _hasNoPreview;
 
-    public bool IsNotLoaded => !IsLoaded;
+    public bool IsNotLoaded => !IsLoaded && !HasNoPreview;
     public bool IsLandscape => Width >= Height;
-    public string OrientationText => IsLandscape ? "横图" : "竖图";
+    public string OrientationText => IsMusic ? string.Empty : IsLandscape ? "横图" : "竖图";
     public bool IsVideo => FileTypeConstants.IsVideoFile(FilePath);
+    public bool IsMusic => FileTypeConstants.IsMusicFile(FilePath);
+    public bool ShowMusicPlaceholder => IsMusic && HasNoPreview;
+    public bool ShowStandardContextMenuItems => !IsMusic;
 
     // Deterministic placeholder color from filename — avoids empty white space during loading
     public string PlaceholderColor
@@ -56,8 +61,18 @@ public partial class ImageViewItem : ObservableObject
         OnPropertyChanged(nameof(IsNotLoaded));
         OnPropertyChanged(nameof(IsLandscape));
         OnPropertyChanged(nameof(OrientationText));
+        OnPropertyChanged(nameof(IsVideo));
+        OnPropertyChanged(nameof(IsMusic));
+        OnPropertyChanged(nameof(ShowMusicPlaceholder));
+        OnPropertyChanged(nameof(ShowStandardContextMenuItems));
         OnPropertyChanged(nameof(TagSummary));
         OnPropertyChanged(nameof(StatusText));
+    }
+
+    partial void OnHasNoPreviewChanged(bool value)
+    {
+        OnPropertyChanged(nameof(IsNotLoaded));
+        OnPropertyChanged(nameof(ShowMusicPlaceholder));
     }
 
     /// <summary>
@@ -66,7 +81,7 @@ public partial class ImageViewItem : ObservableObject
     /// </summary>
     public void NotifyThumbnailNeeded()
     {
-        if (ThumbnailData == null)
+        if (ThumbnailData == null && !HasNoPreview)
         {
             IsLoaded = false;
             OnPropertyChanged(nameof(IsNotLoaded));

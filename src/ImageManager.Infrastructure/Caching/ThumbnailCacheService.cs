@@ -4,6 +4,8 @@ using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Helpers;
+using ImageManager.Infrastructure.Audio;
+using ImageManager.Infrastructure.Imaging;
 
 namespace ImageManager.Infrastructure.Caching;
 
@@ -23,7 +25,8 @@ public readonly record struct ThumbnailCacheLoadResult(
     long CacheLookupMilliseconds,
     long GenerateMilliseconds,
     long WriteMilliseconds,
-    long LruMilliseconds);
+    long LruMilliseconds,
+    bool IsFinalWithoutThumbnail = false);
 
 public class ThumbnailCacheService : IThumbnailCacheService
 {
@@ -101,6 +104,11 @@ public class ThumbnailCacheService : IThumbnailCacheService
                     {
                         try { Directory.Delete(dir, true); } catch { }
                     }
+                    var musicCoverDirectory = Path.Combine(oldPath, "music_covers");
+                    if (Directory.Exists(musicCoverDirectory))
+                    {
+                        try { Directory.Delete(musicCoverDirectory, true); } catch { }
+                    }
                 }
             }
             catch { }
@@ -125,7 +133,8 @@ public class ThumbnailCacheService : IThumbnailCacheService
             return new(null, 0, 0, ThumbnailCacheSource.Missing, 0, 0, 0, 0);
 
         var isVideo = FileTypeConstants.IsVideoFile(filePath);
-        if (_index.TryGetValue(filePath, out var node)
+        var isMusic = FileTypeConstants.IsMusicFile(filePath);
+        if (!isMusic && _index.TryGetValue(filePath, out var node)
             && node.Value.Data != null
             && node.Value.DecodeWidth == decodeWidth)
         {
@@ -141,6 +150,9 @@ public class ThumbnailCacheService : IThumbnailCacheService
         // instance prevents concurrent zoom/folder requests from writing to a
         // different width directory after an awaited decode.
         var diskCache = new DiskThumbnailCache(CacheDirectory, decodeWidth);
+
+        if (isMusic)
+            return await GetOrCreateMusicThumbnailAsync(filePath, decodeWidth, diskCache, ct).ConfigureAwait(false);
 
         var diskRead = Stopwatch.StartNew();
         var cached = diskCache.Load(filePath);
@@ -221,8 +233,23 @@ public class ThumbnailCacheService : IThumbnailCacheService
             return (null, 0, 0);
 
         var isVideo = FileTypeConstants.IsVideoFile(filePath);
+        var isMusic = FileTypeConstants.IsMusicFile(filePath);
 
-        if (_index.TryGetValue(filePath, out var node)
+        if (isMusic)
+        {
+            var musicCache = new MusicCoverCache(CacheDirectory);
+            var cover = musicCache.Load(filePath);
+            if (cover.IsStale)
+            {
+                musicCache.Delete(filePath);
+                new DiskThumbnailCache(CacheDirectory, decodeWidth).DeleteAllWidths(filePath);
+                return (null, 0, 0);
+            }
+            if (cover.IsFinalWithoutThumbnail)
+                return (null, 0, 0);
+        }
+
+        if (!isMusic && _index.TryGetValue(filePath, out var node)
             && node.Value.Data != null
             && node.Value.DecodeWidth == decodeWidth)
         {
@@ -415,13 +442,18 @@ public class ThumbnailCacheService : IThumbnailCacheService
         }
     }
 
-    public void DeleteFromDiskCache(string filePath) => _diskCache.DeleteAllWidths(filePath);
+    public void DeleteFromDiskCache(string filePath)
+    {
+        _diskCache.DeleteAllWidths(filePath);
+        new MusicCoverCache(CacheDirectory).Delete(filePath);
+    }
 
     public void MoveDiskCache(string oldPath, string newPath)
     {
         ClearMemoryEntry(oldPath);
         ClearMemoryEntry(newPath);
         _diskCache.MoveAllWidths(oldPath, newPath);
+        new MusicCoverCache(CacheDirectory).Move(oldPath, newPath);
     }
 
     public void ClearMemoryEntry(string filePath)
@@ -445,6 +477,155 @@ public class ThumbnailCacheService : IThumbnailCacheService
     {
         ClearMemoryEntry(filePath);
         DeleteFromDiskCache(filePath);
+    }
+
+    /// <summary>
+    /// Creates a requested-width video thumbnail only from an already cached original frame.
+    /// This never opens the source video, invokes a media processor, or starts FFmpeg.
+    /// </summary>
+    public Task<ThumbnailCacheLoadResult> TryCreateThumbnailFromExistingVideoOriginalFrameAsync(
+        string filePath,
+        string originalFramePath,
+        int decodeWidth,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (string.IsNullOrWhiteSpace(filePath) || string.IsNullOrWhiteSpace(originalFramePath))
+            return Task.FromResult(new ThumbnailCacheLoadResult(null, 0, 0, ThumbnailCacheSource.Missing, 0, 0, 0, 0));
+
+        var diskRead = Stopwatch.StartNew();
+        var diskCache = new DiskThumbnailCache(CacheDirectory, decodeWidth);
+        var cached = diskCache.Load(filePath);
+        var diskReadMs = diskRead.ElapsedMilliseconds;
+        if (cached is { Length: > 0 })
+        {
+            var meta = diskCache.LoadMeta(filePath);
+            if (!IsLegacyVideoPlaceholder(cached, decodeWidth, meta))
+            {
+                var dimensions = meta ?? ParseJpegDimensions(cached);
+                if (dimensions.Width > 0 && dimensions.Height > 0)
+                {
+                    if (!meta.HasValue)
+                        diskCache.SaveMeta(filePath, dimensions.Width, dimensions.Height);
+                    var cachedLruMs = AddToMemory(filePath, cached, decodeWidth, dimensions.Width, dimensions.Height);
+                    return Task.FromResult(new ThumbnailCacheLoadResult(cached, dimensions.Width, dimensions.Height,
+                        ThumbnailCacheSource.Disk, diskReadMs, 0, 0, cachedLruMs));
+                }
+            }
+            diskCache.DeleteCurrentWidth(filePath);
+        }
+
+        ct.ThrowIfCancellationRequested();
+        if (!File.Exists(originalFramePath))
+            return Task.FromResult(new ThumbnailCacheLoadResult(null, 0, 0, ThumbnailCacheSource.Missing, diskReadMs, 0, 0, 0));
+
+        var generation = Stopwatch.StartNew();
+        var thumbnail = ThumbnailGenerator.Generate(originalFramePath, decodeWidth);
+        ct.ThrowIfCancellationRequested();
+        var generationMs = generation.ElapsedMilliseconds;
+        if (thumbnail is not { Length: > 0 })
+            return Task.FromResult(new ThumbnailCacheLoadResult(null, 0, 0, ThumbnailCacheSource.Missing, diskReadMs, generationMs, 0, 0));
+
+        var (width, height) = ThumbnailGenerator.GetDimensions(originalFramePath);
+        if (width <= 0 || height <= 0)
+            return Task.FromResult(new ThumbnailCacheLoadResult(null, 0, 0, ThumbnailCacheSource.Missing, diskReadMs, generationMs, 0, 0));
+
+        var write = Stopwatch.StartNew();
+        diskCache.Save(filePath, thumbnail);
+        diskCache.SaveMeta(filePath, width, height);
+        var writeMs = write.ElapsedMilliseconds;
+        var lruMs = AddToMemory(filePath, thumbnail, decodeWidth, width, height);
+        return Task.FromResult(new ThumbnailCacheLoadResult(thumbnail, width, height,
+            ThumbnailCacheSource.Generated, diskReadMs, generationMs, writeMs, lruMs));
+    }
+
+    private async Task<ThumbnailCacheLoadResult> GetOrCreateMusicThumbnailAsync(
+        string filePath,
+        int decodeWidth,
+        DiskThumbnailCache diskCache,
+        CancellationToken ct,
+        bool retryChangedSource = true)
+    {
+        var diskRead = Stopwatch.StartNew();
+        var musicCache = new MusicCoverCache(CacheDirectory);
+        var cachedCover = musicCache.Load(filePath);
+        var diskReadMs = diskRead.ElapsedMilliseconds;
+        if (cachedCover.IsStale)
+        {
+            musicCache.Delete(filePath);
+            diskCache.DeleteAllWidths(filePath);
+        }
+        else if (cachedCover.IsFinalWithoutThumbnail)
+        {
+            return new(null, 0, 0, ThumbnailCacheSource.Disk, diskReadMs, 0, 0, 0, true);
+        }
+        else if (cachedCover.Cover is { Length: > 0 })
+        {
+            var existingThumbnail = diskCache.Load(filePath);
+            var existingMeta = diskCache.LoadMeta(filePath);
+            if (existingThumbnail is { Length: > 0 } && existingMeta.HasValue)
+            {
+                var lruMs = AddToMemory(filePath, existingThumbnail, decodeWidth,
+                    existingMeta.Value.Width, existingMeta.Value.Height);
+                return new(existingThumbnail, existingMeta.Value.Width, existingMeta.Value.Height,
+                    ThumbnailCacheSource.Disk, diskReadMs, 0, 0, lruMs);
+            }
+            return SaveDerivedMusicThumbnail(filePath, decodeWidth, diskCache, cachedCover.Cover,
+                cachedCover.Width, cachedCover.Height, diskReadMs, ThumbnailCacheSource.Disk);
+        }
+
+        if (!File.Exists(filePath))
+            return new(null, 0, 0, ThumbnailCacheSource.Missing, diskReadMs, 0, 0, 0);
+
+        if (!MusicCoverCache.TryGetFingerprint(filePath, out var sourceFingerprint))
+            return new(null, 0, 0, ThumbnailCacheSource.Missing, diskReadMs, 0, 0, 0);
+
+        var generation = Stopwatch.StartNew();
+        var processor = _factory.GetProcessor(filePath);
+        var result = await processor.ExtractThumbnailAsync(filePath, decodeWidth, ct).ConfigureAwait(false);
+        var generationMs = generation.ElapsedMilliseconds;
+        if (result?.IsFinalWithoutThumbnail == true)
+        {
+            if (musicCache.SaveNoArtwork(filePath, sourceFingerprint) == MusicCoverCacheSaveResult.SourceChanged)
+                return await RetryMusicThumbnailAfterSourceChangeAsync().ConfigureAwait(false);
+            return new(null, 0, 0, ThumbnailCacheSource.Generated, diskReadMs, generationMs, 0, 0, true);
+        }
+        if (result?.Data is not { Length: > 0 })
+            return new(null, 0, 0, ThumbnailCacheSource.Missing, diskReadMs, generationMs, 0, 0);
+
+        if (musicCache.SaveCover(filePath, sourceFingerprint, result.Data, result.Width, result.Height)
+            == MusicCoverCacheSaveResult.SourceChanged)
+            return await RetryMusicThumbnailAfterSourceChangeAsync().ConfigureAwait(false);
+        return SaveDerivedMusicThumbnail(filePath, decodeWidth, diskCache, result.Data,
+            result.Width, result.Height, diskReadMs, ThumbnailCacheSource.Generated, generationMs);
+
+        Task<ThumbnailCacheLoadResult> RetryMusicThumbnailAfterSourceChangeAsync() => retryChangedSource
+            ? GetOrCreateMusicThumbnailAsync(filePath, decodeWidth, diskCache, ct, retryChangedSource: false)
+            : Task.FromResult(new ThumbnailCacheLoadResult(null, 0, 0, ThumbnailCacheSource.Missing,
+                diskReadMs, generationMs, 0, 0));
+    }
+
+    private ThumbnailCacheLoadResult SaveDerivedMusicThumbnail(
+        string filePath,
+        int decodeWidth,
+        DiskThumbnailCache diskCache,
+        byte[] primaryCover,
+        int width,
+        int height,
+        long diskReadMs,
+        ThumbnailCacheSource source,
+        long generationMs = 0)
+    {
+        var thumbnail = ThumbnailGenerator.Generate(primaryCover, decodeWidth);
+        if (thumbnail == null)
+            return new(null, 0, 0, ThumbnailCacheSource.Missing, diskReadMs, generationMs, 0, 0);
+
+        var write = Stopwatch.StartNew();
+        diskCache.Save(filePath, thumbnail);
+        diskCache.SaveMeta(filePath, width, height);
+        var writeMs = write.ElapsedMilliseconds;
+        var lruMs = AddToMemory(filePath, thumbnail, decodeWidth, width, height);
+        return new(thumbnail, width, height, source, diskReadMs, generationMs, writeMs, lruMs);
     }
 
     public long EstimateDiskUsage() => _diskCache.EstimateDiskUsage();

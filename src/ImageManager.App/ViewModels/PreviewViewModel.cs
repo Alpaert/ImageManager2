@@ -42,10 +42,10 @@ public partial class PreviewViewModel : ViewModelBase
         if (ImagePaths.Count == 0) return -1;
         int newIdx = CurrentIndex + delta;
 
-        // Skip video files when navigating
+        // Defense in depth for callers that still pass a mixed media list.
         int direction = delta > 0 ? 1 : -1;
         while (newIdx >= 0 && newIdx < ImagePaths.Count
-               && FileTypeConstants.IsVideoFile(ImagePaths[newIdx]))
+               && !FileTypeConstants.IsImageFile(ImagePaths[newIdx]))
         {
             newIdx += direction;
         }

@@ -59,6 +59,10 @@ public partial class MainWindow : Window
     private string? _videoOriginalFrameTargetPath;
     private int _videoOriginalFrameBatchRunning;
     private CancellationTokenSource? _videoOriginalFrameBatchCts;
+    private string? _prewarmThumbnailsTargetName;
+    private string? _prewarmThumbnailsTargetPath;
+    private int _prewarmThumbnailsRunning;
+    private CancellationTokenSource? _prewarmThumbnailsCts;
 
     public MainWindow()
     {
@@ -106,7 +110,11 @@ public partial class MainWindow : Window
 
     private async Task OpenPreviewForFileAsync(string filePath)
     {
-        var fileList = Vm.ActiveFileList;
+        // The built-in preview only decodes images. Video and music remain in
+        // the browser and open through their system-default handlers.
+        var fileList = Vm.ActiveFileList.Where(FileTypeConstants.IsImageFile).ToList();
+        if (fileList.Count == 0)
+            return;
         int index = fileList.FindIndex(f => string.Equals(f, filePath, StringComparison.OrdinalIgnoreCase));
         if (index < 0) index = 0;
 
@@ -1294,8 +1302,12 @@ public partial class MainWindow : Window
             _ = ApplyDisplayModeAsync(0);
 
         if (Vm.DisplayMode == ImageDisplayMode.Continuous &&
-            e.PropertyName is nameof(MainWindowViewModel.WaterfallMode) or nameof(MainWindowViewModel.ThumbnailBaseWidth))
+            e.PropertyName == nameof(MainWindowViewModel.WaterfallMode))
             _ = ApplyDisplayModeAsync(GetContinuousAnchorIndex());
+
+        if (Vm.DisplayMode == ImageDisplayMode.Continuous &&
+            e.PropertyName == nameof(MainWindowViewModel.ThumbnailBaseWidth))
+            QueueContinuousGeometryReflow(GetContinuousAnchorIndex());
     }
 
     private int GetContinuousAnchorIndex() => Math.Max(0, _continuousVisibleRange.StartIndex);
@@ -1313,10 +1325,13 @@ public partial class MainWindow : Window
             Math.Abs(width - geometry.Options.ContainerWidth) < 1))
             return;
 
-        // Keep the current leading item visible. This is a fixed-rate throttle,
-        // not a trailing debounce, so reflow stays visually coupled to dragging.
-        _continuousResizeAnchorIndex = GetContinuousAnchorIndex();
-        _continuousResizeRequestedWidth = width;
+        QueueContinuousGeometryReflow(GetContinuousAnchorIndex(), width);
+    }
+
+    private void QueueContinuousGeometryReflow(int anchorIndex, double? requestedWidth = null)
+    {
+        _continuousResizeAnchorIndex = anchorIndex;
+        _continuousResizeRequestedWidth = requestedWidth ?? GetContinuousContainerWidth();
         if (!_continuousResizeTimer.IsEnabled)
             _continuousResizeTimer.Start();
     }
@@ -1338,7 +1353,7 @@ public partial class MainWindow : Window
 
         if (viewModel.ContinuousDisplayGeometryIndex is { } geometry)
         {
-            if (Math.Abs(width - geometry.Options.ContainerWidth) >= 1)
+            if (NeedsContinuousGeometryReflow(viewModel, geometry, width))
             {
                 // Do not cancel work that is already arranging the previous frame.
                 // Constant cancellation while the user drags makes the view appear
@@ -1399,14 +1414,21 @@ public partial class MainWindow : Window
             if (completedCurrentReflow && !wasCancelled &&
                 Vm.DisplayMode == ImageDisplayMode.Continuous &&
                 Vm.ContinuousDisplayGeometryIndex is { } geometry &&
-                Math.Abs(GetContinuousContainerWidth() - geometry.Options.ContainerWidth) >= 1 &&
+                NeedsContinuousGeometryReflow(Vm, geometry, GetContinuousContainerWidth()) &&
                 !_continuousResizeTimer.IsEnabled)
             {
-                _continuousResizeRequestedWidth = GetContinuousContainerWidth();
-                _continuousResizeTimer.Start();
+                QueueContinuousGeometryReflow(_continuousResizeAnchorIndex);
             }
         }
     }
+
+    private static bool NeedsContinuousGeometryReflow(
+        MainWindowViewModel viewModel,
+        ImageDisplayGeometryIndex geometry,
+        double containerWidth) =>
+        Math.Abs(containerWidth - geometry.Options.ContainerWidth) >= 1 ||
+        Math.Abs(viewModel.ThumbnailBaseWidth - geometry.Options.ThumbnailBaseWidth) >= 0.01 ||
+        Math.Abs(viewModel.AppSettings.ThumbnailAspectRatio - geometry.Options.GridAspectRatio) >= 0.0001;
 
     private async Task ApplyDisplayModeAsync(int preferredIndex)
     {
@@ -1559,8 +1581,8 @@ public partial class MainWindow : Window
         if (border.DataContext is not ImageViewItem item) return;
         if (!File.Exists(item.FilePath)) return;
 
-        // Video: open with system default player
-        if (FileTypeConstants.IsVideoFile(item.FilePath))
+        // Video and music: open with their system-default player.
+        if (FileTypeConstants.IsVideoFile(item.FilePath) || FileTypeConstants.IsMusicFile(item.FilePath))
         {
             try
             {
@@ -1573,7 +1595,7 @@ public partial class MainWindow : Window
             }
             catch (Exception ex)
             {
-                AppLogger.Error($"Failed to open video: {ex.Message}");
+                AppLogger.Error($"Failed to open media file: {ex.Message}");
             }
         }
         else
@@ -1659,9 +1681,29 @@ public partial class MainWindow : Window
         var clicked = GetCtxItem(sender);
         if (clicked == null) return;
 
-        var items = CreateTemporaryImageItems(GetTargetFilePathsForContextMenu(clicked));
+        var paths = GetTargetFilePathsForContextMenu(clicked);
+        var items = CreateTemporaryImageItems(paths);
+        items.AddRange(Vm.GetMaterializedThumbnailItems(paths));
         await App.Services.GetRequiredService<PageManager>().RegenerateThumbnailsAsync(items);
-        Vm.StatusText = $"已重新生成 {items.Count} 个缩略图";
+        Vm.StatusText = $"已重新生成 {paths.Count} 个缩略图";
+    }
+
+    private async void MenuRegenerateMusicCover_Click(object? sender, RoutedEventArgs e)
+    {
+        var clicked = GetCtxItem(sender);
+        if (clicked == null) return;
+
+        var paths = GetTargetFilePathsForContextMenu(clicked)
+            .Where(FileTypeConstants.IsMusicFile)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var items = CreateTemporaryImageItems(paths);
+        if (items.Count == 0) return;
+
+        items.AddRange(Vm.GetMaterializedThumbnailItems(paths));
+
+        await App.Services.GetRequiredService<PageManager>().RegenerateThumbnailsAsync(items);
+        Vm.StatusText = $"已重新读取 {paths.Count} 个音乐文件的封面";
     }
 
     private async Task<bool> EditTagForItemAsync(ImageViewItem item)
@@ -2493,6 +2535,12 @@ public partial class MainWindow : Window
         FolderStopVideoMenu.IsEnabled = _videoOriginalFrameBatchCts?.IsCancellationRequested == false;
         FolderStopVideoMenu.Header = $"停止视频原始帧生成：{_videoOriginalFrameTargetName}";
         ToolTip.SetTip(FolderStopVideoMenu, _videoOriginalFrameTargetPath);
+        var prewarmRunning = Volatile.Read(ref _prewarmThumbnailsRunning) != 0;
+        FolderPrewarmThumbnailsMenu.IsEnabled = !prewarmRunning;
+        FolderStopPrewarmThumbnailsMenu.IsVisible = prewarmRunning;
+        FolderStopPrewarmThumbnailsMenu.IsEnabled = _prewarmThumbnailsCts?.IsCancellationRequested == false;
+        FolderStopPrewarmThumbnailsMenu.Header = $"停止媒体缩略图预生成：{_prewarmThumbnailsTargetName}";
+        ToolTip.SetTip(FolderStopPrewarmThumbnailsMenu, _prewarmThumbnailsTargetPath);
     }
 
     private bool IsBlockedByTagClear(FolderOperationScope scope)
@@ -2644,6 +2692,81 @@ public partial class MainWindow : Window
         cts.Cancel();
         Vm.StatusText = $"正在停止视频原始帧生成：{_videoOriginalFrameTargetName}…";
         RefreshFolderMenuState();
+    }
+
+    private void MenuStopPrewarmMediaThumbnails_Click(object? sender, RoutedEventArgs e)
+    {
+        var cts = _prewarmThumbnailsCts;
+        if (_prewarmThumbnailsRunning == 0 || cts == null) return;
+        cts.Cancel();
+        Vm.StatusText = $"正在停止媒体缩略图预生成：{_prewarmThumbnailsTargetName}…";
+        RefreshFolderMenuState();
+    }
+
+    private async void MenuPrewarmMediaThumbnails_Click(object? sender, RoutedEventArgs e)
+    {
+        var folder = CaptureContextMenuFolder(sender);
+        if (folder == null || _prewarmThumbnailsRunning != 0) return;
+        if (!await Settings.FolderActionDialog.ShowConfirmAsync(
+            this, "预生成媒体缩略图", folder.DisplayName, folder.Path,
+            "将递归处理当前文件夹及所有子文件夹中的图片、视频和音乐。视频缺少原始帧时会安全跳过；运行中可在文件夹菜单中停止。",
+            "开始预生成")) return;
+        if (Interlocked.CompareExchange(ref _prewarmThumbnailsRunning, 1, 0) != 0) return;
+
+        var batchCts = new CancellationTokenSource();
+        _prewarmThumbnailsCts = batchCts;
+        _prewarmThumbnailsTargetName = folder.DisplayName;
+        _prewarmThumbnailsTargetPath = folder.Path;
+        RefreshFolderMenuState();
+        await RunMediaThumbnailPrewarmAsync(folder.Path, batchCts);
+    }
+
+    private async Task RunMediaThumbnailPrewarmAsync(string rootPath, CancellationTokenSource batchCts)
+    {
+        var token = batchCts.Token;
+        try
+        {
+            Vm.StatusText = "正在扫描媒体文件…";
+            Vm.BackgroundStatusText = "";
+            var paths = await Task.Run(() => FolderContentOperations.EnumerateMediaFiles(rootPath, recursive: true), token);
+            token.ThrowIfCancellationRequested();
+            if (paths.Count == 0)
+            {
+                Vm.StatusText = "文件夹及子文件夹中没有支持的媒体文件";
+                return;
+            }
+
+            Vm.StatusText = $"正在预生成 {paths.Count} 个媒体缩略图…";
+            var progress = new Progress<MediaThumbnailPrewarmProgress>(update =>
+            {
+                Vm.BackgroundStatusText =
+                    $"媒体缩略图 {update.Completed}/{update.Total} | 命中 {update.Cached} / 生成 {update.Generated} / 无封面 {update.NoPreview} / 跳过视频 {update.SkippedVideos} / 失败 {update.Failed}";
+            });
+            var service = App.Services.GetRequiredService<IMediaThumbnailPrewarmService>();
+            var pageManager = App.Services.GetRequiredService<PageManager>();
+            var result = await service.PrewarmAsync(paths, pageManager.ThumbnailDecodeWidth, progress, token);
+            Vm.StatusText =
+                $"媒体缩略图预生成完成: 总数 {result.Total}, 命中 {result.Cached}, 生成 {result.Generated}, 无封面 {result.NoPreview}, 跳过视频 {result.SkippedVideos}, 失败 {result.Failed}";
+        }
+        catch (OperationCanceledException)
+        {
+            Vm.StatusText = "媒体缩略图预生成已停止";
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error($"Media thumbnail prewarm failed: {ex}");
+            Vm.StatusText = $"媒体缩略图预生成失败: {ex.Message}";
+        }
+        finally
+        {
+            Vm.BackgroundStatusText = "";
+            _prewarmThumbnailsRunning = 0;
+            _prewarmThumbnailsCts = null;
+            _prewarmThumbnailsTargetName = null;
+            _prewarmThumbnailsTargetPath = null;
+            batchCts.Dispose();
+            RefreshFolderMenuState();
+        }
     }
 
     private async void MenuComputeVideoOriginalFramesRecursive_Click(object? sender, RoutedEventArgs e)
@@ -3283,6 +3406,7 @@ public partial class MainWindow : Window
 
     private void Window_Closing(object? sender, Avalonia.Controls.WindowClosingEventArgs e)
     {
+        _prewarmThumbnailsCts?.Cancel();
         _scrollActivityCts?.Cancel();
         _scrollActivityCts?.Dispose();
         _scrollActivityCts = null;

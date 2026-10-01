@@ -1,4 +1,5 @@
 using System.Collections;
+using System.Collections.Specialized;
 using ImageManager.App.Models;
 using ImageManager.App.ViewModels;
 
@@ -10,12 +11,14 @@ namespace ImageManager.App.Services;
 /// synchronization for concurrent cache updates. It is intentionally index-only:
 /// enumerating or copying every entry would defeat virtualization.
 /// </summary>
-public sealed class ContinuousImageItemSource : IList
+public sealed class ContinuousImageItemSource : IList, INotifyCollectionChanged
 {
-    private readonly IReadOnlyList<string> _paths;
-    private readonly IReadOnlyList<ImageDisplayItemSize> _sizes;
+    private readonly List<string> _paths;
+    private readonly List<ImageDisplayItemSize> _sizes;
     private readonly Func<string, List<string>> _getTags;
     private readonly Dictionary<int, ImageViewItem> _cachedItems = new();
+
+    public event NotifyCollectionChangedEventHandler? CollectionChanged;
 
     public ContinuousImageItemSource(
         IReadOnlyList<string> paths,
@@ -33,8 +36,8 @@ public sealed class ContinuousImageItemSource : IList
                 nameof(sizes));
         }
 
-        _paths = paths;
-        _sizes = sizes;
+        _paths = paths.ToList();
+        _sizes = sizes.ToList();
         _getTags = getTags;
     }
 
@@ -153,7 +156,53 @@ public sealed class ContinuousImageItemSource : IList
 
     public void Remove(object? value) => throw new NotSupportedException("The continuous image item source is read-only.");
 
-    public void RemoveAt(int index) => throw new NotSupportedException("The continuous image item source is read-only.");
+    /// <summary>
+    /// Removes result entries in descending source order while preserving cached
+    /// item instances for entries that merely shift one index to the left.
+    /// </summary>
+    public IReadOnlyList<int> RemovePaths(ISet<string> deletedPaths)
+    {
+        ArgumentNullException.ThrowIfNull(deletedPaths);
+        var indexes = _paths
+            .Select((path, index) => (path, index))
+            .Where(entry => deletedPaths.Contains(entry.path))
+            .Select(entry => entry.index)
+            .OrderByDescending(index => index)
+            .ToArray();
+
+        foreach (var index in indexes)
+            RemoveAt(index);
+        return indexes;
+    }
+
+    public void RemoveAt(int index)
+    {
+        if ((uint)index >= (uint)_paths.Count)
+            throw new ArgumentOutOfRangeException(nameof(index));
+
+        var oldPath = _paths[index];
+        _paths.RemoveAt(index);
+        _sizes.RemoveAt(index);
+
+        if (_cachedItems.Remove(index, out var removed))
+            removed.ThumbnailData = null;
+
+        foreach (var pair in _cachedItems
+                     .Where(pair => pair.Key > index)
+                     .OrderBy(pair => pair.Key)
+                     .ToArray())
+        {
+            _cachedItems.Remove(pair.Key);
+            _cachedItems[pair.Key - 1] = pair.Value;
+        }
+
+        object oldItem = removed is not null ? removed : oldPath;
+        CollectionChanged?.Invoke(this,
+            new NotifyCollectionChangedEventArgs(
+                NotifyCollectionChangedAction.Remove,
+                oldItem,
+                index));
+    }
 
     public void CopyTo(Array array, int index)
     {

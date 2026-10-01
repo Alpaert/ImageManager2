@@ -4,6 +4,7 @@ using ImageManager.Core.Models;
 var tests = new (string Name, Func<Task> Run)[]
 {
     ("classifies extensions case-insensitively and excludes unsupported files", ClassifiesExtensions),
+    ("music type filters without metadata I/O and ignores orientation", MusicTypeBehavior),
     ("type-only filtering does not load dimensions or image headers", TypeOnlySkipsMetadata),
     ("type is applied before dimensions are requested", TypeIsAppliedBeforeDimensions),
     ("orientation intersection preserves source order", OrientationIntersectionPreservesOrder),
@@ -56,10 +57,29 @@ static async Task<DisplayFilterResult> Apply(
 
 static async Task ClassifiesExtensions()
 {
-    var source = new[] { "A.JPG", "b.Mp4", "c.txt", "d.PNG", "e.bin" };
+    var source = new[] { "A.JPG", "b.Mp4", "c.txt", "d.PNG", "e.bin", "f.FlAc" };
     var result = await Apply(source, new());
-    AssertSequence(result.Files, "A.JPG", "b.Mp4", "d.PNG");
+    AssertSequence(result.Files, "A.JPG", "b.Mp4", "d.PNG", "f.FlAc");
     Assert(result.UnknownDimensionsCount == 0, "type-only filtering has no unknown count");
+}
+
+static async Task MusicTypeBehavior()
+{
+    var loadCalls = 0;
+    var result = await Apply(new[] { "song.MP3", "cover.jpg", "other.flac" }, new("music"),
+        (_, _) =>
+        {
+            loadCalls++;
+            throw new InvalidOperationException("music type filtering must not load dimensions");
+        });
+    AssertSequence(result.Files, "song.MP3", "other.flac");
+    Assert(loadCalls == 0, "music type filtering performed metadata I/O");
+
+    var orientationResult = await Apply(new[] { "song.mp3", "wide.jpg" },
+        new(null, MediaOrientation.Landscape, true),
+        (_, _) => Task.FromResult(new Dictionary<string, (int, int)> { ["wide.jpg"] = (4, 2) }));
+    AssertSequence(orientationResult.Files, "wide.jpg");
+    Assert(orientationResult.UnknownDimensionsCount == 0, "music is not an unknown visual orientation");
 }
 
 static async Task TypeOnlySkipsMetadata()

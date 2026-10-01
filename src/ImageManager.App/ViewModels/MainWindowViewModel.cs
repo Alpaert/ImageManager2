@@ -316,7 +316,12 @@ public partial class MainWindowViewModel : ViewModelBase
         if (snapshot is null || source is null || !double.IsFinite(containerWidth) || containerWidth <= 0)
             return false;
 
-        var options = snapshot.GeometryIndex.Options with { ContainerWidth = containerWidth };
+        var options = snapshot.GeometryIndex.Options with
+        {
+            ContainerWidth = containerWidth,
+            ThumbnailBaseWidth = ThumbnailBaseWidth,
+            GridAspectRatio = AppSettings.ThumbnailAspectRatio
+        };
         var geometry = await Task.Run(
             () => ImageDisplayGeometryIndex.Build(snapshot.Sizes, options), cancellationToken)
             .ConfigureAwait(false);
@@ -515,6 +520,61 @@ public partial class MainWindowViewModel : ViewModelBase
         ContinuousDisplayGeometryIndex = null;
     }
 
+    private void CancelContinuousGeometryWorkPreservingSource()
+    {
+        ++_continuousDisplayGeometryVersion;
+        _continuousDisplayGeometryCts?.Cancel();
+        _continuousDisplayGeometryCts = null;
+        _continuousDimensionRepairCts?.Cancel();
+        _continuousDimensionRepairCts = null;
+        IsContinuousGeometryBuilding = false;
+    }
+
+    private async Task<bool> ApplyContinuousDeletionAsync(
+        ContinuousImageItemSource source,
+        ContinuousDisplayGeometrySnapshot snapshot,
+        HashSet<string> deletedPaths)
+    {
+        var remainingPaths = snapshot.Paths
+            .Where(path => !deletedPaths.Contains(path))
+            .ToArray();
+        var remainingSizes = snapshot.Paths
+            .Select((path, index) => (path, index))
+            .Where(entry => !deletedPaths.Contains(entry.path))
+            .Select(entry => snapshot.Sizes[entry.index])
+            .ToArray();
+
+        if (snapshot.Paths.Count != source.Count || remainingPaths.Length != remainingSizes.Length)
+            return false;
+
+        var requestVersion = _continuousDisplayGeometryVersion;
+        var options = snapshot.GeometryIndex.Options;
+        var geometry = await Task.Run(
+            () => ImageDisplayGeometryIndex.Build(remainingSizes, options));
+
+        if (requestVersion != _continuousDisplayGeometryVersion ||
+            !ReferenceEquals(snapshot, ContinuousDisplayGeometrySnapshot) ||
+            !ReferenceEquals(source, ContinuousImageItemSource) ||
+            DisplayMode != ImageDisplayMode.Continuous)
+            return false;
+
+        source.RemovePaths(deletedPaths);
+        if (source.Count != remainingPaths.Length)
+            return false;
+
+        // Paths after the deletion shift left. A numerically unchanged viewport
+        // range can therefore contain a newly visible item that the previous
+        // range had not loaded; force the next panel range publication to queue
+        // only those missing thumbnails without clearing retained image bytes.
+        CancelContinuousViewportThumbnailLoad();
+
+        var dimensionHitCount = remainingSizes.Count(size => size.Width > 1 && size.Height > 1);
+        ContinuousDisplayGeometrySnapshot = new ContinuousDisplayGeometrySnapshot(
+            remainingPaths, remainingSizes, geometry, dimensionHitCount);
+        ContinuousDisplayGeometryIndex = geometry;
+        return true;
+    }
+
     private async Task PersistCachedDimensionsAsync(
         IReadOnlyDictionary<string, (int Width, int Height)> dimensions)
     {
@@ -653,6 +713,72 @@ public partial class MainWindowViewModel : ViewModelBase
         _pageManager.LoadPrefetchThumbnailsForItems(prefetchItems, cts.Token);
     }
 
+    private bool RefreshContinuousViewportThumbnailsAfterZoom()
+    {
+        if (DisplayMode != ImageDisplayMode.Continuous || ContinuousImageItemSource is not { } source)
+            return false;
+
+        // The virtualizing panel owns which items exist. Keep the old bytes on its
+        // current visible and prefetch items until each replacement has succeeded.
+        var visibleRange = _continuousVisibleRange;
+        var prefetchRange = _continuousPrefetchRange;
+        var visibleItems = source.GetCachedItems(visibleRange);
+        var visiblePaths = new HashSet<string>(
+            visibleItems.Select(item => item.FilePath),
+            StringComparer.OrdinalIgnoreCase);
+        var prefetchItems = source.GetOrCreateItems(prefetchRange)
+            .Where(item => !visiblePaths.Contains(item.FilePath))
+            .ToArray();
+
+        // Retained items are already materialized but may cross into the viewport
+        // before being evicted. Mark them now, then schedule only active ranges.
+        foreach (var item in source.GetAllCachedItems())
+        {
+            if (item.ThumbnailData is { Length: > 0 })
+            {
+                item.IsRefreshingThumbnail = true;
+                item.IsLoading = false;
+            }
+            else if (!item.HasNoPreview)
+            {
+                item.IsLoaded = false;
+                item.IsLoading = true;
+            }
+        }
+
+        CancelContinuousViewportThumbnailLoad();
+        _continuousViewportSource = source;
+        _continuousVisibleRange = visibleRange;
+        _continuousPrefetchRange = prefetchRange;
+        if (visibleRange.IsEmpty)
+            return true;
+
+        var cts = new CancellationTokenSource();
+        _continuousViewportThumbnailCts = cts;
+        _pageManager.LoadViewportThumbnailsForItems(visibleItems, cts.Token);
+        _pageManager.LoadPrefetchThumbnailsForItems(prefetchItems, cts.Token);
+        return true;
+    }
+
+    /// <summary>
+    /// Returns existing item projections only. It never materializes additional
+    /// continuous items merely to service a context-menu command.
+    /// </summary>
+    public IReadOnlyList<ImageViewItem> GetMaterializedThumbnailItems(IEnumerable<string> filePaths)
+    {
+        var paths = new HashSet<string>(
+            filePaths.Where(path => !string.IsNullOrWhiteSpace(path)),
+            StringComparer.OrdinalIgnoreCase);
+        if (paths.Count == 0)
+            return Array.Empty<ImageViewItem>();
+
+        return Images
+            .Concat(ContinuousImageItemSource?.GetAllCachedItems() ?? Array.Empty<ImageViewItem>())
+            .Where(item => paths.Contains(item.FilePath))
+            .DistinctBy(item => item.FilePath, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
     private void CancelContinuousViewportThumbnailLoad()
     {
         _continuousViewportThumbnailCts?.Cancel();
@@ -780,7 +906,6 @@ public partial class MainWindowViewModel : ViewModelBase
     private DateTime _deferMaintenanceUntilUtc = DateTime.MinValue;
     private FileSystemWatcher? _folderWatcher;
     private CancellationTokenSource? _folderWatchDebounceCts;
-    private CancellationTokenSource? _widthDebounceCts;
     private int _resultNavigationVersion;
     private HashSet<string>? _pendingSelectionRestorePaths;
     private readonly HashSet<string> _selectedFilePaths = new(StringComparer.OrdinalIgnoreCase);
@@ -880,6 +1005,7 @@ public partial class MainWindowViewModel : ViewModelBase
             // 发送 Images 更新完成信号
             _imagesUpdatedTcs?.TrySetResult(true);
         };
+        _pageManager.ThumbnailRefreshRequested += RefreshContinuousViewportThumbnailsAfterZoom;
 
         // Tag search completed
         messenger.Register<MainWindowViewModel, ImageManager.Core.Messages.TagSearchCompletedMessage>(this, (r, msg) =>
@@ -2282,7 +2408,8 @@ public partial class MainWindowViewModel : ViewModelBase
     }
     partial void OnThumbnailBaseWidthChanged(double value)
     {
-        InvalidateContinuousDisplayGeometry();
+        if (DisplayMode != ImageDisplayMode.Continuous)
+            InvalidateContinuousDisplayGeometry();
         OnPropertyChanged(nameof(GridThumbnailHeight));
         _ = RefreshFolderCardThumbnailsForCurrentScaleAsync();
     }
@@ -2310,24 +2437,7 @@ partial void OnCornerRadiusDipChanged(double value)
             ThumbnailBaseWidth, WaterfallMode, AppSettings.ThumbnailAspectRatio));
         var (baseWidth, _) = _pageManager.OnZoomTickChanged(value, CurrentPage, TotalPages,
             ActiveFileList, GetTagsForFile);
-        if ((int)baseWidth != (int)ThumbnailBaseWidth)
-        {
-            _widthDebounceCts?.Cancel();
-            _widthDebounceCts?.Dispose();
-            _widthDebounceCts = new CancellationTokenSource();
-            var capturedWidth = baseWidth;
-            var token = _widthDebounceCts.Token;
-            RunBackgroundSafe("thumbnail-width-debounce", token, async ct =>
-            {
-                await Task.Delay(50, ct);
-                if (ct.IsCancellationRequested) return;
-                await _dispatcher.InvokeAsync(() =>
-                {
-                    if (!ct.IsCancellationRequested)
-                        ThumbnailBaseWidth = capturedWidth;
-                });
-            });
-        }
+        ThumbnailBaseWidth = baseWidth;
     }
 
     partial void OnShowAllSubfoldersChanged(bool value)
@@ -2757,7 +2867,6 @@ partial void OnCornerRadiusDipChanged(double value)
         _folderWorkCts.Cancel();
         _hashCts?.Cancel();
         _searchCts?.Cancel();
-        _widthDebounceCts?.Cancel();
     }
 
     private bool IsFolderViewRequestCurrent(int requestVersion, string folderPath, bool showAllSubfolders)
@@ -2891,6 +3000,17 @@ partial void OnCornerRadiusDipChanged(double value)
         {
 
         var filterWasPending = IsDisplayFilterBusy;
+        var wasContinuous = DisplayMode == ImageDisplayMode.Continuous;
+        var continuousAnchor = _continuousVisibleRange.StartIndex;
+        var continuousSource = wasContinuous ? ContinuousImageItemSource : null;
+        var continuousSnapshot = wasContinuous ? ContinuousDisplayGeometrySnapshot : null;
+        if (wasContinuous && continuousAnchor > 0)
+        {
+            var deletedBeforeAnchor = ActiveFileList
+                .Take(Math.Min(continuousAnchor, ActiveFileList.Count))
+                .Count(deletedPaths.Contains);
+            continuousAnchor = Math.Max(0, continuousAnchor - deletedBeforeAnchor);
+        }
         CancelDisplayFilter();
         IsDisplayFilterBusy = false;
         // Remove from master lists and both published snapshots.
@@ -2899,7 +3019,8 @@ partial void OnCornerRadiusDipChanged(double value)
         _filteredNavigationFiles.RemoveAll(p => deletedPaths.Contains(p));
         _allFiles.RemoveAll(p => deletedPaths.Contains(p));
         _selectedFilePaths.RemoveWhere(deletedPaths.Contains);
-        InvalidateContinuousDisplayGeometry();
+        if (!wasContinuous || HasDisplayFilter || filterWasPending)
+            InvalidateContinuousDisplayGeometry();
         if (_tagSearch.SearchResultFiles.Count > 0)
             _tagSearch.SearchResultFiles.RemoveAll(p => deletedPaths.Contains(p));
 
@@ -2921,10 +3042,36 @@ partial void OnCornerRadiusDipChanged(double value)
         if (CurrentPage >= TotalPages && TotalPages > 0)
             CurrentPage = TotalPages - 1;
 
+        if (wasContinuous && continuousSource is not null && continuousSnapshot is not null)
+        {
+            CancelContinuousGeometryWorkPreservingSource();
+            if (await ApplyContinuousDeletionAsync(continuousSource, continuousSnapshot, deletedPaths))
+            {
+                _pageManager.InvalidateCache();
+                return;
+            }
+
+            // The source may have been replaced by another result update while the
+            // CPU-only geometry rebuild was running. Fall back to the normal full
+            // continuous refresh in that case rather than publishing stale indexes.
+            InvalidateContinuousDisplayGeometry();
+        }
+
         if (TotalPages == 0)
         {
             Images = new ObservableCollection<ImageViewItem>();
             _pageManager.InvalidateCache();
+            return;
+        }
+
+        if (wasContinuous)
+        {
+            // Continuous mode owns its virtualized source; the page Items collection
+            // is not the visible surface. Rebuild the source after invalidation so a
+            // single deletion does not leave the whole continuous view blank.
+            _pageManager.InvalidateCache();
+            if (ContinuousDisplayRefreshRequested is { } refresh)
+                await refresh(Math.Clamp(continuousAnchor, 0, ActiveFileList.Count - 1));
             return;
         }
 

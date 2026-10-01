@@ -184,6 +184,65 @@ try
     }
     Console.WriteLine($"PASS continuous resize geometry rebuild: {geometryWidthBeforeResize:F0} -> {actualPanel.GeometryIndex!.Options.ContainerWidth:F0}");
 
+    vm.WaterfallMode = "Vertical";
+    WaitUntil(() => !vm.IsContinuousGeometryBuilding &&
+                    actualPanel.GeometryIndex?.Options.Mode == ImageDisplayLayoutMode.Vertical);
+    WaitForImages(actualPanel);
+
+    // A deletion outside the viewport must use the same incremental contract as
+    // paged mode: keep the source and already-realized thumbnail controls alive.
+    actualPanel.ScrollToIndex(0);
+    Pump();
+    WaitForImages(actualPanel);
+    var sourceBeforeDelete = vm.ContinuousImageItemSource!;
+    var retainedVisualBeforeDelete = actualPanel.GetVisualDescendants().OfType<Border>().First();
+    var deletedPath = paths[8000];
+    WaitForTask(vm.RemoveFilesFromViewAsync(new HashSet<string>([deletedPath], StringComparer.OrdinalIgnoreCase)));
+    WaitUntil(() => vm.ContinuousImageItemSource?.Count == paths.Length - 1 &&
+                    actualPanel.GeometryIndex?.Count == paths.Length - 1);
+    WaitForImages(actualPanel);
+    if (!ReferenceEquals(sourceBeforeDelete, vm.ContinuousImageItemSource) ||
+        !actualPanel.GetVisualDescendants().OfType<Border>().Any(border => ReferenceEquals(border, retainedVisualBeforeDelete)) ||
+        !actualItems.GetVisualDescendants().OfType<Image>().Any(image => image.Source != null))
+    {
+        throw new InvalidOperationException("Continuous deletion must retain visible containers and decoded thumbnails.");
+    }
+    Console.WriteLine("PASS continuous deletion retains visible containers and thumbnails");
+
+    var shiftedContainerBeforeDelete = actualPanel.GetVisualChildren()
+        .OfType<Control>()
+        .First(control => (control.DataContext as ImageViewItem)?.FilePath == paths[2]);
+    WaitForTask(vm.RemoveFilesFromViewAsync(new HashSet<string>([paths[1]], StringComparer.OrdinalIgnoreCase)));
+    WaitUntil(() => vm.ContinuousImageItemSource?.Count == paths.Length - 2 &&
+                    actualPanel.GeometryIndex?.Count == paths.Length - 2);
+    WaitForImages(actualPanel);
+    if (!actualPanel.GetVisualChildren().Any(control => ReferenceEquals(control, shiftedContainerBeforeDelete)) ||
+        (shiftedContainerBeforeDelete.DataContext as ImageViewItem)?.FilePath != paths[2])
+    {
+        throw new InvalidOperationException("Deleting a visible item must retain and reindex its neighboring containers.");
+    }
+    var visibleThumbnailImages = actualPanel.GetVisualDescendants()
+        .OfType<Image>()
+        .Where(image => image.Bounds.Width > 0 && image.Bounds.Height > 0)
+        .ToArray();
+    if (visibleThumbnailImages.Length == 0 || visibleThumbnailImages.Any(image => image.Source is null))
+    {
+        throw new InvalidOperationException("Continuous deletion leaves a visible thumbnail card without an image source.");
+    }
+    var realizedItemControls = actualPanel.GetVisualChildren()
+        .OfType<Control>()
+        .Where(control => control.DataContext is ImageViewItem)
+        .ToArray();
+    var realizedPaths = realizedItemControls
+        .Select(control => ((ImageViewItem)control.DataContext!).FilePath)
+        .ToArray();
+    if (realizedItemControls.Length != actualPanel.RealizedCount ||
+        realizedPaths.Distinct(StringComparer.OrdinalIgnoreCase).Count() != realizedPaths.Length)
+    {
+        throw new InvalidOperationException("Continuous deletion leaves orphaned or duplicate realized thumbnail containers.");
+    }
+    Console.WriteLine("PASS continuous visible deletion reindexes neighboring containers without reset");
+
     // Drive the real filter -> invalidation -> ShowPage -> continuous refresh chain.
     SetFiles(paths.Take(7));
     WaitForTask(vm.ResetDisplayFilterAsync());
@@ -201,6 +260,28 @@ try
     if (actualItems.IsVisible || !main.FindControl<ItemsControl>("ItemsImages")!.IsVisible)
         throw new InvalidOperationException("Returning to paged mode failed.");
     WaitForTask(vm.TrySetDisplayModeAsync(ImageManager.App.Models.ImageDisplayMode.Continuous));
+    WaitForImages(actualPanel);
+
+    // Deleting the final result follows the incremental continuous-delete path,
+    // unlike filter replacement. It must remove every realized card immediately.
+    SetFiles(new[] { paths[0] });
+    WaitForTask(vm.ResetDisplayFilterAsync());
+    WaitUntil(() => vm.ContinuousImageItemSource?.Count == 1 &&
+                    actualPanel.GeometryIndex?.Count == 1);
+    WaitForImages(actualPanel);
+    WaitForTask(vm.RemoveFilesFromViewAsync(new HashSet<string>([paths[0]], StringComparer.OrdinalIgnoreCase)));
+    WaitUntil(() => vm.ContinuousImageItemSource?.Count == 0 &&
+                    actualPanel.GeometryIndex?.Count == 0);
+    Pump();
+    if (actualItems.ItemCount != 0 || actualPanel.RealizedCount != 0 ||
+        actualItems.GetVisualDescendants().Any(control => control.DataContext is ImageViewItem))
+    {
+        throw new InvalidOperationException("Deleting the final continuous result leaves stale thumbnail cards.");
+    }
+    Console.WriteLine("PASS deleting final continuous result clears all realized cards");
+
+    SetFiles(paths);
+    WaitForTask(vm.ResetDisplayFilterAsync());
     WaitForImages(actualPanel);
     var capturePath = Path.Combine(Path.GetTempPath(), "ImageManager-continuous-regression.png");
     using (var capture = new Avalonia.Media.Imaging.RenderTargetBitmap(new PixelSize((int)main.Bounds.Width, (int)main.Bounds.Height)))

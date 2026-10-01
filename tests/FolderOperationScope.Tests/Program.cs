@@ -115,12 +115,13 @@ static void MediaEnumerationAndCounts()
     try
     {
         File.WriteAllText(Path.Combine(root, "a.JPG"), "image");
+        File.WriteAllText(Path.Combine(root, "song.MP3"), "music");
         File.WriteAllText(Path.Combine(root, "notes.txt"), "text");
         File.WriteAllText(Path.Combine(child, "b.MP4"), "video");
 
-        Assert(FolderContentOperations.GetDisplayCount(root) == 1, "nonrecursive count should include direct media only");
-        Assert(FolderContentOperations.GetDisplayCount(root, true) == 2, "recursive count should include descendants");
-        Assert(FolderContentOperations.EnumerateMediaFiles(root, true).Count == 2, "enumeration should find image and video");
+        Assert(FolderContentOperations.GetDisplayCount(root) == 2, "nonrecursive count should include direct media only");
+        Assert(FolderContentOperations.GetDisplayCount(root, true) == 3, "recursive count should include descendants");
+        Assert(FolderContentOperations.EnumerateMediaFiles(root, true).Count == 3, "enumeration should find image, music, and video");
     }
     finally
     {

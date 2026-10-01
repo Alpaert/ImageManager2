@@ -8,6 +8,8 @@ using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Video;
 using ImageManager.Infrastructure.Services;
 using ImageManager.Infrastructure.Caching;
+using ImageManager.Infrastructure.Audio;
+using SkiaSharp;
 
 var messenger = new WeakReferenceMessenger();
 var repository = DispatchProxy.Create<IImageMetaRepository, MetadataProxy>();
@@ -54,6 +56,179 @@ finally
     try { Directory.Delete(cacheFixtureDirectory, recursive: true); } catch { }
 }
 
+var sidecarArtworkFixtureDirectory = Path.Combine(
+    Path.GetTempPath(), "ImageManager-SidecarArtwork-" + Guid.NewGuid().ToString("N"));
+try
+{
+    Directory.CreateDirectory(sidecarArtworkFixtureDirectory);
+    var audioPath = Path.Combine(sidecarArtworkFixtureDirectory, "track.flac");
+    var coverPath = Path.Combine(sidecarArtworkFixtureDirectory, "Cover.jpg");
+    File.WriteAllText(audioPath, "audio without readable embedded tags");
+    await File.WriteAllBytesAsync(coverPath, CreateTestJpeg());
+
+    var processor = new MusicMediaProcessor();
+    var sidecarResult = await processor.ExtractThumbnailAsync(audioPath, 200, CancellationToken.None);
+    Require(sidecarResult?.Data is { Length: > 0 } && sidecarResult.Width == 8 && sidecarResult.Height == 6,
+        "music without embedded artwork must fall back to a same-folder Cover image");
+    File.Delete(coverPath);
+
+    var sameStemAudioPath = Path.Combine(sidecarArtworkFixtureDirectory, "LACM-14184.flac");
+    var sameStemArtworkPath = Path.Combine(sidecarArtworkFixtureDirectory, "LACM-14184.jpg");
+    File.WriteAllText(sameStemAudioPath, "album track without embedded tags");
+    await File.WriteAllBytesAsync(sameStemArtworkPath, CreateTestJpeg());
+    var sameStemResult = await processor.ExtractThumbnailAsync(sameStemAudioPath, 200, CancellationToken.None);
+    Require(sameStemResult?.Data is { Length: > 0 },
+        "music must fall back to an image matching the audio file name");
+
+    var scansAudioPath = Path.Combine(sidecarArtworkFixtureDirectory, "scans-track.flac");
+    var scansDirectory = Path.Combine(sidecarArtworkFixtureDirectory, "Scans");
+    Directory.CreateDirectory(scansDirectory);
+    File.WriteAllText(scansAudioPath, "album track with scans only");
+    await File.WriteAllBytesAsync(Path.Combine(scansDirectory, "001.webp"), CreateTestJpeg());
+    var scansResult = await processor.ExtractThumbnailAsync(scansAudioPath, 200, CancellationToken.None);
+    Require(scansResult?.Data is { Length: > 0 },
+        "music must fall back to the first supported image in a Scans directory");
+
+    await File.WriteAllBytesAsync(coverPath, CreateTestJpeg());
+    var fingerprintFactory = new TestMusicProcessorFactory(CreateTestJpeg());
+    var fingerprintCache = new ThumbnailCacheService(
+        fingerprintFactory, Path.Combine(sidecarArtworkFixtureDirectory, "cache"), 200);
+    var firstSidecarCached = await fingerprintCache.GetOrCreateThumbnailWithDiagnosticsAsync(audioPath, 200);
+    await File.AppendAllTextAsync(coverPath, "changed");
+    var changedSidecarCached = await fingerprintCache.GetOrCreateThumbnailWithDiagnosticsAsync(audioPath, 200);
+    Require(firstSidecarCached.Data is { Length: > 0 } && changedSidecarCached.Data is { Length: > 0 } &&
+            fingerprintFactory.CoverReads == 2,
+        "changing a sidecar cover must invalidate the music master-cover cache");
+    Console.WriteLine("PASS music sidecar artwork fallback and cache invalidation");
+}
+finally
+{
+    try { Directory.Delete(sidecarArtworkFixtureDirectory, recursive: true); } catch { }
+}
+
+var albumArtworkFixtureDirectory = Path.Combine(
+    Path.GetTempPath(), "ImageManager-AlbumArtwork-" + Guid.NewGuid().ToString("N"));
+try
+{
+    Directory.CreateDirectory(albumArtworkFixtureDirectory);
+    var albumAudioPath = Path.Combine(albumArtworkFixtureDirectory, "01. 序章.flac");
+    var albumArtworkPath = Path.Combine(albumArtworkFixtureDirectory, "pjsk_movie_ost_cut.jpeg");
+    File.WriteAllText(albumAudioPath, "album track without matching cover name");
+    await File.WriteAllBytesAsync(albumArtworkPath, CreateTestJpeg());
+
+    var processor = new MusicMediaProcessor();
+    var albumArtworkResult = await processor.ExtractThumbnailAsync(albumAudioPath, 200, CancellationToken.None);
+    Require(albumArtworkResult?.Data is { Length: > 0 },
+        "music must use a shared arbitrary image from an album folder");
+    Console.WriteLine("PASS music album-folder artwork fallback");
+}
+finally
+{
+    try { Directory.Delete(albumArtworkFixtureDirectory, recursive: true); } catch { }
+}
+
+var musicCacheFixtureDirectory = Path.Combine(Path.GetTempPath(), "ImageManager-MusicCache-" + Guid.NewGuid().ToString("N"));
+try
+{
+    Directory.CreateDirectory(musicCacheFixtureDirectory);
+    var musicPath = Path.Combine(musicCacheFixtureDirectory, "cover.mp3");
+    var noArtworkPath = Path.Combine(musicCacheFixtureDirectory, "no-artwork.mp3");
+    File.WriteAllText(musicPath, "music source");
+    File.WriteAllText(noArtworkPath, "music without cover");
+
+    var musicFactory = new TestMusicProcessorFactory(CreateTestJpeg());
+    var musicThumbnailCache = new ThumbnailCacheService(musicFactory, musicCacheFixtureDirectory, 200);
+    var firstMusicThumbnail = await musicThumbnailCache.GetOrCreateThumbnailWithDiagnosticsAsync(musicPath, 200);
+    Require(firstMusicThumbnail.Data is { Length: > 0 } && musicFactory.CoverReads == 1,
+        "first music thumbnail must extract embedded artwork once");
+
+    var secondMusicThumbnail = await musicThumbnailCache.GetOrCreateThumbnailWithDiagnosticsAsync(musicPath, 200);
+    Require(secondMusicThumbnail.Data is { Length: > 0 } && musicFactory.CoverReads == 1,
+        "same-width music thumbnail must reuse disk cache without rereading tags");
+
+    var resizedMusicThumbnail = await musicThumbnailCache.GetOrCreateThumbnailWithDiagnosticsAsync(musicPath, 80);
+    Require(resizedMusicThumbnail.Data is { Length: > 0 } && musicFactory.CoverReads == 1,
+        "different-width music thumbnail must derive from the cached master cover");
+
+    var firstNoArtwork = await musicThumbnailCache.GetOrCreateThumbnailWithDiagnosticsAsync(noArtworkPath, 200);
+    var secondNoArtwork = await musicThumbnailCache.GetOrCreateThumbnailWithDiagnosticsAsync(noArtworkPath, 80);
+    Require(firstNoArtwork.IsFinalWithoutThumbnail && secondNoArtwork.IsFinalWithoutThumbnail && musicFactory.NoArtworkReads == 1,
+        "no-artwork music must use a persistent negative cache across widths");
+
+    File.AppendAllText(musicPath, " updated");
+    var refreshedMusicThumbnail = await musicThumbnailCache.GetOrCreateThumbnailWithDiagnosticsAsync(musicPath, 200);
+    Require(refreshedMusicThumbnail.Data is { Length: > 0 } && musicFactory.CoverReads == 2,
+        "music source changes must invalidate the master and derived cover caches");
+
+    var racePath = Path.Combine(musicCacheFixtureDirectory, "changed-during-read.mp3");
+    File.WriteAllText(racePath, "old tag payload");
+    musicFactory.MutateSourceOnce = racePath;
+    var readsBeforeRace = musicFactory.CoverReads;
+    var raceThumbnail = await musicThumbnailCache.GetOrCreateThumbnailWithDiagnosticsAsync(racePath, 200);
+    Require(raceThumbnail.Data is { Length: > 0 } && musicFactory.CoverReads == readsBeforeRace + 2,
+        "a source changed during tag extraction must discard stale artwork and retry once");
+    var cachedRaceThumbnail = await musicThumbnailCache.GetOrCreateThumbnailWithDiagnosticsAsync(racePath, 80);
+    Require(cachedRaceThumbnail.Data is { Length: > 0 } && musicFactory.CoverReads == readsBeforeRace + 2,
+        "the retried artwork must be reusable after its source fingerprint is stable");
+
+    var unwritableCacheRoot = Path.Combine(musicCacheFixtureDirectory, "cache-root-file");
+    File.WriteAllText(unwritableCacheRoot, "not a directory");
+    var cacheWriteFailureMusicPath = Path.Combine(musicCacheFixtureDirectory, "cache-write-failure.mp3");
+    var cacheWriteFailureNoArtworkPath = Path.Combine(musicCacheFixtureDirectory, "no-artwork-cache-write-failure.mp3");
+    File.WriteAllText(cacheWriteFailureMusicPath, "music source");
+    File.WriteAllText(cacheWriteFailureNoArtworkPath, "music without cover");
+    var cacheWriteFailureService = new ThumbnailCacheService(musicFactory, unwritableCacheRoot, 200);
+    var coverReadsBeforeWriteFailure = musicFactory.CoverReads;
+    var noArtworkReadsBeforeWriteFailure = musicFactory.NoArtworkReads;
+    var cacheWriteFailureCover = await cacheWriteFailureService.GetOrCreateThumbnailWithDiagnosticsAsync(cacheWriteFailureMusicPath, 200);
+    var cacheWriteFailureNoArtwork = await cacheWriteFailureService.GetOrCreateThumbnailWithDiagnosticsAsync(cacheWriteFailureNoArtworkPath, 200);
+    Require(cacheWriteFailureCover.Data is { Length: > 0 } && musicFactory.CoverReads == coverReadsBeforeWriteFailure + 1,
+        "music cover must remain displayable when its cache cannot be written");
+    Require(cacheWriteFailureNoArtwork.IsFinalWithoutThumbnail && musicFactory.NoArtworkReads == noArtworkReadsBeforeWriteFailure + 1,
+        "no-artwork state must remain displayable when its cache cannot be written");
+    Console.WriteLine("PASS music artwork cache reuses master cover, persists no-artwork state, and invalidates changed sources");
+}
+finally
+{
+    try { Directory.Delete(musicCacheFixtureDirectory, recursive: true); } catch { }
+}
+
+var prewarmFixtureDirectory = Path.Combine(Path.GetTempPath(), "ImageManager-Prewarm-" + Guid.NewGuid().ToString("N"));
+try
+{
+    Directory.CreateDirectory(prewarmFixtureDirectory);
+    var imagePath = Path.Combine(prewarmFixtureDirectory, "image.jpg");
+    var musicPath = Path.Combine(prewarmFixtureDirectory, "music.mp3");
+    var noArtworkPath = Path.Combine(prewarmFixtureDirectory, "no-artwork.mp3");
+    var videoPath = Path.Combine(prewarmFixtureDirectory, "cached-frame.mp4");
+    var skippedVideoPath = Path.Combine(prewarmFixtureDirectory, "missing-frame.mp4");
+    foreach (var path in new[] { imagePath, musicPath, noArtworkPath, videoPath, skippedVideoPath })
+        File.WriteAllText(path, "fixture");
+
+    var prewarmFactory = new TestMusicProcessorFactory(CreateTestJpeg());
+    var prewarmCache = new ThumbnailCacheService(prewarmFactory, prewarmFixtureDirectory, 120);
+    var prewarmFrames = new VideoOriginalFrameCacheService(prewarmFixtureDirectory);
+    var originalFramePath = prewarmFrames.GetOriginalFramePath(videoPath);
+    Directory.CreateDirectory(Path.GetDirectoryName(originalFramePath)!);
+    await File.WriteAllBytesAsync(originalFramePath, CreateTestJpeg());
+    var prewarm = new MediaThumbnailPrewarmService(prewarmCache, prewarmFrames);
+
+    var prewarmResult = await prewarm.PrewarmAsync(
+        [imagePath, musicPath, noArtworkPath, videoPath, skippedVideoPath, "not-media.txt", "missing.jpg"], 120);
+    Require(prewarmResult.Total == 5 && prewarmResult.Completed == 5 && prewarmResult.Generated == 3 &&
+            prewarmResult.NoPreview == 1 && prewarmResult.SkippedVideos == 1 && prewarmResult.Failed == 0,
+        "prewarm must classify image/music generation, no artwork, and video frame availability");
+    Require(prewarmCache.TryGetCachedThumbnail(videoPath, 120).Data is { Length: > 0 },
+        "prewarm must derive a video thumbnail from an existing original frame");
+    Require(prewarmFactory.VideoProcessorAttempts == 0,
+        "prewarm must not route any video through a media processor");
+    Console.WriteLine("PASS thumbnail prewarm reuses cached video frames and skips FFmpeg paths");
+}
+finally
+{
+    try { Directory.Delete(prewarmFixtureDirectory, recursive: true); } catch { }
+}
+
 var firstPage = ImageDisplayRange.ForPage(0, ImagePaging.Default, 401);
 var lastPage = ImageDisplayRange.ForPage(2, ImagePaging.Default, 401);
 Require(firstPage == new ImageDisplayRange(0, 200), "first page range must be bounded by page size");
@@ -77,6 +252,17 @@ Require(vm.DisplayMode == ImageDisplayMode.Continuous && !vm.IsPagedDisplay, "co
 Require(await vm.TrySetDisplayModeAsync(ImageDisplayMode.Paged), "paged mode must remain restorable");
 Require(vm.DisplayMode == ImageDisplayMode.Paged && vm.IsPagedDisplay, "returning to paging must restore paged state");
 Console.WriteLine("PASS display mode switching preserves paged fallback");
+
+var mixedPreview = new PreviewViewModel
+{
+    ImagePaths = ["first.jpg", "track.mp3", "clip.mp4", "last.png"],
+    CurrentIndex = 0
+};
+Require(mixedPreview.NavigateIndex(1) == 3 && mixedPreview.CurrentIndex == 3,
+    "preview navigation must skip music and video entries in a mixed list");
+Require(mixedPreview.NavigateIndex(-1) == 0 && mixedPreview.CurrentIndex == 0,
+    "preview navigation must return to the preceding image without decoding music");
+Console.WriteLine("PASS preview navigation skips non-image media");
 
 var emptyWindow = new ImageDisplayWindowManager();
 var emptySnapshot = emptyWindow.UpdateVisibleRange(0, 10, 20);
@@ -306,9 +492,29 @@ vm.Images = new();
 fake.Load = paths => Task.FromResult(paths.ToDictionary(path => path, _ => (1920, 1080)));
 Require(await vm.PrepareContinuousDisplayGeometryAsync(800),
     "continuous geometry must build before deletion invalidation is tested");
+var continuousDeleteRefreshes = 0;
+var continuousSourceBeforeDelete = vm.ContinuousImageItemSource!;
+var survivingContinuousItem = GetImageItem(
+    continuousSourceBeforeDelete[1], "continuous item retained across deletion");
+survivingContinuousItem.ThumbnailData = [4, 5, 6];
+Func<int, Task> refreshContinuousAfterDelete = async _ =>
+{
+    continuousDeleteRefreshes++;
+    await vm.PrepareContinuousDisplayGeometryAsync(800);
+};
+vm.DisplayMode = ImageDisplayMode.Continuous;
+vm.ContinuousDisplayRefreshRequested += refreshContinuousAfterDelete;
 await vm.RemoveFilesFromViewAsync(new HashSet<string>(["geometry-delete-1.jpg"], StringComparer.OrdinalIgnoreCase));
-Require(vm.ContinuousDisplayGeometrySnapshot is null && vm.ContinuousImageItemSource is null,
-    "incremental deletion must invalidate the continuous display snapshot");
+Require(continuousDeleteRefreshes == 0 && vm.ContinuousDisplayGeometrySnapshot is not null &&
+        ReferenceEquals(continuousSourceBeforeDelete, vm.ContinuousImageItemSource) &&
+        vm.ContinuousImageItemSource?.Count == 1 &&
+        ReferenceEquals(survivingContinuousItem,
+            GetImageItem(vm.ContinuousImageItemSource[0], "remaining continuous item")) &&
+        survivingContinuousItem.ThumbnailData is { Length: 3 } &&
+        survivingContinuousItem.FilePath == "geometry-delete-2.jpg",
+    "deleting in continuous mode must retain the remaining source and thumbnail state");
+vm.ContinuousDisplayRefreshRequested -= refreshContinuousAfterDelete;
+vm.DisplayMode = ImageDisplayMode.Paged;
 Console.WriteLine("PASS continuous geometry coordinator publishes current work and rejects stale work");
 
 SetDisplayFiles(vm, ["selection-1.jpg", "selection-2.jpg", "selection-3.jpg"]);
@@ -391,6 +597,14 @@ static byte[] CreateJpegHeader(int width, int height) =>
     (byte)(width >> 8), (byte)width,
     0x00
 ];
+static byte[] CreateTestJpeg()
+{
+    using var surface = SKSurface.Create(new SKImageInfo(8, 6));
+    surface.Canvas.Clear(SKColors.CornflowerBlue);
+    using var image = surface.Snapshot();
+    using var encoded = image.Encode(SKEncodedImageFormat.Jpeg, 85);
+    return encoded.ToArray();
+}
 static void RequireThrows<TException>(Action action, string message) where TException : Exception
 {
     try { action(); }
@@ -423,4 +637,46 @@ public class ImmediateDispatcher : IDispatcher
     public Task InvokeAsync(Func<Task> callback) => callback();
     public Task<T> InvokeAsync<T>(Func<T> callback) => Task.FromResult(callback());
     public Task<T> InvokeAsync<T>(Func<Task<T>> callback) => callback();
+}
+
+public sealed class TestMusicProcessorFactory(byte[] artwork) : IMediaProcessorFactory
+{
+    public int CoverReads { get; private set; }
+    public int NoArtworkReads { get; private set; }
+    public int VideoProcessorAttempts { get; private set; }
+    public string? MutateSourceOnce { get; set; }
+
+    public IMediaProcessor GetProcessor(string filePath) => new TestMusicProcessor(this, artwork, filePath);
+
+    private sealed class TestMusicProcessor(TestMusicProcessorFactory owner, byte[] artwork, string filePath) : IMediaProcessor
+    {
+        public bool CanHandle(string extension) => true;
+
+        public Task<MediaResult?> ExtractThumbnailAsync(string path, int decodeWidth, CancellationToken ct = default)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (Path.GetExtension(path).Equals(".mp4", StringComparison.OrdinalIgnoreCase))
+                owner.VideoProcessorAttempts++;
+            if (filePath.Contains("no-artwork", StringComparison.OrdinalIgnoreCase))
+            {
+                owner.NoArtworkReads++;
+                return Task.FromResult<MediaResult?>(new MediaResult { IsFinalWithoutThumbnail = true });
+            }
+
+            owner.CoverReads++;
+            if (string.Equals(owner.MutateSourceOnce, path, StringComparison.OrdinalIgnoreCase))
+            {
+                owner.MutateSourceOnce = null;
+                File.AppendAllText(path, " changed during extraction");
+            }
+            return Task.FromResult<MediaResult?>(new MediaResult
+            {
+                Data = artwork,
+                Width = 8,
+                Height = 6
+            });
+        }
+
+        public (int Width, int Height) GetDimensions(string path) => (8, 6);
+    }
 }

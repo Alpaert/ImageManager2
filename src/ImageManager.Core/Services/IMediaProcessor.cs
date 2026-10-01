@@ -6,6 +6,12 @@ public class MediaResult
     public byte[] Data { get; set; } = Array.Empty<byte>();
     public int Width { get; set; }
     public int Height { get; set; }
+    /// <summary>
+    /// The media was read successfully but has no visual preview, such as a
+    /// music file without embedded artwork. Callers should show a placeholder
+    /// and cache this terminal result instead of retrying the source read.
+    /// </summary>
+    public bool IsFinalWithoutThumbnail { get; set; }
     public double? Duration { get; set; }        // 视频专用
     public double? Timestamp { get; set; }       // 视频专用
 }

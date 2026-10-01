@@ -20,6 +20,99 @@ public sealed class GifFrame
 public static class ThumbnailGenerator
 {
     /// <summary>
+    /// Re-encodes in-memory artwork as a JPEG constrained by its longest edge.
+    /// This is used for embedded media artwork so raw tag payloads are never
+    /// persisted in the thumbnail cache.
+    /// </summary>
+    public static byte[]? NormalizeJpeg(byte[] imageData, int maxLongestEdge)
+    {
+        try
+        {
+            using var stream = new MemoryStream(imageData, writable: false);
+            using var codec = SKCodec.Create(stream);
+            if (codec == null || codec.Info.Width <= 0 || codec.Info.Height <= 0)
+                return null;
+
+            var longestEdge = Math.Max(codec.Info.Width, codec.Info.Height);
+            var scale = Math.Min(1f, (float)maxLongestEdge / longestEdge);
+            var targetWidth = Math.Max(1, (int)Math.Round(codec.Info.Width * scale));
+            var targetHeight = Math.Max(1, (int)Math.Round(codec.Info.Height * scale));
+            var colorType = codec.Info.ColorType == SKColorType.Unknown ? SKColorType.Rgba8888 : codec.Info.ColorType;
+            var alphaType = codec.Info.AlphaType == SKAlphaType.Unknown ? SKAlphaType.Premul : codec.Info.AlphaType;
+
+            using var decoded = new SKBitmap(new SKImageInfo(codec.Info.Width, codec.Info.Height, colorType, alphaType));
+            if (codec.GetPixels(decoded.Info, decoded.GetPixels()) != SKCodecResult.Success)
+                return null;
+
+            SKBitmap? resized = null;
+            try
+            {
+                var output = targetWidth == decoded.Width && targetHeight == decoded.Height
+                    ? decoded
+                    : resized = decoded.Resize(new SKSizeI(targetWidth, targetHeight),
+                        new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
+                if (output == null)
+                    return null;
+
+                using var image = SKImage.FromBitmap(output);
+                using var jpeg = image.Encode(SKEncodedImageFormat.Jpeg, 85);
+                return jpeg?.ToArray();
+            }
+            finally
+            {
+                resized?.Dispose();
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Generates a JPEG thumbnail from an already cached JPEG cover.</summary>
+    public static byte[]? Generate(byte[] imageData, int decodeWidth)
+    {
+        try
+        {
+            using var stream = new MemoryStream(imageData, writable: false);
+            using var codec = SKCodec.Create(stream);
+            if (codec == null || codec.Info.Width <= 0 || codec.Info.Height <= 0)
+                return null;
+
+            var targetWidth = Math.Min(Math.Max(1, decodeWidth), codec.Info.Width);
+            var targetHeight = Math.Max(1, (int)Math.Round(codec.Info.Height * ((float)targetWidth / codec.Info.Width)));
+            var colorType = codec.Info.ColorType == SKColorType.Unknown ? SKColorType.Rgba8888 : codec.Info.ColorType;
+            var alphaType = codec.Info.AlphaType == SKAlphaType.Unknown ? SKAlphaType.Premul : codec.Info.AlphaType;
+            using var decoded = new SKBitmap(new SKImageInfo(codec.Info.Width, codec.Info.Height, colorType, alphaType));
+            if (codec.GetPixels(decoded.Info, decoded.GetPixels()) != SKCodecResult.Success)
+                return null;
+
+            SKBitmap? resized = null;
+            try
+            {
+                var output = targetWidth == decoded.Width && targetHeight == decoded.Height
+                    ? decoded
+                    : resized = decoded.Resize(new SKSizeI(targetWidth, targetHeight),
+                        new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear));
+                if (output == null)
+                    return null;
+
+                using var image = SKImage.FromBitmap(output);
+                using var jpeg = image.Encode(SKEncodedImageFormat.Jpeg, 85);
+                return jpeg?.ToArray();
+            }
+            finally
+            {
+                resized?.Dispose();
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Generate thumbnail bytes (JPEG). Always uses SKCodec-based decode to avoid
     /// loading full-resolution bitmaps into memory, even for images with moderate
     /// pixel dimensions but large file sizes (e.g. 200 MB+ high-bit-depth TIFFs).
