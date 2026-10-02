@@ -363,18 +363,62 @@
                           VerticalAlignment="Center" Margin="12,0,0,0" FontSize="12"/>
             </Menu>
             <Menu HorizontalAlignment="Right" Background="Transparent">
-                <MenuItem Header="排序 ▾" Height="28" Padding="12,4">
-                    <MenuItem Header="按文件名 ↑" Click="SortFileNameAsc_Click"/>
-                    <MenuItem Header="按文件名 ↓" Click="SortFileNameDesc_Click"/>
-
-                    <MenuItem Header="按修改时间 ↑" Click="SortModifiedAsc_Click"/>
-                    <MenuItem Header="按修改时间 ↓" Click="SortModifiedDesc_Click"/>
-
-                    <MenuItem Header="按文件大小 ↑" Click="SortFileSizeAsc_Click"/>
-                    <MenuItem Header="按文件大小 ↓" Click="SortFileSizeDesc_Click"/>
-
-                    <MenuItem Header="按分辨率 ↑" Click="SortResolutionAsc_Click"/>
-                    <MenuItem Header="按分辨率 ↓" Click="SortResolutionDesc_Click"/>
+                <MenuItem Header="{Binding SortMenuHeader}" Height="28" Padding="12,4">
+                    <MenuItem Header="组织方式" IsEnabled="False"/>
+                    <MenuItem Header="全部文件混排"
+                              ToggleType="Radio"
+                              GroupName="SortScope"
+                              IsChecked="{Binding IsAllFilesSortScope, Mode=OneWay}"
+                              Command="{Binding SetSortScopeCommand}"
+                              CommandParameter="AllFiles"
+                              IsEnabled="{Binding ShowAllSubfolders}"/>
+                    <MenuItem Header="按文件夹分组"
+                              ToggleType="Radio"
+                              GroupName="SortScope"
+                              IsChecked="{Binding IsFolderGroupedSortScope, Mode=OneWay}"
+                              Command="{Binding SetSortScopeCommand}"
+                              CommandParameter="FolderGrouped"
+                              IsEnabled="{Binding ShowAllSubfolders}"/>
+                    <Separator/>
+                    <MenuItem Header="排序依据" IsEnabled="False"/>
+                    <MenuItem Header="文件名"
+                              ToggleType="Radio"
+                              GroupName="SortField"
+                              IsChecked="{Binding IsSortByFileName, Mode=OneWay}"
+                              Command="{Binding SetSortFieldCommand}"
+                              CommandParameter="FileName"/>
+                    <MenuItem Header="修改时间"
+                              ToggleType="Radio"
+                              GroupName="SortField"
+                              IsChecked="{Binding IsSortByModified, Mode=OneWay}"
+                              Command="{Binding SetSortFieldCommand}"
+                              CommandParameter="Modified"/>
+                    <MenuItem Header="文件大小"
+                              ToggleType="Radio"
+                              GroupName="SortField"
+                              IsChecked="{Binding IsSortByFileSize, Mode=OneWay}"
+                              Command="{Binding SetSortFieldCommand}"
+                              CommandParameter="FileSize"/>
+                    <MenuItem Header="分辨率"
+                              ToggleType="Radio"
+                              GroupName="SortField"
+                              IsChecked="{Binding IsSortByResolution, Mode=OneWay}"
+                              Command="{Binding SetSortFieldCommand}"
+                              CommandParameter="Resolution"/>
+                    <Separator/>
+                    <MenuItem Header="顺序" IsEnabled="False"/>
+                    <MenuItem Header="升序"
+                              ToggleType="Radio"
+                              GroupName="SortDirection"
+                              IsChecked="{Binding IsSortAscending, Mode=OneWay}"
+                              Command="{Binding SetSortDirectionCommand}"
+                              CommandParameter="Ascending"/>
+                    <MenuItem Header="降序"
+                              ToggleType="Radio"
+                              GroupName="SortDirection"
+                              IsChecked="{Binding IsSortDescending, Mode=OneWay}"
+                              Command="{Binding SetSortDirectionCommand}"
+                              CommandParameter="Descending"/>
                 </MenuItem>
             </Menu>
         </DockPanel>
@@ -449,16 +493,19 @@
                         <StackPanel Orientation="Horizontal" Spacing="4">
                             <StackPanel>
                                 <Border BorderBrush="{Binding SearchBoxBorderColor}" BorderThickness="1.5" CornerRadius="4">
-                                    <TextBox x:Name="TxtTagSearchA" Classes="toolbar-compact" Text="{Binding TagSearchText}"
+                                    <TextBox x:Name="TxtTagSearchA" Classes="toolbar-compact" Text="{Binding TagSearchText, UpdateSourceTrigger=PropertyChanged}"
                                              Width="200" PlaceholderText="输入 Tag 名称…"
                                              Background="{DynamicResource InputBgBrush}" BorderThickness="0"
                                              KeyDown="TxtTagSearch_KeyDown" GotFocus="TxtTagSearch_GotFocus"/>
                                 </Border>
-                                <Popup IsOpen="{Binding IsTagSearchPopupOpenA}" Placement="Bottom">
+                                <Popup x:Name="TagSearchSuggestionsPopupA"
+                                       IsOpen="{Binding IsTagSearchPopupOpenA}"
+                                       Placement="Bottom"
+                                       TakesFocusFromNativeControl="False">
                                     <Border Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource CtrlBorderBrush}"
                                             BorderThickness="1" CornerRadius="8" Padding="6" MaxWidth="300">
                                         <StackPanel>
-                                            <TextBox Classes="toolbar-compact" PlaceholderText="过滤共有 Tag..." Text="{Binding CoTagFilterText}"
+                                            <TextBox Classes="toolbar-compact" PlaceholderText="输入以联想共现 Tag..." Text="{Binding CoTagFilterText, UpdateSourceTrigger=PropertyChanged}"
                                                      IsVisible="{Binding IsSuggestionCoTagMode}" Margin="0,0,0,4"/>
                                             <ScrollViewer MaxHeight="400">
                                                 <ItemsControl ItemsSource="{Binding TagSearchSuggestions}">
@@ -513,16 +560,19 @@
                     <StackPanel Orientation="Horizontal" Spacing="4">
                         <StackPanel>
                             <Border BorderBrush="{Binding SearchBoxBorderColor}" BorderThickness="1.5" CornerRadius="4">
-                                <TextBox x:Name="TxtTagSearchC" Classes="toolbar-compact" Text="{Binding TagSearchText}"
+                                <TextBox x:Name="TxtTagSearchC" Classes="toolbar-compact" Text="{Binding TagSearchText, UpdateSourceTrigger=PropertyChanged}"
                                          Width="200" PlaceholderText="输入 Tag 名称…"
                                          Background="{DynamicResource InputBgBrush}" BorderThickness="0"
                                          KeyDown="TxtTagSearch_KeyDown" GotFocus="TxtTagSearch_GotFocus"/>
                             </Border>
-                            <Popup IsOpen="{Binding IsTagSearchPopupOpenC}" Placement="Bottom">
+                            <Popup x:Name="TagSearchSuggestionsPopupC"
+                                   IsOpen="{Binding IsTagSearchPopupOpenC}"
+                                   Placement="Bottom"
+                                   TakesFocusFromNativeControl="False">
                                 <Border Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource CtrlBorderBrush}"
                                         BorderThickness="1" CornerRadius="8" Padding="6" MaxWidth="300">
                                     <StackPanel>
-                                        <TextBox Classes="toolbar-compact" PlaceholderText="过滤共有 Tag..." Text="{Binding CoTagFilterText}"
+                                        <TextBox Classes="toolbar-compact" PlaceholderText="输入以联想共现 Tag..." Text="{Binding CoTagFilterText, UpdateSourceTrigger=PropertyChanged}"
                                                  IsVisible="{Binding IsSuggestionCoTagMode}" Margin="0,0,0,4"/>
                                         <ScrollViewer MaxHeight="400">
                                             <ItemsControl ItemsSource="{Binding TagSearchSuggestions}">
@@ -740,6 +790,16 @@
             </Grid>
         </ScrollViewer>
 		</Grid>
+
+        <Popup x:Name="HoverPreviewHost"
+               Placement="AnchorAndGravity"
+               PlacementAnchor="TopLeft"
+               PlacementGravity="BottomRight"
+               IsLightDismissEnabled="False"
+               TakesFocusFromNativeControl="False"
+               Topmost="True">
+            <controls:HoverPreviewPopup x:Name="HoverPreviewContent"/>
+        </Popup>
 
     </Grid>
 </Window>

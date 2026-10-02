@@ -12,6 +12,7 @@ using Microsoft.Data.Sqlite;
 var tests = new (string Name, Func<Task> Run)[]
 {
     ("Database initialization is idempotent and NOCASE lookup uses its index", DatabaseInitializationIsIdempotentAsync),
+    ("Sort metadata queries preserve exact folder scope, chunk paths, and honor cancellation", SortMetadataQueriesAsync),
     ("Prepare skips 20,000 tagged missing files without opening them and reports NOCASE lookup timing", PrepareSkipsTaggedMissingFilesAsync),
     ("Repository treats path casing and duplicate registration as one image", CaseInsensitiveAndDuplicateRegistrationAsync),
     ("Repository persists known content ratings without accepting unknown", SystemRatingPersistenceAsync),
@@ -63,6 +64,65 @@ static async Task DatabaseInitializationIsIdempotentAsync()
     Assert(details.Any(d => d.Contains("SEARCH", StringComparison.OrdinalIgnoreCase) &&
                             d.Contains("idx_imagemeta_filepath_nocase", StringComparison.OrdinalIgnoreCase)),
         $"Expected NOCASE index search, got: {string.Join(" | ", details)}");
+}
+
+static async Task SortMetadataQueriesAsync()
+{
+    await using var scope = await TestScope.CreateAsync();
+    var root = Path.Combine(scope.Directory, "Root_%_A");
+    var child = Path.Combine(root, "Child");
+    var wildcardDecoy = Path.Combine(scope.Directory, "Root_XYZZA", "decoy.jpg");
+    var sibling = root + "_sibling";
+    var directPath = Path.Combine(root, "direct.jpg");
+    var childPath = Path.Combine(child, "child.jpg");
+    var siblingPath = Path.Combine(sibling, "sibling.jpg");
+
+    using (var conn = scope.Factory.CreateConnection())
+    using (var txn = conn.BeginTransaction())
+    {
+        var rows = new[]
+        {
+            (directPath, 11L, 101L, 10, 20),
+            (childPath, 22L, 202L, 30, 40),
+            (siblingPath, 33L, 303L, 50, 60),
+            (wildcardDecoy, 44L, 404L, 70, 80)
+        };
+        foreach (var row in rows)
+        {
+            using var command = conn.CreateCommand();
+            command.Transaction = txn;
+            command.CommandText = """
+                INSERT INTO ImageMeta (FilePath, FileSize, LastWriteTicks, Width, Height)
+                VALUES (@path, @size, @ticks, @width, @height);
+                """;
+            command.Parameters.AddWithValue("@path", row.Item1);
+            command.Parameters.AddWithValue("@size", row.Item2);
+            command.Parameters.AddWithValue("@ticks", row.Item3);
+            command.Parameters.AddWithValue("@width", row.Item4);
+            command.Parameters.AddWithValue("@height", row.Item5);
+            await command.ExecuteNonQueryAsync();
+        }
+        txn.Commit();
+    }
+
+    var recursive = await scope.Repository.GetSortMetadataByFolderAsync(root, recursive: true);
+    Assert(recursive.Select(row => row.FilePath).ToHashSet(StringComparer.OrdinalIgnoreCase)
+        .SetEquals(new[] { directPath, childPath }),
+        "Recursive sort metadata query leaked a sibling or wildcard-matching folder.");
+    var direct = await scope.Repository.GetSortMetadataByFolderAsync(root, recursive: false);
+    Assert(direct.Count == 1 && direct[0] == new ImageSortMetadata(directPath, 11, 101, 10, 20),
+        "Non-recursive sort metadata query did not return only the direct file projection.");
+
+    var requested = Enumerable.Range(0, 901).Select(i => $"Z:/missing-{i:D4}.jpg").ToList();
+    requested.Add(childPath.ToUpperInvariant());
+    var byPaths = await scope.Repository.GetSortMetadataByPathsAsync(requested);
+    Assert(byPaths.Count == 1 && string.Equals(byPaths[0].FilePath, childPath, StringComparison.OrdinalIgnoreCase),
+        "Chunked sort metadata lookup did not preserve NOCASE path matching.");
+
+    using var canceled = new CancellationTokenSource();
+    canceled.Cancel();
+    await AssertCanceled(async () => await scope.Repository.GetSortMetadataByFolderAsync(root, true, canceled.Token));
+    await AssertCanceled(async () => await scope.Repository.GetSortMetadataByPathsAsync([directPath], canceled.Token));
 }
 
 static async Task PrepareSkipsTaggedMissingFilesAsync()

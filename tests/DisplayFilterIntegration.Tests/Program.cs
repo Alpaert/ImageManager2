@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Reflection;
 using CommunityToolkit.Mvvm.Messaging;
 using ImageManager.App.Models;
@@ -584,7 +585,211 @@ await vm.RemoveFilesFromViewAsync(new HashSet<string>(new[] { "delete.mp4" }, St
 Require(vm.ActiveFileList.SequenceEqual(new[] { "keep.jpg" }) && vm.DisplayFilterSourceCount == 1 && !vm.IsDisplayFilterBusy,
     "delete during pending reset must complete publication and clear busy state");
 Console.WriteLine("PASS delete reconciles a pending reset publication");
-Console.WriteLine("All 8 display-filter integration groups passed.");
+
+var crossFolderFiles = new List<string>
+{
+    Path.Combine("B", "m.jpg"),
+    Path.Combine("A", "z.jpg"),
+    Path.Combine("B", "b.jpg"),
+    Path.Combine("A", "a.jpg")
+};
+var allFilesSorted = crossFolderFiles.ToList();
+await SortFiles(vm, allFilesSorted, ImageSortOrder.FileNameAsc, true, ImageSortScope.AllFiles);
+Require(allFilesSorted.Select(Path.GetFileName).SequenceEqual(new[] { "a.jpg", "b.jpg", "m.jpg", "z.jpg" }),
+    "all-files sorting must compare files across folder boundaries");
+var folderGroupedSorted = crossFolderFiles.ToList();
+await SortFiles(vm, folderGroupedSorted, ImageSortOrder.FileNameAsc, true, ImageSortScope.FolderGrouped);
+Require(folderGroupedSorted.SequenceEqual(new[]
+{
+    Path.Combine("A", "a.jpg"),
+    Path.Combine("A", "z.jpg"),
+    Path.Combine("B", "b.jpg"),
+    Path.Combine("B", "m.jpg")
+}), "folder-grouped sorting must keep each directory together");
+Require(new AppSettings().ImageSortScope == "FolderGrouped",
+    "existing users must retain folder-grouped sorting by default");
+vm.CurrentSortScope = ImageSortScope.AllFiles;
+vm.CurrentSortOrder = ImageSortOrder.ModifiedDesc;
+Require(vm.SortMenuHeader == "排序：修改时间 ↓" && vm.IsAllFilesSortScope &&
+        vm.IsSortByModified && vm.IsSortDescending,
+    "sort menu state must expose scope, field, direction, and dynamic header consistently");
+var metaCache = (Dictionary<string, ImageMeta>)typeof(MainWindowViewModel)
+    .GetField("_metaCache", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(vm)!;
+metaCache["known.jpg"] = new ImageMeta { FilePath = "known.jpg", Width = 100, Height = 100 };
+var resolutionSorted = new List<string> { "unknown.mp4", "known.jpg" };
+await SortFiles(vm, resolutionSorted, ImageSortOrder.ResolutionAsc, true, ImageSortScope.AllFiles);
+Require(resolutionSorted.SequenceEqual(new[] { "known.jpg", "unknown.mp4" }),
+    "unknown dimensions must remain last even in ascending order");
+vm.AppSettings = new AppSettings { ImageSortScope = "999", ImageSortOrder = "999" };
+vm.SyncUISettingsFromAppData();
+Require(vm.CurrentSortScope == ImageSortScope.FolderGrouped &&
+        vm.CurrentSortOrder == ImageSortOrder.FileNameAsc,
+    "invalid persisted sort enum values must fall back to compatible defaults");
+Console.WriteLine("PASS all-files and folder-grouped sort scopes");
+
+var gatedSettings = new GatedSettingsRepository();
+var raceSearch = new TagSearchEngine(repository, messenger, ImagePaging.Default);
+var raceVm = new MainWindowViewModel(gatedSettings, null!, repository, null!, null!, null!, null!, cache, page,
+    raceSearch, null!, null!, null!, messenger, new ImmediateDispatcher())
+{
+    CurrentSortScope = ImageSortScope.AllFiles
+};
+SetFiles(raceVm, ["a.jpg", "b.jpg"]);
+var metadataRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+fake.NextSortMetadataGate = metadataRelease;
+var olderSort = raceVm.SortImagesAsync(ImageSortOrder.FileNameAsc);
+await gatedSettings.FirstSaveEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+var latestSort = raceVm.SortImagesAsync(ImageSortOrder.FileNameDesc);
+await gatedSettings.SecondSaveEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+gatedSettings.ReleaseSecondSave.TrySetResult();
+await fake.SortMetadataEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+gatedSettings.ReleaseFirstSave.TrySetResult();
+metadataRelease.TrySetResult();
+await Task.WhenAll(olderSort, latestSort).WaitAsync(TimeSpan.FromSeconds(5));
+Require(raceVm.ActiveFileList.SequenceEqual(new[] { "b.jpg", "a.jpg" }),
+    "overlapping sort requests must publish the last user-selected order");
+Console.WriteLine("PASS overlapping sort requests publish latest selection");
+
+var recursiveSmall = Path.Combine("sub", "a-small.jpg");
+var recursiveLarge = Path.Combine("sub", "z-large.jpg");
+SetFiles(raceVm, ["main.jpg"]);
+raceSearch.SearchResultFiles = [recursiveSmall, recursiveLarge];
+fake.SortMetadataByPath[recursiveSmall] = new ImageSortMetadata(recursiveSmall, 10, 1, 100, 100);
+fake.SortMetadataByPath[recursiveLarge] = new ImageSortMetadata(recursiveLarge, 100, 1, 100, 100);
+await raceVm.SortImagesAsync(ImageSortOrder.FileSizeDesc);
+Require(raceSearch.SearchResultFiles.SequenceEqual(new[] { recursiveLarge, recursiveSmall }),
+    "recursive Tag results outside the visible file snapshot must load their missing sort metadata");
+raceVm.ShutdownBackgroundWork();
+Console.WriteLine("PASS recursive Tag result sorting fills snapshot metadata gaps");
+
+var perfEntries = Enumerable.Range(0, 100_000)
+    .Select(index => new FileSortEntry(
+        $@"C:\perf\{index % 100:D3}\image-{index:D06}.jpg",
+        $"image-{index:D06}.jpg",
+        $@"C:\perf\{index % 100:D3}",
+        index + 1,
+        10_000_000L + index,
+        100 + index % 17,
+        100 + index % 13,
+        (100 + index % 17L) * (100 + index % 13L),
+        FileSortKnownFields.FileSize | FileSortKnownFields.LastWriteTicks | FileSortKnownFields.Resolution))
+    .ToArray();
+var perfSnapshot = new FileSortSnapshot(@"C:\perf", recursive: true, 1, perfEntries);
+var unfilteredSource = perfEntries.Take(100).Select(entry => entry.Path).ToList();
+SetFiles(vm, unfilteredSource);
+vm.DisplayFilter = new DisplayFilterOptions();
+vm.IsShowingSearchResult = false;
+Require(await Publish(vm) && ReferenceEquals(vm.ActiveFileList, unfilteredSource),
+    "publishing without an active display filter must reuse the source list");
+var publishAllFiles = typeof(MainWindowViewModel).GetMethod(
+    "PublishAllFiles",
+    BindingFlags.NonPublic | BindingFlags.Instance,
+    binder: null,
+    types: [typeof(List<string>), typeof(FileSortSnapshot), typeof(bool)],
+    modifiers: null);
+Require(publishAllFiles is not null,
+    "sorting publication must distinguish a reorder from a file-list content mutation");
+typeof(MainWindowViewModel).GetField("_allFiles", BindingFlags.NonPublic | BindingFlags.Instance)!
+    .SetValue(vm, perfEntries.Select(entry => entry.Path).ToList());
+typeof(MainWindowViewModel).GetField("_fileListMutationVersion", BindingFlags.NonPublic | BindingFlags.Instance)!
+    .SetValue(vm, 1);
+typeof(MainWindowViewModel).GetField("_fileSortSnapshot", BindingFlags.NonPublic | BindingFlags.Instance)!
+    .SetValue(vm, perfSnapshot);
+publishAllFiles!.Invoke(vm, [perfEntries.Reverse().Select(entry => entry.Path).ToList(), perfSnapshot, false]);
+Require((int)typeof(MainWindowViewModel)
+        .GetField("_fileListMutationVersion", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(vm)! == 1 &&
+        ReferenceEquals(typeof(MainWindowViewModel)
+            .GetField("_fileSortSnapshot", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(vm), perfSnapshot),
+    "reordering the same file content must preserve its mutation version and sorting snapshot instance");
+var shuffledPaths = perfEntries.Select(entry => entry.Path).ToArray();
+var random = new Random(20261002);
+random.Shuffle(shuffledPaths);
+var sortOrders = Enum.GetValues<ImageSortOrder>();
+var sortTimings = new List<long>();
+foreach (var folderGrouped in new[] { false, true })
+{
+    foreach (var sortOrder in sortOrders)
+    {
+        var perfStopwatch = Stopwatch.StartNew();
+        var perfSorted = perfSnapshot.SortPaths(shuffledPaths, sortOrder, folderGrouped);
+        perfStopwatch.Stop();
+        sortTimings.Add(perfStopwatch.ElapsedMilliseconds);
+        Require(perfSorted.Count == 100_000,
+            "100k deterministic snapshot sort must preserve every path");
+        for (var index = 1; index < perfSorted.Count; index++)
+        {
+            Require(FileSortComparer.Compare(
+                    perfSnapshot.EntriesByPath[perfSorted[index - 1]],
+                    perfSnapshot.EntriesByPath[perfSorted[index]],
+                    sortOrder,
+                    folderGrouped) <= 0,
+                $"100k {sortOrder} folderGrouped={folderGrouped} sort is not ordered at {index}");
+        }
+    }
+}
+sortTimings.Sort();
+var sortP95 = sortTimings[(int)Math.Ceiling(sortTimings.Count * 0.95) - 1];
+Console.WriteLine($"PASS 100k pure-memory matrix runs={sortTimings.Count} median_ms={sortTimings[sortTimings.Count / 2]} p95_ms={sortP95} max_ms={sortTimings[^1]}");
+
+var unknownEntry = FileSortEntry.Unknown(@"C:\perf\unknown.jpg");
+var knownEntry = perfEntries[0];
+var unknownSnapshot = new FileSortSnapshot(@"C:\perf", true, 1, [unknownEntry, knownEntry]);
+foreach (var order in new[]
+         {
+             ImageSortOrder.ModifiedAsc, ImageSortOrder.ModifiedDesc,
+             ImageSortOrder.FileSizeAsc, ImageSortOrder.FileSizeDesc,
+             ImageSortOrder.ResolutionAsc, ImageSortOrder.ResolutionDesc
+         })
+{
+    Require(unknownSnapshot.SortPaths([unknownEntry.Path, knownEntry.Path], order, false)[0] == knownEntry.Path,
+        $"{order} must keep unknown metadata last");
+}
+
+var groupedKnownA = knownEntry with { Path = @"C:\perf\A\known.jpg", Directory = @"C:\perf\A" };
+var groupedUnknownA = FileSortEntry.Unknown(@"C:\perf\A\unknown.jpg");
+var groupedKnownB = knownEntry with { Path = @"C:\perf\B\known.jpg", Directory = @"C:\perf\B" };
+var groupedUnknownSnapshot = new FileSortSnapshot(
+    @"C:\perf", true, 1, [groupedUnknownA, groupedKnownB, groupedKnownA]);
+Require(groupedUnknownSnapshot.SortPaths(
+        [groupedUnknownA.Path, groupedKnownB.Path, groupedKnownA.Path],
+        ImageSortOrder.FileSizeAsc,
+        folderGrouped: true).SequenceEqual([groupedKnownA.Path, groupedUnknownA.Path, groupedKnownB.Path]),
+    "folder-grouped metric sorting must keep directories intact and place unknown values last within each group");
+
+using var cancelSort = new CancellationTokenSource(TimeSpan.FromMilliseconds(5));
+var cancelStopwatch = Stopwatch.StartNew();
+try
+{
+    perfSnapshot.SortPaths(shuffledPaths, ImageSortOrder.FileNameAsc, true, cancelSort.Token);
+    throw new InvalidOperationException("an in-flight stale sort must observe cancellation");
+}
+catch (OperationCanceledException) when (cancelSort.IsCancellationRequested) { }
+cancelStopwatch.Stop();
+Require(cancelStopwatch.Elapsed < TimeSpan.FromMilliseconds(500),
+    "a superseded 100k sort must stop promptly");
+Console.WriteLine($"PASS 100k sort cancellation elapsed_ms={cancelStopwatch.ElapsedMilliseconds}");
+
+var knownGeometryDimensions = perfEntries.ToDictionary(
+    entry => entry.Path,
+    entry => (entry.Width, entry.Height),
+    StringComparer.OrdinalIgnoreCase);
+var geometryLoaderCalls = 0;
+var geometryStopwatch = Stopwatch.StartNew();
+var knownGeometry = await geometryBuilder.BuildAsync(
+    shuffledPaths,
+    ImageDisplayGeometryOptions.Default,
+    (_, _) =>
+    {
+        geometryLoaderCalls++;
+        return Task.FromResult(new Dictionary<string, (int Width, int Height)>());
+    },
+    CancellationToken.None,
+    knownGeometryDimensions);
+geometryStopwatch.Stop();
+Require(knownGeometry.GeometryIndex.Count == 100_000 && geometryLoaderCalls == 0,
+    "100k continuous geometry with known dimensions must not query dimensions again");
+Console.WriteLine($"PASS 100k continuous geometry known-dimension reuse elapsed_ms={geometryStopwatch.ElapsedMilliseconds} loader_calls={geometryLoaderCalls}");
+Console.WriteLine("All 11 display-filter integration groups passed.");
 
 static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
 static byte[] CreateJpegHeader(int width, int height) =>
@@ -618,16 +823,76 @@ static void SetDisplayFiles(MainWindowViewModel vm, List<string> files) => typeo
 static void InvokePrivate(MainWindowViewModel vm, string methodName) => typeof(MainWindowViewModel).GetMethod(methodName, BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(vm, null);
 static Task<bool> Publish(MainWindowViewModel vm) => (Task<bool>)typeof(MainWindowViewModel).GetMethod("UpdateDisplayFilterAsync", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(vm, [false])!;
 static void Paging(MainWindowViewModel vm) => typeof(MainWindowViewModel).GetMethod("SetDisplayPaging", BindingFlags.NonPublic | BindingFlags.Instance)!.Invoke(vm, null);
+static Task SortFiles(MainWindowViewModel vm, List<string> files, ImageSortOrder order, bool showAllSubfolders, ImageSortScope scope) =>
+    (Task)typeof(MainWindowViewModel).GetMethod("SortFilesAsync", BindingFlags.NonPublic | BindingFlags.Instance,
+        binder: null, types: [typeof(List<string>), typeof(ImageSortOrder), typeof(bool), typeof(ImageSortScope)], modifiers: null)!
+        .Invoke(vm, [files, order, showAllSubfolders, scope])!;
 
 public class MetadataProxy : DispatchProxy
 {
+    private TaskCompletionSource? _nextSortMetadataGate;
     public Func<List<string>, Task<Dictionary<string, (int, int)>>> Load = _ => Task.FromResult(new Dictionary<string, (int, int)>());
+    public Dictionary<string, ImageSortMetadata> SortMetadataByPath { get; } =
+        new(StringComparer.OrdinalIgnoreCase);
+    public TaskCompletionSource? NextSortMetadataGate
+    {
+        set => Volatile.Write(ref _nextSortMetadataGate, value);
+    }
+    public TaskCompletionSource SortMetadataEntered { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
     protected override object? Invoke(MethodInfo? method, object?[]? args) => method!.Name switch
     {
+        "GetSortMetadataByFolderAsync" => Task.FromResult<IReadOnlyList<ImageSortMetadata>>(Array.Empty<ImageSortMetadata>()),
+        "GetSortMetadataByPathsAsync" => GetSortMetadataAsync(
+            (IReadOnlyCollection<string>)args![0]!, (CancellationToken)args[1]!),
         "GetDimensionsByPathsAsync" => Load((List<string>)args![0]!),
         "GetTagMapByPathsAsync" => Task.FromResult(new Dictionary<string, List<string>>()),
         _ => throw new NotSupportedException(method.Name)
     };
+
+    private async Task<IReadOnlyList<ImageSortMetadata>> GetSortMetadataAsync(
+        IReadOnlyCollection<string> paths,
+        CancellationToken cancellationToken)
+    {
+        var gate = Interlocked.Exchange(ref _nextSortMetadataGate, null);
+        if (gate is not null)
+        {
+            SortMetadataEntered.TrySetResult();
+            await gate.Task;
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+        return paths.Where(SortMetadataByPath.ContainsKey)
+            .Select(path => SortMetadataByPath[path])
+            .ToArray();
+    }
+}
+
+public sealed class GatedSettingsRepository : ISettingsRepository
+{
+    private int _saveCallCount;
+    public TaskCompletionSource FirstSaveEntered { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public TaskCompletionSource SecondSaveEntered { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public TaskCompletionSource ReleaseFirstSave { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public TaskCompletionSource ReleaseSecondSave { get; } =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public Task<AppSettings> LoadAsync() => Task.FromResult(new AppSettings());
+
+    public Task SaveAsync(AppSettings settings)
+    {
+        var call = Interlocked.Increment(ref _saveCallCount);
+        if (call == 1)
+        {
+            FirstSaveEntered.TrySetResult();
+            return ReleaseFirstSave.Task;
+        }
+
+        SecondSaveEntered.TrySetResult();
+        return ReleaseSecondSave.Task;
+    }
 }
 
 public class ImmediateDispatcher : IDispatcher

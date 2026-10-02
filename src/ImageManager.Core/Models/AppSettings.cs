@@ -24,6 +24,10 @@ public class AppSettings
     public string SearchToolbarLayout { get; set; } = "A";
     /// <summary>Image result projection: Paged or Continuous.</summary>
     public string ImageDisplayMode { get; set; } = "Paged";
+    /// <summary>File ordering scope: AllFiles or FolderGrouped.</summary>
+    public string ImageSortScope { get; set; } = "FolderGrouped";
+    /// <summary>Last image sort order used by the browser.</summary>
+    public string ImageSortOrder { get; set; } = "FileNameAsc";
     public int ImagesPerPage { get; set; } = ImagePaging.Default;
     public string WaterfallMode { get; set; } = "None";
     public double GridZoomLevel { get; set; } = 1;

@@ -22,6 +22,8 @@ using Avalonia.Interactivity;
 
 AppBuilder.Configure<Application>().UsePlatformDetect().SetupWithoutStarting();
 Application.Current!.Styles.Add(new FluentTheme());
+if (typeof(Window).IsAssignableFrom(typeof(HoverPreviewPopup)))
+    throw new InvalidOperationException("Hover preview must not create a secondary Window/TopLevel.");
 var fixtureDirectory = Path.Combine(Path.GetTempPath(), "ImageManager-ContinuousTests", Guid.NewGuid().ToString("N"));
 Directory.CreateDirectory(fixtureDirectory);
 using var bitmap = new SkiaSharp.SKBitmap(100, 100);
@@ -68,14 +70,16 @@ try
 finally { window.Close(); }
 
 var repo = DispatchProxy.Create<IImageMetaRepository, MetadataProxy>();
+var metadataProxy = (MetadataProxy)(object)repo;
 var messenger = new WeakReferenceMessenger();
 var cache = new ThumbnailCacheService(new MediaProcessorFactory(null!), Path.Combine(fixtureDirectory, "cache"));
 var page = new PageManager(cache, null!);
 var dispatcher = new ImageManager.App.Helpers.AvaloniaDispatcher();
 typeof(ImageManager.App.App).GetProperty("Services")!.SetValue(null, new ServiceCollection().AddSingleton(page).BuildServiceProvider());
 typeof(ImageManager.App.App).GetProperty("UI")!.SetValue(null, dispatcher);
+var tagSearchEngine = new TagSearchEngine(repo, messenger, ImagePaging.Default);
 var vm = new MainWindowViewModel(null!, null!, repo, null!, null!, null!, null!, cache, page,
-    new TagSearchEngine(repo, messenger, ImagePaging.Default), null!, null!, null!, messenger, dispatcher);
+    tagSearchEngine, null!, null!, null!, messenger, dispatcher);
 vm.WaterfallMode = "Horizontal";
 typeof(MainWindowViewModel).GetField("_displayFilteredFiles", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(vm, paths.ToList());
 var main = new TestMainWindow { DataContext = vm, ShowInTaskbar = false };
@@ -86,6 +90,103 @@ try
 {
     main.Show();
     Pump();
+    var hoverPreview = main.FindControl<HoverPreviewPopup>("HoverPreviewContent")!;
+    var hoverHost = main.FindControl<Avalonia.Controls.Primitives.Popup>("HoverPreviewHost")!;
+    var tagPopupA = main.FindControl<Avalonia.Controls.Primitives.Popup>("TagSearchSuggestionsPopupA")!;
+    var tagPopupC = main.FindControl<Avalonia.Controls.Primitives.Popup>("TagSearchSuggestionsPopupC")!;
+    if (hoverHost.TakesFocusFromNativeControl || tagPopupA.TakesFocusFromNativeControl ||
+        tagPopupC.TakesFocusFromNativeControl)
+        throw new InvalidOperationException("Tag and hover popups must not take native focus when opened.");
+    var hoverAnchor = main.PointToScreen(new Point(600, 350));
+    var hoverPosition = hoverPreview.Present(
+        new byte[4 * 4 * 4], 4, 4, "preview.png", 4, 4, 64,
+        main, hoverAnchor, new PixelRect(hoverAnchor.X - 40, hoverAnchor.Y - 40, 30, 30));
+    if (hoverPosition is not { } previewPosition)
+        throw new InvalidOperationException("Hover preview could not calculate popup placement.");
+    hoverHost.PlacementRect = new Rect(main.FindControl<Grid>("RootGrid")!.PointToClient(previewPosition), new Size(1, 1));
+    hoverHost.IsOpen = true;
+    Pump();
+    hoverPreview.RefreshActualScreenRect();
+    if (hoverPreview.CurrentScreenRect is not { Width: > 0, Height: > 0 })
+        throw new InvalidOperationException("Hover popup opened without a usable screen rectangle.");
+    hoverHost.IsOpen = false;
+    hoverPreview.ResetPreviewSurface();
+    var tagSearchBox = main.FindControl<TextBox>("TxtTagSearchA")!;
+    var tagSearchPresenter = tagSearchBox.GetVisualDescendants()
+        .OfType<Avalonia.Controls.Presenters.TextPresenter>()
+        .First();
+    tagSearchPresenter.PreeditText = "ni";
+    var isImeComposing = (bool)typeof(MainWindow)
+        .GetMethod("IsImeComposing", BindingFlags.Static | BindingFlags.NonPublic)!
+        .Invoke(null, new object[] { tagSearchBox })!;
+    tagSearchPresenter.PreeditText = null;
+    if (!isImeComposing)
+        throw new InvalidOperationException("Tag search Enter guard did not detect active IME preedit text.");
+    Console.WriteLine("PASS hover preview is not a Window and IME preedit state is detected");
+
+    SetFiles(paths);
+    var rootGrid = main.FindControl<Grid>("RootGrid")!;
+    rootGrid.Focusable = true;
+    rootGrid.Focus();
+    Pump();
+    vm.GetAllTagCounts().Clear();
+    vm.GetAllTagCounts().Add(new TagCount { Name = "red", Count = 2 });
+    vm.GetAllTagCounts().Add(new TagCount { Name = "blue sky", Count = 1 });
+    var callsBeforeFocus = metadataProxy.CoTagCalls;
+    tagSearchBox.Focus();
+    WaitUntil(() => vm.TagSearchSuggestions.Count == 2);
+    if (metadataProxy.CoTagCalls != callsBeforeFocus)
+        throw new InvalidOperationException("Opening the Tag input must not query co-tags.");
+    WaitForTask(vm.OnTagSearchGotFocusAsync(preserveCurrentMode: true));
+    if (metadataProxy.CoTagCalls != callsBeforeFocus)
+        throw new InvalidOperationException("Re-focusing an open Tag suggestions popup must not query co-tags.");
+    vm.TagSearchText = "bl";
+    WaitUntil(() => vm.TagSearchSuggestions.Count == 1 && vm.TagSearchSuggestions[0].Name == "blue sky");
+    if (metadataProxy.CoTagCalls != callsBeforeFocus)
+        throw new InvalidOperationException("Typing a Tag prefix must use in-memory suggestions only.");
+    vm.DismissTagSearchSuggestions();
+    rootGrid.Focus();
+    Pump();
+
+    // Simulate a completed search-result co-tag snapshot. Filtering this snapshot
+    // must remain local and must not issue another repository query.
+    typeof(TagSearchEngine)
+        .GetField("_coTagMode", BindingFlags.Instance | BindingFlags.NonPublic)!
+        .SetValue(tagSearchEngine, true);
+    var suggestionModeField = typeof(MainWindowViewModel)
+        .GetField("_tagSuggestionMode", BindingFlags.Instance | BindingFlags.NonPublic)!;
+    suggestionModeField.SetValue(vm, Enum.Parse(suggestionModeField.FieldType, "SearchResultCoTags"));
+    typeof(MainWindowViewModel)
+        .GetField("_searchResultSuggestionVersion", BindingFlags.Instance | BindingFlags.NonPublic)!
+        .SetValue(vm, (int)typeof(MainWindowViewModel)
+            .GetField("_tagSuggestionVersion", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(vm)!);
+    messenger.Send(new ImageManager.Core.Messages.TagSearchSuggestionsChangedMessage(
+        new List<TagCount>
+        {
+            new() { Name = "red", Count = 2 },
+            new() { Name = "blue sky", Count = 1 }
+        }));
+    Pump();
+    var cachedCoTagCalls = metadataProxy.CoTagCalls;
+    vm.CoTagFilterText = "blue";
+    WaitUntil(() => vm.TagSearchSuggestions.Count == 1 && vm.TagSearchSuggestions[0].Name == "blue sky");
+    if (metadataProxy.CoTagCalls != cachedCoTagCalls)
+        throw new InvalidOperationException("Filtering cached co-tags must not issue a repository query.");
+    vm.CoTagFilterText = string.Empty;
+    WaitUntil(() => vm.TagSearchSuggestions.Select(tag => tag.Name)
+        .SequenceEqual(new[] { "red", "blue sky" }));
+    if (metadataProxy.CoTagCalls != cachedCoTagCalls)
+        throw new InvalidOperationException("Clearing the co-tag filter must use the cached snapshot.");
+    typeof(TagSearchEngine)
+        .GetField("_coTagMode", BindingFlags.Instance | BindingFlags.NonPublic)!
+        .SetValue(tagSearchEngine, false);
+    vm.GetAllTagCounts().Clear();
+    vm.GetAllTagCounts().Add(new TagCount { Name = "cat", Count = 5 });
+    vm.TagSearchText = "ca";
+    if (vm.IsSuggestionCoTagMode || vm.TagSearchSuggestions.SingleOrDefault()?.Name != "cat")
+        throw new InvalidOperationException("Editing the main Tag input did not switch to typed suggestions.");
+    vm.DismissTagSearchSuggestions();
+    Console.WriteLine("PASS focus co-tags, in-memory typing/filtering, clear restore, and no duplicate queries");
     var dialog = new ImageManager.App.Views.Settings.AppearanceSettingWindow
     {
         DataContext = new AppearanceSettingViewModel("Dark", "Expanded", ImageManager.App.Models.ImageDisplayMode.Paged, (_, _, _) => { })
@@ -335,10 +436,33 @@ public class TestMainWindow : MainWindow
 }
 public class MetadataProxy : DispatchProxy
 {
+    public TaskCompletionSource<List<TagCount>>? CoTagGate { get; set; }
+    public int GatedCoTagCall { get; set; }
+    public int CoTagCalls { get; private set; }
+
     protected override object? Invoke(MethodInfo? method, object?[]? args) => method!.Name switch
     {
+        "GetSortMetadataByFolderAsync" => Task.FromResult<IReadOnlyList<ImageSortMetadata>>(Array.Empty<ImageSortMetadata>()),
+        "GetSortMetadataByPathsAsync" => Task.FromResult<IReadOnlyList<ImageSortMetadata>>(Array.Empty<ImageSortMetadata>()),
         "GetDimensionsByPathsAsync" => Task.FromResult(((List<string>)args![0]!).ToDictionary(p => p, _ => (100, 100))),
         "GetTagMapByPathsAsync" => Task.FromResult(new Dictionary<string, List<string>>()),
+        "GetCoOccurringTagsAsync" => GetCoTags((string?)args![2]),
         _ => throw new NotSupportedException(method.Name)
     };
+
+    private Task<List<TagCount>> GetCoTags(string? filter)
+    {
+        CoTagCalls++;
+        if (CoTagCalls == GatedCoTagCall && CoTagGate is not null)
+            return CoTagGate.Task;
+
+        var all = new List<TagCount>
+        {
+            new() { Name = "red", Count = 2 },
+            new() { Name = "blue sky", Count = 1 }
+        };
+        return Task.FromResult(string.IsNullOrWhiteSpace(filter)
+            ? all
+            : all.Where(tag => tag.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToList());
+    }
 }

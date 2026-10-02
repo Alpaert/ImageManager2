@@ -65,9 +65,13 @@
                     <LineBreak/>
                     <LineBreak/>
 
-                    <Run FontWeight="SemiBold" Text="共现标签模式（搜索后自动进入）"/>
+                    <Run FontWeight="SemiBold" Text="共现标签与输入联想"/>
                     <LineBreak/>
-                    <Run Text="  搜索完成后联想框显示与结果集共现的其他标签。"/>
+                    <Run Text="  聚焦搜索框会显示当前范围内的共现标签；输入后按当前文字实时联想。"/>
+                    <LineBreak/>
+                    <Run Text="  共现标签框内也可继续输入并实时过滤，清空后恢复完整列表。"/>
+                    <LineBreak/>
+                    <Run Text="  搜索完成后联想框切换为结果集的共现标签。"/>
                     <LineBreak/>
                     <Run Text="  点击联想标签循环切换状态："/>
                     <LineBreak/>

@@ -31,6 +31,12 @@ public enum ImageSortOrder
     ResolutionAsc, ResolutionDesc
 }
 
+public enum ImageSortScope
+{
+    AllFiles,
+    FolderGrouped
+}
+
 internal readonly record struct FileEnumerationResult(List<string> Files, bool Canceled);
 
 public partial class MainWindowViewModel : ViewModelBase
@@ -78,6 +84,16 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         AppSettings.SearchToolbarLayout = NormalizeSearchToolbarLayout(AppSettings.SearchToolbarLayout);
         AppSettings.ImageDisplayMode = NormalizeImageDisplayMode(AppSettings.ImageDisplayMode);
+        CurrentSortScope = Enum.TryParse<ImageSortScope>(AppSettings.ImageSortScope, true, out var sortScope) &&
+                           Enum.IsDefined(typeof(ImageSortScope), sortScope)
+            ? sortScope
+            : ImageSortScope.FolderGrouped;
+        CurrentSortOrder = Enum.TryParse<ImageSortOrder>(AppSettings.ImageSortOrder, true, out var sortOrder) &&
+                           Enum.IsDefined(typeof(ImageSortOrder), sortOrder)
+            ? sortOrder
+            : ImageSortOrder.FileNameAsc;
+        AppSettings.ImageSortScope = CurrentSortScope.ToString();
+        AppSettings.ImageSortOrder = CurrentSortOrder.ToString();
         SearchToolbarLayout = AppSettings.SearchToolbarLayout;
         WaterfallMode = AppSettings.WaterfallMode;
         // Restore zoom for the current mode
@@ -113,7 +129,7 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        IsTagSearchPopupOpen = false;
+        DismissTagSearchSuggestions();
         SearchToolbarLayout = normalized;
         AppSettings.SearchToolbarLayout = normalized;
     }
@@ -255,6 +271,8 @@ public partial class MainWindowViewModel : ViewModelBase
     // ==================== Paging ====================
     private List<string> _allFiles = new();
     private int _fileListMutationVersion;
+    private FileSortSnapshot? _fileSortSnapshot;
+    private readonly FileSortSnapshotBuilder _fileSortSnapshotBuilder = new();
     [ObservableProperty] private int _currentPage;
     [ObservableProperty] private int _totalPages;
     [ObservableProperty] private ObservableCollection<int> _pageNumbers = new();
@@ -355,6 +373,8 @@ public partial class MainWindowViewModel : ViewModelBase
         var requestVersion = _continuousDisplayGeometryVersion;
         var displayFilterVersion = _displayFilterVersion;
         var sourcePaths = ActiveFileList.ToArray();
+        var sortDimensions = _fileSortSnapshot?.GetKnownDimensions(sourcePaths)
+            ?? new Dictionary<string, (int Width, int Height)>(StringComparer.OrdinalIgnoreCase);
         var options = new ImageDisplayGeometryOptions(
             ToImageDisplayLayoutMode(WaterfallMode),
             containerWidth,
@@ -368,6 +388,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
         try
         {
+            var geometryStopwatch = Stopwatch.StartNew();
             var snapshot = await _continuousDisplayGeometryBuilder.BuildAsync(
                 sourcePaths,
                 options,
@@ -423,7 +444,8 @@ public partial class MainWindowViewModel : ViewModelBase
                     token.ThrowIfCancellationRequested();
                     return dimensions;
                 },
-                cts.Token).ConfigureAwait(false);
+                cts.Token,
+                sortDimensions).ConfigureAwait(false);
 
             if (cts.IsCancellationRequested
                 || requestVersion != _continuousDisplayGeometryVersion
@@ -454,6 +476,9 @@ public partial class MainWindowViewModel : ViewModelBase
 
             if (!published)
                 return false;
+
+            PerfLogger.Log(
+                $"[SortPerf] continuous_geometry_ms={geometryStopwatch.ElapsedMilliseconds} count={snapshot.Paths.Count} known_dimensions={sortDimensions.Count}");
 
             if (cachedDimensionRepairs.Count > 0)
                 _ = PersistCachedDimensionsAsync(cachedDimensionRepairs);
@@ -859,6 +884,16 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private ObservableCollection<TagCount> _tagSearchSuggestions = new();
     [ObservableProperty] private bool _isTagSearchPopupOpen;
     [ObservableProperty] private string _coTagFilterText = string.Empty;
+    private enum TagSuggestionMode { None, FocusCoTags, TypedSuggestions, SearchResultCoTags }
+    private readonly List<TagCount> _coTagSuggestionBase = new();
+    private List<string> _coTagSuggestionFiles = new();
+    private bool _coTagSuggestionBaseLoaded;
+    private CancellationTokenSource? _tagSuggestionCts;
+    private int _tagSuggestionVersion;
+    private int _searchResultSuggestionVersion = -1;
+    private TagSuggestionMode _tagSuggestionMode;
+    private bool _isTagSearchInputFocused;
+    private bool _suppressCoTagFilterChange;
 
     // ==================== Status ====================
     [ObservableProperty] private string _statusText = "就绪";
@@ -876,7 +911,8 @@ public partial class MainWindowViewModel : ViewModelBase
     }
     [ObservableProperty] private bool _isShowingSearchResult;
 
-    public bool IsSuggestionCoTagMode => _tagSearch.IsSuggestionCoTagMode;
+    public bool IsSuggestionCoTagMode =>
+        _tagSuggestionMode is TagSuggestionMode.FocusCoTags or TagSuggestionMode.SearchResultCoTags;
 
     public int GetCoTagState(string tagName) => _tagSearch.GetCoTagState(tagName);
 
@@ -895,7 +931,10 @@ public partial class MainWindowViewModel : ViewModelBase
     private readonly object _tagCacheLock = new();
     private Dictionary<string, ImageMeta> _metaCache = new(StringComparer.OrdinalIgnoreCase);
     [ObservableProperty] private ImageSortOrder _currentSortOrder = ImageSortOrder.FileNameAsc;
+    [ObservableProperty] private ImageSortScope _currentSortScope = ImageSortScope.FolderGrouped;
     private int _folderViewRequestVersion;
+    private int _sortRequestVersion;
+    private CancellationTokenSource _sortCts = new();
     private CancellationTokenSource? _searchCts;
     private int _searchRequestVersion;
     private readonly SemaphoreSlim _hashGate = new(1, 1);
@@ -1010,17 +1049,52 @@ public partial class MainWindowViewModel : ViewModelBase
         // Tag search completed
         messenger.Register<MainWindowViewModel, ImageManager.Core.Messages.TagSearchCompletedMessage>(this, (r, msg) =>
         {
-            CoTagFilterText = string.Empty;
-            OnPropertyChanged(nameof(IsSuggestionCoTagMode));
+            _dispatcher.Post(() =>
+            {
+                InvalidateTagSuggestionRequest();
+                _searchResultSuggestionVersion = _tagSuggestionVersion;
+                SetCoTagFilterTextWithoutRefresh(string.Empty);
+                _tagSuggestionMode = _tagSearch.IsSuggestionCoTagMode && msg.ResultFiles.Count > 0
+                    ? TagSuggestionMode.SearchResultCoTags
+                    : TagSuggestionMode.None;
+                _coTagSuggestionBase.Clear();
+                _coTagSuggestionBaseLoaded = false;
+                _coTagSuggestionFiles = msg.ResultFiles.ToList();
+                OnPropertyChanged(nameof(IsSuggestionCoTagMode));
 
-            _ = ApplyTagSearchDisplayAsync();
+                _ = ApplyTagSearchDisplayAsync();
+
+                // The result list is already available. Co-tag aggregation is the
+                // expensive secondary query and must never run on the UI thread.
+                if (_tagSuggestionMode == TagSuggestionMode.SearchResultCoTags)
+                    _ = _tagSearch.RefreshCurrentCoTagSuggestionsAsync();
+            });
         });
 
         // Suggestions changed
         messenger.Register<MainWindowViewModel, ImageManager.Core.Messages.TagSearchSuggestionsChangedMessage>(this, (r, msg) =>
         {
-            TagSearchSuggestions = new ObservableCollection<TagCount>(msg.Suggestions);
-            IsTagSearchPopupOpen = msg.Suggestions.Count > 0;
+            _dispatcher.Post(() =>
+            {
+                if (!_tagSearch.IsSuggestionCoTagMode ||
+                    _tagSuggestionMode != TagSuggestionMode.SearchResultCoTags ||
+                    _tagSuggestionVersion != _searchResultSuggestionVersion)
+                    return;
+
+                _tagSuggestionMode = TagSuggestionMode.SearchResultCoTags;
+                _coTagSuggestionBase.Clear();
+                _coTagSuggestionBase.AddRange(msg.Suggestions);
+                _coTagSuggestionBaseLoaded = true;
+                _coTagSuggestionFiles = _tagSearch.SearchResultFiles.ToList();
+                if (_isTagSearchInputFocused)
+                {
+                    if (string.IsNullOrWhiteSpace(CoTagFilterText))
+                        PublishTagSuggestions(msg.Suggestions);
+                    else
+                        FilterCoTagSuggestions(CoTagFilterText);
+                }
+                OnPropertyChanged(nameof(IsSuggestionCoTagMode));
+            });
         });
 
         // Co-tag cycled
@@ -1032,7 +1106,12 @@ public partial class MainWindowViewModel : ViewModelBase
         // Co-tag mode exited
         messenger.Register<MainWindowViewModel, ImageManager.Core.Messages.CoTagModeExitedMessage>(this, (r, msg) =>
         {
-            CoTagFilterText = string.Empty;
+            SetCoTagFilterTextWithoutRefresh(string.Empty);
+            if (_tagSuggestionMode != TagSuggestionMode.TypedSuggestions)
+                _tagSuggestionMode = TagSuggestionMode.None;
+            _coTagSuggestionBase.Clear();
+            _coTagSuggestionBaseLoaded = false;
+            _coTagSuggestionFiles.Clear();
             OnPropertyChanged(nameof(SearchBoxBorderColor));
             OnPropertyChanged(nameof(IsSuggestionCoTagMode));
         });
@@ -1151,7 +1230,7 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             CurrentFolder = string.Empty;
             Images.Clear();
-            _allFiles.Clear();
+            PublishAllFiles(new());
             StatusText = "文件夹已归档";
         }
 
@@ -1287,9 +1366,11 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
+        ResetTagSuggestionContext();
+        _tagSearch.ClearSearchResults();
         IsShowingSearchResult = false;
         Images.Clear();
-        _allFiles = new();
+        PublishAllFiles(new());
         _displayFilteredFiles = new();
         _filteredNavigationFiles = new();
         DisplayFilterSourceCount = 0;
@@ -1329,6 +1410,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (showAllSubfolders)
         {
             await RebuildFileListAsync(requestVersion, folder, true, folderWorkToken);
+            PerfLogger.Log($"[SortPerf] total_time_to_first_visible_ms={sw.ElapsedMilliseconds} count={_allFiles.Count}");
             PerfLogger.Log($"[LoadFolder] END (showAll) total={_allFiles.Count} elapsed={sw.ElapsedMilliseconds}ms");
             return;
         }
@@ -1345,6 +1427,7 @@ public partial class MainWindowViewModel : ViewModelBase
         // 磁盘枚举先行（<1ms），DB 查询在后台异步运行，不阻塞 LoadFolderAsync
         PerfLogger.Log($"[LoadFolder] disk-enum start {sw.ElapsedMilliseconds}ms");
         List<string> loadedFiles;
+        var enumerationStopwatch = Stopwatch.StartNew();
         try
         {
             loadedFiles = await Task.Run(() =>
@@ -1372,7 +1455,11 @@ public partial class MainWindowViewModel : ViewModelBase
         }
         if (folderWorkToken.IsCancellationRequested || isCurrent?.Invoke() == false ||
             !IsFolderViewRequestCurrent(requestVersion, folder, showAllSubfolders)) return;
-        _allFiles = loadedFiles;
+        PerfLogger.Log($"[SortPerf] enumeration_ms={enumerationStopwatch.ElapsedMilliseconds} count={loadedFiles.Count} recursive=false");
+        var loadedSnapshot = await SortFilesUsingCurrentSettingsAsync(loadedFiles, showAllSubfolders, folderWorkToken);
+        if (folderWorkToken.IsCancellationRequested || isCurrent?.Invoke() == false ||
+            !IsFolderViewRequestCurrent(requestVersion, folder, showAllSubfolders)) return;
+        PublishAllFiles(loadedFiles, loadedSnapshot);
         PerfLogger.Log($"[LoadFolder] disk-enum done count={_allFiles.Count} {sw.ElapsedMilliseconds}ms");
         AppLogger.Memory($"LoadFolder.DiskEnum count={_allFiles.Count}");
 
@@ -1391,7 +1478,10 @@ public partial class MainWindowViewModel : ViewModelBase
         int startPage = GetStartPageForLoadedFolder(preferredFilePath, null);
         PerfLogger.Log($"[LoadFolder] A-before-showpage page={startPage} {sw.ElapsedMilliseconds}ms");
         PerfLogger.Log($"[LoadFolder] show-page start page={startPage} {sw.ElapsedMilliseconds}ms");
+        var firstPageStopwatch = Stopwatch.StartNew();
         await ShowPageAsync(startPage);
+        PerfLogger.Log($"[SortPerf] first_page_ms={firstPageStopwatch.ElapsedMilliseconds} page={startPage}");
+        PerfLogger.Log($"[SortPerf] total_time_to_first_visible_ms={sw.ElapsedMilliseconds} count={_allFiles.Count}");
 
         PerfLogger.Log($"[LoadFolder] END total={_allFiles.Count} elapsed={sw.ElapsedMilliseconds}ms");
         AppLogger.Memory($"LoadFolder.End total={_allFiles.Count}");
@@ -1645,7 +1735,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 return;
             var diskFiles = refreshEnumResult.Files;
 
-            await SortFilesAsync(diskFiles, CurrentSortOrder, ShowAllSubfolders);
+            var diskSnapshot = await SortFilesUsingCurrentSettingsAsync(diskFiles, ShowAllSubfolders, folderWorkToken);
 
             if (folderWorkToken.IsCancellationRequested) return;
             var oldSet = new HashSet<string>(_allFiles, StringComparer.OrdinalIgnoreCase);
@@ -1655,9 +1745,14 @@ public partial class MainWindowViewModel : ViewModelBase
             if (deleted.Count == 0 && added.Count == 0) return;
 
             AppLogger.Memory($"FolderRefresh reason={reason} added={added.Count} deleted={deleted.Count} showAll={ShowAllSubfolders}");
-            _allFiles = diskFiles;
+            PublishAllFiles(diskFiles, diskSnapshot);
             if (_tagSearch.SearchResultFiles.Count > 0)
                 _tagSearch.SearchResultFiles.RemoveAll(path => deleted.Contains(path));
+            if (_tagSearch.IsSuggestionCoTagMode)
+            {
+                InvalidateCoTagSuggestionCache();
+                _ = _tagSearch.RefreshCurrentCoTagSuggestionsAsync();
+            }
 
             CaptureSelectionForNextPageRefresh();
             await RebuildDisplayFilterAsync(CurrentPage);
@@ -2444,6 +2539,7 @@ partial void OnCornerRadiusDipChanged(double value)
     {
         if (value) SearchScope = 1; // auto-switch to recursive
         OnPropertyChanged(nameof(ShowFolderSection));
+        OnPropertyChanged(nameof(IsSortScopeEnabled));
         if (string.IsNullOrEmpty(CurrentFolder)) return;
         var requestVersion = BeginFolderViewRequest();
         var folderWorkToken = BeginFolderWorkScope(CurrentFolder);
@@ -2717,6 +2813,7 @@ partial void OnCornerRadiusDipChanged(double value)
 
         if (folderWorkToken.IsCancellationRequested)
             return;
+        var enumerationStopwatch = Stopwatch.StartNew();
         FileEnumerationResult rebuildEnumResult;
         if (showAllSubfolders)
         {
@@ -2740,20 +2837,23 @@ partial void OnCornerRadiusDipChanged(double value)
         if (rebuildEnumResult.Canceled)
             return;
         var rebuiltFiles = rebuildEnumResult.Files;
+        PerfLogger.Log($"[SortPerf] enumeration_ms={enumerationStopwatch.ElapsedMilliseconds} count={rebuiltFiles.Count} recursive={showAllSubfolders}");
 
         if (folderWorkToken.IsCancellationRequested ||
             !IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
             return;
 
-        await SortFilesAsync(rebuiltFiles, CurrentSortOrder, showAllSubfolders);
+        var rebuiltSnapshot = await SortFilesUsingCurrentSettingsAsync(rebuiltFiles, showAllSubfolders, folderWorkToken);
         if (folderWorkToken.IsCancellationRequested ||
             !IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
             return;
 
-        _allFiles = rebuiltFiles;
+        PublishAllFiles(rebuiltFiles, rebuiltSnapshot);
         AppLogger.Memory($"RebuildList count={rebuiltFiles.Count}");
         CaptureSelectionForNextPageRefresh();
+        var firstPageStopwatch = Stopwatch.StartNew();
         await RebuildDisplayFilterAsync(CurrentPage);
+        PerfLogger.Log($"[SortPerf] first_page_ms={firstPageStopwatch.ElapsedMilliseconds} page={CurrentPage}");
         if (folderWorkToken.IsCancellationRequested ||
             !IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders)) return;
 
@@ -2805,12 +2905,69 @@ partial void OnCornerRadiusDipChanged(double value)
         }
     }
 
+    private void InvalidateFileSortSnapshot()
+    {
+        _fileSortSnapshot = null;
+    }
+
+    private void PublishAllFiles(
+        List<string> files,
+        FileSortSnapshot? snapshot = null,
+        bool contentChanged = true)
+    {
+        _allFiles = files;
+        if (!contentChanged)
+        {
+            _fileSortSnapshot = snapshot?.MutationVersion == _fileListMutationVersion ? snapshot : null;
+            return;
+        }
+
+        var mutationVersion = Interlocked.Increment(ref _fileListMutationVersion);
+        _fileSortSnapshot = snapshot?.MutationVersion == mutationVersion ? snapshot : null;
+    }
+
+    private async Task<FileSortSnapshot> BuildFileSortSnapshotAsync(
+        IReadOnlyList<string> files,
+        bool showAllSubfolders,
+        int mutationVersion,
+        bool useFolderQuery,
+        CancellationToken cancellationToken = default)
+    {
+        var cached = new Dictionary<string, ImageMeta>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in _metaCache)
+            cached[pair.Key] = pair.Value;
+
+        return await _fileSortSnapshotBuilder.BuildAsync(
+            files,
+            CurrentFolder,
+            showAllSubfolders,
+            mutationVersion,
+            _metaRepo,
+            useFolderQuery,
+            cached,
+            _fileSortSnapshot,
+            cancellationToken).ConfigureAwait(false);
+    }
+
     private int BeginFolderViewRequest()
+    {
+        CancelDisplayFilter();
+        InvalidateFileSortSnapshot();
+        InvalidateContinuousDisplayGeometry();
+        Interlocked.Increment(ref _resultNavigationVersion);
+        return Interlocked.Increment(ref _folderViewRequestVersion);
+    }
+
+    private int BeginSortRequest()
     {
         CancelDisplayFilter();
         InvalidateContinuousDisplayGeometry();
         Interlocked.Increment(ref _resultNavigationVersion);
-        return Interlocked.Increment(ref _folderViewRequestVersion);
+        var nextCts = CancellationTokenSource.CreateLinkedTokenSource(CurrentFolderWorkToken);
+        var previousCts = Interlocked.Exchange(ref _sortCts, nextCts);
+        previousCts.Cancel();
+        previousCts.Dispose();
+        return Interlocked.Increment(ref _sortRequestVersion);
     }
 
     private CancellationToken BeginFolderWorkScope(string folderPath)
@@ -2865,8 +3022,10 @@ partial void OnCornerRadiusDipChanged(double value)
         _idleTimer?.Stop();
         _pageManager.CancelCurrentLoads();
         _folderWorkCts.Cancel();
+        _sortCts.Cancel();
         _hashCts?.Cancel();
         _searchCts?.Cancel();
+        InvalidateTagSuggestionRequest();
     }
 
     private bool IsFolderViewRequestCurrent(int requestVersion, string folderPath, bool showAllSubfolders)
@@ -2876,50 +3035,74 @@ partial void OnCornerRadiusDipChanged(double value)
             && ShowAllSubfolders == showAllSubfolders;
     }
 
-    private Comparison<string> CreateSortComparison(ImageSortOrder order)
+    private async Task SortFilesAsync(
+        List<string> files,
+        ImageSortOrder order,
+        bool showAllSubfolders,
+        ImageSortScope sortScope) =>
+        await SortFilesAsync(files, order, showAllSubfolders, sortScope, CancellationToken.None)
+            .ConfigureAwait(false);
+
+    private async Task SortFilesAsync(
+        List<string> files,
+        ImageSortOrder order,
+        bool showAllSubfolders,
+        ImageSortScope sortScope,
+        CancellationToken cancellationToken)
     {
-        return order switch
-        {
-            ImageSortOrder.FileNameAsc => (a, b) =>
-                string.Compare(Path.GetFileName(a), Path.GetFileName(b), StringComparison.OrdinalIgnoreCase),
-            ImageSortOrder.FileNameDesc => (a, b) =>
-                string.Compare(Path.GetFileName(b), Path.GetFileName(a), StringComparison.OrdinalIgnoreCase),
-            ImageSortOrder.ModifiedAsc => (a, b) =>
-                GetMetaTicks(a).CompareTo(GetMetaTicks(b)),
-            ImageSortOrder.ModifiedDesc => (a, b) =>
-                GetMetaTicks(b).CompareTo(GetMetaTicks(a)),
-            ImageSortOrder.FileSizeAsc => (a, b) =>
-                GetMetaFileSize(a).CompareTo(GetMetaFileSize(b)),
-            ImageSortOrder.FileSizeDesc => (a, b) =>
-                GetMetaFileSize(b).CompareTo(GetMetaFileSize(a)),
-            ImageSortOrder.ResolutionAsc => (a, b) =>
-                GetMetaResolution(a).CompareTo(GetMetaResolution(b)),
-            ImageSortOrder.ResolutionDesc => (a, b) =>
-                GetMetaResolution(b).CompareTo(GetMetaResolution(a)),
-            _ => (a, b) => 0
-        };
+        var snapshot = await BuildFileSortSnapshotAsync(
+            files,
+            showAllSubfolders,
+            Volatile.Read(ref _fileListMutationVersion),
+            useFolderQuery: false,
+            cancellationToken).ConfigureAwait(false);
+        await SortFilesAsync(files, order, showAllSubfolders, sortScope, snapshot, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task SortFilesAsync(List<string> files, ImageSortOrder order, bool showAllSubfolders)
+    private async Task SortFilesAsync(
+        List<string> files,
+        ImageSortOrder order,
+        bool showAllSubfolders,
+        ImageSortScope sortScope,
+        FileSortSnapshot snapshot,
+        CancellationToken cancellationToken = default)
     {
-        var comparison = CreateSortComparison(order);
         await Task.Run(() =>
         {
-            if (showAllSubfolders)
-            {
-                files.Sort((a, b) =>
-                {
-                    int dirCmp = string.Compare(
-                        Path.GetDirectoryName(a), Path.GetDirectoryName(b),
-                        StringComparison.OrdinalIgnoreCase);
-                    return dirCmp != 0 ? dirCmp : comparison(a, b);
-                });
-            }
-            else
-            {
-                files.Sort(comparison);
-            }
-        });
+            var sorted = snapshot.SortPaths(
+                files,
+                order,
+                showAllSubfolders && sortScope == ImageSortScope.FolderGrouped,
+                cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            files.Clear();
+            files.AddRange(sorted);
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<FileSortSnapshot> SortFilesUsingCurrentSettingsAsync(
+        List<string> files,
+        bool showAllSubfolders,
+        CancellationToken cancellationToken = default)
+    {
+        var snapshotStopwatch = Stopwatch.StartNew();
+        while (true)
+        {
+            var order = CurrentSortOrder;
+            var scope = CurrentSortScope;
+            var snapshot = await BuildFileSortSnapshotAsync(
+                files,
+                showAllSubfolders,
+                Volatile.Read(ref _fileListMutationVersion) + 1,
+                useFolderQuery: true,
+                cancellationToken).ConfigureAwait(false);
+            PerfLogger.Log($"[SortPerf] metadata_snapshot_ms={snapshotStopwatch.ElapsedMilliseconds} count={files.Count}");
+            var sortStopwatch = Stopwatch.StartNew();
+            await SortFilesAsync(files, order, showAllSubfolders, scope, snapshot, cancellationToken).ConfigureAwait(false);
+            PerfLogger.Log($"[SortPerf] sort_ms={sortStopwatch.ElapsedMilliseconds} count={files.Count}");
+            if (order == CurrentSortOrder && scope == CurrentSortScope)
+                return snapshot;
+        }
     }
 
     // ==================== Tag Search ====================
@@ -2934,6 +3117,7 @@ partial void OnCornerRadiusDipChanged(double value)
             return;
         }
 
+        DismissTagSearchSuggestions();
         CurrentTagFilter = raw;
 
         if (!IsShowingSearchResult)
@@ -2965,6 +3149,19 @@ partial void OnCornerRadiusDipChanged(double value)
 
     partial void OnTagSearchTextChanged(string value)
     {
+        if (string.IsNullOrWhiteSpace(value) && _isTagSearchInputFocused)
+        {
+            PublishFocusTagSuggestions();
+            return;
+        }
+
+        InvalidateTagSuggestionRequest();
+        _tagSuggestionMode = TagSuggestionMode.TypedSuggestions;
+        SetCoTagFilterTextWithoutRefresh(string.Empty);
+        _coTagSuggestionBase.Clear();
+        _coTagSuggestionBaseLoaded = false;
+        _coTagSuggestionFiles.Clear();
+        OnPropertyChanged(nameof(IsSuggestionCoTagMode));
         _tagSearch.OnTextChanged(value, TagSearchText,
             () => OnPropertyChanged(nameof(SearchBoxBorderColor)),
             keyword => UpdateTagSuggestions(keyword));
@@ -2972,23 +3169,118 @@ partial void OnCornerRadiusDipChanged(double value)
 
     private void UpdateTagSuggestions(string keyword)
     {
-        TagSearchSuggestions.Clear();
-        _tagSearch.UpdateSuggestions(keyword,
-            t => TagSearchSuggestions.Add(t),
-            open => IsTagSearchPopupOpen = open);
+        _tagSuggestionMode = TagSuggestionMode.TypedSuggestions;
+        PublishTagSuggestions(_tagSearch.GetTypedSuggestions(keyword));
+        OnPropertyChanged(nameof(IsSuggestionCoTagMode));
     }
 
     partial void OnCoTagFilterTextChanged(string value)
     {
-        if (_tagSearch.IsSuggestionCoTagMode)
-            _ = _tagSearch.SearchCoTagsAsync(value);
+        if (!_suppressCoTagFilterChange && IsSuggestionCoTagMode)
+            FilterCoTagSuggestions(value);
     }
 
-    public void OnTagSearchGotFocus()
+    public Task OnTagSearchGotFocusAsync(bool preserveCurrentMode = false)
     {
-        _tagSearch.OnGotFocus(TagSearchText,
-            open => IsTagSearchPopupOpen = open,
-            () => TagSearchSuggestions.ToList());
+        _isTagSearchInputFocused = true;
+        if (preserveCurrentMode && IsTagSearchPopupOpen)
+            return Task.CompletedTask;
+
+        PublishFocusTagSuggestions();
+        return Task.CompletedTask;
+    }
+
+    public void DismissTagSearchSuggestions()
+    {
+        _isTagSearchInputFocused = false;
+        InvalidateTagSuggestionRequest();
+        IsTagSearchPopupOpen = false;
+    }
+
+    private void ResetTagSuggestionContext()
+    {
+        DismissTagSearchSuggestions();
+        SetCoTagFilterTextWithoutRefresh(string.Empty);
+        _tagSuggestionMode = TagSuggestionMode.None;
+        _coTagSuggestionBase.Clear();
+        _coTagSuggestionBaseLoaded = false;
+        _coTagSuggestionFiles.Clear();
+        TagSearchSuggestions = new ObservableCollection<TagCount>();
+        OnPropertyChanged(nameof(IsSuggestionCoTagMode));
+    }
+
+    private void InvalidateCoTagSuggestionCache()
+    {
+        _coTagSuggestionBase.Clear();
+        _coTagSuggestionBaseLoaded = false;
+        _coTagSuggestionFiles.Clear();
+        if (_tagSuggestionMode == TagSuggestionMode.SearchResultCoTags && _isTagSearchInputFocused)
+            PublishTagSuggestions(GetImmediateTagSuggestions(TagSearchText), keepOpen: true);
+    }
+
+    private void PublishFocusTagSuggestions()
+    {
+        InvalidateTagSuggestionRequest();
+        _tagSuggestionMode = TagSuggestionMode.FocusCoTags;
+        SetCoTagFilterTextWithoutRefresh(string.Empty);
+        var suggestions = _coTagSuggestionBaseLoaded
+            ? _coTagSuggestionBase
+            : GetImmediateTagSuggestions(TagSearchText);
+        PublishTagSuggestions(suggestions, keepOpen: true);
+        OnPropertyChanged(nameof(IsSuggestionCoTagMode));
+    }
+
+    private void FilterCoTagSuggestions(string value)
+    {
+        if (!IsSuggestionCoTagMode)
+            return;
+
+        var baseSuggestions = _coTagSuggestionBaseLoaded
+            ? _coTagSuggestionBase
+            : GetImmediateTagSuggestions(TagSearchText);
+        var filtered = string.IsNullOrWhiteSpace(value)
+            ? baseSuggestions
+            : baseSuggestions.Where(tag => tag.Name.Contains(value, StringComparison.OrdinalIgnoreCase));
+        PublishTagSuggestions(filtered, keepOpen: true);
+    }
+
+    private IReadOnlyList<TagCount> GetImmediateTagSuggestions(string keyword)
+    {
+        if (!string.IsNullOrWhiteSpace(keyword))
+            return _tagSearch.GetTypedSuggestions(keyword);
+
+        return _tagSearch.AllTagCounts
+            .OrderByDescending(tag => tag.Count)
+            .Take(300)
+            .ToList();
+    }
+
+    private void InvalidateTagSuggestionRequest()
+    {
+        ++_tagSuggestionVersion;
+        _tagSuggestionCts?.Cancel();
+        _tagSuggestionCts?.Dispose();
+        _tagSuggestionCts = null;
+    }
+
+    private void PublishTagSuggestions(IEnumerable<TagCount> suggestions, bool keepOpen = false)
+    {
+        var snapshot = suggestions.ToList();
+        TagSearchSuggestions = new ObservableCollection<TagCount>(snapshot);
+        IsTagSearchPopupOpen = keepOpen || snapshot.Count > 0;
+    }
+
+    private void SetCoTagFilterTextWithoutRefresh(string value)
+    {
+        _suppressCoTagFilterChange = true;
+        try
+        {
+            CoTagFilterText = value;
+        }
+        finally
+        {
+            _suppressCoTagFilterChange = false;
+        }
     }
 
     /// <summary>Remove deleted files incrementally, keeping existing thumbnails intact</summary>
@@ -3014,15 +3306,20 @@ partial void OnCornerRadiusDipChanged(double value)
         CancelDisplayFilter();
         IsDisplayFilterBusy = false;
         // Remove from master lists and both published snapshots.
-        ++_fileListMutationVersion;
-        _displayFilteredFiles.RemoveAll(p => deletedPaths.Contains(p));
+        if (!ReferenceEquals(_displayFilteredFiles, _allFiles))
+            _displayFilteredFiles.RemoveAll(p => deletedPaths.Contains(p));
         _filteredNavigationFiles.RemoveAll(p => deletedPaths.Contains(p));
-        _allFiles.RemoveAll(p => deletedPaths.Contains(p));
+        PublishAllFiles(_allFiles.Where(path => !deletedPaths.Contains(path)).ToList());
         _selectedFilePaths.RemoveWhere(deletedPaths.Contains);
         if (!wasContinuous || HasDisplayFilter || filterWasPending)
             InvalidateContinuousDisplayGeometry();
         if (_tagSearch.SearchResultFiles.Count > 0)
             _tagSearch.SearchResultFiles.RemoveAll(p => deletedPaths.Contains(p));
+        if (_tagSearch.IsSuggestionCoTagMode)
+        {
+            InvalidateCoTagSuggestionCache();
+            _ = _tagSearch.RefreshCurrentCoTagSuggestionsAsync();
+        }
 
         if (HasDisplayFilter || filterWasPending)
         {
@@ -3150,76 +3447,168 @@ partial void OnCornerRadiusDipChanged(double value)
 
     // ==================== Sort ====================
 
+    public string SortMenuHeader => $"排序：{GetSortFieldLabel(CurrentSortOrder)} {(IsSortAscending ? "↑" : "↓")}";
+    public bool IsSortScopeEnabled => ShowAllSubfolders;
+    public bool IsAllFilesSortScope => CurrentSortScope == ImageSortScope.AllFiles;
+    public bool IsFolderGroupedSortScope => CurrentSortScope == ImageSortScope.FolderGrouped;
+    public bool IsSortByFileName => CurrentSortOrder is ImageSortOrder.FileNameAsc or ImageSortOrder.FileNameDesc;
+    public bool IsSortByModified => CurrentSortOrder is ImageSortOrder.ModifiedAsc or ImageSortOrder.ModifiedDesc;
+    public bool IsSortByFileSize => CurrentSortOrder is ImageSortOrder.FileSizeAsc or ImageSortOrder.FileSizeDesc;
+    public bool IsSortByResolution => CurrentSortOrder is ImageSortOrder.ResolutionAsc or ImageSortOrder.ResolutionDesc;
+    public bool IsSortAscending => CurrentSortOrder is ImageSortOrder.FileNameAsc or ImageSortOrder.ModifiedAsc or
+        ImageSortOrder.FileSizeAsc or ImageSortOrder.ResolutionAsc;
+    public bool IsSortDescending => !IsSortAscending;
+
+    partial void OnCurrentSortOrderChanged(ImageSortOrder value) => NotifySortMenuState();
+    partial void OnCurrentSortScopeChanged(ImageSortScope value) => NotifySortMenuState();
+
+    private void NotifySortMenuState()
+    {
+        OnPropertyChanged(nameof(SortMenuHeader));
+        OnPropertyChanged(nameof(IsAllFilesSortScope));
+        OnPropertyChanged(nameof(IsFolderGroupedSortScope));
+        OnPropertyChanged(nameof(IsSortByFileName));
+        OnPropertyChanged(nameof(IsSortByModified));
+        OnPropertyChanged(nameof(IsSortByFileSize));
+        OnPropertyChanged(nameof(IsSortByResolution));
+        OnPropertyChanged(nameof(IsSortAscending));
+        OnPropertyChanged(nameof(IsSortDescending));
+    }
+
+    [RelayCommand]
+    private async Task SetSortScope(string? scope)
+    {
+        if (!ShowAllSubfolders || !Enum.TryParse<ImageSortScope>(scope, true, out var parsed) ||
+            parsed == CurrentSortScope)
+            return;
+
+        CurrentSortScope = parsed;
+        await SortImagesAsync(CurrentSortOrder);
+    }
+
+    [RelayCommand]
+    private async Task SetSortField(string? field)
+    {
+        var ascending = IsSortAscending;
+        var order = field switch
+        {
+            "FileName" => ascending ? ImageSortOrder.FileNameAsc : ImageSortOrder.FileNameDesc,
+            "Modified" => ascending ? ImageSortOrder.ModifiedAsc : ImageSortOrder.ModifiedDesc,
+            "FileSize" => ascending ? ImageSortOrder.FileSizeAsc : ImageSortOrder.FileSizeDesc,
+            "Resolution" => ascending ? ImageSortOrder.ResolutionAsc : ImageSortOrder.ResolutionDesc,
+            _ => CurrentSortOrder
+        };
+        if (order != CurrentSortOrder)
+            await SortImagesAsync(order);
+    }
+
+    [RelayCommand]
+    private async Task SetSortDirection(string? direction)
+    {
+        var ascending = string.Equals(direction, "Ascending", StringComparison.OrdinalIgnoreCase);
+        var descending = string.Equals(direction, "Descending", StringComparison.OrdinalIgnoreCase);
+        if ((!ascending && !descending) || ascending == IsSortAscending)
+            return;
+
+        var order = CurrentSortOrder switch
+        {
+            ImageSortOrder.FileNameAsc or ImageSortOrder.FileNameDesc =>
+                ascending ? ImageSortOrder.FileNameAsc : ImageSortOrder.FileNameDesc,
+            ImageSortOrder.ModifiedAsc or ImageSortOrder.ModifiedDesc =>
+                ascending ? ImageSortOrder.ModifiedAsc : ImageSortOrder.ModifiedDesc,
+            ImageSortOrder.FileSizeAsc or ImageSortOrder.FileSizeDesc =>
+                ascending ? ImageSortOrder.FileSizeAsc : ImageSortOrder.FileSizeDesc,
+            _ => ascending ? ImageSortOrder.ResolutionAsc : ImageSortOrder.ResolutionDesc
+        };
+        await SortImagesAsync(order);
+    }
+
     public async Task SortImagesAsync(ImageSortOrder order)
     {
         CurrentSortOrder = order;
+        AppSettings.ImageSortOrder = order.ToString();
+        AppSettings.ImageSortScope = CurrentSortScope.ToString();
+        var sortVersion = BeginSortRequest();
+        var sortToken = _sortCts.Token;
+        await SaveSettingsAsync();
+        if (sortToken.IsCancellationRequested)
+            return;
 
         var folder = CurrentFolder;
+        var showAllSubfolders = ShowAllSubfolders;
+        var sortScope = CurrentSortScope;
         var source = _allFiles;
         var mutationVersion = _fileListMutationVersion;
-        var folderVersion = _folderViewRequestVersion;
         var sorted = source.ToList();
-        await SortFilesAsync(sorted, order, ShowAllSubfolders);
-        if (!ReferenceEquals(source, _allFiles) || mutationVersion != _fileListMutationVersion ||
-            folderVersion != _folderViewRequestVersion ||
-            !string.Equals(folder, CurrentFolder, StringComparison.OrdinalIgnoreCase) || CurrentSortOrder != order) return;
-        _allFiles = sorted;
-        // Similarity result order is its relevance rank; only ordinary Tag results use file sorting.
-        if (_similarityScores.Count == 0) _tagSearch.SearchResultFiles.Sort(CreateSortComparison(order));
-        await RebuildDisplayFilterAsync();
-
-        var labels = new Dictionary<ImageSortOrder, string>
-        {
-            [ImageSortOrder.FileNameAsc] = "文件名 ↑",
-            [ImageSortOrder.FileNameDesc] = "文件名 ↓",
-            [ImageSortOrder.ModifiedAsc] = "修改时间 ↑",
-            [ImageSortOrder.ModifiedDesc] = "修改时间 ↓",
-            [ImageSortOrder.FileSizeAsc] = "文件大小 ↑",
-            [ImageSortOrder.FileSizeDesc] = "文件大小 ↓",
-            [ImageSortOrder.ResolutionAsc] = "分辨率 ↑",
-            [ImageSortOrder.ResolutionDesc] = "分辨率 ↓"
-        };
-        StatusText = $"排序: {labels.GetValueOrDefault(order, order.ToString())}";
-    }
-
-    private long GetMetaTicks(string path)
-    {
-        if (_metaCache.TryGetValue(path, out var m) && m.LastWriteTicks > 0)
-            return m.LastWriteTicks;
-        try { return new FileInfo(path).LastWriteTimeUtc.Ticks; }
-        catch { return 0; }
-    }
-
-    private long GetMetaFileSize(string path)
-    {
-        if (_metaCache.TryGetValue(path, out var m) && m.FileSize > 0)
-            return m.FileSize;
-        try { return new FileInfo(path).Length; }
-        catch { return 0; }
-    }
-
-    private long GetMetaResolution(string path)
-    {
-        if (_metaCache.TryGetValue(path, out var m) && m.Width > 0)
-            return (long)m.Width * m.Height;
-        if (FileTypeConstants.IsVideoFile(path))
-            return 0;
+        FileSortSnapshot sortSnapshot;
+        List<string> searchSource;
+        List<string>? sortedSearch;
         try
         {
-            var (w, h) = ImageManager.Infrastructure.Imaging.ThumbnailGenerator.GetDimensions(path);
-            return (long)w * h;
+            sortSnapshot = await BuildFileSortSnapshotAsync(
+                sorted,
+                showAllSubfolders,
+                mutationVersion,
+                useFolderQuery: true,
+                sortToken).ConfigureAwait(false);
+            searchSource = _tagSearch.SearchResultFiles;
+            sortedSearch = _similarityScores.Count == 0 ? searchSource.ToList() : null;
+            var sortMainTask = SortFilesAsync(
+                sorted, order, showAllSubfolders, sortScope, sortSnapshot, sortToken);
+            Task sortSearchTask = Task.CompletedTask;
+            if (sortedSearch is not null)
+            {
+                var searchSnapshot = sortSnapshot.Covers(
+                    sortedSearch, folder, showAllSubfolders, mutationVersion)
+                    ? sortSnapshot
+                    : await BuildFileSortSnapshotAsync(
+                        sortedSearch,
+                        showAllSubfolders,
+                        mutationVersion,
+                        useFolderQuery: false,
+                        sortToken).ConfigureAwait(false);
+                sortSearchTask = SortFilesAsync(
+                    sortedSearch, order, showAllSubfolders, sortScope, searchSnapshot, sortToken);
+            }
+            await Task.WhenAll(sortMainTask, sortSearchTask);
         }
-        catch { return 0; }
+        catch (OperationCanceledException) when (sortToken.IsCancellationRequested)
+        {
+            return;
+        }
+        if (!ReferenceEquals(source, _allFiles) || mutationVersion != _fileListMutationVersion ||
+            sortVersion != Volatile.Read(ref _sortRequestVersion) ||
+            !string.Equals(folder, CurrentFolder, StringComparison.OrdinalIgnoreCase) ||
+            CurrentSortOrder != order || CurrentSortScope != sortScope || ShowAllSubfolders != showAllSubfolders) return;
+        PublishAllFiles(sorted, sortSnapshot, contentChanged: false);
+        // Similarity result order is its relevance rank; only ordinary Tag results use file sorting.
+        if (sortedSearch is not null && ReferenceEquals(searchSource, _tagSearch.SearchResultFiles))
+            _tagSearch.SearchResultFiles = sortedSearch;
+        await RebuildDisplayFilterAsync(CurrentPage);
+
+        var scopeLabel = showAllSubfolders
+            ? (sortScope == ImageSortScope.AllFiles ? "全部文件混排" : "按文件夹分组") + " · "
+            : string.Empty;
+        StatusText = $"排序：{scopeLabel}{GetSortFieldLabel(order)} {(IsSortAscending ? "↑" : "↓")}";
     }
+
+    private static string GetSortFieldLabel(ImageSortOrder order) => order switch
+    {
+        ImageSortOrder.FileNameAsc or ImageSortOrder.FileNameDesc => "文件名",
+        ImageSortOrder.ModifiedAsc or ImageSortOrder.ModifiedDesc => "修改时间",
+        ImageSortOrder.FileSizeAsc or ImageSortOrder.FileSizeDesc => "文件大小",
+        _ => "分辨率"
+    };
 
     [RelayCommand]
     private async Task ClearFilter()
     {
+        ResetTagSuggestionContext();
+        _tagSearch.ClearSearchResults();
         TagSearchText = string.Empty;
         CurrentTagFilter = string.Empty;
         DisplayFilter = new();
         IsShowingSearchResult = false;
-        _tagSearch.SearchResultFiles.Clear();
         _similarityScores.Clear();
         _similarityMatchKinds.Clear();
         NotifyFolderSectionSearchStateChanged();
@@ -3571,7 +3960,7 @@ partial void OnCornerRadiusDipChanged(double value)
             }
 
             // 更新文件列表并跳到目标文件所在页
-            _allFiles = folderFiles;
+            PublishAllFiles(folderFiles);
             CurrentFolder = targetDir;
             // Refilter the new folder; preserve the selected result after filter publication resets navigation.
             if (!await UpdateDisplayFilterAsync(preserveNavigation: true) || !IsCurrentNavigation()) return;
@@ -3733,8 +4122,9 @@ partial void OnCornerRadiusDipChanged(double value)
     private async Task BackFromSearch()
     {
         if (!IsShowingSearchResult) return;
+        ResetTagSuggestionContext();
+        _tagSearch.ClearSearchResults();
         IsShowingSearchResult = false;
-        _tagSearch.SearchResultFiles.Clear();
         _similarityScores.Clear();
         _similarityMatchKinds.Clear();
         NotifyFolderSectionSearchStateChanged();
@@ -3863,7 +4253,9 @@ partial void OnCornerRadiusDipChanged(double value)
         }
 
         _tagSearch.AllTagCounts = counts;
-        if (!string.IsNullOrWhiteSpace(TagSearchText))
+        if (_isTagSearchInputFocused &&
+            _tagSuggestionMode == TagSuggestionMode.TypedSuggestions &&
+            !string.IsNullOrWhiteSpace(TagSearchText))
         {
             await _dispatcher.InvokeAsync(() => UpdateTagSuggestions(TagSearchText));
         }
@@ -3910,7 +4302,10 @@ partial void OnCornerRadiusDipChanged(double value)
         }
 
         if (_tagSearch.IsSuggestionCoTagMode)
+        {
+            InvalidateCoTagSuggestionCache();
             await _tagSearch.RefreshCurrentCoTagSuggestionsAsync();
+        }
     }
 
     public List<TagCount> GetAllTagCounts()
@@ -3963,6 +4358,12 @@ partial void OnCornerRadiusDipChanged(double value)
 
         InvalidateTagCountsCache();
         await RefreshTagCountsAsync(forceRefresh: true);
+
+        if (_tagSearch.IsSuggestionCoTagMode)
+        {
+            InvalidateCoTagSuggestionCache();
+            await _tagSearch.RefreshCurrentCoTagSuggestionsAsync();
+        }
     }
 
     public async Task RefreshImageTagsAsync(string filePath)

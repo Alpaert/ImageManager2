@@ -67,6 +67,10 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        _hoverPreview = HoverPreviewContent;
+        HoverPreviewHost.PlacementTarget = RootGrid;
+        _hoverPreview.PointerEnteredPreview += OnHoverPreviewPointerEntered;
+        _hoverPreview.PointerExitedPreview += OnHoverPreviewPointerExited;
         _continuousResizeTimer = new DispatcherTimer(
             TimeSpan.FromMilliseconds(16),
             DispatcherPriority.Background,
@@ -841,7 +845,7 @@ public partial class MainWindow : Window
         }
 
         // Dismiss tag search popup when clicking on blank area
-        Vm.IsTagSearchPopupOpen = false;
+        Vm.DismissTagSearchSuggestions();
         RootGrid.Focus();
 
         var point = e.GetCurrentPoint(ImagePanelHost);
@@ -920,7 +924,7 @@ public partial class MainWindow : Window
         CloseHoverPreview();
 
         // Dismiss tag search popup when clicking on an image
-        Vm.IsTagSearchPopupOpen = false;
+        Vm.DismissTagSearchSuggestions();
         RootGrid.Focus();
 
         // Store for potential drag-drop initiation
@@ -1001,7 +1005,7 @@ public partial class MainWindow : Window
     // completed background decode harmless after the pointer has moved away.
     private readonly DispatcherTimer _hoverPreviewTimer;
     private DispatcherTimer _hoverPreviewCloseTimer = null!;
-    private HoverPreviewPopup? _hoverPreview;
+    private HoverPreviewPopup _hoverPreview = null!;
     private CancellationTokenSource? _hoverPreviewCts;
     private ImageViewItem? _hoverPreviewCandidate;
     private Border? _hoverPreviewSource;
@@ -1011,24 +1015,13 @@ public partial class MainWindow : Window
     private int _hoverPreviewRequestVersion;
     private int _hoverPreviewCloseGeneration;
 
-    private HoverPreviewPopup CreateHoverPreviewPopup()
-    {
-        var popup = new HoverPreviewPopup();
-        popup.PointerEnteredPreview += OnHoverPreviewPointerEntered;
-        popup.PointerExitedPreview += OnHoverPreviewPointerExited;
-        return popup;
-    }
-
     private void ReleaseHoverPreviewPopup()
     {
         var popup = _hoverPreview;
-        if (popup == null)
-            return;
-
         popup.PointerEnteredPreview -= OnHoverPreviewPointerEntered;
         popup.PointerExitedPreview -= OnHoverPreviewPointerExited;
-        popup.Close();
-        _hoverPreview = null;
+        HoverPreviewHost.IsOpen = false;
+        popup.ResetPreviewSurface();
     }
 
     private void CreateHoverPreviewCloseTimer()
@@ -1091,7 +1084,7 @@ public partial class MainWindow : Window
     private void UpdatePendingHoverPreviewAnchor(Border source, ImageViewItem item, PixelPoint anchor)
     {
         if (_hoverPreviewCandidate != item || !ReferenceEquals(_hoverPreviewSource, source) ||
-            _hoverPreview?.IsVisible == true)
+            HoverPreviewHost.IsOpen)
             return;
 
         _hoverPreviewAnchor = anchor;
@@ -1153,15 +1146,13 @@ public partial class MainWindow : Window
                 _hoverPreviewCandidate != item || result.Pixels == null)
                 return;
 
-            ReleaseHoverPreviewPopup();
-            var popup = CreateHoverPreviewPopup();
-            _hoverPreview = popup;
+            var popup = _hoverPreview;
 
             popup.MaxPreviewWidth = maxPreviewSize;
             popup.MaxPreviewHeight = maxPreviewSize;
             var sourceRect = GetScreenRect(_hoverPreviewSource!);
             _hoverPreviewSourceRect = sourceRect;
-            popup.Present(
+            var popupPosition = popup.Present(
                 result.Pixels,
                 result.DecodedWidth,
                 result.DecodedHeight,
@@ -1172,6 +1163,13 @@ public partial class MainWindow : Window
                 this,
                 anchor,
                 sourceRect);
+            if (popupPosition is not { } position)
+                return;
+
+            var clientPosition = RootGrid.PointToClient(position);
+            HoverPreviewHost.PlacementRect = new Rect(clientPosition, new Size(1, 1));
+            HoverPreviewHost.IsOpen = true;
+            Dispatcher.UIThread.Post(popup.RefreshActualScreenRect, DispatcherPriority.Loaded);
         }
         catch (OperationCanceledException)
         {
@@ -1287,7 +1285,8 @@ public partial class MainWindow : Window
         {
             cts.Cancel();
         }
-        _hoverPreview?.ResetPreviewSurface();
+        HoverPreviewHost.IsOpen = false;
+        _hoverPreview.ResetPreviewSurface();
     }
 
     private void OnViewModelPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
@@ -2188,6 +2187,8 @@ public partial class MainWindow : Window
 
     // Drag-to-folder handled by ListBox DragDrop events below
 
+    private bool _preserveTagSuggestionModeOnNextFocus;
+
     private async void TagSuggestion_Click(object? sender, RoutedEventArgs e)
     {
         if (sender is Button btn && btn.Tag is Core.Models.TagCount tag)
@@ -2211,6 +2212,7 @@ public partial class MainWindow : Window
 
             // Return focus to search box so Enter triggers search, not another cycle
             var searchBox = Vm.IsSearchToolbarLayoutC ? TxtTagSearchC : TxtTagSearchA;
+            _preserveTagSuggestionModeOnNextFocus = true;
             searchBox.Focus();
             searchBox.CaretIndex = searchBox.Text?.Length ?? 0;
         }
@@ -2218,12 +2220,21 @@ public partial class MainWindow : Window
 
     private void TxtTagSearch_GotFocus(object? sender, RoutedEventArgs e)
     {
-        Vm.OnTagSearchGotFocus();
+        if (sender is not TextBox searchBox)
+            return;
+
+        var preserveCurrentMode = _preserveTagSuggestionModeOnNextFocus;
+        _preserveTagSuggestionModeOnNextFocus = false;
+        Dispatcher.UIThread.Post(() =>
+        {
+            if (searchBox.IsFocused)
+                _ = Vm.OnTagSearchGotFocusAsync(preserveCurrentMode);
+        }, DispatcherPriority.Background);
     }
 
     private async void TxtTagSearch_KeyDown(object? sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Enter)
+        if (e.Key == Key.Enter && sender is TextBox textBox && !IsImeComposing(textBox))
         {
             Vm.PreSearchScrollOffset = ThumbnailScrollViewer.Offset.Y;
             await Vm.SearchByTagCommand.ExecuteAsync(null);
@@ -2231,6 +2242,11 @@ public partial class MainWindow : Window
             e.Handled = true;
         }
     }
+
+    private static bool IsImeComposing(TextBox textBox) =>
+        textBox.GetVisualDescendants()
+            .OfType<Avalonia.Controls.Presenters.TextPresenter>()
+            .Any(presenter => !string.IsNullOrEmpty(presenter.PreeditText));
 
     private void BtnStopSearch_Click(object? sender, RoutedEventArgs e)
     {

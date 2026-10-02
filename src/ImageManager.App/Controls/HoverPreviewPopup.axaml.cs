@@ -8,10 +8,10 @@ using ImageManager.Common.Helpers;
 namespace ImageManager.App.Controls;
 
 /// <summary>
-/// A transient, non-activating-style image preview surface. The owner supplies
-/// decoded BGRA pixels; this window owns the resulting bitmap until it is hidden.
+/// Content for the main window's reusable hover <see cref="Avalonia.Controls.Primitives.Popup"/>.
+/// The owner supplies decoded BGRA pixels; this control owns the resulting bitmap.
 /// </summary>
-public partial class HoverPreviewPopup : Window
+public partial class HoverPreviewPopup : UserControl
 {
     public const int DefaultMaxPreviewWidth = 800;
     public const int DefaultMaxPreviewHeight = 600;
@@ -40,9 +40,7 @@ public partial class HoverPreviewPopup : Window
     public int MaxPreviewHeight { get; set; } = DefaultMaxPreviewHeight;
 
     /// <summary>
-    /// The visible popup bounds in physical screen pixels. This is calculated
-    /// from the native window position and current screen scale so callers can
-    /// use it together with other top-level window coordinates.
+    /// The visible popup bounds in physical screen pixels.
     /// </summary>
     public PixelRect? ActualScreenRect => CurrentScreenRect;
 
@@ -53,10 +51,10 @@ public partial class HoverPreviewPopup : Window
     public PixelRect? CurrentScreenRect { get; private set; }
 
     /// <summary>
-    /// Replaces the preview image and displays this popup near <paramref name="anchor"/>.
+    /// Replaces the preview image and lays out this content near <paramref name="anchor"/>.
     /// The supplied pixels must be BGRA8888 premultiplied-alpha data.
     /// </summary>
-    public void Present(
+    public PixelPoint? Present(
         byte[] pixels,
         int decodedWidth,
         int decodedHeight,
@@ -69,7 +67,7 @@ public partial class HoverPreviewPopup : Window
         PixelRect sourceRect)
     {
         if (pixels.Length == 0 || decodedWidth <= 0 || decodedHeight <= 0)
-            return;
+            return null;
 
         var screen = owner.Screens.ScreenFromPoint(anchor) ?? owner.Screens.Primary;
         var workArea = screen?.WorkingArea ?? new PixelRect(0, 0, 1920, 1080);
@@ -80,8 +78,8 @@ public partial class HoverPreviewPopup : Window
             Math.Max(MinimumPreviewHeight, MaxPreviewHeight));
         if (layout is null)
         {
-            HidePreview();
-            return;
+            ResetPreviewSurface();
+            return null;
         }
 
         ReleaseBitmap();
@@ -105,22 +103,12 @@ public partial class HoverPreviewPopup : Window
         PreviewImage.Height = Math.Max(1, Math.Round(decodedHeight * scale));
         Width = Math.Max(180, PreviewImage.Width + HorizontalChrome);
         Height = PreviewImage.Height + VerticalChrome;
-        Position = resolvedLayout.Position;
-
-        if (!IsVisible)
-            Show(owner);
-
-        // Refresh after Show so the hover controller sees the active native
-        // top-level window position.
-        CurrentScreenRect = GetActualScreenRect();
-    }
-
-    public void HidePreview()
-    {
-        if (IsVisible)
-            Hide();
-        CurrentScreenRect = null;
-        ReleaseBitmap();
+        CurrentScreenRect = new PixelRect(
+            resolvedLayout.Position.X,
+            resolvedLayout.Position.Y,
+            Math.Max(1, (int)Math.Ceiling(Width * screenScaling)),
+            Math.Max(1, (int)Math.Ceiling(Height * screenScaling)));
+        return resolvedLayout.Position;
     }
 
     /// <summary>
@@ -132,16 +120,21 @@ public partial class HoverPreviewPopup : Window
     {
         PreviewImage.Source = null;
         CurrentScreenRect = null;
-        if (IsVisible)
-            Hide();
         ReleaseBitmap();
     }
 
-    protected override void OnClosed(EventArgs e)
+    public void RefreshActualScreenRect()
     {
-        CurrentScreenRect = null;
-        ReleaseBitmap();
-        base.OnClosed(e);
+        if (TopLevel.GetTopLevel(this) is null || Bounds.Width <= 0 || Bounds.Height <= 0)
+            return;
+
+        var topLeft = this.PointToScreen(new Point(0, 0));
+        var bottomRight = this.PointToScreen(new Point(Bounds.Width, Bounds.Height));
+        CurrentScreenRect = new PixelRect(
+            topLeft.X,
+            topLeft.Y,
+            Math.Max(1, bottomRight.X - topLeft.X),
+            Math.Max(1, bottomRight.Y - topLeft.Y));
     }
 
     private void ReleaseBitmap()
@@ -149,19 +142,6 @@ public partial class HoverPreviewPopup : Window
         PreviewImage.Source = null;
         _bitmap?.Dispose();
         _bitmap = null;
-    }
-
-    private PixelRect GetActualScreenRect()
-    {
-        var screen = Screens.ScreenFromPoint(Position) ?? Screens.Primary;
-        var scaling = screen?.Scaling > 0 ? screen.Scaling : 1d;
-        // This popup has no native decorations and explicitly owns Width and
-        // Height, so these values describe the top-level hit-test rectangle.
-        var widthDip = ClientSize.Width > 0 ? ClientSize.Width : Width;
-        var heightDip = ClientSize.Height > 0 ? ClientSize.Height : Height;
-        var width = Math.Max(1, (int)Math.Ceiling(widthDip * scaling));
-        var height = Math.Max(1, (int)Math.Ceiling(heightDip * scaling));
-        return new PixelRect(Position.X, Position.Y, width, height);
     }
 
     private static (double ImageScale, PixelPoint Position)? CalculateLayout(

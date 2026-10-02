@@ -22,6 +22,7 @@ public class TagSearchEngine
     private readonly Dictionary<string, int> _coTagStates = new(StringComparer.OrdinalIgnoreCase);
     private string _lastSearchText = string.Empty;
     private List<TagCount> _fullCoTags = new();
+    private int _coTagContextVersion;
 
     public bool IsSuggestionCoTagMode => _coTagMode;
     public List<string> SearchResultFiles { get; set; } = new();
@@ -38,11 +39,40 @@ public class TagSearchEngine
 
     public void SetAllTagCounts(List<TagCount> counts) => AllTagCounts = counts;
 
+    public IReadOnlyList<TagCount> GetTypedSuggestions(string keyword)
+    {
+        if (string.IsNullOrWhiteSpace(keyword) || AllTagCounts.Count == 0)
+            return Array.Empty<TagCount>();
+
+        var activeToken = ExtractActiveToken(keyword);
+        if (string.IsNullOrWhiteSpace(activeToken))
+            return Array.Empty<TagCount>();
+
+        return AllTagCounts
+            .Where(t => t.Name.Contains(activeToken, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(t => t.Name.StartsWith(activeToken, StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(t => t.Count)
+            .Take(300)
+            .ToList();
+    }
+
+    public async Task<IReadOnlyList<TagCount>> GetCoTagSuggestionsAsync(
+        IReadOnlyCollection<string> filePaths, string expression, string? nameFilter = null)
+    {
+        if (filePaths.Count == 0)
+            return Array.Empty<TagCount>();
+
+        var results = await _metaRepo.GetCoOccurringTagsAsync(
+            filePaths.ToList(), ParseTagNames(expression), nameFilter);
+        return results.Take(300).ToList();
+    }
+
     public void ClearSearchResults()
     {
+        Interlocked.Increment(ref _coTagContextVersion);
         SearchResultFiles = new List<string>();
-        AllTagCounts = new List<TagCount>();
         _coTagMode = false;
+        _lastSearchText = string.Empty;
         _coTagStates.Clear();
         _fullCoTags.Clear();
     }
@@ -57,25 +87,7 @@ public class TagSearchEngine
     {
         if (_coTagMode) return;
 
-        if (string.IsNullOrWhiteSpace(keyword) || AllTagCounts.Count == 0)
-        {
-            setPopupOpen(false);
-            return;
-        }
-
-        var activeToken = ExtractActiveToken(keyword);
-        if (string.IsNullOrWhiteSpace(activeToken))
-        {
-            setPopupOpen(false);
-            return;
-        }
-
-        var results = AllTagCounts
-            .Where(t => t.Name.Contains(activeToken, StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(t => t.Name.StartsWith(activeToken, StringComparison.OrdinalIgnoreCase))
-            .ThenByDescending(t => t.Count)
-            .Take(300)
-            .ToList();
+        var results = GetTypedSuggestions(keyword);
 
         foreach (var t in results)
             addSuggestion(t);
@@ -120,6 +132,11 @@ public class TagSearchEngine
     public async Task SearchByTagAsync(string raw, List<string> allFiles, bool alreadyShowingSearch,
         Action<List<TagCount>> setSuggestions)
     {
+        Interlocked.Increment(ref _coTagContextVersion);
+        _coTagMode = false;
+        _lastSearchText = string.Empty;
+        _fullCoTags.Clear();
+
         // Special keyword: -every = find images with no tags
         if (string.Equals(raw, "-every", StringComparison.OrdinalIgnoreCase))
         {
@@ -188,7 +205,6 @@ public class TagSearchEngine
             _lastSearchText = raw;
 
             SendSearchCompleted(statusText: "", opName: "");
-            _ = RefreshCoTagSuggestionsAsync(setSuggestions);
             return;
         }
 
@@ -272,7 +288,6 @@ public class TagSearchEngine
         _lastSearchText = raw;
 
         SendSearchCompleted(statusText: "", opName: "");
-        _ = RefreshCoTagSuggestionsAsync(setSuggestions);
     }
 
     public void SelectSuggestion(TagCount tag, string currentText, Action<string> setTagSearchText, Action<bool> setPopupOpen,
@@ -286,7 +301,6 @@ public class TagSearchEngine
 
         setTagSearchText(ReplaceActiveToken(currentText, tag.Name));
         setPopupOpen(false);
-        _ = triggerSearch();
     }
 
     public string SearchBoxBorderColor(string text)
@@ -374,44 +388,39 @@ public class TagSearchEngine
         _messenger.Send(new CoTagCycledMessage());
     }
 
-    private async Task RefreshCoTagSuggestionsAsync(Action<List<TagCount>> setSuggestions)
+    private async Task RefreshCoTagSuggestionsAsync(int coTagContextVersion)
     {
         try
         {
-            var usedTags = ParseTagNames(_lastSearchText);
             var samplePaths = SearchResultFiles.Count > 5000
                 ? SearchResultFiles.Take(5000).ToList()
                 : SearchResultFiles;
-            var coTags = await _metaRepo.GetCoOccurringTagsAsync(samplePaths, usedTags);
-            _fullCoTags = coTags.Take(300).ToList();
+            var coTags = await GetCoTagSuggestionsAsync(samplePaths, _lastSearchText);
+            if (coTagContextVersion != Volatile.Read(ref _coTagContextVersion))
+                return;
+
+            _fullCoTags = coTags.ToList();
             _messenger.Send(new TagSearchSuggestionsChangedMessage(_fullCoTags));
         }
         catch (Exception ex)
         {
+            if (coTagContextVersion != Volatile.Read(ref _coTagContextVersion))
+                return;
+
             AppLogger.Warn($"Co-tag query failed: {ex.Message}");
             _messenger.Send(new TagSearchSuggestionsChangedMessage(new List<TagCount>()));
         }
     }
 
-    public async Task SearchCoTagsAsync(string keyword)
+    public Task SearchCoTagsAsync(string keyword)
     {
-        if (string.IsNullOrWhiteSpace(keyword))
-        {
-            _messenger.Send(new TagSearchSuggestionsChangedMessage(_fullCoTags));
-            return;
-        }
-
-        try
-        {
-            var usedTags = ParseTagNames(_lastSearchText);
-            var results = await _metaRepo.GetCoOccurringTagsAsync(SearchResultFiles, usedTags, keyword);
-            _messenger.Send(new TagSearchSuggestionsChangedMessage(results));
-        }
-        catch (Exception ex)
-        {
-            AppLogger.Warn($"Co-tag query failed: {ex.Message}");
-            _messenger.Send(new TagSearchSuggestionsChangedMessage(new List<TagCount>()));
-        }
+        var results = string.IsNullOrWhiteSpace(keyword)
+            ? _fullCoTags
+            : _fullCoTags
+                .Where(tag => tag.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        _messenger.Send(new TagSearchSuggestionsChangedMessage(results));
+        return Task.CompletedTask;
     }
 
     public Task RefreshCurrentCoTagSuggestionsAsync()
@@ -419,7 +428,7 @@ public class TagSearchEngine
         if (!_coTagMode)
             return Task.CompletedTask;
 
-        return RefreshCoTagSuggestionsAsync(_ => { });
+        return Task.Run(() => RefreshCoTagSuggestionsAsync(Volatile.Read(ref _coTagContextVersion)));
     }
 
     internal static string ExtractActiveToken(string text)

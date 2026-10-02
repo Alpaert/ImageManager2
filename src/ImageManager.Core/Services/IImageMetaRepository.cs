@@ -8,6 +8,13 @@ public interface IImageMetaRepository
     Task<ImageMeta?> GetByPathAsync(string filePath);
     Task<List<ImageMeta>> GetByFolderAsync(string folderPath);
     Task<List<ImageMeta>> GetByFolderIdAsync(long folderId);
+    Task<IReadOnlyList<ImageSortMetadata>> GetSortMetadataByFolderAsync(
+        string folderPath,
+        bool recursive,
+        CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<ImageSortMetadata>> GetSortMetadataByPathsAsync(
+        IReadOnlyCollection<string> filePaths,
+        CancellationToken cancellationToken = default);
     Task<List<ImageMeta>> GetHashMetadataByPathsAsync(IReadOnlyCollection<string> filePaths);
     Task<int> CountByFolderIdAsync(long folderId);
     Task SetFolderIdAsync(string filePath, long folderId);

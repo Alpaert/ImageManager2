@@ -1,15 +1,9 @@
-<Window xmlns="https://github.com/avaloniaui"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        x:Class="ImageManager.App.Controls.HoverPreviewPopup"
-        Width="220"
-        Height="180"
-        CanResize="False"
-        ShowInTaskbar="False"
-        ShowActivated="False"
-        Topmost="True"
-        SystemDecorations="None"
-        WindowStartupLocation="Manual"
-        Background="Transparent">
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Class="ImageManager.App.Controls.HoverPreviewPopup"
+             Width="220"
+             Height="180"
+             Background="Transparent">
     <Border x:Name="PopupBorder"
             Background="{DynamicResource SurfaceBrush}"
             BorderBrush="{DynamicResource CtrlBorderBrush}"
@@ -39,4 +33,4 @@
                        MaxLines="1" />
         </Grid>
     </Border>
-</Window>
+</UserControl>

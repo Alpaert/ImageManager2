@@ -55,7 +55,8 @@ public sealed class ContinuousDisplayGeometryBuilder
         IReadOnlyList<string> sourcePaths,
         ImageDisplayGeometryOptions options,
         Func<List<string>, CancellationToken, Task<Dictionary<string, (int Width, int Height)>>> loadDimensionsAsync,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyDictionary<string, (int Width, int Height)>? knownDimensions = null)
     {
         ArgumentNullException.ThrowIfNull(sourcePaths);
         ArgumentNullException.ThrowIfNull(loadDimensionsAsync);
@@ -77,22 +78,39 @@ public sealed class ContinuousDisplayGeometryBuilder
             cancellationToken.ThrowIfCancellationRequested();
 
             var batchEnd = Math.Min(batchStart + BatchSize, paths.Length);
-            var batchPaths = new List<string>(batchEnd - batchStart);
+            var missingPaths = new List<string>(batchEnd - batchStart);
             for (var index = batchStart; index < batchEnd; index++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                batchPaths.Add(paths[index]);
+                if (knownDimensions is not null &&
+                    knownDimensions.TryGetValue(paths[index], out var known) &&
+                    known.Width > 0 && known.Height > 0)
+                {
+                    sizes[index] = new ImageDisplayItemSize(known.Width, known.Height);
+                    dimensionHitCount++;
+                }
+                else
+                {
+                    missingPaths.Add(paths[index]);
+                }
             }
 
-            var dimensions = await loadDimensionsAsync(batchPaths, cancellationToken).ConfigureAwait(false)
-                ?? throw new InvalidOperationException("The dimension loader returned no result.");
+            var dimensions = missingPaths.Count == 0
+                ? new Dictionary<string, (int Width, int Height)>(StringComparer.OrdinalIgnoreCase)
+                : await loadDimensionsAsync(missingPaths, cancellationToken).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("The dimension loader returned no result.");
             cancellationToken.ThrowIfCancellationRequested();
 
-            // Read from the frozen snapshot, not from batchPaths: the loader owns
-            // its input for the duration of its call and must not affect filling.
+            // Read from the frozen snapshot: the loader owns its input for the
+            // duration of its call and must not affect filling.
             for (var index = batchStart; index < batchEnd; index++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+
+                if (knownDimensions is not null &&
+                    knownDimensions.TryGetValue(paths[index], out var known) &&
+                    known.Width > 0 && known.Height > 0)
+                    continue;
 
                 if (!dimensions.TryGetValue(paths[index], out var dimension)
                     || dimension.Width <= 0

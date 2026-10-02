@@ -6,6 +6,7 @@ using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Infrastructure.Imaging;
+using System.Diagnostics;
 
 namespace ImageManager.App.ViewModels;
 
@@ -104,13 +105,31 @@ public partial class MainWindowViewModel
         var token = cts.Token;
         var options = DisplayFilter;
         var showingSearch = IsShowingSearchResult;
-        var source = (showingSearch ? _tagSearch.SearchResultFiles : _allFiles).ToArray();
-        var navigationSource = !showingSearch && _similarityScores.Count > 0
-            ? _tagSearch.SearchResultFiles.ToArray() : Array.Empty<string>();
+        var sourceList = showingSearch ? _tagSearch.SearchResultFiles : _allFiles;
+        IReadOnlyList<string> source = options.IsActive ? sourceList.ToArray() : sourceList;
+        var navigationList = !showingSearch && _similarityScores.Count > 0
+            ? _tagSearch.SearchResultFiles : null;
+        IReadOnlyList<string>? navigationSource = options.IsActive
+            ? navigationList?.ToArray() ?? Array.Empty<string>()
+            : navigationList;
         IsDisplayFilterBusy = true;
         NotifyDisplayFilterState();
         try
         {
+            var filterStopwatch = Stopwatch.StartNew();
+            if (!options.IsActive)
+            {
+                if (version != _displayFilterVersion || token.IsCancellationRequested) return false;
+                _displayFilteredFiles = sourceList;
+                _filteredNavigationFiles = navigationList ?? new();
+                InvalidateContinuousDisplayGeometry();
+                DisplayFilterSourceCount = sourceList.Count;
+                DisplayFilterUnknownCount = 0;
+                PerfLogger.Log($"[SortPerf] filter_publish_ms={filterStopwatch.ElapsedMilliseconds} count={sourceList.Count} active=false");
+                if (!preserveNavigation) _currentResultIndex = 0;
+                return true;
+            }
+
             async Task<DisplayFilterResult> Filter(string[] paths) => await Task.Run(() =>
                 DisplayFileFilter.ApplyAsync(paths, options,
                     async (candidates, ct) =>
@@ -137,15 +156,17 @@ public partial class MainWindowViewModel
                     },
                     ThumbnailGenerator.GetDimensionsOrUnknown, token), token);
 
-            var result = await Filter(source);
-            var navigation = navigationSource.Length == 0 ? new DisplayFilterResult(new(), 0)
-                : await Filter(navigationSource);
+            var result = await Filter(source.ToArray());
+            var navigation = navigationSource is null || navigationSource.Count == 0
+                ? new DisplayFilterResult(new(), 0)
+                : await Filter(navigationSource.ToArray());
             if (version != _displayFilterVersion || token.IsCancellationRequested) return false;
             _displayFilteredFiles = result.Files;
             _filteredNavigationFiles = navigation.Files;
             InvalidateContinuousDisplayGeometry();
-            DisplayFilterSourceCount = source.Length;
+            DisplayFilterSourceCount = source.Count;
             DisplayFilterUnknownCount = result.UnknownDimensionsCount;
+            PerfLogger.Log($"[SortPerf] filter_publish_ms={filterStopwatch.ElapsedMilliseconds} count={result.Files.Count} active={options.IsActive}");
             if (!preserveNavigation) _currentResultIndex = 0;
             return true;
         }
@@ -157,7 +178,7 @@ public partial class MainWindowViewModel
                 _displayFilteredFiles = new();
                 _filteredNavigationFiles = new();
                 InvalidateContinuousDisplayGeometry();
-                DisplayFilterSourceCount = source.Length;
+                DisplayFilterSourceCount = source.Count;
                 DisplayFilterUnknownCount = 0;
                 _pageManager.CancelCurrentLoads();
                 _pageManager.InvalidateCache();
@@ -220,6 +241,19 @@ public partial class MainWindowViewModel
         _similarityScores.Clear();
         _similarityMatchKinds.Clear();
         IsShowingSearchResult = true;
+        var source = _tagSearch.SearchResultFiles;
+        var order = CurrentSortOrder;
+        var scope = CurrentSortScope;
+        var showAllSubfolders = ShowAllSubfolders;
+        var sortVersion = Volatile.Read(ref _sortRequestVersion);
+        var sorted = source.ToList();
+        await SortFilesAsync(sorted, order, showAllSubfolders, scope);
+        if (!ReferenceEquals(source, _tagSearch.SearchResultFiles) ||
+            sortVersion != Volatile.Read(ref _sortRequestVersion) ||
+            order != CurrentSortOrder || scope != CurrentSortScope ||
+            showAllSubfolders != ShowAllSubfolders)
+            return;
+        _tagSearch.SearchResultFiles = sorted;
         await RebuildDisplayFilterAsync();
     }
 }

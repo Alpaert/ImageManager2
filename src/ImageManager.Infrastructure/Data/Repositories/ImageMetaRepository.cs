@@ -54,6 +54,68 @@ public class ImageMetaRepository : IImageMetaRepository
         return metas;
     }
 
+    public async Task<IReadOnlyList<ImageSortMetadata>> GetSortMetadataByFolderAsync(
+        string folderPath,
+        bool recursive,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(folderPath);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var normalized = PathHelper.NormalizeFolderPath(folderPath);
+        var relativePath = "substr(FilePath, length(@Prefix) + 1)";
+        var directFilesPredicate = recursive
+            ? string.Empty
+            : $" AND instr({relativePath}, @DirectorySeparator) = 0"
+                + $" AND instr({relativePath}, @AlternateDirectorySeparator) = 0";
+
+        using var conn = _dbFactory.CreateConnection();
+        var command = new CommandDefinition($@"
+            SELECT FilePath, FileSize, LastWriteTicks, Width, Height
+            FROM ImageMeta
+            WHERE substr(FilePath, 1, length(@Prefix)) COLLATE NOCASE = @Prefix
+              {directFilesPredicate}",
+            new
+            {
+                Prefix = normalized,
+                DirectorySeparator = Path.DirectorySeparatorChar.ToString(),
+                AlternateDirectorySeparator = Path.AltDirectorySeparatorChar.ToString()
+            },
+            cancellationToken: cancellationToken);
+
+        var rows = await conn.QueryAsync<ImageSortMetadata>(command);
+        cancellationToken.ThrowIfCancellationRequested();
+        return rows.AsList();
+    }
+
+    public async Task<IReadOnlyList<ImageSortMetadata>> GetSortMetadataByPathsAsync(
+        IReadOnlyCollection<string> filePaths,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(filePaths);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (filePaths.Count == 0)
+            return [];
+
+        using var conn = _dbFactory.CreateConnection();
+        var result = new List<ImageSortMetadata>();
+        foreach (var chunk in filePaths.Chunk(900))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var command = new CommandDefinition(@"
+                SELECT FilePath, FileSize, LastWriteTicks, Width, Height
+                FROM ImageMeta
+                WHERE FilePath COLLATE NOCASE IN @Paths",
+                new { Paths = chunk },
+                cancellationToken: cancellationToken);
+            var rows = await conn.QueryAsync<ImageSortMetadata>(command);
+            result.AddRange(rows);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        return result;
+    }
+
     public async Task<List<ImageMeta>> GetByFolderIdAsync(long folderId)
     {
         using var conn = _dbFactory.CreateConnection();
