@@ -51,6 +51,13 @@ public class ThumbnailCacheService : IThumbnailCacheService
     private const int MaxCachedItems = 500;
     private const long MaxMemoryBytes = 80 * 1024 * 1024;
 
+    /// <summary>Read-only cache root retained from before a startup fallback.</summary>
+    public string? ReadOnlyFallbackCacheDirectory
+    {
+        get => _diskCache.FallbackCacheDirectory;
+        set => _diskCache.FallbackCacheDirectory = value;
+    }
+
     public long EstimatedMemoryBytes => Interlocked.Read(ref _totalBytes);
 
     private string _cacheDirectory = @"C:\ImageManagerCache";
@@ -85,6 +92,9 @@ public class ThumbnailCacheService : IThumbnailCacheService
         DecodeWidth = decodeWidth;
         _cacheDirectory = cacheRoot;
     }
+
+    private DiskThumbnailCache CreateDiskCache(int decodeWidth)
+        => new(CacheDirectory, decodeWidth, ReadOnlyFallbackCacheDirectory);
 
     public void SwitchCacheDirectory(string newPath)
     {
@@ -149,7 +159,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
         // DiskThumbnailCache keeps its width as mutable state. A request-local
         // instance prevents concurrent zoom/folder requests from writing to a
         // different width directory after an awaited decode.
-        var diskCache = new DiskThumbnailCache(CacheDirectory, decodeWidth);
+        var diskCache = CreateDiskCache(decodeWidth);
 
         if (isMusic)
             return await GetOrCreateMusicThumbnailAsync(filePath, decodeWidth, diskCache, ct).ConfigureAwait(false);
@@ -242,7 +252,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
             if (cover.IsStale)
             {
                 musicCache.Delete(filePath);
-                new DiskThumbnailCache(CacheDirectory, decodeWidth).DeleteAllWidths(filePath);
+                CreateDiskCache(decodeWidth).DeleteAllWidths(filePath);
                 return (null, 0, 0);
             }
             if (cover.IsFinalWithoutThumbnail)
@@ -257,7 +267,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
             return (node.Value.Data, node.Value.Width, node.Value.Height);
         }
 
-        var diskCache = new DiskThumbnailCache(CacheDirectory, decodeWidth);
+        var diskCache = CreateDiskCache(decodeWidth);
 
         if (!diskCache.Exists(filePath))
         {
@@ -494,7 +504,7 @@ public class ThumbnailCacheService : IThumbnailCacheService
             return Task.FromResult(new ThumbnailCacheLoadResult(null, 0, 0, ThumbnailCacheSource.Missing, 0, 0, 0, 0));
 
         var diskRead = Stopwatch.StartNew();
-        var diskCache = new DiskThumbnailCache(CacheDirectory, decodeWidth);
+        var diskCache = CreateDiskCache(decodeWidth);
         var cached = diskCache.Load(filePath);
         var diskReadMs = diskRead.ElapsedMilliseconds;
         if (cached is { Length: > 0 })

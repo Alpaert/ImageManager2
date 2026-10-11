@@ -2,6 +2,11 @@ namespace ImageManager.Core.Models;
 
 public class AppSettings
 {
+    public static string DefaultDiskCacheDirectory => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "ImageManager",
+        "Cache");
+
     public double StartupWidth { get; set; }
     public double StartupHeight { get; set; }
     public double PreviewWidth { get; set; }
@@ -38,7 +43,7 @@ public class AppSettings
     public double ThumbnailOpacity { get; set; } = 1.0;
     /// <summary>Maximum edge length, in pixels, for the thumbnail hover preview.</summary>
     public int HoverPreviewMaxSize { get; set; } = 840;
-    public string DiskCacheDirectory { get; set; } = @"C:\ImageManagerCache";
+    public string DiskCacheDirectory { get; set; } = DefaultDiskCacheDirectory;
     public int MaxTagSuggestionCount { get; set; } = 30;
     public string LastFolder { get; set; } = string.Empty;
     public List<string> FavoriteTags { get; set; } = new();

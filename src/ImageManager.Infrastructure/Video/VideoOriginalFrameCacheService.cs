@@ -21,16 +21,19 @@ public sealed class VideoOriginalFrameCacheService
         _cacheDirectory = cacheDirectory;
     }
 
+    /// <summary>Read-only frame cache retained from before a startup fallback.</summary>
+    public string? ReadOnlyFallbackCacheDirectory { get; set; }
+
     public string GetOriginalFramePath(string filePath)
     {
-        var folderHash = GetFolderHash(filePath);
-        var fileHash = GetFileHash(filePath);
-        return System.IO.Path.Combine(_cacheDirectory, "video_originals", folderHash, fileHash + ".jpg");
+        return GetOriginalFramePath(filePath, _cacheDirectory);
     }
 
     public bool Exists(string filePath)
     {
-        return File.Exists(GetOriginalFramePath(filePath));
+        return File.Exists(GetOriginalFramePath(filePath))
+            || (!string.IsNullOrWhiteSpace(ReadOnlyFallbackCacheDirectory)
+                && File.Exists(GetOriginalFramePath(filePath, ReadOnlyFallbackCacheDirectory)));
     }
 
     public async Task<VideoOriginalFrameResult> EnsureAsync(
@@ -41,6 +44,13 @@ public sealed class VideoOriginalFrameCacheService
         var originalPath = GetOriginalFramePath(filePath);
         if (File.Exists(originalPath))
             return new VideoOriginalFrameResult(true, true, originalPath, null);
+
+        if (!string.IsNullOrWhiteSpace(ReadOnlyFallbackCacheDirectory))
+        {
+            var fallbackPath = GetOriginalFramePath(filePath, ReadOnlyFallbackCacheDirectory);
+            if (File.Exists(fallbackPath))
+                return new VideoOriginalFrameResult(true, true, fallbackPath, null);
+        }
 
         var key = NormalizeKey(filePath);
         var lazy = _inflight.GetOrAdd(
@@ -114,6 +124,17 @@ public sealed class VideoOriginalFrameCacheService
             AppLogger.Warn($"[VideoOriginalFrame] failed file={filePath} error={ex.Message}");
             return new VideoOriginalFrameResult(false, false, originalPath, ex.Message);
         }
+    }
+
+    private string GetOriginalFramePath(string filePath, string? cacheDirectory = null)
+    {
+        var folderHash = GetFolderHash(filePath);
+        var fileHash = GetFileHash(filePath);
+        return System.IO.Path.Combine(
+            cacheDirectory ?? _cacheDirectory,
+            "video_originals",
+            folderHash,
+            fileHash + ".jpg");
     }
 
     private static string GetFolderHash(string filePath)

@@ -10,6 +10,9 @@ public class DiskThumbnailCache
     private string _cacheRoot;
     private int _decodeWidth;
 
+    /// <summary>Optional read-only cache root from a previous startup location.</summary>
+    public string? FallbackCacheDirectory { get; set; }
+
     public string CacheDirectory
     {
         get => _cacheRoot;
@@ -32,10 +35,12 @@ public class DiskThumbnailCache
 
     public string CurrentCacheDirectory => Path.Combine(_cacheRoot, $"w{_decodeWidth}");
 
-    public DiskThumbnailCache(string cacheRoot = @"C:\ImageManagerCache", int decodeWidth = 200)
+    public DiskThumbnailCache(string cacheRoot = @"C:\ImageManagerCache", int decodeWidth = 200,
+        string? fallbackCacheDirectory = null)
     {
         _cacheRoot = cacheRoot;
         _decodeWidth = decodeWidth;
+        FallbackCacheDirectory = fallbackCacheDirectory;
         try { Directory.CreateDirectory(CurrentCacheDirectory); } catch { }
     }
 
@@ -114,6 +119,12 @@ public class DiskThumbnailCache
                 }
                 else
                 {
+                    if (!string.IsNullOrWhiteSpace(FallbackCacheDirectory))
+                    {
+                        var fallback = new DiskThumbnailCache(FallbackCacheDirectory, _decodeWidth);
+                        return fallback.LoadMeta(filePath);
+                    }
+
                     return null;
                 }
             }
@@ -144,6 +155,8 @@ public class DiskThumbnailCache
         // Some older cache entries predate the sidecar JSON. The thumbnail itself
         // is still sufficient and must be reused before probing the source video.
         var currentThumbnail = TryReadCachedJpegDimensions(filePath, Path.Combine(_cacheRoot, $"w{decodeWidth}"));
+        if (!IsUsableDimension(currentThumbnail) && !string.IsNullOrWhiteSpace(FallbackCacheDirectory))
+            currentThumbnail = TryReadCachedJpegDimensions(filePath, Path.Combine(FallbackCacheDirectory, $"w{decodeWidth}"));
         if (IsUsableDimension(currentThumbnail))
             return currentThumbnail;
 
@@ -151,6 +164,8 @@ public class DiskThumbnailCache
         {
             var originalFramePath = GetOriginalFramePath(filePath);
             var originalDimensions = TryReadJpegDimensions(originalFramePath);
+            if (!IsUsableDimension(originalDimensions) && !string.IsNullOrWhiteSpace(FallbackCacheDirectory))
+                originalDimensions = TryReadJpegDimensions(GetOriginalFramePath(filePath, FallbackCacheDirectory));
             if (IsUsableDimension(originalDimensions))
                 return originalDimensions;
         }
@@ -183,6 +198,8 @@ public class DiskThumbnailCache
             }
 
             var currentThumbnail = TryReadCachedJpegDimensions(filePath, Path.Combine(_cacheRoot, $"w{decodeWidth}"));
+            if (!IsUsableDimension(currentThumbnail) && !string.IsNullOrWhiteSpace(FallbackCacheDirectory))
+                currentThumbnail = TryReadCachedJpegDimensions(filePath, Path.Combine(FallbackCacheDirectory, $"w{decodeWidth}"));
             if (IsUsableDimension(currentThumbnail))
             {
                 dimensions[filePath] = currentThumbnail!.Value;
@@ -192,6 +209,8 @@ public class DiskThumbnailCache
             if (preferVideoOriginalFrame(filePath))
             {
                 var original = TryReadJpegDimensions(GetOriginalFramePath(filePath));
+                if (!IsUsableDimension(original) && !string.IsNullOrWhiteSpace(FallbackCacheDirectory))
+                    original = TryReadJpegDimensions(GetOriginalFramePath(filePath, FallbackCacheDirectory));
                 if (IsUsableDimension(original))
                 {
                     dimensions[filePath] = original!.Value;
@@ -224,6 +243,18 @@ public class DiskThumbnailCache
                 try { File.Delete(oldPath); } catch { }
                 return data;
             }
+
+            if (!string.IsNullOrWhiteSpace(FallbackCacheDirectory))
+            {
+                var fallback = new DiskThumbnailCache(FallbackCacheDirectory, _decodeWidth);
+                var data = fallback.Load(filePath);
+                if (data is { Length: > 0 })
+                {
+                    Save(filePath, data);
+                    return data;
+                }
+            }
+
             return null;
         }
         catch
@@ -236,7 +267,11 @@ public class DiskThumbnailCache
     {
         try
         {
-            return File.Exists(GetCacheFilePath(filePath)) || File.Exists(GetOldCacheFilePath(filePath));
+            if (File.Exists(GetCacheFilePath(filePath)) || File.Exists(GetOldCacheFilePath(filePath)))
+                return true;
+
+            return !string.IsNullOrWhiteSpace(FallbackCacheDirectory)
+                && new DiskThumbnailCache(FallbackCacheDirectory, _decodeWidth).Exists(filePath);
         }
         catch
         {
@@ -355,7 +390,11 @@ public class DiskThumbnailCache
 
     private (int Width, int Height)? TryLoadMeta(string filePath, int decodeWidth)
     {
-        return TryLoadMeta(filePath, Path.Combine(_cacheRoot, $"w{decodeWidth}"));
+        var result = TryLoadMeta(filePath, Path.Combine(_cacheRoot, $"w{decodeWidth}"));
+        if (result.HasValue || string.IsNullOrWhiteSpace(FallbackCacheDirectory))
+            return result;
+
+        return TryLoadMeta(filePath, Path.Combine(FallbackCacheDirectory, $"w{decodeWidth}"));
     }
 
     private (int Width, int Height)? TryLoadMeta(string filePath, string cacheDirectory)
@@ -390,9 +429,9 @@ public class DiskThumbnailCache
             : TryReadJpegDimensions(Path.Combine(cacheDirectory, hashName));
     }
 
-    private string GetOriginalFramePath(string filePath)
+    private string GetOriginalFramePath(string filePath, string? root = null)
     {
-        return Path.Combine(_cacheRoot, "video_originals", GetFolderHash(filePath), GetCacheFileName(filePath));
+        return Path.Combine(root ?? _cacheRoot, "video_originals", GetFolderHash(filePath), GetCacheFileName(filePath));
     }
 
     private static bool IsUsableDimension((int Width, int Height)? dimensions)
@@ -426,9 +465,14 @@ public class DiskThumbnailCache
     {
         try
         {
-            return Directory.Exists(_cacheRoot)
-                ? Directory.EnumerateDirectories(_cacheRoot, "w*").ToArray()
-                : Array.Empty<string>();
+            var roots = new[] { _cacheRoot, FallbackCacheDirectory }
+                .Where(path => !string.IsNullOrWhiteSpace(path))
+                .Distinct(StringComparer.OrdinalIgnoreCase);
+            return roots
+                .Where(Directory.Exists)
+                .SelectMany(path => Directory.EnumerateDirectories(path!, "w*"))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
         }
         catch
         {
