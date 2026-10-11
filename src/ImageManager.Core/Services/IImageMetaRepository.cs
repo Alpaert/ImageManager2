@@ -49,6 +49,10 @@ public interface IImageMetaRepository
     /// <summary>Returns (FilePath → TagNames) for a batch of file paths</summary>
     Task<Dictionary<string, List<string>>> GetTagMapByPathsAsync(List<string> filePaths);
     Task<List<TagCount>> GetCoOccurringTagsAsync(List<string> filePaths, List<string>? excludeNames = null, string? nameFilter = null);
+    Task<ICoTagQuerySession> CreateCoTagQuerySessionAsync(
+        IReadOnlyCollection<string> filePaths,
+        IReadOnlyCollection<string>? excludeNames = null,
+        CancellationToken cancellationToken = default);
 
     /// <summary>Batch-load valid perceptual hashes for a specific set of file paths (lightweight, no tags)</summary>
     Task<Dictionary<string, string>> GetPerceptualHashesByPathsAsync(List<string> filePaths);

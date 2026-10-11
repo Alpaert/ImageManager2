@@ -890,10 +890,14 @@ public partial class MainWindowViewModel : ViewModelBase
     private bool _coTagSuggestionBaseLoaded;
     private CancellationTokenSource? _tagSuggestionCts;
     private int _tagSuggestionVersion;
+    private CancellationTokenSource? _coTagFilterCts;
+    private readonly object _coTagFilterCtsSync = new();
+    private int _coTagFilterVersion;
     private int _searchResultSuggestionVersion = -1;
     private TagSuggestionMode _tagSuggestionMode;
     private bool _isTagSearchInputFocused;
     private bool _suppressCoTagFilterChange;
+    private bool _suppressTagSearchTextChange;
 
     // ==================== Status ====================
     [ObservableProperty] private string _statusText = "就绪";
@@ -1681,7 +1685,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void OnFolderFileRenamed(object sender, RenamedEventArgs e)
     {
-        if (!FileTypeConstants.IsMediaFile(e.Name) && !FileTypeConstants.IsMediaFile(e.OldName))
+        if (!FileTypeConstants.IsMediaFile(e.Name ?? string.Empty) && !FileTypeConstants.IsMediaFile(e.OldName ?? string.Empty))
             return;
 
         if (FileTypeConstants.IsMediaFile(e.OldFullPath) && FileTypeConstants.IsMediaFile(e.FullPath))
@@ -1758,8 +1762,9 @@ public partial class MainWindowViewModel : ViewModelBase
 
             AppLogger.Memory($"FolderRefresh reason={reason} added={added.Count} deleted={deleted.Count} showAll={ShowAllSubfolders}");
             PublishAllFiles(diskFiles, diskSnapshot);
-            if (_tagSearch.SearchResultFiles.Count > 0)
-                _tagSearch.SearchResultFiles.RemoveAll(path => deleted.Contains(path));
+            if (_tagSearch.SearchResultFiles.Count > 0
+                && _tagSearch.SearchResultFiles.RemoveAll(path => deleted.Contains(path)) > 0)
+                _tagSearch.NotifySearchResultFilesChanged();
             if (_tagSearch.IsSuggestionCoTagMode)
             {
                 InvalidateCoTagSuggestionCache();
@@ -2032,10 +2037,10 @@ public partial class MainWindowViewModel : ViewModelBase
         int failedLogCount = 0;
         int totalNeed = needsHashing.Count;
 
-        _dispatcher.InvokeAsync(() =>
+        _ = _dispatcher.InvokeAsync(() =>
             BackgroundStatusText = $"正在计算图片指纹... 0/{totalNeed}");
 
-        var consumeTasks = Enumerable.Range(0, cpuConcurrency).Select(async _ =>
+        var consumeTasks = Enumerable.Range(0, cpuConcurrency).Select(async workerIndex =>
         {
             try
             {
@@ -2080,7 +2085,7 @@ public partial class MainWindowViewModel : ViewModelBase
                                 }
                                 Interlocked.Add(ref processed, batch.Count);
                                 int snap = Interlocked.CompareExchange(ref processed, 0, 0);
-                                _dispatcher.InvokeAsync(() =>
+                                _ = _dispatcher.InvokeAsync(() =>
                                     BackgroundStatusText = $"正在计算图片指纹... {snap}/{totalNeed}");
                                 if (MemoryPressureMonitor.Current >= MemoryPressureMonitor.PressureLevel.High)
                                 {
@@ -2165,7 +2170,7 @@ public partial class MainWindowViewModel : ViewModelBase
             await _metaRepo.BulkUpsertAsync(batch.ToList());
         }
 
-        _dispatcher.InvokeAsync(() =>
+        _ = _dispatcher.InvokeAsync(() =>
             BackgroundStatusText = "");
         AppLogger.Memory($"HashPrecompute.End processed={processed} failed={failed}");
         return;
@@ -3038,6 +3043,7 @@ partial void OnCornerRadiusDipChanged(double value)
         _hashCts?.Cancel();
         _searchCts?.Cancel();
         InvalidateTagSuggestionRequest();
+        _tagSearch.Dispose();
     }
 
     private bool IsFolderViewRequestCurrent(int requestVersion, string folderPath, bool showAllSubfolders)
@@ -3147,20 +3153,38 @@ partial void OnCornerRadiusDipChanged(double value)
     }
 
     [RelayCommand]
-    private async Task SelectTagSuggestion(TagCount tag)
+    private Task SelectTagSuggestion(TagCount tag)
     {
+        var wasCoTagMode = _tagSearch.IsSuggestionCoTagMode;
         _tagSearch.SelectSuggestion(tag, TagSearchText,
             name =>
             {
-                _tagSearchText = name;
-                OnPropertyChanged(nameof(TagSearchText));
+                if (!wasCoTagMode)
+                {
+                    TagSearchText = name;
+                    return;
+                }
+
+                _suppressTagSearchTextChange = true;
+                try
+                {
+                    TagSearchText = name;
+                }
+                finally
+                {
+                    _suppressTagSearchTextChange = false;
+                }
             },
             open => IsTagSearchPopupOpen = open,
             () => SearchByTagCommand.ExecuteAsync(null));
+        return Task.CompletedTask;
     }
 
     partial void OnTagSearchTextChanged(string value)
     {
+        if (_suppressTagSearchTextChange)
+            return;
+
         if (string.IsNullOrWhiteSpace(value) && _isTagSearchInputFocused)
         {
             PublishFocusTagSuggestions();
@@ -3223,6 +3247,7 @@ partial void OnCornerRadiusDipChanged(double value)
 
     private void InvalidateCoTagSuggestionCache()
     {
+        CancelCoTagFilterRequest();
         _coTagSuggestionBase.Clear();
         _coTagSuggestionBaseLoaded = false;
         _coTagSuggestionFiles.Clear();
@@ -3233,13 +3258,22 @@ partial void OnCornerRadiusDipChanged(double value)
     private void PublishFocusTagSuggestions()
     {
         InvalidateTagSuggestionRequest();
-        _tagSuggestionMode = TagSuggestionMode.FocusCoTags;
+        var hasSearchResultContext = _tagSearch.IsSuggestionCoTagMode
+            && _coTagSuggestionFiles.Count > 0;
+        _tagSuggestionMode = hasSearchResultContext
+            ? TagSuggestionMode.SearchResultCoTags
+            : TagSuggestionMode.FocusCoTags;
+        if (hasSearchResultContext)
+            _searchResultSuggestionVersion = _tagSuggestionVersion;
         SetCoTagFilterTextWithoutRefresh(string.Empty);
         var suggestions = _coTagSuggestionBaseLoaded
             ? _coTagSuggestionBase
             : GetImmediateTagSuggestions(TagSearchText);
         PublishTagSuggestions(suggestions, keepOpen: true);
         OnPropertyChanged(nameof(IsSuggestionCoTagMode));
+
+        if (hasSearchResultContext && !_coTagSuggestionBaseLoaded)
+            _ = _tagSearch.RefreshCurrentCoTagSuggestionsAsync();
     }
 
     private void FilterCoTagSuggestions(string value)
@@ -3247,13 +3281,88 @@ partial void OnCornerRadiusDipChanged(double value)
         if (!IsSuggestionCoTagMode)
             return;
 
-        var baseSuggestions = _coTagSuggestionBaseLoaded
-            ? _coTagSuggestionBase
-            : GetImmediateTagSuggestions(TagSearchText);
-        var filtered = string.IsNullOrWhiteSpace(value)
-            ? baseSuggestions
-            : baseSuggestions.Where(tag => tag.Name.Contains(value, StringComparison.OrdinalIgnoreCase));
+        IReadOnlyList<TagCount> filtered;
+        if (_tagSuggestionMode == TagSuggestionMode.FocusCoTags
+            && !string.IsNullOrWhiteSpace(value))
+        {
+            filtered = _tagSearch.GetTypedSuggestions(value);
+        }
+        else
+        {
+            var baseSuggestions = _coTagSuggestionBaseLoaded
+                ? _coTagSuggestionBase
+                : GetImmediateTagSuggestions(TagSearchText);
+            filtered = string.IsNullOrWhiteSpace(value)
+                ? baseSuggestions
+                : baseSuggestions
+                    .Where(tag => tag.Name.Contains(value, StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+        }
         PublishTagSuggestions(filtered, keepOpen: true);
+
+        CancelCoTagFilterRequest();
+        if (string.IsNullOrWhiteSpace(value)
+            || _tagSuggestionMode != TagSuggestionMode.SearchResultCoTags)
+            return;
+
+        var requestVersion = ++_coTagFilterVersion;
+        var requestCts = new CancellationTokenSource();
+        lock (_coTagFilterCtsSync)
+            _coTagFilterCts = requestCts;
+        _ = RefreshFilteredCoTagsAsync(value, requestVersion, requestCts);
+    }
+
+    private async Task RefreshFilteredCoTagsAsync(
+        string filter,
+        int requestVersion,
+        CancellationTokenSource requestCts)
+    {
+        try
+        {
+            await Task.Delay(200, requestCts.Token).ConfigureAwait(false);
+            var suggestions = await _tagSearch.QueryCurrentCoTagSuggestionsAsync(
+                filter,
+                requestCts.Token).ConfigureAwait(false);
+
+            await _dispatcher.InvokeAsync(() =>
+            {
+                if (requestCts.IsCancellationRequested
+                    || requestVersion != _coTagFilterVersion
+                    || !_isTagSearchInputFocused
+                    || _tagSuggestionMode != TagSuggestionMode.SearchResultCoTags
+                    || !string.Equals(CoTagFilterText, filter, StringComparison.Ordinal))
+                    return;
+
+                PublishTagSuggestions(suggestions, keepOpen: true);
+            });
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"共现 Tag 联想查询失败: {ex.Message}");
+        }
+        finally
+        {
+            lock (_coTagFilterCtsSync)
+            {
+                if (ReferenceEquals(_coTagFilterCts, requestCts))
+                    _coTagFilterCts = null;
+                requestCts.Dispose();
+            }
+        }
+    }
+
+    private void CancelCoTagFilterRequest()
+    {
+        ++_coTagFilterVersion;
+        lock (_coTagFilterCtsSync)
+        {
+            var previous = _coTagFilterCts;
+            _coTagFilterCts = null;
+            previous?.Cancel();
+        }
     }
 
     private IReadOnlyList<TagCount> GetImmediateTagSuggestions(string keyword)
@@ -3269,6 +3378,7 @@ partial void OnCornerRadiusDipChanged(double value)
 
     private void InvalidateTagSuggestionRequest()
     {
+        CancelCoTagFilterRequest();
         ++_tagSuggestionVersion;
         _tagSuggestionCts?.Cancel();
         _tagSuggestionCts?.Dispose();
@@ -3325,8 +3435,9 @@ partial void OnCornerRadiusDipChanged(double value)
         _selectedFilePaths.RemoveWhere(deletedPaths.Contains);
         if (!wasContinuous || HasDisplayFilter || filterWasPending)
             InvalidateContinuousDisplayGeometry();
-        if (_tagSearch.SearchResultFiles.Count > 0)
-            _tagSearch.SearchResultFiles.RemoveAll(p => deletedPaths.Contains(p));
+        if (_tagSearch.SearchResultFiles.Count > 0
+            && _tagSearch.SearchResultFiles.RemoveAll(p => deletedPaths.Contains(p)) > 0)
+            _tagSearch.NotifySearchResultFilesChanged();
         if (_tagSearch.IsSuggestionCoTagMode)
         {
             InvalidateCoTagSuggestionCache();

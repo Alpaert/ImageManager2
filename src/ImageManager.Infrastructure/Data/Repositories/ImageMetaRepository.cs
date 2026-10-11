@@ -3,6 +3,7 @@ using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
 using Microsoft.Data.Sqlite;
+using System.Text.Json;
 
 namespace ImageManager.Infrastructure.Data.Repositories;
 
@@ -755,6 +756,143 @@ public class ImageMetaRepository : IImageMetaRepository
         var results = await conn.QueryAsync<TagCount>(sql,
             new { FilePaths = filePaths, ExcludeNames = excludeNames ?? new List<string>(), NameFilter = $"%{nameFilter}%" });
         return results.ToList();
+    }
+
+    public async Task<ICoTagQuerySession> CreateCoTagQuerySessionAsync(
+        IReadOnlyCollection<string> filePaths,
+        IReadOnlyCollection<string>? excludeNames = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(filePaths);
+
+        var connection = _dbFactory.CreateConnection();
+        try
+        {
+            const string createScopeSql = """
+                DROP TABLE IF EXISTS temp.CoTagSearchScope;
+
+                CREATE TEMP TABLE CoTagSearchScope (
+                    ImageMetaId INTEGER PRIMARY KEY
+                ) WITHOUT ROWID;
+
+                INSERT INTO CoTagSearchScope (ImageMetaId)
+                SELECT im.Id
+                FROM ImageMeta im
+                INNER JOIN json_each(@FilePathsJson) requested
+                    ON im.FilePath = requested.value COLLATE NOCASE;
+                """;
+
+            var filePathsJson = JsonSerializer.Serialize(filePaths);
+            await connection.ExecuteAsync(new CommandDefinition(
+                createScopeSql,
+                new { FilePathsJson = filePathsJson },
+                cancellationToken: cancellationToken)).ConfigureAwait(false);
+
+            return new CoTagQuerySession(connection, excludeNames);
+        }
+        catch
+        {
+            await DropCoTagSearchScopeAsync(connection).ConfigureAwait(false);
+            await connection.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private sealed class CoTagQuerySession : ICoTagQuerySession
+    {
+        private readonly SqliteConnection _connection;
+        private readonly IReadOnlyCollection<string> _excludeNames;
+        private bool _disposed;
+
+        public CoTagQuerySession(
+            SqliteConnection connection,
+            IReadOnlyCollection<string>? excludeNames)
+        {
+            _connection = connection;
+            _excludeNames = excludeNames?.ToArray() ?? Array.Empty<string>();
+        }
+
+        public async Task<IReadOnlyList<TagCount>> QueryAsync(
+            string nameFilter,
+            int limit = 300,
+            CancellationToken cancellationToken = default)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (string.IsNullOrWhiteSpace(nameFilter) || limit <= 0)
+                return Array.Empty<TagCount>();
+
+            var escapedFilter = EscapeLikePattern(nameFilter.Trim());
+            var sql = """
+                SELECT t.Name, COUNT(*) AS Count
+                FROM Tag t
+                CROSS JOIN ImageTag it INDEXED BY idx_imagetag_tag
+                CROSS JOIN CoTagSearchScope scope
+                WHERE t.Name LIKE @ContainsPattern ESCAPE '\' COLLATE NOCASE
+                  AND it.TagId = t.Id
+                  AND scope.ImageMetaId = it.ImageMetaId
+                """;
+
+            if (_excludeNames.Count > 0)
+                sql += "\n  AND t.Name NOT IN @ExcludeNames COLLATE NOCASE";
+
+            sql += """
+
+                GROUP BY t.Id, t.Name
+                ORDER BY
+                    CASE WHEN t.Name LIKE @PrefixPattern ESCAPE '\' COLLATE NOCASE THEN 0 ELSE 1 END,
+                    Count DESC,
+                    t.Name COLLATE NOCASE
+                LIMIT @Limit
+                """;
+
+            var command = new CommandDefinition(
+                sql,
+                new
+                {
+                    ContainsPattern = $"%{escapedFilter}%",
+                    PrefixPattern = $"{escapedFilter}%",
+                    ExcludeNames = _excludeNames,
+                    Limit = limit
+                },
+                cancellationToken: cancellationToken);
+            var results = await _connection.QueryAsync<TagCount>(command).ConfigureAwait(false);
+            return results.AsList();
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            if (_disposed)
+                return;
+
+            _disposed = true;
+            try
+            {
+                await DropCoTagSearchScopeAsync(_connection).ConfigureAwait(false);
+            }
+            finally
+            {
+                await _connection.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        private static string EscapeLikePattern(string value) =>
+            value.Replace("\\", "\\\\", StringComparison.Ordinal)
+                .Replace("%", "\\%", StringComparison.Ordinal)
+                .Replace("_", "\\_", StringComparison.Ordinal);
+    }
+
+    private static async Task DropCoTagSearchScopeAsync(SqliteConnection connection)
+    {
+        try
+        {
+            await connection.ExecuteAsync("DROP TABLE IF EXISTS temp.CoTagSearchScope;")
+                .ConfigureAwait(false);
+        }
+        catch (SqliteException)
+        {
+            // Disposing the connection remains the final cleanup path when an
+            // interrupted command leaves it unusable.
+        }
     }
 
     public async Task<Dictionary<string, string>> GetPerceptualHashesByPathsAsync(List<string> filePaths)

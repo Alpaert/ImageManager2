@@ -12,7 +12,7 @@ namespace ImageManager.Infrastructure.Services;
 /// Lives in Infrastructure with no dependency on Avalonia UI.
 /// Communicates results via <see cref="IMessenger"/>.
 /// </summary>
-public class TagSearchEngine
+public class TagSearchEngine : IDisposable
 {
     private readonly IImageMetaRepository _metaRepo;
     private readonly IMessenger _messenger;
@@ -23,6 +23,12 @@ public class TagSearchEngine
     private string _lastSearchText = string.Empty;
     private List<TagCount> _fullCoTags = new();
     private int _coTagContextVersion;
+    private readonly SemaphoreSlim _coTagSessionGate = new(1, 1);
+    private readonly object _coTagSessionCtsSync = new();
+    private ICoTagQuerySession? _coTagQuerySession;
+    private int _coTagQuerySessionVersion = -1;
+    private CancellationTokenSource _coTagSessionCts = new();
+    private bool _disposed;
 
     public bool IsSuggestionCoTagMode => _coTagMode;
     public List<string> SearchResultFiles { get; set; } = new();
@@ -70,8 +76,9 @@ public class TagSearchEngine
     public void ClearSearchResults()
     {
         Interlocked.Increment(ref _coTagContextVersion);
-        SearchResultFiles = new List<string>();
         _coTagMode = false;
+        InvalidateCoTagQuerySession();
+        SearchResultFiles = new List<string>();
         _lastSearchText = string.Empty;
         _coTagStates.Clear();
         _fullCoTags.Clear();
@@ -81,6 +88,13 @@ public class TagSearchEngine
     {
         _coTagStates.TryGetValue(tagName, out int state);
         return state;
+    }
+
+    public void NotifySearchResultFilesChanged()
+    {
+        Interlocked.Increment(ref _coTagContextVersion);
+        InvalidateCoTagQuerySession();
+        _fullCoTags.Clear();
     }
 
     public void UpdateSuggestions(string keyword, Action<TagCount> addSuggestion, Action<bool> setPopupOpen)
@@ -134,6 +148,7 @@ public class TagSearchEngine
     {
         Interlocked.Increment(ref _coTagContextVersion);
         _coTagMode = false;
+        InvalidateCoTagQuerySession();
         _lastSearchText = string.Empty;
         _fullCoTags.Clear();
 
@@ -412,15 +427,67 @@ public class TagSearchEngine
         }
     }
 
-    public Task SearchCoTagsAsync(string keyword)
+    public async Task SearchCoTagsAsync(string keyword)
     {
-        var results = string.IsNullOrWhiteSpace(keyword)
-            ? _fullCoTags
-            : _fullCoTags
-                .Where(tag => tag.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase))
-                .ToList();
+        var results = await QueryCurrentCoTagSuggestionsAsync(keyword);
         _messenger.Send(new TagSearchSuggestionsChangedMessage(results));
-        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Returns co-tag suggestions for the current search context. Blank input
+    /// stays on the fast overview cache; typed input uses the complete result set.
+    /// </summary>
+    public async Task<IReadOnlyList<TagCount>> QueryCurrentCoTagSuggestionsAsync(
+        string keyword,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(keyword))
+            return _fullCoTags;
+
+        var contextVersion = Volatile.Read(ref _coTagContextVersion);
+        CancellationTokenSource linkedCts;
+        lock (_coTagSessionCtsSync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken, _coTagSessionCts.Token);
+        }
+        using (linkedCts)
+        {
+            await _coTagSessionGate.WaitAsync(linkedCts.Token).ConfigureAwait(false);
+            try
+            {
+                linkedCts.Token.ThrowIfCancellationRequested();
+                if (contextVersion != Volatile.Read(ref _coTagContextVersion)
+                    || !_coTagMode
+                    || SearchResultFiles.Count == 0)
+                    return Array.Empty<TagCount>();
+
+                if (_coTagQuerySession == null || _coTagQuerySessionVersion != contextVersion)
+                {
+                    if (_coTagQuerySession != null)
+                        await _coTagQuerySession.DisposeAsync().ConfigureAwait(false);
+
+                    _coTagQuerySession = await _metaRepo.CreateCoTagQuerySessionAsync(
+                        SearchResultFiles,
+                        ParseTagNames(_lastSearchText),
+                        linkedCts.Token).ConfigureAwait(false);
+                    _coTagQuerySessionVersion = contextVersion;
+                }
+
+                var results = await _coTagQuerySession.QueryAsync(
+                    keyword,
+                    cancellationToken: linkedCts.Token).ConfigureAwait(false);
+                linkedCts.Token.ThrowIfCancellationRequested();
+                if (contextVersion != Volatile.Read(ref _coTagContextVersion))
+                    return Array.Empty<TagCount>();
+                return results;
+            }
+            finally
+            {
+                _coTagSessionGate.Release();
+            }
+        }
     }
 
     public Task RefreshCurrentCoTagSuggestionsAsync()
@@ -429,6 +496,70 @@ public class TagSearchEngine
             return Task.CompletedTask;
 
         return Task.Run(() => RefreshCoTagSuggestionsAsync(Volatile.Read(ref _coTagContextVersion)));
+    }
+
+    private void InvalidateCoTagQuerySession()
+    {
+        var currentContextVersion = Volatile.Read(ref _coTagContextVersion);
+        CancellationTokenSource previousCts;
+        lock (_coTagSessionCtsSync)
+        {
+            if (_disposed)
+                return;
+            previousCts = _coTagSessionCts;
+            _coTagSessionCts = new CancellationTokenSource();
+            previousCts.Cancel();
+        }
+        previousCts.Dispose();
+
+        _ = DisposeStaleCoTagQuerySessionAsync(currentContextVersion);
+    }
+
+    private async Task DisposeStaleCoTagQuerySessionAsync(int currentContextVersion)
+    {
+        await _coTagSessionGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_coTagQuerySession != null
+                && _coTagQuerySessionVersion != currentContextVersion)
+            {
+                await _coTagQuerySession.DisposeAsync().ConfigureAwait(false);
+                _coTagQuerySession = null;
+                _coTagQuerySessionVersion = -1;
+            }
+        }
+        finally
+        {
+            _coTagSessionGate.Release();
+        }
+    }
+
+    public void Dispose()
+    {
+        CancellationTokenSource sessionCts;
+        lock (_coTagSessionCtsSync)
+        {
+            if (_disposed)
+                return;
+
+            _disposed = true;
+            sessionCts = _coTagSessionCts;
+            sessionCts.Cancel();
+        }
+
+        _coTagSessionGate.Wait();
+        try
+        {
+            if (_coTagQuerySession != null)
+                _coTagQuerySession.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            _coTagQuerySession = null;
+            _coTagQuerySessionVersion = -1;
+        }
+        finally
+        {
+            _coTagSessionGate.Release();
+            sessionCts.Dispose();
+        }
     }
 
     internal static string ExtractActiveToken(string text)
