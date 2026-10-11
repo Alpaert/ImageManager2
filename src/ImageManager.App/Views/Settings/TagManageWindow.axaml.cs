@@ -35,7 +35,7 @@ public partial class TagManageWindow : Window
 
         // Defer rename to avoid nested dispatcher frame deadlock after ShowDialog
         var oldName = tag.Name;
-        Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
+        _ = Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
         {
             var result = await Vm.HandleRenameAsync(oldName, newName);
             if (result == RenameResult.Conflict)

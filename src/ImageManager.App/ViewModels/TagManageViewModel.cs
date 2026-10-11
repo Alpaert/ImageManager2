@@ -52,7 +52,7 @@ public partial class TagManageViewModel : ViewModelBase, IDisposable
             {
                 await Task.Delay(200, token);
                 if (!token.IsCancellationRequested)
-                    Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() => ApplyFilter(captured));
+                    _ = Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() => ApplyFilter(captured));
             }
             catch (OperationCanceledException) { }
         });
@@ -121,9 +121,10 @@ public partial class TagManageViewModel : ViewModelBase, IDisposable
         StatusText = $"共 {Tags.Count} 个标签";
     }
 
-    public async Task RefreshAsync()
+    public Task RefreshAsync()
     {
         // Will be re-initialized by caller
+        return Task.CompletedTask;
     }
 
     public void Dispose()

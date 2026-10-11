@@ -291,7 +291,7 @@ public partial class TagEditViewModel : ViewModelBase
             {
                 await Task.Delay(200, token);
                 if (!token.IsCancellationRequested)
-                    Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() => RebuildAutoSuggestions(captured));
+                    _ = Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() => RebuildAutoSuggestions(captured));
             }
             catch (OperationCanceledException) { }
         });
@@ -350,6 +350,7 @@ public partial class TagEditViewModel : ViewModelBase
 
         IEnumerable<string> query = _favoriteTagsBacking
             .Select(t => t?.Trim())
+            .OfType<string>()
             .Where(t => !string.IsNullOrWhiteSpace(t))
             .Distinct(StringComparer.OrdinalIgnoreCase);
 

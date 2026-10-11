@@ -103,7 +103,7 @@ public partial class TagEditWindow : Window
             return;
 
         // Defer rename to avoid nested dispatcher frame deadlock after ShowDialog
-        Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
+        _ = Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(async () =>
         {
             var result = await Vm.HandleRenameAsync(oldName, newName);
             if (result == RenameResult.Conflict)
