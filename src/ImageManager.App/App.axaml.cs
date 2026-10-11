@@ -29,7 +29,7 @@ public partial class App : Application
     /// <summary>UI-thread dispatcher for safe cross-thread UI access. Set after DI container is built.</summary>
     public static IDispatcher UI { get; private set; } = null!;
     public static string CacheDirectoryPath { get; private set; } = StartupCacheConfig.DefaultCacheDirectory;
-    private static StartupCacheConfig _startupCacheConfig = StartupCacheConfig.Load();
+    private static StartupCacheConfig _startupCacheConfig = new();
 
     public static void ReleaseInferenceSessions()
     {
@@ -69,47 +69,24 @@ public partial class App : Application
         // Create connection factory
         var dbFactory = new DbContextFactory(dbPath);
 
-        // Initialize schema + migrations (one-shot, no retry)
-        using (var initConn = dbFactory.CreateConnection())
+        // Initialize schema and validate a second connection without destructive recovery.
+        // A lock, permission error, or malformed database must never turn into silent data loss.
+        try
         {
-            DatabaseInitializer.Initialize(initConn);
-        }
+            using (var initConn = dbFactory.CreateConnection())
+            {
+                DatabaseInitializer.Initialize(initConn);
+            }
 
-        // Open DB with recovery: if corrupt, delete files and start fresh
-        bool dbReady = false;
-        for (int attempt = 0; attempt < 5; attempt++)
+            using var testConn = dbFactory.CreateConnection();
+        }
+        catch (Exception ex)
         {
-            try
-            {
-                using var testConn = dbFactory.CreateConnection();
-                dbReady = true;
-                break;
-            }
-            catch
-            {
-                SqliteConnection.ClearAllPools();
-                // Wipe everything related to this DB and let SQLite create fresh
-                foreach (var path in new[] { dbPath, dbPath + "-wal", dbPath + "-shm", dbPath + ".bak" })
-                {
-                    for (int retry = 0; retry < 3; retry++)
-                    {
-                        try
-                        {
-                            if (System.IO.File.Exists(path))
-                                System.IO.File.Delete(path);
-                            break;
-                        }
-                        catch { System.Threading.Thread.Sleep(50); }
-                    }
-                }
-                // Re-initialize after wiping
-                using var freshConn = dbFactory.CreateConnection();
-                DatabaseInitializer.Initialize(freshConn);
-            }
+            SqliteConnection.ClearAllPools();
+            AppLogger.Error($"Database startup failed; existing database was preserved: path={dbPath} error={ex}");
+            throw new InvalidOperationException(
+                $"无法打开或初始化数据库，原有数据未删除：{dbPath}", ex);
         }
-
-        if (!dbReady)
-            throw new InvalidOperationException("Unable to open or create database at " + dbPath);
 
         services.AddSingleton<IDbContextFactory>(dbFactory);
 
@@ -190,19 +167,28 @@ public partial class App : Application
         {
             desktopLifetime.ShutdownMode = ShutdownMode.OnExplicitShutdown;
             ApplyColors(true);
-            var ready = await EnsureStartupCacheDirectoryAsync();
-            if (!ready)
+            try
             {
+                if (!await EnsureStartupCacheDirectoryAsync())
+                {
+                    desktopLifetime.Shutdown();
+                    return;
+                }
+                Services = ConfigureServices(CacheDirectoryPath);
+            }
+            catch (Exception ex)
+            {
+                await ShowStartupFailureAsync(ex);
                 desktopLifetime.Shutdown();
                 return;
             }
-
-            Services = ConfigureServices(CacheDirectoryPath);
         }
         else
         {
             Services = ConfigureServices(CacheDirectoryPath);
         }
+
+        ConfigureReadOnlyCacheFallback();
 
         UI = Services.GetRequiredService<IDispatcher>();
 
@@ -274,83 +260,84 @@ public partial class App : Application
 
     private static void MigrateDatabaseIfAvailable(string dbPath)
     {
-        string[] candidateDirs = [
+        CacheDatabaseMigration.MigrateIfMissing(dbPath,
             _startupCacheConfig.PreviousCacheDirectory,
-            System.IO.Path.GetDirectoryName(StartupCacheConfig.ConfigPath) ?? "", // %LocalAppData%\ImageManager (legacy)
-        ];
+            Path.GetDirectoryName(StartupCacheConfig.ConfigPath) ?? "");
+    }
 
-        foreach (var srcDir in candidateDirs)
-        {
-            if (string.IsNullOrWhiteSpace(srcDir)) continue;
+    public static string GetConfiguredCacheDirectory() => _startupCacheConfig.CacheDirectory;
 
-            var srcDb = System.IO.Path.Combine(srcDir, "data.db");
-            if (!System.IO.File.Exists(srcDb)) continue;
-
-            try
-            {
-                System.IO.File.Copy(srcDb, dbPath);
-                foreach (var suffix in new[] { "-wal", "-shm" })
-                {
-                    if (System.IO.File.Exists(srcDb + suffix))
-                        System.IO.File.Copy(srcDb + suffix, dbPath + suffix);
-                }
-                return;
-            }
-            catch (Exception ex)
-            {
-                foreach (var path in new[] { dbPath, dbPath + "-wal", dbPath + "-shm" })
-                {
-                    try
-                    {
-                        if (System.IO.File.Exists(path))
-                            System.IO.File.Delete(path);
-                    }
-                    catch { }
-                }
-
-                throw new InvalidOperationException(
-                    $"Failed to migrate database from {srcDb} to {dbPath}", ex);
-            }
-        }
+    public static string RequestCacheDirectoryChange(string path)
+    {
+        _startupCacheConfig.RequestDirectoryChange(path, CacheDirectoryPath);
+        return _startupCacheConfig.CacheDirectory;
     }
 
     private static async Task<bool> EnsureStartupCacheDirectoryAsync()
     {
         _startupCacheConfig = StartupCacheConfig.Load();
-
-        if (!_startupCacheConfig.CachePromptShown)
-        {
-            var firstRunWindow = new Views.Settings.StartupCacheWindow(
-                _startupCacheConfig.CacheDirectory,
-                isRepairRequired: false);
-            var accepted = await ShowStartupWindowAsync(firstRunWindow);
-            var selectedPath = accepted
-                ? firstRunWindow.SelectedPath
-                : StartupCacheConfig.DefaultCacheDirectory;
-
-            if (!StartupCacheConfig.TryValidateWritableDirectory(selectedPath, out _))
-                selectedPath = StartupCacheConfig.DefaultCacheDirectory;
-
-            _startupCacheConfig.SetCacheDirectory(selectedPath, promptShown: true);
-            _startupCacheConfig.Save();
-        }
-
-        while (!StartupCacheConfig.TryValidateWritableDirectory(_startupCacheConfig.CacheDirectory, out var error))
+        // First launch uses LocalAppData directly. Explicit paths are never replaced
+        // with an exe-relative Cache or CacheRecovery directory.
+        while (!StartupCacheConfig.TryPrepareDirectory(_startupCacheConfig.CacheDirectory, out var error))
         {
             var repairWindow = new Views.Settings.StartupCacheWindow(
-                _startupCacheConfig.CacheDirectory,
-                isRepairRequired: true,
-                repairReason: error);
-            var accepted = await ShowStartupWindowAsync(repairWindow);
-            if (!accepted)
-                return false;
+                _startupCacheConfig.CacheDirectory, isRepairRequired: true, repairReason: error);
+            if (!await ShowStartupWindowAsync(repairWindow)) return false;
 
             _startupCacheConfig.SetCacheDirectory(repairWindow.SelectedPath, promptShown: true);
             _startupCacheConfig.Save();
         }
 
-        CacheDirectoryPath = Path.GetFullPath(_startupCacheConfig.CacheDirectory);
+        CacheDirectoryPath = StartupCacheConfig.NormalizeDirectory(_startupCacheConfig.CacheDirectory);
+        _startupCacheConfig.CacheDirectory = CacheDirectoryPath;
+        if (!File.Exists(StartupCacheConfig.ConfigPath))
+        {
+            _startupCacheConfig.CachePromptShown = true;
+            _startupCacheConfig.Save();
+        }
         return true;
+    }
+
+    private static async Task ShowStartupFailureAsync(Exception error)
+    {
+        var window = new Window
+        {
+            Title = "无法打开缓存位置",
+            Width = 620, Height = 300,
+            WindowStartupLocation = WindowStartupLocation.CenterScreen
+        };
+        var close = new Button { Content = "关闭", HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Right };
+        close.Click += (_, _) => window.Close();
+        var panel = new StackPanel { Margin = new Avalonia.Thickness(20), Spacing = 16 };
+        panel.Children.Add(new TextBlock
+        {
+            Text = $"无法使用指定的缓存位置：{_startupCacheConfig.CacheDirectory}\n"
+                + "原有数据和目录选择已保留。请根据下面的实际错误检查后重新启动。\n\n"
+                + error.GetBaseException().Message,
+            TextWrapping = TextWrapping.Wrap
+        });
+        panel.Children.Add(close);
+        window.Content = panel;
+        await ShowStartupWindowAsync(window);
+    }
+
+    private static void ConfigureReadOnlyCacheFallback()
+    {
+        var previous = _startupCacheConfig.PreviousCacheDirectory;
+        if (string.IsNullOrWhiteSpace(previous)
+            || string.Equals(previous.TrimEnd('\\', '/'),
+                CacheDirectoryPath.TrimEnd('\\', '/'),
+                StringComparison.OrdinalIgnoreCase)
+            || !Directory.Exists(previous))
+        {
+            return;
+        }
+
+        var thumbnails = Services.GetRequiredService<ThumbnailCacheService>();
+        thumbnails.ReadOnlyFallbackCacheDirectory = previous;
+        var videoFrames = Services.GetRequiredService<VideoOriginalFrameCacheService>();
+        videoFrames.ReadOnlyFallbackCacheDirectory = previous;
+        AppLogger.Info($"Using read-only legacy cache fallback: {previous}");
     }
 
     private static Task<bool> ShowStartupWindowAsync(Window window)

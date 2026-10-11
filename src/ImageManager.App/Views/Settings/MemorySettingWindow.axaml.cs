@@ -7,6 +7,8 @@ namespace ImageManager.App.Views.Settings;
 
 public partial class MemorySettingWindow : Window
 {
+    private bool _saving;
+
     public MemorySettingWindow()
     {
         InitializeComponent();
@@ -26,13 +28,33 @@ public partial class MemorySettingWindow : Window
         }
     }
 
-    private void BtnOk_Click(object? sender, RoutedEventArgs e)
+    private async void BtnOk_Click(object? sender, RoutedEventArgs e)
     {
-        Close(true);
+        if (_saving || DataContext is not MemorySettingViewModel vm) return;
+        _saving = true;
+        var content = Content as Control;
+        if (content != null) content.IsEnabled = false;
+        bool saved;
+        try
+        {
+            saved = await vm.SaveSettingsAsync();
+        }
+        finally
+        {
+            _saving = false;
+            if (content != null) content.IsEnabled = true;
+        }
+        if (saved) Close(true);
+    }
+
+    protected override void OnClosing(WindowClosingEventArgs e)
+    {
+        if (_saving) e.Cancel = true;
+        base.OnClosing(e);
     }
 
     private void BtnCancel_Click(object? sender, RoutedEventArgs e)
     {
-        Close(false);
+        if (!_saving) Close(false);
     }
 }

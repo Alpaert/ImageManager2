@@ -6,7 +6,8 @@ namespace ImageManager.App.ViewModels;
 public partial class MemorySettingViewModel : ViewModelBase
 {
     [ObservableProperty] private string _cachePath =
-        System.IO.Path.Combine(AppContext.BaseDirectory, "Cache");
+        Services.StartupCacheConfig.DefaultCacheDirectory;
+    [ObservableProperty] private bool _isSaving;
     [ObservableProperty] private string _diskUsageHint = string.Empty;
     [ObservableProperty] private string _deepSeekApiKey = string.Empty;
 
@@ -25,7 +26,7 @@ public partial class MemorySettingViewModel : ViewModelBase
     // --- 单模型设置 ---
     [ObservableProperty] private double _singleModelMinConfidence = 0.15;
 
-    public Action<bool>? OnSave { get; set; }
+    public Func<bool, Task<bool>>? OnSave { get; set; }
     public Func<string, long>? GetDiskUsage { get; set; }
 
     private string _originalCachePath = string.Empty;
@@ -37,7 +38,7 @@ public partial class MemorySettingViewModel : ViewModelBase
         bool enableCharacterRecognition, double characterMatchThreshold, int characterMaxMatches,
         double singleModelMinConfidence,
         Func<string, long>? getDiskUsage,
-        Action<bool>? onSave)
+        Func<bool, Task<bool>>? onSave)
     {
         _cachePath = cachePath;
         _deepSeekApiKey = deepSeekApiKey ?? string.Empty;
@@ -79,14 +80,28 @@ public partial class MemorySettingViewModel : ViewModelBase
         }
     }
 
-    [RelayCommand]
-    private void Save()
+    public async Task<bool> SaveSettingsAsync()
     {
-        bool pathChanged = !string.Equals(
-            (CachePath ?? "").TrimEnd('\\', '/'),
-            (_originalCachePath ?? "").TrimEnd('\\', '/'),
-            StringComparison.OrdinalIgnoreCase);
+        if (IsSaving) return false;
+        IsSaving = true;
+        var selectedPath = CachePath;
+        try
+        {
+            bool pathChanged = !string.Equals(
+                (selectedPath ?? "").TrimEnd('\\', '/'),
+                (_originalCachePath ?? "").TrimEnd('\\', '/'),
+                StringComparison.OrdinalIgnoreCase);
 
-        OnSave?.Invoke(pathChanged);
+            var saved = OnSave == null || await OnSave(pathChanged);
+            if (saved) _originalCachePath = selectedPath ?? string.Empty;
+            return saved;
+        }
+        finally
+        {
+            IsSaving = false;
+        }
     }
+
+    [RelayCommand]
+    private Task<bool> SaveAsync() => SaveSettingsAsync();
 }

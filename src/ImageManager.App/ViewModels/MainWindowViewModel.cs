@@ -1125,11 +1125,23 @@ public partial class MainWindowViewModel : ViewModelBase
         AppSettings.ImagesPerPage = ImagePaging.Clamp(AppSettings.ImagesPerPage);
         _pageManager.PageSize = AppSettings.ImagesPerPage;
 
-        // Sync: if DB was recovered fresh, settings default may not match actual cache dir
-        if (string.IsNullOrWhiteSpace(AppSettings.DiskCacheDirectory)
-            || AppSettings.DiskCacheDirectory == @"C:\ImageManagerCache")
+        // The startup selection owns all cache services and the database.
+        // A setting from the destination's existing database must not switch
+        // thumbnails back to a different drive after startup.
+        var diskCacheNeedsSync = !string.Equals(AppSettings.DiskCacheDirectory,
+            App.CacheDirectoryPath, StringComparison.OrdinalIgnoreCase);
+
+        if (diskCacheNeedsSync)
         {
             AppSettings.DiskCacheDirectory = App.CacheDirectoryPath;
+            try
+            {
+                await _settingsRepo.SaveAsync(AppSettings);
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Warn($"修复缓存目录设置失败: {ex.Message}");
+            }
         }
         _thumbCache.CacheDirectory = AppSettings.DiskCacheDirectory;
 

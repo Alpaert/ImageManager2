@@ -3216,7 +3216,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task ShowInfoDialogAsync(string message)
+    private async Task ShowInfoDialogAsync(string message, Window? owner = null)
     {
         var dialog = new Window
         {
@@ -3469,9 +3469,10 @@ public partial class MainWindow : Window
 
     private async void MenuMemorySettings_Click(object? sender, RoutedEventArgs e)
     {
+        Settings.MemorySettingWindow? win = null;
         MemorySettingViewModel? memVm = null;
         memVm = new MemorySettingViewModel(
-            Vm.AppSettings.DiskCacheDirectory,
+            App.GetConfiguredCacheDirectory(),
             Vm.AppSettings.DeepSeekApiKey,
             Vm.AppSettings.TagMode,
             Vm.AppSettings.EnsembleMaxTagsPerImage,
@@ -3481,50 +3482,76 @@ public partial class MainWindow : Window
             Vm.AppSettings.CharacterMatchThreshold,
             Vm.AppSettings.CharacterMaxMatchesPerImage,
             Vm.AppSettings.SingleModelMinConfidence,
-            path => new Infrastructure.Caching.DiskThumbnailCache(path).EstimateDiskUsage(),
-            pathChanged =>
+            EstimateDirectoryUsage,
+            async pathChanged =>
             {
-                if (memVm == null) return;
+                if (memVm == null)
+                    return false;
 
-                var oldPath = Vm.AppSettings.DiskCacheDirectory;
-                var newPath = Path.GetFullPath(memVm.CachePath);
-                if (!StartupCacheConfig.TryValidateWritableDirectory(newPath, out var validationError))
+                try
                 {
-                    _ = ShowInfoDialogAsync(validationError);
-                    return;
+                    var selectedCachePath = memVm.CachePath;
+                    Vm.AppSettings.DeepSeekApiKey = memVm.DeepSeekApiKey;
+                    Vm.AppSettings.TagMode = memVm.TagMode;
+                    Vm.AppSettings.EnsembleMaxTagsPerImage = memVm.EnsembleMaxTags;
+                    Vm.AppSettings.EnsemblePixaiMinConfidence = memVm.PixaiMinConfidence;
+                    Vm.AppSettings.ArtistMatchThreshold = memVm.ArtistMatchThreshold;
+                    Vm.AppSettings.EnableCharacterRecognition = memVm.EnableCharacterRecognition;
+                    Vm.AppSettings.CharacterMatchThreshold = memVm.CharacterMatchThreshold;
+                    Vm.AppSettings.CharacterMaxMatchesPerImage = Math.Clamp(memVm.CharacterMaxMatches, 1, 5);
+                    Vm.AppSettings.SingleModelMinConfidence = memVm.SingleModelMinConfidence;
+                    await Vm.SaveSettingsAsync();
+
+                    if (pathChanged)
+                    {
+                        App.RequestCacheDirectoryChange(selectedCachePath);
+                        await ShowInfoDialogAsync(
+                            "缓存位置已保存。缩略图、视频帧、临时文件和数据库将在重新启动后切换到新目录。", win);
+                    }
+
+                    return true;
                 }
-
-                Vm.AppSettings.DiskCacheDirectory = newPath;
-                Vm.AppSettings.DeepSeekApiKey = memVm.DeepSeekApiKey;
-                Vm.AppSettings.TagMode = memVm.TagMode;
-                Vm.AppSettings.EnsembleMaxTagsPerImage = memVm.EnsembleMaxTags;
-                Vm.AppSettings.EnsemblePixaiMinConfidence = memVm.PixaiMinConfidence;
-                Vm.AppSettings.ArtistMatchThreshold = memVm.ArtistMatchThreshold;
-                Vm.AppSettings.EnableCharacterRecognition = memVm.EnableCharacterRecognition;
-                Vm.AppSettings.CharacterMatchThreshold = memVm.CharacterMatchThreshold;
-                Vm.AppSettings.CharacterMaxMatchesPerImage = Math.Clamp(memVm.CharacterMaxMatches, 1, 5);
-                Vm.AppSettings.SingleModelMinConfidence = memVm.SingleModelMinConfidence;
-                var cache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
-                cache.SwitchCacheDirectory(newPath);
-                OnlineSearchHelper.SetTempDir(Path.Combine(newPath, "search_temp"));
-                _ = Vm.SaveSettingsAsync();
-
-                // Update boot config with previous path for startup DB migration
-                var startupConfig = StartupCacheConfig.Load();
-                startupConfig.PreviousCacheDirectory = oldPath;
-                startupConfig.CacheDirectory = newPath;
-                startupConfig.CachePromptShown = true;
-                startupConfig.Save();
-
-                if (pathChanged)
+                catch (Exception ex)
                 {
-                    _ = ShowInfoDialogAsync(
-                        "缓存位置已更新。缩略图和临时文件会立即使用新目录，数据库会在下次启动时迁移到新目录。");
+                    await ShowInfoDialogAsync($"无法保存缓存设置：{ex.Message}", win);
+                    return false;
                 }
             });
 
-        var win = new Settings.MemorySettingWindow { DataContext = memVm };
+        win = new Settings.MemorySettingWindow { DataContext = memVm };
         await win.ShowDialog(this);
+    }
+
+    private static long EstimateDirectoryUsage(string path)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(path) || !Directory.Exists(path))
+                return 0;
+
+            long total = 0;
+            foreach (var file in Directory.EnumerateFiles(path, "*.jpg", SearchOption.AllDirectories))
+            {
+                try
+                {
+                    total = checked(total + new FileInfo(file).Length);
+                }
+                catch (IOException)
+                {
+                    // Files can disappear while this informational estimate is running.
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    // Skip inaccessible entries rather than failing the settings dialog.
+                }
+            }
+
+            return total;
+        }
+        catch (Exception)
+        {
+            return 0;
+        }
     }
 
     private async void MenuShortcutSettings_Click(object? sender, RoutedEventArgs e)

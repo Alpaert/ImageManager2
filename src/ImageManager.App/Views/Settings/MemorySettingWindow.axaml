@@ -129,7 +129,6 @@
             <Button Content="取消" Width="80"
                     Click="BtnCancel_Click"/>
             <Button Content="确定" Width="80"
-                    Command="{Binding SaveCommand}"
                     Click="BtnOk_Click"/>
         </StackPanel>
     </Grid>

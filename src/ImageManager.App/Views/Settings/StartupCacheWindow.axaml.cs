@@ -32,7 +32,7 @@ public partial class StartupCacheWindow : Window
             Title = "修复缓存位置";
             TitleText.Text = "缓存位置不可用";
             DescriptionText.Text =
-                "上次配置的缓存目录不存在或不可写。请选择一个可用目录后再进入软件，避免数据库和缓存分散。";
+                "无法使用上次配置的缓存目录。请选择目录或使用默认位置，原目录的数据会保留。";
             ExitButton.IsVisible = true;
             if (!string.IsNullOrWhiteSpace(repairReason))
                 ShowError(repairReason);
@@ -69,13 +69,13 @@ public partial class StartupCacheWindow : Window
     private void TryAcceptSelectedPath()
     {
         var path = PathBox.Text ?? string.Empty;
-        if (!StartupCacheConfig.TryValidateWritableDirectory(path, out var error))
+        if (!StartupCacheConfig.TryPrepareDirectory(path, out var error))
         {
             ShowError(error);
             return;
         }
 
-        SelectedPath = Path.GetFullPath(path);
+        SelectedPath = StartupCacheConfig.NormalizeDirectory(path);
         IsAccepted = true;
         Close(true);
     }
