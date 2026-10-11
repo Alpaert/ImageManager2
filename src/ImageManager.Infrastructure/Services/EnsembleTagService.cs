@@ -60,8 +60,8 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
         _pixai.SetEnsembleMode();
 
         // 双模型并行加载
-        var wdTask = _wd.LoadAsync(Path.Combine(modelsRootDir, "wd14"));
-        var pixaiTask = _pixai.LoadModelAsync(Path.Combine(modelsRootDir, "pixai"));
+        var wdTask = _wd.LoadAsync(Path.Combine(modelsRootDir, "wd14"), ct);
+        var pixaiTask = _pixai.LoadModelAsync(Path.Combine(modelsRootDir, "pixai"), ct);
 
         await Task.WhenAll(wdTask, pixaiTask);
 
@@ -78,7 +78,7 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
     }
 
     public async Task<SystemRating> PredictRatingAsync(string imagePath, CancellationToken ct = default)
-        => await _wd.PredictRatingAsync(imagePath);
+        => await _wd.PredictRatingAsync(imagePath, ct);
 
     public async Task<List<TagPrediction>> PredictAsync(string imagePath, CancellationToken ct = default)
     {

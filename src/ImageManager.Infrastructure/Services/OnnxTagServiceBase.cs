@@ -77,7 +77,7 @@ public abstract class OnnxTagServiceBase : IDisposable
 
     public async Task LoadModelAsync(string modelDir, CancellationToken ct = default)
     {
-        await _initLock.WaitAsync();
+        await _initLock.WaitAsync(ct);
         try
         {
             // 取消旧空闲定时器，防止它在加载期间或之后误释放新 session
@@ -94,7 +94,7 @@ public abstract class OnnxTagServiceBase : IDisposable
             if (!File.Exists(onnxPath))
             {
                 AppLogger.Info($"下载模型 {ModelRepo}/{ModelFileName} → {onnxPath}");
-                await DownloadFileAsync($"{ModelRepo}/resolve/main/{ModelFileName}", onnxPath, $"{ModelSubDir} 模型");
+                await DownloadFileAsync($"{ModelRepo}/resolve/main/{ModelFileName}", onnxPath, $"{ModelSubDir} 模型", ct);
             }
             if (!File.Exists(tagsPath))
             {
@@ -102,11 +102,12 @@ public abstract class OnnxTagServiceBase : IDisposable
                     ? $"{ModelRepo}/resolve/main/{TagsFileName}"
                     : $"{ModelRepo}/resolve/main/{TagsFileName}";
                 AppLogger.Info($"下载标签 {ModelRepo}/{TagsFileName} → {tagsPath}");
-                await DownloadFileAsync(tagsRepoPath, tagsPath, $"{ModelSubDir} 标签");
+                await DownloadFileAsync(tagsRepoPath, tagsPath, $"{ModelSubDir} 标签", ct);
             }
 
             AppLogger.Info($"创建 InferenceSession (CUDA): {onnxPath}");
-            _session = await Task.Run(() => OnnxSessionFactory.Create(onnxPath, ModelSubDir));
+            ct.ThrowIfCancellationRequested();
+            _session = await Task.Run(() => OnnxSessionFactory.Create(onnxPath, ModelSubDir), ct);
             _inputName = _session.InputNames[0];
             var inMeta = _session.InputMetadata[_inputName];
             var shape = $"[{string.Join(",", inMeta.Dimensions)}]";
@@ -125,7 +126,7 @@ public abstract class OnnxTagServiceBase : IDisposable
                 _outputName = allOuts[0];
             AppLogger.Info($"模型 {ModelSubDir} 输出选择: '{_outputName}' (可用: [{string.Join(", ", allOuts)}])");
 
-            (_tagNames, _tagCategories) = await Task.Run(() => ParseTagsCsv(tagsPath));
+            (_tagNames, _tagCategories) = await Task.Run(() => ParseTagsCsv(tagsPath), ct);
             _totalTagCount = _tagNames.Length;
 
             int enabledCount = EnabledCategories == null
@@ -146,11 +147,12 @@ public abstract class OnnxTagServiceBase : IDisposable
         if (_session == null)
             throw new InvalidOperationException($"{ModelSubDir}: Model not loaded");
 
-        await _inferenceLock.WaitAsync();
+        await _inferenceLock.WaitAsync(ct);
         try
         {
             var result = await Task.Run(() =>
             {
+                ct.ThrowIfCancellationRequested();
                 var tensor = Preprocess(imagePath);
                 if (tensor == null)
                 {
@@ -172,7 +174,7 @@ public abstract class OnnxTagServiceBase : IDisposable
                 var probs = output.AsTensor<float>().ToArray();
 
                 return Postprocess(probs, DefaultThreshold);
-            });
+            }, ct);
 
             ResetIdleTimer();
             return result;
@@ -426,27 +428,27 @@ public abstract class OnnxTagServiceBase : IDisposable
 
     // ==================== 下载 ====================
 
-    private async Task DownloadFileAsync(string repoFile, string destPath, string label)
+    private async Task DownloadFileAsync(string repoFile, string destPath, string label, CancellationToken ct)
     {
         var url = $"https://huggingface.co/{repoFile}";
         AppLogger.Info($"开始下载: {url}");
         try
         {
-            using var response = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+            using var response = await _http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
             response.EnsureSuccessStatusCode();
             var totalBytes = response.Content.Headers.ContentLength ?? -1;
 
-            using var stream = await response.Content.ReadAsStreamAsync();
-            using var fs = new FileStream(destPath, FileMode.Create, FileAccess.Write);
+            using var stream = await response.Content.ReadAsStreamAsync(ct);
+            using var fs = new FileStream(destPath, FileMode.Create, FileAccess.Write, FileShare.None);
 
             var buffer = new byte[8192];
             long totalRead = 0;
             int read;
             int reportStep = 0;
 
-            while ((read = await stream.ReadAsync(buffer)) > 0)
+            while ((read = await stream.ReadAsync(buffer, ct)) > 0)
             {
-                await fs.WriteAsync(buffer.AsMemory(0, read));
+                await fs.WriteAsync(buffer.AsMemory(0, read), ct);
                 totalRead += read;
                 if (++reportStep % 100 == 0 && totalBytes > 0)
                 {
