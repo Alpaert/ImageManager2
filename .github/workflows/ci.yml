@@ -1,0 +1,47 @@
+name: Build and regression tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore
+        run: dotnet restore ImageManager2.sln
+
+      - name: Build
+        run: dotnet build ImageManager2.sln --no-restore --configuration Release --nologo
+
+      - name: Run discovered unit tests
+        run: dotnet test ImageManager2.sln --no-build --configuration Release --nologo
+
+      - name: Run regression programs
+        shell: pwsh
+        run: |
+          $projects = @(
+            'tests/TagSearchEngine.Tests/TagSearchEngine.Tests.csproj',
+            'tests/FolderOperationScope.Tests/FolderOperationScope.Tests.csproj',
+            'tests/DisplayFilters.Tests/DisplayFilters.Tests.csproj',
+            'tests/DisplayFilterIntegration.Tests/DisplayFilterIntegration.Tests.csproj',
+            'tests/ContinuousDisplay.Tests/ContinuousDisplay.Tests.csproj',
+            'tests/AutoTagPreparation.Tests/AutoTagPreparation.Tests.csproj'
+          )
+
+          foreach ($project in $projects) {
+            Write-Host "Running $project"
+            dotnet run --project $project --no-build --configuration Release
+            if ($LASTEXITCODE -ne 0) {
+              throw "Regression program failed: $project"
+            }
+          }

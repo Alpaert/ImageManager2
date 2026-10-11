@@ -392,3 +392,13 @@ config.toml
 
 # 本地模型与转换素材 - 不推送
 /杂项（不要上传到远程库）/
+
+# 应用运行时数据库和本地模型
+*.db
+*.sqlite*
+*.onnx
+*.safetensors
+*.bin
+
+# 验证与诊断临时目录 - 不推送
+/.verification-temp/
