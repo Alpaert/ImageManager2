@@ -3,21 +3,38 @@ using Microsoft.Data.Sqlite;
 namespace ImageManager.Infrastructure.Data;
 
 /// <summary>
-/// One-shot database schema initialization and migration.
+/// Database schema initialization and versioned migration.
 /// Called at application startup before any repositories are used.
 /// </summary>
 public static class DatabaseInitializer
 {
+    private const int CurrentSchemaVersion = 1;
+
     public static void Initialize(SqliteConnection conn)
     {
-        CreateSchema(conn);
-        RunMigrations(conn);
-        CreateIndexes(conn);
+        using var transaction = conn.BeginTransaction();
+        CreateSchema(conn, transaction);
+
+        var version = GetUserVersion(conn, transaction);
+        if (version > CurrentSchemaVersion)
+            throw new InvalidOperationException(
+                $"数据库版本 {version} 高于当前程序支持的版本 {CurrentSchemaVersion}。请先升级程序。");
+
+        if (version < CurrentSchemaVersion)
+            RunMigrations(conn, transaction);
+
+        // Schema migrations are version-gated, but this data repair is deliberately
+        // rerun on every startup. The UPDATE only targets unknown ratings and is idempotent.
+        BackfillSystemRatingsFromLegacyTags(conn, transaction);
+        CreateIndexes(conn, transaction);
+        SetUserVersion(conn, transaction, CurrentSchemaVersion);
+        transaction.Commit();
     }
 
-    private static void CreateSchema(SqliteConnection conn)
+    private static void CreateSchema(SqliteConnection conn, SqliteTransaction transaction)
     {
         using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
         cmd.CommandText = """
             CREATE TABLE IF NOT EXISTS ImageMeta (
                 Id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,26 +134,24 @@ public static class DatabaseInitializer
         cmd.ExecuteNonQuery();
     }
 
-    private static void RunMigrations(SqliteConnection conn)
+    private static void RunMigrations(SqliteConnection conn, SqliteTransaction transaction)
     {
-        TryAddColumn(conn, "ALTER TABLE ImageMeta ADD COLUMN FolderId INTEGER;");
-        TryAddColumn(conn, "ALTER TABLE ImageTag ADD COLUMN Source TEXT DEFAULT NULL;");
-        TryAddColumn(conn, "ALTER TABLE ImageMeta ADD COLUMN SystemRating INTEGER DEFAULT -1;");
-        TryAddColumn(conn, "ALTER TABLE ImageMeta ADD COLUMN AutoTagStatus INTEGER DEFAULT 0;");
-        TryAddColumn(conn, "ALTER TABLE ImageMeta ADD COLUMN HashStatus INTEGER DEFAULT 0;");
-        TryAddColumn(conn, "ALTER TABLE ImageEmbedding ADD COLUMN SourceFileSize INTEGER;");
-        TryAddColumn(conn, "ALTER TABLE ImageEmbedding ADD COLUMN SourceLastWriteTicks INTEGER;");
-        TryAddColumn(conn, "ALTER TABLE Folder ADD COLUMN IsArchived INTEGER NOT NULL DEFAULT 0;");
-        TryAddColumns(conn, """
-            ALTER TABLE ImageMeta ADD COLUMN Duration REAL DEFAULT NULL;
-            ALTER TABLE ImageMeta ADD COLUMN ThumbnailTimestamp REAL DEFAULT NULL;
-            """);
-        BackfillSystemRatingsFromLegacyTags(conn);
+        TryAddColumn(conn, transaction, "ImageMeta", "FolderId", "INTEGER");
+        TryAddColumn(conn, transaction, "ImageTag", "Source", "TEXT DEFAULT NULL");
+        TryAddColumn(conn, transaction, "ImageMeta", "SystemRating", "INTEGER DEFAULT -1");
+        TryAddColumn(conn, transaction, "ImageMeta", "AutoTagStatus", "INTEGER DEFAULT 0");
+        TryAddColumn(conn, transaction, "ImageMeta", "HashStatus", "INTEGER DEFAULT 0");
+        TryAddColumn(conn, transaction, "ImageEmbedding", "SourceFileSize", "INTEGER");
+        TryAddColumn(conn, transaction, "ImageEmbedding", "SourceLastWriteTicks", "INTEGER");
+        TryAddColumn(conn, transaction, "Folder", "IsArchived", "INTEGER NOT NULL DEFAULT 0");
+        TryAddColumn(conn, transaction, "ImageMeta", "Duration", "REAL DEFAULT NULL");
+        TryAddColumn(conn, transaction, "ImageMeta", "ThumbnailTimestamp", "REAL DEFAULT NULL");
     }
 
-    private static void CreateIndexes(SqliteConnection conn)
+    private static void CreateIndexes(SqliteConnection conn, SqliteTransaction transaction)
     {
         using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
         cmd.CommandText = """
             CREATE INDEX IF NOT EXISTS idx_imagemeta_folderid ON ImageMeta(FolderId);
             CREATE INDEX IF NOT EXISTS idx_imagemeta_filepath_nocase ON ImageMeta(FilePath COLLATE NOCASE);
@@ -146,9 +161,10 @@ public static class DatabaseInitializer
         cmd.ExecuteNonQuery();
     }
 
-    private static void BackfillSystemRatingsFromLegacyTags(SqliteConnection conn)
+    private static void BackfillSystemRatingsFromLegacyTags(SqliteConnection conn, SqliteTransaction transaction)
     {
         using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
         cmd.CommandText = """
             WITH RatingCandidates AS (
                 SELECT im.Id, 0 AS Rating
@@ -195,31 +211,54 @@ public static class DatabaseInitializer
         cmd.ExecuteNonQuery();
     }
 
-    private static void TryAddColumn(SqliteConnection conn, string sql)
+    private static int GetUserVersion(SqliteConnection conn, SqliteTransaction transaction)
     {
-        try
-        {
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = sql;
-            cmd.ExecuteNonQuery();
-        }
-        catch (SqliteException ex) when (ex.Message.Contains("duplicate column"))
-        {
-            // Column already exists — migration already applied
-        }
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
+        cmd.CommandText = "PRAGMA user_version;";
+        return Convert.ToInt32(cmd.ExecuteScalar());
     }
 
-    private static void TryAddColumns(SqliteConnection conn, string sql)
+    private static void SetUserVersion(SqliteConnection conn, SqliteTransaction transaction, int version)
     {
-        try
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
+        cmd.CommandText = $"PRAGMA user_version = {version};";
+        cmd.ExecuteNonQuery();
+    }
+
+    private static void TryAddColumn(
+        SqliteConnection conn,
+        SqliteTransaction transaction,
+        string table,
+        string column,
+        string definition)
+    {
+        if (HasColumn(conn, transaction, table, column))
+            return;
+
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
+        cmd.CommandText = $"ALTER TABLE {table} ADD COLUMN {column} {definition};";
+        cmd.ExecuteNonQuery();
+    }
+
+    private static bool HasColumn(
+        SqliteConnection conn,
+        SqliteTransaction transaction,
+        string table,
+        string column)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.Transaction = transaction;
+        cmd.CommandText = $"PRAGMA table_info({table});";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
         {
-            using var cmd = conn.CreateCommand();
-            cmd.CommandText = sql;
-            cmd.ExecuteNonQuery();
+            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+                return true;
         }
-        catch (SqliteException ex) when (ex.Message.Contains("duplicate column"))
-        {
-            // Columns already exist — migration already applied
-        }
+
+        return false;
     }
 }

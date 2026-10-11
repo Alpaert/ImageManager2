@@ -1,4 +1,5 @@
 using System.Text.Json;
+using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
 
@@ -40,6 +41,10 @@ public class DataMigrator
         int imageCount = 0;
         int folderCount = 0;
         int favoriteCount = 0;
+        int failedImageCount = 0;
+        int failedFolderCount = 0;
+        int failedFavoriteCount = 0;
+        var failureDetails = new List<string>();
 
         // Migrate images and their tags
         if (oldData.Images != null)
@@ -69,7 +74,11 @@ public class DataMigrator
 
                     imageCount++;
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    failedImageCount++;
+                    RecordFailure(failureDetails, $"图片 {oldMeta.FilePath}", ex);
+                }
             }
         }
 
@@ -92,7 +101,11 @@ public class DataMigrator
 
                     folderCount++;
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    failedFolderCount++;
+                    RecordFailure(failureDetails, $"文件夹 {folder}", ex);
+                }
             }
         }
 
@@ -107,7 +120,11 @@ public class DataMigrator
                     await _tagRepo.AddFavoriteAsync(tag);
                     favoriteCount++;
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    failedFavoriteCount++;
+                    RecordFailure(failureDetails, $"常用 Tag {tag}", ex);
+                }
             }
         }
 
@@ -133,7 +150,7 @@ public class DataMigrator
         settings.ThumbnailBorderColor = oldData.ThumbnailBorderColor ?? "#FF808080";
         settings.ThumbnailBackgroundColor = oldData.ThumbnailBackgroundColor ?? "#CCFFFFFF";
         settings.ThumbnailOpacity = oldData.ThumbnailOpacity > 0 ? oldData.ThumbnailOpacity : 1.0;
-        settings.DiskCacheDirectory = oldData.DiskCacheDirectory ?? @"C:\ImageManagerCache";
+        settings.DiskCacheDirectory = oldData.DiskCacheDirectory ?? AppSettings.DefaultDiskCacheDirectory;
         settings.MaxTagSuggestionCount = oldData.MaxTagSuggestionCount > 0 ? oldData.MaxTagSuggestionCount : 30;
         settings.LastFolder = oldData.LastFolder ?? "";
 
@@ -142,7 +159,22 @@ public class DataMigrator
 
         await _settingsRepo.SaveAsync(settings);
 
-        return $"迁移完成：{imageCount} 张图片、{folderCount} 个文件夹、{favoriteCount} 个常用 Tag。";
+        var failedTotal = failedImageCount + failedFolderCount + failedFavoriteCount;
+        var result = $"迁移完成：{imageCount} 张图片、{folderCount} 个文件夹、{favoriteCount} 个常用 Tag。";
+        if (failedTotal == 0)
+            return result;
+
+        result += $" 失败 {failedTotal} 项（图片 {failedImageCount}、文件夹 {failedFolderCount}、常用 Tag {failedFavoriteCount}）。";
+        if (failureDetails.Count > 0)
+            result += $" 示例：{string.Join("；", failureDetails)}";
+        return result;
+    }
+
+    private static void RecordFailure(List<string> details, string item, Exception ex)
+    {
+        AppLogger.Warn($"数据迁移失败: {item}; {ex}");
+        if (details.Count < 10)
+            details.Add($"{item}: {ex.Message}");
     }
 
     // Legacy JSON model matching old AppData structure
