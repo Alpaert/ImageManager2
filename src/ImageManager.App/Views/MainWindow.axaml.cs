@@ -168,6 +168,7 @@ public partial class MainWindow : Window
     {
         var deletedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         int successCount = 0;
+        int failedCount = 0;
         var thumbCache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
 
         Vm.SuppressDeletedEvent();
@@ -182,14 +183,20 @@ public partial class MainWindow : Window
                 deletedPaths.Add(filePath);
                 successCount++;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                failedCount++;
+                AppLogger.Warn($"删除文件失败: {filePath}; {ex.Message}");
+            }
         }
         Vm.RestoreDeletedEvent();
 
         if (deletedPaths.Count > 0)
             await Vm.RemoveFilesFromViewAsync(deletedPaths);
 
-        Vm.StatusText = $"已删除 {successCount} 个文件";
+        Vm.StatusText = failedCount == 0
+            ? $"已删除 {successCount} 个文件"
+            : $"已删除 {successCount} 个文件，失败 {failedCount} 个";
     }
 
     private async Task CopySelectedImagesToClipboardAsync()
@@ -210,8 +217,8 @@ public partial class MainWindow : Window
                     storageFiles.Add(sf);
             }
 
-            if (storageFiles.Count > 0)
-                await topLevel.Clipboard.SetFilesAsync(storageFiles);
+            if (storageFiles.Count > 0 && topLevel.Clipboard is { } clipboard)
+                await clipboard.SetFilesAsync(storageFiles);
         }
         catch { }
     }
@@ -227,7 +234,8 @@ public partial class MainWindow : Window
             var storageFile = await topLevel.StorageProvider.TryGetFileFromPathAsync(filePath);
             if (storageFile == null) return;
 
-            await topLevel.Clipboard.SetFileAsync(storageFile);
+            if (topLevel.Clipboard is { } clipboard)
+                await clipboard.SetFileAsync(storageFile);
         }
         catch { }
     }
@@ -696,7 +704,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void BtnSaveData_Click(object? sender, RoutedEventArgs e)
+    private void BtnSaveData_Click(object? sender, RoutedEventArgs e)
     {
         _ = Vm.SaveSettingsAsync();
     }
@@ -1959,6 +1967,7 @@ public partial class MainWindow : Window
         var targetDir = folders[0].Path.LocalPath;
         Vm.StatusText = "正在复制...";
         int success = 0;
+        int failed = 0;
         await Task.Run(() =>
         {
             Directory.CreateDirectory(targetDir);
@@ -1972,7 +1981,11 @@ public partial class MainWindow : Window
                     File.Copy(filePath, destPath);
                     Interlocked.Increment(ref success);
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Interlocked.Increment(ref failed);
+                    AppLogger.Warn($"复制文件失败: {filePath}; {ex.Message}");
+                }
             }
         });
 
@@ -1981,7 +1994,9 @@ public partial class MainWindow : Window
                 StringComparison.OrdinalIgnoreCase))
             await Vm.LoadFolderAsync(Vm.CurrentFolder);
 
-        Vm.StatusText = $"已复制 {success} 个文件到: {targetDir}";
+        Vm.StatusText = failed == 0
+            ? $"已复制 {success} 个文件到: {targetDir}"
+            : $"已复制 {success} 个文件，失败 {failed} 个到: {targetDir}";
     }
 
     private async void MenuMoveFileToFolder_Click(object? sender, RoutedEventArgs e)
@@ -1999,6 +2014,7 @@ public partial class MainWindow : Window
         var targetDir = folders[0].Path.LocalPath;
         Vm.StatusText = "正在移动...";
         int success = 0;
+        int failed = 0;
 
         await Task.Run(() =>
         {
@@ -2021,12 +2037,18 @@ public partial class MainWindow : Window
                     thumbCache.MoveDiskCache(oldPath, destPath);
                     Interlocked.Increment(ref success);
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Interlocked.Increment(ref failed);
+                    AppLogger.Warn($"移动文件失败: {filePath}; {ex.Message}");
+                }
             }
         });
 
         await Vm.LoadFolderAsync(Vm.CurrentFolder);
-        Vm.StatusText = $"已移动 {success} 个文件到: {targetDir}";
+        Vm.StatusText = failed == 0
+            ? $"已移动 {success} 个文件到: {targetDir}"
+            : $"已移动 {success} 个文件，失败 {failed} 个到: {targetDir}";
     }
 
     private async void MenuRefreshFolder_Click(object? sender, RoutedEventArgs e)
@@ -2152,7 +2174,7 @@ public partial class MainWindow : Window
                                 if (p != null)
                                 {
                                     // Could be IStorageItem with Path property
-                                    var pathProp = obj.GetType().GetProperty("Path");
+                                    var pathProp = obj?.GetType().GetProperty("Path");
                                     if (pathProp != null)
                                     {
                                         var uri = pathProp.GetValue(obj);
@@ -3230,7 +3252,7 @@ public partial class MainWindow : Window
         btn.Click += (_, _) => dialog.Close();
         panel.Children.Add(btn);
         dialog.Content = panel;
-        await dialog.ShowDialog(this);
+        await dialog.ShowDialog(owner ?? this);
     }
 
     private async Task<bool> ShowConfirmDialogAsync(string message)
