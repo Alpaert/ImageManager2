@@ -55,6 +55,11 @@ static async Task DatabaseInitializationIsIdempotentAsync()
     DatabaseInitializer.Initialize(conn);
     DatabaseInitializer.Initialize(conn);
 
+    using var versionCommand = conn.CreateCommand();
+    versionCommand.CommandText = "PRAGMA user_version;";
+    var schemaVersion = Convert.ToInt32(await versionCommand.ExecuteScalarAsync());
+    Assert(schemaVersion == 1, $"Expected schema version 1, got {schemaVersion}");
+
     await ExecuteAsync(conn, "INSERT INTO ImageMeta (FilePath, AutoTagStatus) VALUES ('C:/Index/Photo.PNG', 1);");
     using var plan = conn.CreateCommand();
     plan.CommandText = "EXPLAIN QUERY PLAN SELECT Id, FilePath, AutoTagStatus FROM ImageMeta WHERE FilePath COLLATE NOCASE IN ('c:/index/photo.png')";

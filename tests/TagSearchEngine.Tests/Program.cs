@@ -11,6 +11,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("clearing search state preserves loaded autocomplete counts", ClearSearchPreservesCounts),
     ("co-tag suggestions exclude expression, pass filter, and limit results", CoTagSuggestions),
     ("co-tag suggestions skip repository for empty files", CoTagSuggestionsEmptyFiles),
+    ("typed co-tag lookup uses the complete search result set", TypedCoTagLookupUsesCompleteResults),
+    ("changed search result scope rebuilds typed co-tag session", ChangedScopeRebuildsCoTagSession),
     ("tag search does not implicitly query co-tags", SearchDoesNotImplicitlyQueryCoTags),
     ("selecting a typed suggestion waits for Enter", SelectSuggestionWaitsForEnter)
 };
@@ -109,6 +111,43 @@ static async Task CoTagSuggestionsEmptyFiles()
     Assert(repository.Calls == 0, "empty files should not query repository");
 }
 
+static async Task TypedCoTagLookupUsesCompleteResults()
+{
+    var engine = CreateEngine(out var repository);
+    repository.SearchResults = Enumerable.Range(0, 6001)
+        .Select(i => $"image-{i:0000}.jpg")
+        .ToList();
+    repository.Results = new List<TagCount> { new() { Name = "common", Count = 5000 } };
+
+    await engine.SearchByTagAsync("base", repository.SearchResults, false, _ => { });
+    await engine.RefreshCurrentCoTagSuggestionsAsync();
+    Assert(repository.Paths.Count == 5000, "blank co-tag overview should keep its bounded sample");
+
+    await engine.SearchCoTagsAsync("rare");
+
+    Assert(repository.Calls == 2, "typed co-tag lookup should issue a complete filtered query");
+    Assert(repository.Paths.Count == 6001, "typed co-tag lookup must not use the overview sample");
+    Assert(repository.NameFilter == "rare", "typed co-tag lookup should pass the entered filter");
+}
+
+static async Task ChangedScopeRebuildsCoTagSession()
+{
+    var engine = CreateEngine(out var repository);
+    repository.SearchResults = new List<string> { "a.jpg", "b.jpg" };
+    repository.Results = new List<TagCount> { new() { Name = "rare", Count = 1 } };
+
+    await engine.SearchByTagAsync("base", repository.SearchResults, false, _ => { });
+    await engine.QueryCurrentCoTagSuggestionsAsync("rare");
+    Assert(repository.Paths.SequenceEqual(new[] { "a.jpg", "b.jpg" }), "initial session scope was incorrect");
+
+    engine.SearchResultFiles.Remove("b.jpg");
+    engine.NotifySearchResultFilesChanged();
+    await engine.QueryCurrentCoTagSuggestionsAsync("rare");
+
+    Assert(repository.Paths.SequenceEqual(new[] { "a.jpg" }), "changed scope should rebuild the query session");
+    Assert(repository.SessionCreations == 2, "changed scope should create a new query session");
+}
+
 static async Task SearchDoesNotImplicitlyQueryCoTags()
 {
     var engine = CreateEngine(out var repository);
@@ -156,6 +195,7 @@ class RepositoryProxy : DispatchProxy
     public string? NameFilter { get; private set; }
     public int Calls { get; private set; }
     public int SearchCalls { get; private set; }
+    public int SessionCreations { get; private set; }
     public List<string> SearchResults { get; set; } = new();
 
     protected override object? Invoke(MethodInfo? targetMethod, object?[]? args)
@@ -169,6 +209,14 @@ class RepositoryProxy : DispatchProxy
             return Task.FromResult(Current.Results);
         }
 
+        if (targetMethod?.Name == nameof(IImageMetaRepository.CreateCoTagQuerySessionAsync))
+        {
+            Current.SessionCreations++;
+            Current.Paths = ((IReadOnlyCollection<string>)args![0]!).ToList();
+            Current.Excludes = ((IReadOnlyCollection<string>?)args[1] ?? Array.Empty<string>()).ToList();
+            return Task.FromResult<ICoTagQuerySession>(new QuerySession(Current));
+        }
+
         if (targetMethod?.Name == nameof(IImageMetaRepository.GetFilePathsByTagAsync))
         {
             Current.SearchCalls++;
@@ -176,5 +224,25 @@ class RepositoryProxy : DispatchProxy
         }
 
         throw new NotSupportedException($"Unexpected repository call: {targetMethod?.Name}");
+    }
+
+    private sealed class QuerySession : ICoTagQuerySession
+    {
+        private readonly RepositoryProxy _owner;
+
+        public QuerySession(RepositoryProxy owner) => _owner = owner;
+
+        public Task<IReadOnlyList<TagCount>> QueryAsync(
+            string nameFilter,
+            int limit = 300,
+            CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            _owner.Calls++;
+            _owner.NameFilter = nameFilter;
+            return Task.FromResult<IReadOnlyList<TagCount>>(_owner.Results.Take(limit).ToList());
+        }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }
