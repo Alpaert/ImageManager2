@@ -30,6 +30,7 @@ public partial class MemorySettingViewModel : ViewModelBase
     public Func<string, long>? GetDiskUsage { get; set; }
 
     private string _originalCachePath = string.Empty;
+    private int _diskUsageRefreshVersion;
 
     public MemorySettingViewModel(string cachePath,
         string deepSeekApiKey,
@@ -53,8 +54,6 @@ public partial class MemorySettingViewModel : ViewModelBase
         _originalCachePath = cachePath;
         GetDiskUsage = getDiskUsage;
         OnSave = onSave;
-
-        UpdateHints();
     }
 
     public bool IsSingleModelMode => TagMode == 0;
@@ -69,14 +68,31 @@ public partial class MemorySettingViewModel : ViewModelBase
             : "双模型流水线：WD 负责 Rating 分级 + PixAI 负责打标（特征+角色）+ 嵌入匹配画师";
     }
 
-    private void UpdateHints()
+    public async Task RefreshDiskUsageHintAsync()
     {
-        if (GetDiskUsage != null)
+        var getDiskUsage = GetDiskUsage;
+        if (getDiskUsage == null)
+            return;
+
+        var path = CachePath;
+        var refreshVersion = Interlocked.Increment(ref _diskUsageRefreshVersion);
+        DiskUsageHint = "正在统计缓存占用…";
+        try
         {
-            double diskMb = GetDiskUsage(CachePath) / 1024.0 / 1024.0;
+            var bytes = await Task.Run(() => getDiskUsage(path));
+            if (refreshVersion != Volatile.Read(ref _diskUsageRefreshVersion) ||
+                !string.Equals(path, CachePath, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            double diskMb = bytes / 1024.0 / 1024.0;
             DiskUsageHint = diskMb >= 1024
                 ? $"磁盘缓存占用约 {diskMb / 1024:0.0} GB"
                 : $"磁盘缓存占用约 {diskMb:0.0} MB";
+        }
+        catch (Exception ex)
+        {
+            if (refreshVersion == Volatile.Read(ref _diskUsageRefreshVersion))
+                DiskUsageHint = $"无法读取缓存占用：{ex.Message}";
         }
     }
 

@@ -1,16 +1,12 @@
 using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using ImageManager.Common.Helpers;
+using ImageManager.Core.Models;
+using ImageManager.Core.Services;
 
 namespace ImageManager.Infrastructure.Video;
 
-public sealed record VideoOriginalFrameResult(
-    bool Success,
-    bool AlreadyExisted,
-    string? Path,
-    string? Error);
-
-public sealed class VideoOriginalFrameCacheService
+public sealed class VideoOriginalFrameCacheService : IVideoOriginalFrameCacheService
 {
     private readonly string _cacheDirectory;
     private readonly ConcurrentDictionary<string, Lazy<Task<VideoOriginalFrameResult>>> _inflight =

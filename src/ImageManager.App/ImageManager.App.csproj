@@ -51,6 +51,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="ContinuousDisplay.UnitTests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Copy ffmpeg binaries to build and publish output directories. -->
     <None Include="..\..\libffmpeg\**\*.*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

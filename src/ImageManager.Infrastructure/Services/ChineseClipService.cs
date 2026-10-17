@@ -5,9 +5,11 @@ using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 using SkiaSharp;
 
+using ImageManager.Core.Services;
+
 namespace ImageManager.Infrastructure.Services;
 
-public sealed class ChineseClipService : IDisposable
+public sealed class ChineseClipService : IChineseClipService, IDisposable
 {
     public const string ModelKey = "chinese-clip-vit-base-patch16";
     public const string ModelVersion = "v2";

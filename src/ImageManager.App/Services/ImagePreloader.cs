@@ -2,7 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using ImageManager.Common.Helpers;
 using ImageManager.Infrastructure.Caching;
-using ImageManager.Infrastructure.Helpers;
+
 using ImageManager.Infrastructure.Imaging;
 
 namespace ImageManager.App.Services;

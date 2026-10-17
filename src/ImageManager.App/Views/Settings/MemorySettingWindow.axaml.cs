@@ -12,6 +12,11 @@ public partial class MemorySettingWindow : Window
     public MemorySettingWindow()
     {
         InitializeComponent();
+        Opened += async (_, _) =>
+        {
+            if (DataContext is MemorySettingViewModel vm)
+                await vm.RefreshDiskUsageHintAsync();
+        };
     }
 
     private async void BtnBrowseCachePath_Click(object? sender, RoutedEventArgs e)

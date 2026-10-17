@@ -130,6 +130,21 @@ public static class DatabaseInitializer
                 PRIMARY KEY (ImageMetaId, TagName)
             );
 
+            CREATE TABLE IF NOT EXISTS MediaMoveJournal (
+                Id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                OperationId    TEXT NOT NULL,
+                ItemType       TEXT NOT NULL,
+                SourcePath     TEXT NOT NULL,
+                TargetPath     TEXT NOT NULL,
+                TargetFolderId INTEGER,
+                State          TEXT NOT NULL,
+                ErrorMessage   TEXT,
+                CreatedAt      TEXT NOT NULL DEFAULT (datetime('now')),
+                UpdatedAt      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_mediamovejournal_op ON MediaMoveJournal(OperationId);
+            CREATE INDEX IF NOT EXISTS idx_mediamovejournal_state ON MediaMoveJournal(State);
             """;
         cmd.ExecuteNonQuery();
     }
@@ -146,6 +161,26 @@ public static class DatabaseInitializer
         TryAddColumn(conn, transaction, "Folder", "IsArchived", "INTEGER NOT NULL DEFAULT 0");
         TryAddColumn(conn, transaction, "ImageMeta", "Duration", "REAL DEFAULT NULL");
         TryAddColumn(conn, transaction, "ImageMeta", "ThumbnailTimestamp", "REAL DEFAULT NULL");
+
+        using var journalCmd = conn.CreateCommand();
+        journalCmd.Transaction = transaction;
+        journalCmd.CommandText = """
+            CREATE TABLE IF NOT EXISTS MediaMoveJournal (
+                Id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                OperationId    TEXT NOT NULL,
+                ItemType       TEXT NOT NULL,
+                SourcePath     TEXT NOT NULL,
+                TargetPath     TEXT NOT NULL,
+                TargetFolderId INTEGER,
+                State          TEXT NOT NULL,
+                ErrorMessage   TEXT,
+                CreatedAt      TEXT NOT NULL DEFAULT (datetime('now')),
+                UpdatedAt      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_mediamovejournal_op ON MediaMoveJournal(OperationId);
+            CREATE INDEX IF NOT EXISTS idx_mediamovejournal_state ON MediaMoveJournal(State);
+            """;
+        journalCmd.ExecuteNonQuery();
     }
 
     private static void CreateIndexes(SqliteConnection conn, SqliteTransaction transaction)

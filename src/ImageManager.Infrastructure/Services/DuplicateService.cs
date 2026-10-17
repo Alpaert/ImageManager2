@@ -1,6 +1,6 @@
 using System.Security.Cryptography;
+using ImageManager.Core.Models;
 using ImageManager.Core.Services;
-using ImageManager.Infrastructure.Caching;
 using ImageManager.Infrastructure.Imaging;
 
 namespace ImageManager.Infrastructure.Services;
@@ -8,12 +8,12 @@ namespace ImageManager.Infrastructure.Services;
 public class DuplicateService : IDuplicateService
 {
     private readonly IImageMetaRepository _metaRepo;
-    private readonly ThumbnailCacheService _thumbCache;
+    private readonly IMediaMoveService _mediaMoveService;
 
-    public DuplicateService(IImageMetaRepository metaRepo, ThumbnailCacheService thumbCache)
+    public DuplicateService(IImageMetaRepository metaRepo, IMediaMoveService mediaMoveService)
     {
-        _metaRepo = metaRepo;
-        _thumbCache = thumbCache;
+        _metaRepo = metaRepo ?? throw new ArgumentNullException(nameof(metaRepo));
+        _mediaMoveService = mediaMoveService ?? throw new ArgumentNullException(nameof(mediaMoveService));
     }
 
     public async Task<(int exactCount, int fuzzyCount)> DetectAndMoveDuplicatesAsync(
@@ -78,33 +78,19 @@ public class DuplicateService : IDuplicateService
                     continue;
                 if (moved.Contains(img.FilePath)) continue;
 
-                await MoveFileAsync(img.FilePath, targetDir);
-                moved.Add(img.FilePath);
-                exactCount++;
+                var result = await _mediaMoveService.MoveFilesAsync(
+                    new MediaMoveRequest([img.FilePath], targetDir),
+                    cancellationToken: ct);
+
+                if (result.SuccessCount > 0)
+                {
+                    moved.Add(img.FilePath);
+                    exactCount++;
+                }
             }
         }
 
         return (exactCount, 0);
-    }
-
-    private async Task MoveFileAsync(string oldPath, string targetDir)
-    {
-        try
-        {
-            var fileName = Path.GetFileName(oldPath);
-            var destPath = Common.Helpers.PathHelper.GetNonConflictingPath(
-                Path.Combine(targetDir, fileName));
-            File.Move(oldPath, destPath);
-            _thumbCache.MoveDiskCache(oldPath, destPath);
-
-            var meta = await _metaRepo.GetByPathAsync(oldPath);
-            if (meta != null)
-            {
-                meta.FilePath = destPath;
-                await _metaRepo.UpsertAsync(meta);
-            }
-        }
-        catch { }
     }
 
     private class DuplicateImageInfo

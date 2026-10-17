@@ -1,6 +1,7 @@
 using Dapper;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Data.Helpers;
 
 namespace ImageManager.Infrastructure.Data.Repositories;
 
@@ -127,36 +128,47 @@ public sealed class ImageEmbeddingRepository : IImageEmbeddingRepository
         if (filePaths.Count == 0)
             return [];
 
-        using var conn = _dbFactory.CreateConnection();
-        var command = new CommandDefinition(@"
-            SELECT ie.ImageMetaId, im.FilePath, ie.FileHash, ie.EmbeddingDim, ie.EmbeddingBlob,
-                   ie.SourceFileSize, ie.SourceLastWriteTicks
-            FROM ImageEmbedding ie
-            INNER JOIN ImageMeta im ON im.Id = ie.ImageMetaId
-            WHERE ie.ModelKey = @ModelKey
-              AND ie.ModelVersion = @ModelVersion
-              AND ie.SourceFileSize = im.FileSize
-              AND ie.SourceLastWriteTicks = im.LastWriteTicks
-              AND im.FilePath IN @FilePaths",
-            new { ModelKey = modelKey, ModelVersion = modelVersion, FilePaths = filePaths },
-            cancellationToken: ct);
-        var rows = await conn.QueryAsync<(
-            long ImageMetaId,
-            string FilePath,
-            string? FileHash,
-            int EmbeddingDim,
-            byte[] EmbeddingBlob,
-            long SourceFileSize,
-            long SourceLastWriteTicks)>(command);
+        var distinctPaths = filePaths
+            .Where(p => !string.IsNullOrEmpty(p))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (distinctPaths.Count == 0)
+            return [];
 
+        using var conn = _dbFactory.CreateConnection();
         var result = new List<ImageEmbeddingRecord>();
-        foreach (var row in rows)
+        foreach (var chunk in distinctPaths.Chunk(500))
         {
             ct.ThrowIfCancellationRequested();
-            var embedding = FromBytes(row.EmbeddingBlob, row.EmbeddingDim);
-            if (embedding.Length > 0)
-                result.Add(new ImageEmbeddingRecord(row.ImageMetaId, row.FilePath, row.FileHash, embedding,
-                    row.SourceFileSize, row.SourceLastWriteTicks));
+            var command = new CommandDefinition(@"
+                SELECT ie.ImageMetaId, im.FilePath, ie.FileHash, ie.EmbeddingDim, ie.EmbeddingBlob,
+                       ie.SourceFileSize, ie.SourceLastWriteTicks
+                FROM ImageEmbedding ie
+                INNER JOIN ImageMeta im ON im.Id = ie.ImageMetaId
+                WHERE ie.ModelKey = @ModelKey
+                  AND ie.ModelVersion = @ModelVersion
+                  AND ie.SourceFileSize = im.FileSize
+                  AND ie.SourceLastWriteTicks = im.LastWriteTicks
+                  AND im.FilePath COLLATE NOCASE IN @FilePaths",
+                new { ModelKey = modelKey, ModelVersion = modelVersion, FilePaths = chunk },
+                cancellationToken: ct);
+            var rows = await conn.QueryAsync<(
+                long ImageMetaId,
+                string FilePath,
+                string? FileHash,
+                int EmbeddingDim,
+                byte[] EmbeddingBlob,
+                long SourceFileSize,
+                long SourceLastWriteTicks)>(command);
+
+            foreach (var row in rows)
+            {
+                ct.ThrowIfCancellationRequested();
+                var embedding = FromBytes(row.EmbeddingBlob, row.EmbeddingDim);
+                if (embedding.Length > 0)
+                    result.Add(new ImageEmbeddingRecord(row.ImageMetaId, row.FilePath, row.FileHash, embedding,
+                        row.SourceFileSize, row.SourceLastWriteTicks));
+            }
         }
 
         return result;
@@ -172,11 +184,9 @@ public sealed class ImageEmbeddingRepository : IImageEmbeddingRepository
         object parameters = new { };
         if (!scope.IsAll)
         {
-            var root = Path.GetFullPath(scope.FolderPath!)
-                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            var prefix = EscapeLike(root + Path.DirectorySeparatorChar) + "%";
-            sql += " AND FilePath LIKE @Prefix ESCAPE '\\' COLLATE NOCASE";
-            parameters = new { Prefix = prefix };
+            var (predicate, paramObj) = SqlPathHelper.CreateFolderPredicate("FilePath", scope.FolderPath!, scope.IncludeSubfolders);
+            sql += $" AND {predicate}";
+            parameters = paramObj;
         }
         sql += " ORDER BY Id";
         var rows = await conn.QueryAsync<SearchIndexCandidate>(sql, parameters);
@@ -254,20 +264,21 @@ public sealed class ImageEmbeddingRepository : IImageEmbeddingRepository
         string modelVersion)
     {
         using var conn = _dbFactory.CreateConnection();
-        var normalized = Common.Helpers.PathHelper.NormalizeFolderPath(folderPath);
+        var normalized = SqlPathHelper.NormalizeFolderPath(folderPath);
+        var prefix = SqlPathHelper.GetFolderLikePattern(normalized);
         var rows = await conn.QueryAsync<(long ImageMetaId, string FilePath, string? FileHash, int EmbeddingDim, byte[] EmbeddingBlob)>(@"
             SELECT ie.ImageMetaId, im.FilePath, ie.FileHash, ie.EmbeddingDim, ie.EmbeddingBlob
             FROM ImageEmbedding ie
             INNER JOIN ImageMeta im ON im.Id = ie.ImageMetaId
             WHERE ie.ModelKey = @ModelKey
               AND ie.ModelVersion = @ModelVersion
-              AND (im.FilePath = @Root OR im.FilePath LIKE @Prefix)",
+              AND (im.FilePath = @Root OR im.FilePath LIKE @Prefix ESCAPE '\' COLLATE NOCASE)",
             new
             {
                 ModelKey = modelKey,
                 ModelVersion = modelVersion,
                 Root = folderPath,
-                Prefix = normalized + "%"
+                Prefix = prefix
             });
 
         var result = new List<ImageEmbeddingRecord>();
@@ -342,8 +353,5 @@ public sealed class ImageEmbeddingRepository : IImageEmbeddingRepository
         return values;
     }
 
-    private static string EscapeLike(string value) => value
-        .Replace("\\", "\\\\", StringComparison.Ordinal)
-        .Replace("%", "\\%", StringComparison.Ordinal)
-        .Replace("_", "\\_", StringComparison.Ordinal);
+    private static string EscapeLike(string value) => SqlPathHelper.EscapeLikePattern(value);
 }

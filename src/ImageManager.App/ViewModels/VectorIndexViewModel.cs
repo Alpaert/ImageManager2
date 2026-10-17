@@ -2,13 +2,13 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
-using ImageManager.Infrastructure.Services;
 
 namespace ImageManager.App.ViewModels;
 
 public partial class VectorIndexViewModel : ViewModelBase
 {
     private readonly IVectorIndexService _indexService;
+    private long _statusRefreshVersion;
 
     [ObservableProperty] private string _semanticStatus = "正在读取...";
     [ObservableProperty] private string _atmosphereStatus = "正在读取...";
@@ -21,7 +21,7 @@ public partial class VectorIndexViewModel : ViewModelBase
     [ObservableProperty] private string? _selectedFolderPath;
     [ObservableProperty] private bool _includeSubfolders = true;
 
-    public VectorIndexViewModel(IVectorIndexService indexService, ChineseClipService chineseClip)
+    public VectorIndexViewModel(IVectorIndexService indexService, IChineseClipService chineseClip)
     {
         _indexService = indexService;
         ModelDirectory = chineseClip.ModelDirectory;
@@ -41,13 +41,30 @@ public partial class VectorIndexViewModel : ViewModelBase
     [RelayCommand]
     private async Task RefreshAsync()
     {
-        var statuses = await _indexService.GetStatusesAsync(CurrentScope);
-        var semantic = statuses.First(status => status.Kind == VectorIndexKind.Semantic);
-        var atmosphere = statuses.First(status => status.Kind == VectorIndexKind.Atmosphere);
-        var color = statuses.First(status => status.Kind == VectorIndexKind.Color);
-        SemanticStatus = FormatStatus(semantic);
-        AtmosphereStatus = FormatStatus(atmosphere);
-        ColorStatus = FormatStatus(color);
+        var scope = CurrentScope;
+        var version = Interlocked.Increment(ref _statusRefreshVersion);
+        SemanticStatus = AtmosphereStatus = ColorStatus = "正在读取...";
+        try
+        {
+            // SQLite reads and candidate File.Exists checks may complete synchronously.
+            // Start the whole read on a worker, then resume here on the caller's UI context.
+            var statuses = await Task.Run(() => _indexService.GetStatusesAsync(scope));
+            if (version != Volatile.Read(ref _statusRefreshVersion) || scope != CurrentScope)
+                return;
+
+            var semantic = statuses.First(status => status.Kind == VectorIndexKind.Semantic);
+            var atmosphere = statuses.First(status => status.Kind == VectorIndexKind.Atmosphere);
+            var color = statuses.First(status => status.Kind == VectorIndexKind.Color);
+            SemanticStatus = FormatStatus(semantic);
+            AtmosphereStatus = FormatStatus(atmosphere);
+            ColorStatus = FormatStatus(color);
+        }
+        catch (Exception ex)
+        {
+            if (version != Volatile.Read(ref _statusRefreshVersion) || scope != CurrentScope)
+                return;
+            SemanticStatus = AtmosphereStatus = ColorStatus = $"读取失败: {ex.Message}";
+        }
     }
 
     [RelayCommand] private Task BuildSemanticAsync() => RunAsync(VectorIndexKind.Semantic, false);

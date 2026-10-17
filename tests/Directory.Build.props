@@ -1,0 +1,9 @@
+<Project>
+  <PropertyGroup>
+    <UseAppHost>false</UseAppHost>
+  </PropertyGroup>
+
+  <Target Name="RemoveTesthostExe" AfterTargets="Build">
+    <Delete Files="$(TargetDir)testhost.exe" Condition="Exists('$(TargetDir)testhost.exe')" />
+  </Target>
+</Project>

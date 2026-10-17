@@ -8,7 +8,7 @@ namespace ImageManager.Infrastructure.Services;
 /// 模式 A（SingleModel）：EnabledCategories=null，全部类别输出。
 /// 模式 B（Ensemble）：EnabledCategories=[0,4]，仅 general + character。
 /// </summary>
-public class PixaiTagService : OnnxTagServiceBase
+public class PixaiTagService : OnnxTagServiceBase, IImageEmbeddingExtractor
 {
     protected override string ModelRepo => "deepghs/pixai-tagger-v0.9-onnx";
     protected override string ModelFileName => "model.onnx";
@@ -112,9 +112,9 @@ public class PixaiTagService : OnnxTagServiceBase
     private const int MaxBatchSize = 16;
 
     /// <summary>批量提取嵌入：一次 session.Run 处理多张图，返回 [N, 1024] 的嵌入列表</summary>
-    public async Task<List<float[]>?> GetEmbeddingsBatchAsync(List<string> imagePaths)
+    public async Task<List<float[]>> GetEmbeddingsBatchAsync(List<string> imagePaths)
     {
-        if (_session == null || imagePaths.Count == 0) return null;
+        if (_session == null || imagePaths.Count == 0) return [];
 
         var paths = imagePaths.Count > MaxBatchSize
             ? imagePaths.Take(MaxBatchSize).ToList()
@@ -183,7 +183,7 @@ public class PixaiTagService : OnnxTagServiceBase
             });
 
             ResetIdleTimer();
-            return result;
+            return result ?? [];
         }
         finally { _inferenceLock.Release(); }
     }

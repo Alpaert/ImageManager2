@@ -1,6 +1,6 @@
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
-using ImageManager.Infrastructure.Helpers;
+
 using ImageManager.Infrastructure.Imaging;
 using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
@@ -62,6 +62,7 @@ public abstract class OnnxTagServiceBase : IDisposable
     private CancellationTokenSource? _idleCts;
     private readonly object _idleLock = new();
     private SKBitmap? _scratchBitmap;
+    private bool _disposed;
 
     // === 内存诊断采样计数器 ===
     private int _preprocessCount;
@@ -470,15 +471,17 @@ public abstract class OnnxTagServiceBase : IDisposable
 
     public virtual void Dispose()
     {
-        AppLogger.Info($"Dispose {ModelSubDir}");
-
-        // 1. Cancel idle timer to prevent DisposeSession() from racing
         lock (_idleLock)
         {
+            if (_disposed) return;
+            _disposed = true;
+
             _idleCts?.Cancel();
             _idleCts?.Dispose();
             _idleCts = null;
         }
+
+        AppLogger.Info($"Dispose {ModelSubDir}");
 
         // 2. Wait for any in-flight inference to finish before touching _session
         _inferenceLock.Wait();

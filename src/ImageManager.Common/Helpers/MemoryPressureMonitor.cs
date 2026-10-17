@@ -1,10 +1,14 @@
-﻿using System.Diagnostics;
-using ImageManager.Common.Helpers;
+using System;
+using System.Diagnostics;
+using System.Threading;
 
-namespace ImageManager.Infrastructure.Helpers;
+namespace ImageManager.Common.Helpers;
 
 /// <summary>
-/// LOH 纰庣墖鍖栬嚜閫傚簲绠＄悊銆?/// 64浣?GC 榛樿涓嶅帇缂?LOH 鈫?SKBitmap 瑙ｇ爜纰庣墖绱Н 鈫?commit exhaustion銆?/// 鐢?Private/Heap 姣斿€间綔涓虹鐗囦唬鐞嗘寚鏍囷紝鍥涚骇鍘嬪姏鑷€傚簲瑙﹀彂 Gen2+LOH 鍘嬬缉銆?/// </summary>
+/// LOH 碎片化自适应管理。
+/// 64位 GC 默认不压缩 LOH → SKBitmap 解码碎片累积 → commit exhaustion。
+/// 用 Private/Heap 比值作为碎片代理指标，四级压力自适应触发 Gen2+LOH 压缩。
+/// </summary>
 public static class MemoryPressureMonitor
 {
     public enum PressureLevel { Low, Medium, High, Critical }
@@ -13,7 +17,7 @@ public static class MemoryPressureMonitor
     private const double CriticalCommitMB = 8000;
     private const double MinHeapForFragmentationMB = 512;
 
-    // ==================== 鐘舵€?====================
+    // ==================== 状态 ====================
     private static readonly object _lock = new();
     private static long _largeAllocCount;
     private static long _lastCompactAtCount;
@@ -22,7 +26,7 @@ public static class MemoryPressureMonitor
     private static readonly TimeSpan LevelRefreshInterval = TimeSpan.FromSeconds(5);
     private static readonly SemaphoreSlim _compactGate = new(1, 1);
 
-    // ==================== 鍏紑灞炴€?====================
+    // ==================== 公开属性 ====================
 
     public static PressureLevel Current
     {
@@ -34,10 +38,10 @@ public static class MemoryPressureMonitor
         }
     }
 
-    /// <summary>纰庣墖璇勫垎: (PrivateMB - HeapMB) / HeapMB銆傚€艰秺澶х鐗囪秺涓ラ噸銆?/summary>
+    /// <summary>碎片评分: (PrivateMB - HeapMB) / HeapMB。值越大碎片越严重。</summary>
     public static double FragmentationScore => ComputeScore();
 
-    /// <summary>褰撳墠 Private commit (MB)</summary>
+    /// <summary>当前 Private commit (MB)</summary>
     public static double CommitChargeMB
     {
         get
@@ -47,9 +51,9 @@ public static class MemoryPressureMonitor
         }
     }
 
-    // ==================== 鍐崇瓥 API ====================
+    // ==================== 决策 API ====================
 
-    /// <summary>鏄惁搴旇鎵ц LOH 鍘嬬缉锛堣皟鐢ㄦ柟鍦ㄥ垎閰嶅ぇ瀵硅薄鍚庤皟鐢級</summary>
+    /// <summary>是否应该执行 LOH 压缩（调用方在分配大对象后调用）</summary>
     public static bool ShouldCompactNow()
     {
         var level = Current;
@@ -87,22 +91,22 @@ public static class MemoryPressureMonitor
         };
     }
 
-    // ==================== 鎿嶄綔 API ====================
+    // ==================== 操作 API ====================
 
-    /// <summary>璁板綍涓€娆″ぇ瀵硅薄鍒嗛厤锛堢缉鐣ュ浘鐢熸垚銆佸紶閲忓垎閰嶇瓑锛?/summary>
+    /// <summary>记录一次大对象分配（缩略图生成、张量分配等）</summary>
     public static void RecordAllocation()
     {
         Interlocked.Increment(ref _largeAllocCount);
     }
 
-    /// <summary>鎵ц Gen2 + LOH 鍘嬬缉锛堝湪鍚庡彴绾跨▼鎵ц锛屼笉闃诲璋冪敤鑰咃級</summary>
+    /// <summary>执行 Gen2 + LOH 压缩（在后台线程执行，不阻塞调用者）</summary>
     public static void CompactLoh()
     {
         var levelBefore = Current;
         double scoreBefore = ComputeScore();
         double commitBefore = CommitChargeMB;
 
-        // 鍦ㄥ悗鍙扮嚎绋嬫墽琛屼互閬垮厤闃诲 UI
+        // 在后台线程执行以避免阻塞 UI
         ThreadPool.QueueUserWorkItem(_ =>
         {
             if (!_compactGate.Wait(0)) return;
@@ -114,7 +118,7 @@ public static class MemoryPressureMonitor
                     GC.WaitForPendingFinalizers();
                 }
                 Interlocked.Exchange(ref _lastCompactAtCount, Interlocked.Read(ref _largeAllocCount));
-                // 寮哄埗鍒锋柊缂撳瓨
+                // 强制刷新缓存
                 _lastLevelRefresh = DateTime.MinValue;
 
                 double scoreAfter = ComputeScore();
@@ -130,12 +134,12 @@ public static class MemoryPressureMonitor
         });
     }
 
-    /// <summary>Critical 绾у埆绱ф€ュ洖鏀讹細娓呯┖璋冪敤鏂规彁渚涚殑娓呯悊鍔ㄤ綔 + 鍘嬬缉</summary>
+    /// <summary>Critical 级别紧急回收：清空调用方提供的清理动作 + 压缩</summary>
     public static void EmergencyCleanup(Action? cleanupAction = null)
     {
         AppLogger.Memory($"EmergencyCleanup level={Current} score={ComputeScore():F1}");
         cleanupAction?.Invoke();
-        // 鍚屾鎵ц 鈥?Critical 鏃舵€ц兘宸蹭弗閲嶅姡鍖栵紝浼樺厛鍥炴敹
+        // 同步执行 — Critical 时性能已严重恶化，优先回收
         for (int i = 0; i < 3; i++)
         {
             GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
@@ -146,7 +150,7 @@ public static class MemoryPressureMonitor
         AppLogger.Memory($"EmergencyCleanup done level={Current}");
     }
 
-    // ==================== 鍐呴儴 ====================
+    // ==================== 内部 ====================
 
     private static double ComputeScore()
     {
@@ -184,4 +188,3 @@ public static class MemoryPressureMonitor
         }
     }
 }
-

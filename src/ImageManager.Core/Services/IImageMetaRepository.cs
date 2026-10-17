@@ -2,111 +2,15 @@ using ImageManager.Core.Models;
 
 namespace ImageManager.Core.Services;
 
-public interface IImageMetaRepository
+/// <summary>
+/// Composite repository interface providing metadata, tagging, hash, and lifecycle access for images.
+/// Decomposed into smaller focused interfaces: <see cref="IImageMetaReadRepository"/>,
+/// <see cref="IImageMetaWriteRepository"/>, <see cref="IImageTagRepository"/>, and <see cref="IImageHashRepository"/>.
+/// </summary>
+public interface IImageMetaRepository :
+    IImageMetaReadRepository,
+    IImageMetaWriteRepository,
+    IImageTagRepository,
+    IImageHashRepository
 {
-    Task<ImageMeta?> GetByIdAsync(long id);
-    Task<ImageMeta?> GetByPathAsync(string filePath);
-    Task<List<ImageMeta>> GetByFolderAsync(string folderPath);
-    Task<List<ImageMeta>> GetByFolderIdAsync(long folderId);
-    Task<IReadOnlyList<ImageSortMetadata>> GetSortMetadataByFolderAsync(
-        string folderPath,
-        bool recursive,
-        CancellationToken cancellationToken = default);
-    Task<IReadOnlyList<ImageSortMetadata>> GetSortMetadataByPathsAsync(
-        IReadOnlyCollection<string> filePaths,
-        CancellationToken cancellationToken = default);
-    Task<List<ImageMeta>> GetHashMetadataByPathsAsync(IReadOnlyCollection<string> filePaths);
-    Task<int> CountByFolderIdAsync(long folderId);
-    Task SetFolderIdAsync(string filePath, long folderId);
-    Task<int> UnlinkFolderIdAsync(long folderId);
-    Task<int> UnlinkOrphanFolderIdsAsync();
-    Task<List<ImageMeta>> GetAllAsync();
-    Task<long> UpsertAsync(ImageMeta meta);
-    Task BulkUpsertAsync(List<ImageMeta> metas);
-    Task<int> DeleteAsync(long id);
-    Task<int> DeleteByPathAsync(string filePath);
-    Task<int> DeleteByFolderAsync(string folderPath);
-
-    // Tag associations
-    Task SetTagsAsync(long imageId, List<string> tags);
-    Task AddAutoTagsAsync(long imageId, List<string> tagNames);
-    Task ReplaceAutoTagAsync(long imageId, string englishTagName, long chineseTagId);
-    Task ReplaceAutoTagsBatchAsync(List<(long ImageId, string EnglishName, long ChineseId)> replacements);
-    Task DeleteAutoTagFromImageAsync(long imageId, string tagName);
-    Task<int> DeleteAllAutoTagsByFolderAsync(string folderPath);
-    Task ClearTagsAndStatusBatchAsync(List<string> filePaths);
-    Task<List<TagCount>> GetTagCountsAsync();
-    Task<List<string>> GetFilePathsByTagAsync(string tagName);
-    Task<List<string>> GetFilePathsByTagsAsync(List<string> tagNames, bool requireAll);
-    Task<List<string>> GetFilePathsByTagsExcludingAsync(List<string> includeTags, bool requireAll, List<string> excludeTags);
-    Task<List<string>> GetFilePathsByTagAndEachAsync(List<string> baseTags, bool requireAllBase, List<string> eachTags, List<string>? excludeTags = null);
-    Task<List<string>> GetFilePathsExcludingTagsAsync(List<string> excludeTags, bool requireAll);
-    Task<List<string>> GetFilePathsWithNoTagsAsync();
-
-    // Lightweight tag queries (avoid loading full ImageMeta)
-    /// <summary>Returns (FilePath → TagNames) for all images under a folder prefix</summary>
-    Task<Dictionary<string, List<string>>> GetTagMapByFolderAsync(string folderPath);
-    /// <summary>Returns (FilePath → TagNames) for a batch of file paths</summary>
-    Task<Dictionary<string, List<string>>> GetTagMapByPathsAsync(List<string> filePaths);
-    Task<List<TagCount>> GetCoOccurringTagsAsync(List<string> filePaths, List<string>? excludeNames = null, string? nameFilter = null);
-    Task<ICoTagQuerySession> CreateCoTagQuerySessionAsync(
-        IReadOnlyCollection<string> filePaths,
-        IReadOnlyCollection<string>? excludeNames = null,
-        CancellationToken cancellationToken = default);
-
-    /// <summary>Batch-load valid perceptual hashes for a specific set of file paths (lightweight, no tags)</summary>
-    Task<Dictionary<string, string>> GetPerceptualHashesByPathsAsync(List<string> filePaths);
-
-    /// <summary>Batch-load FileHash for a set of file paths.</summary>
-    Task<Dictionary<string, string>> GetFileHashesByPathsAsync(List<string> filePaths);
-
-    /// <summary>Returns paths where a usable perceptual hash was computed.</summary>
-    Task<HashSet<string>> GetHashedPathsAsync(List<string> filePaths);
-
-    /// <summary>Reset HashStatus to 0 for all records (used when hash algorithm version changes).</summary>
-    Task ResetHashStatusAsync();
-
-    /// <summary>Reset failed hash records under a folder and return the paths to retry.</summary>
-    Task<List<string>> ResetFailedHashStatusByFolderAsync(string folderPath);
-
-    /// <summary>Find a record by its MD5 file hash.</summary>
-    Task<ImageMeta?> GetByFileHashAsync(string fileHash);
-
-    /// <summary>Update FilePath and FolderId for a moved file (preserves Id and tags).</summary>
-    Task UpdateFilePathAsync(long id, string newPath, long newFolderId);
-
-    /// <summary>Batch-load existing paths, IDs and tagging status; missing paths are omitted.</summary>
-    Task<Dictionary<string, (long Id, int Status)>> GetStatusMapByPathsAsync(List<string> filePaths,
-        CancellationToken cancellationToken = default, Action<int>? progress = null);
-
-    /// <summary>Register prepared files without overwriting existing metadata/tags. Rechecks paths and move candidates in a short transaction.</summary>
-    Task<Dictionary<string, (long Id, int Status)>> RegisterAutoTagFilesAsync(
-        IReadOnlyList<AutoTagFileRegistration> files, CancellationToken cancellationToken = default);
-
-    /// <summary>Set AutoTagStatus for a given file path.</summary>
-    Task SetAutoTagStatusByPathAsync(string filePath, int status);
-
-    /// <summary>Batch set AutoTagStatus for multiple file paths.</summary>
-    Task SetAutoTagStatusBatchAsync(List<string> filePaths, int status);
-
-    /// <summary>Get all records with no folder link (externally deleted).</summary>
-    Task<List<ImageMeta>> GetAllUnlinkedAsync();
-
-    /// <summary>Batch-load Width/Height for a set of file paths. Only returns entries with non-zero dimensions.</summary>
-    Task<Dictionary<string, (int Width, int Height)>> GetDimensionsByPathsAsync(List<string> filePaths);
-
-    /// <summary>Persists verified display dimensions without replacing tags, hashes, or other image metadata.</summary>
-    Task UpdateDimensionsByPathsAsync(IReadOnlyDictionary<string, (int Width, int Height)> dimensions);
-
-    /// <summary>Batch-load content ratings, falling back to legacy rating tags when metadata is unknown.</summary>
-    Task<Dictionary<string, int>> GetSystemRatingsByPathsAsync(List<string> filePaths);
-
-    /// <summary>Persist a known content rating for an image path.</summary>
-    Task SetSystemRatingByPathAsync(string filePath, int rating);
-
-    // Batch tag operations
-    Task<Dictionary<string, long>> GetIdsByPathsAsync(List<string> filePaths);
-    Task AddTagToImagesAsync(List<long> imageIds, string tag);
-    Task RemoveTagFromImagesAsync(List<long> imageIds, string tag);
-    Task ClearTagsFromImagesAsync(List<long> imageIds);
 }

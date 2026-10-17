@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using ImageManager.Infrastructure.Helpers;
+using ImageManager.Common.Helpers;
 
 namespace ImageManager.Infrastructure.Caching;
 

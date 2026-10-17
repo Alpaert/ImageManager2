@@ -3,7 +3,6 @@ using System.Diagnostics;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
-using ImageManager.Infrastructure.Helpers;
 using ImageManager.Infrastructure.Audio;
 using ImageManager.Infrastructure.Imaging;
 
@@ -348,6 +347,10 @@ public class ThumbnailCacheService : IThumbnailCacheService
         Interlocked.Exchange(ref _totalBytes, 0);
         return Task.CompletedTask;
     }
+
+    public (int Width, int Height) GetDimensions(string filePath) => ThumbnailGenerator.GetDimensions(filePath);
+    public (int Width, int Height) GetDimensionsOrUnknown(string filePath) => ThumbnailGenerator.GetDimensionsOrUnknown(filePath);
+    public byte[]? DecodeForHashInput(string filePath, int maxSize = 256) => ThumbnailGenerator.DecodeForHashInput(filePath, maxSize);
 
     public void Trim(long maxBytes, string? protectedKey = null)
     {

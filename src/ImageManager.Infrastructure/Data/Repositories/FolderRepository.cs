@@ -1,14 +1,20 @@
 using Dapper;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Data.Helpers;
 
 namespace ImageManager.Infrastructure.Data.Repositories;
 
 public class FolderRepository : IFolderRepository
 {
     private readonly IDbContextFactory _dbFactory;
+    private readonly IHashDataVersionTracker? _versionTracker;
 
-    public FolderRepository(IDbContextFactory dbFactory) => _dbFactory = dbFactory;
+    public FolderRepository(IDbContextFactory dbFactory, IHashDataVersionTracker? versionTracker = null)
+    {
+        _dbFactory = dbFactory;
+        _versionTracker = versionTracker;
+    }
 
     public async Task<List<FolderInfo>> GetAllAsync()
     {
@@ -83,6 +89,7 @@ public class FolderRepository : IFolderRepository
 
         var oldPrefix = Common.Helpers.PathHelper.NormalizeFolderPath(oldPath);
         var newPrefix = Common.Helpers.PathHelper.NormalizeFolderPath(newFolderPath);
+        var oldLike = SqlPathHelper.GetFolderLikePattern(oldPrefix);
 
         // Update Folder
         await conn.ExecuteAsync(
@@ -90,11 +97,12 @@ public class FolderRepository : IFolderRepository
             new { Path = newFolderPath, Id = folderId }, txn);
 
         // Batch update all ImageMeta paths
-        // SQLite REPLACE in UPDATE is applied per-row, so we use LIKE to match old prefix
+        // SQLite REPLACE in UPDATE is applied per-row, so we use LIKE to match old prefix safely
         await conn.ExecuteAsync(
-            "UPDATE ImageMeta SET FilePath = @NewPrefix || SUBSTR(FilePath, @OldLen + 1) WHERE FolderId = @FolderId AND FilePath LIKE @OldLike",
-            new { NewPrefix = newPrefix, OldLen = oldPrefix.Length, FolderId = folderId, OldLike = oldPrefix + "%" }, txn);
+            "UPDATE ImageMeta SET FilePath = @NewPrefix || SUBSTR(FilePath, length(@OldPrefix) + 1) WHERE FolderId = @FolderId AND FilePath LIKE @OldLike ESCAPE '\\' COLLATE NOCASE",
+            new { NewPrefix = newPrefix, OldPrefix = oldPrefix, FolderId = folderId, OldLike = oldLike }, txn);
 
         txn.Commit();
+        _versionTracker?.IncrementVersion();
     }
 }

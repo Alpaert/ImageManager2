@@ -5,7 +5,6 @@ using ImageManager.App.Services;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
-using ImageManager.Infrastructure.Imaging;
 using System.Diagnostics;
 
 namespace ImageManager.App.ViewModels;
@@ -154,7 +153,7 @@ public partial class MainWindowViewModel
                         }
                         return ratings;
                     },
-                    ThumbnailGenerator.GetDimensionsOrUnknown, token), token);
+                    _thumbCache.GetDimensionsOrUnknown, token), token);
 
             var result = await Filter(source.ToArray());
             var navigation = navigationSource is null || navigationSource.Count == 0

@@ -110,6 +110,7 @@ public partial class MainWindow : Window
                 _rightClickedFolder = (el as TreeViewItem)?.DataContext as ViewModels.FolderTreeNode;
             },
             RoutingStrategies.Tunnel);
+        Closed += (_, _) => Vm.CancelActiveBackgroundTasks();
     }
 
     private async Task OpenPreviewForFileAsync(string filePath)
@@ -166,37 +167,7 @@ public partial class MainWindow : Window
 
     private async Task DeleteSelectedFilesAsync(IEnumerable<string> filePaths)
     {
-        var deletedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        int successCount = 0;
-        int failedCount = 0;
-        var thumbCache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
-
-        Vm.SuppressDeletedEvent();
-        foreach (var filePath in filePaths.Where(path => !string.IsNullOrWhiteSpace(path))
-                     .Distinct(StringComparer.OrdinalIgnoreCase))
-        {
-            if (!File.Exists(filePath)) continue;
-            try
-            {
-                File.Delete(filePath);
-                thumbCache.InvalidateThumbnail(filePath);
-                deletedPaths.Add(filePath);
-                successCount++;
-            }
-            catch (Exception ex)
-            {
-                failedCount++;
-                AppLogger.Warn($"删除文件失败: {filePath}; {ex.Message}");
-            }
-        }
-        Vm.RestoreDeletedEvent();
-
-        if (deletedPaths.Count > 0)
-            await Vm.RemoveFilesFromViewAsync(deletedPaths);
-
-        Vm.StatusText = failedCount == 0
-            ? $"已删除 {successCount} 个文件"
-            : $"已删除 {successCount} 个文件，失败 {failedCount} 个";
+        await Vm.DeleteFilesAsync(filePaths);
     }
 
     private async Task CopySelectedImagesToClipboardAsync()
@@ -327,15 +298,15 @@ public partial class MainWindow : Window
             e.Handled = true;
             var memBefore = GC.GetTotalMemory(false);
             var privBefore = System.Diagnostics.Process.GetCurrentProcess().PrivateMemorySize64 / 1048576.0;
-            Infrastructure.Helpers.MemoryPressureMonitor.CompactLoh();
+            MemoryPressureMonitor.CompactLoh();
             var memAfter = GC.GetTotalMemory(false);
             var privAfter = System.Diagnostics.Process.GetCurrentProcess().PrivateMemorySize64 / 1048576.0;
             var freedMB = (memBefore - memAfter) / 1024.0 / 1024.0;
             var privFreed = privBefore - privAfter;
             Vm.StatusText = $"GC: Heap {memBefore/1048576:F0}→{memAfter/1048576:F0}MB | " +
                 $"Private {privBefore:F0}→{privAfter:F0}MB | " +
-                $"FragScore {Infrastructure.Helpers.MemoryPressureMonitor.FragmentationScore:F1} " +
-                $"({Infrastructure.Helpers.MemoryPressureMonitor.Current})";
+                $"FragScore {MemoryPressureMonitor.FragmentationScore:F1} " +
+                $"({MemoryPressureMonitor.Current})";
             return;
         }
 
@@ -455,7 +426,7 @@ public partial class MainWindow : Window
         _scrollActivityCts?.Dispose();
         _scrollActivityCts = new CancellationTokenSource();
         var ct = _scrollActivityCts.Token;
-        App.Services.GetRequiredService<PageManager>().SetScrollActivity(true);
+        Vm.PageManager.SetScrollActivity(true);
         _ = EndScrollActivityWhenIdleAsync(ct);
     }
 
@@ -469,7 +440,7 @@ public partial class MainWindow : Window
                 () =>
                 {
                     if (!cancellationToken.IsCancellationRequested)
-                        App.Services.GetRequiredService<PageManager>().SetScrollActivity(false);
+                        Vm.PageManager.SetScrollActivity(false);
                 },
                 DispatcherPriority.Background);
         }
@@ -772,11 +743,7 @@ public partial class MainWindow : Window
 
     private void MenuAiRecommend_Click(object? sender, RoutedEventArgs e)
     {
-        var recommendService = App.Services.GetRequiredService<Infrastructure.Services.DeepSeekRecommendService>();
-        recommendService.SetApiKey(Vm.AppSettings.DeepSeekApiKey);
-
-        var tagMappingRepo = App.Services.GetRequiredService<Core.Services.ITagMappingRepository>();
-        var vm = new AiRecommendViewModel(recommendService, tagMappingRepo);
+        var vm = Vm.CreateAiRecommendViewModel();
         var win = new Settings.AiRecommendWindow { DataContext = vm };
         win.Show(this);
     }
@@ -1691,7 +1658,7 @@ public partial class MainWindow : Window
         var paths = GetTargetFilePathsForContextMenu(clicked);
         var items = CreateTemporaryImageItems(paths);
         items.AddRange(Vm.GetMaterializedThumbnailItems(paths));
-        await App.Services.GetRequiredService<PageManager>().RegenerateThumbnailsAsync(items);
+        await Vm.PageManager.RegenerateThumbnailsAsync(items);
         Vm.StatusText = $"已重新生成 {paths.Count} 个缩略图";
     }
 
@@ -1709,7 +1676,7 @@ public partial class MainWindow : Window
 
         items.AddRange(Vm.GetMaterializedThumbnailItems(paths));
 
-        await App.Services.GetRequiredService<PageManager>().RegenerateThumbnailsAsync(items);
+        await Vm.PageManager.RegenerateThumbnailsAsync(items);
         Vm.StatusText = $"已重新读取 {paths.Count} 个音乐文件的封面";
     }
 
@@ -1908,9 +1875,7 @@ public partial class MainWindow : Window
 
     private async void MenuVectorIndexSettings_Click(object? sender, RoutedEventArgs e)
     {
-        var indexService = App.Services.GetRequiredService<IVectorIndexService>();
-        var clipService = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.ChineseClipService>();
-        var viewModel = new VectorIndexViewModel(indexService, clipService);
+        var viewModel = Vm.CreateVectorIndexViewModel();
         var window = new Settings.VectorIndexWindow { DataContext = viewModel };
         await window.ShowDialog(this);
     }
@@ -1949,7 +1914,7 @@ public partial class MainWindow : Window
         if (clicked == null) return;
         var filePaths = GetTargetFilePathsForContextMenu(clicked);
         if (filePaths.Count > 0)
-            await DeleteSelectedFilesAsync(filePaths);
+            await Vm.DeleteFilesAsync(filePaths);
     }
 
     private async void MenuCopyFileToFolder_Click(object? sender, RoutedEventArgs e)
@@ -1965,38 +1930,7 @@ public partial class MainWindow : Window
         if (folders.Count == 0) return;
 
         var targetDir = folders[0].Path.LocalPath;
-        Vm.StatusText = "正在复制...";
-        int success = 0;
-        int failed = 0;
-        await Task.Run(() =>
-        {
-            Directory.CreateDirectory(targetDir);
-            foreach (var filePath in filePaths)
-            {
-                if (!File.Exists(filePath)) continue;
-                try
-                {
-                    var destPath = Common.Helpers.PathHelper.GetNonConflictingPath(
-                        Path.Combine(targetDir, Path.GetFileName(filePath)));
-                    File.Copy(filePath, destPath);
-                    Interlocked.Increment(ref success);
-                }
-                catch (Exception ex)
-                {
-                    Interlocked.Increment(ref failed);
-                    AppLogger.Warn($"复制文件失败: {filePath}; {ex.Message}");
-                }
-            }
-        });
-
-        if (string.Equals(Path.GetFullPath(targetDir).TrimEnd('\\', '/'),
-                Path.GetFullPath(Vm.CurrentFolder).TrimEnd('\\', '/'),
-                StringComparison.OrdinalIgnoreCase))
-            await Vm.LoadFolderAsync(Vm.CurrentFolder);
-
-        Vm.StatusText = failed == 0
-            ? $"已复制 {success} 个文件到: {targetDir}"
-            : $"已复制 {success} 个文件，失败 {failed} 个到: {targetDir}";
+        await Vm.CopyFilesAsync(filePaths, targetDir);
     }
 
     private async void MenuMoveFileToFolder_Click(object? sender, RoutedEventArgs e)
@@ -2012,43 +1946,7 @@ public partial class MainWindow : Window
         if (folders.Count == 0) return;
 
         var targetDir = folders[0].Path.LocalPath;
-        Vm.StatusText = "正在移动...";
-        int success = 0;
-        int failed = 0;
-
-        await Task.Run(() =>
-        {
-            var thumbCache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
-            Directory.CreateDirectory(targetDir);
-            foreach (var filePath in filePaths)
-            {
-                if (!File.Exists(filePath)) continue;
-                var srcDir = Path.GetDirectoryName(filePath) ?? "";
-                if (string.Equals(Path.GetFullPath(srcDir).TrimEnd('\\', '/'),
-                        Path.GetFullPath(targetDir).TrimEnd('\\', '/'),
-                        StringComparison.OrdinalIgnoreCase))
-                    continue;
-                try
-                {
-                    var destPath = Common.Helpers.PathHelper.GetNonConflictingPath(
-                        Path.Combine(targetDir, Path.GetFileName(filePath)));
-                    var oldPath = filePath;
-                    File.Move(oldPath, destPath);
-                    thumbCache.MoveDiskCache(oldPath, destPath);
-                    Interlocked.Increment(ref success);
-                }
-                catch (Exception ex)
-                {
-                    Interlocked.Increment(ref failed);
-                    AppLogger.Warn($"移动文件失败: {filePath}; {ex.Message}");
-                }
-            }
-        });
-
-        await Vm.LoadFolderAsync(Vm.CurrentFolder);
-        Vm.StatusText = failed == 0
-            ? $"已移动 {success} 个文件到: {targetDir}"
-            : $"已移动 {success} 个文件，失败 {failed} 个到: {targetDir}";
+        await Vm.MoveFilesAsync(filePaths, targetDir);
     }
 
     private async void MenuRefreshFolder_Click(object? sender, RoutedEventArgs e)
@@ -2409,7 +2307,7 @@ public partial class MainWindow : Window
         if (recursive == null) return;
         var paths = FolderContentOperations.EnumerateMediaFiles(_folderCardPath, recursive.Value);
         var items = CreateTemporaryImageItems(paths);
-        await App.Services.GetRequiredService<PageManager>().RegenerateThumbnailsAsync(items);
+        await Vm.PageManager.RegenerateThumbnailsAsync(items);
         await Vm.RefreshFolderItemsAsync();
         Vm.StatusText = $"已重新生成 {items.Count} 个缩略图";
     }
@@ -2493,32 +2391,7 @@ public partial class MainWindow : Window
             Vm.StatusText = "不能移动到文件夹自身或其子文件夹";
             return;
         }
-        var destination = Path.Combine(targetRoot, Path.GetFileName(_folderCardPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)));
-        try
-        {
-            var sourcePath = _folderCardPath;
-            var movedPaths = FolderContentOperations.EnumerateMediaFiles(sourcePath, recursive: true)
-                .ToDictionary(
-                    oldPath => oldPath,
-                    oldPath => destination + oldPath[sourcePath.Length..],
-                    StringComparer.OrdinalIgnoreCase);
-            Vm.SuppressDeletedEvent();
-            await Task.Run(() => Directory.Move(sourcePath, destination));
-            try
-            {
-                await Vm.UpdateMovedMediaPathsAsync(movedPaths);
-            }
-            catch
-            {
-                await Task.Run(() => Directory.Move(destination, sourcePath));
-                throw;
-            }
-            await Vm.RefreshFolderTreeAsync();
-            await Vm.LoadFolderAsync(Vm.CurrentFolder);
-            Vm.StatusText = $"已移动文件夹到：{targetRoot}";
-        }
-        catch (Exception ex) { Vm.StatusText = $"移动文件夹失败：{ex.Message}"; }
-        finally { Vm.RestoreDeletedEvent(); }
+        await Vm.MoveDirectoryAsync(_folderCardPath, targetRoot);
     }
 
     private static void CopyDirectory(string source, string destination)
@@ -2621,10 +2494,9 @@ public partial class MainWindow : Window
 
     private async void MenuArchivedFolders_Click(object? sender, RoutedEventArgs e)
     {
-        var repo = App.Services.GetRequiredService<IFolderRepository>();
         var window = new Settings.ArchivedFoldersWindow
         {
-            DataContext = new ArchivedFoldersViewModel(repo)
+            DataContext = new ArchivedFoldersViewModel(Vm.FolderRepository)
         };
         await window.ShowDialog(this);
         await Vm.RefreshFolderTreeAsync();
@@ -2684,10 +2556,7 @@ public partial class MainWindow : Window
                 : await GetImageFilesInFolderAsync(folder.Path);
             if (files.Count == 0) { Vm.StatusText = "所选范围内没有图片或视频。"; return; }
             Vm.StatusText = $"正在清空 {files.Count} 个文件的标签…";
-            var repository = App.Services.GetRequiredService<IImageMetaRepository>();
-            await Task.Run(() => repository.ClearTagsAndStatusBatchAsync(files));
-            Vm.InvalidatePageCache();
-            await Vm.RefreshTagsAfterExternalWriteAsync(files);
+            await Vm.ClearFilesTagsAndStatusAsync(files);
             AppLogger.Info($"ClearFolderTags: folder={folder.Path}, recursive={recursive}, files={files.Count}");
             Vm.StatusText = $"已清空 {files.Count} 个文件的标签。";
         }
@@ -2715,7 +2584,7 @@ public partial class MainWindow : Window
         if (_characterMatchScope != null || IsBlockedByTagClear(scope)) return;
         _characterMatchScope = scope;
         RefreshFolderMenuState();
-        try { await RunCharacterEmbeddingMatchAsync(folder.Path); }
+        try { await Vm.RunCharacterMatchAsync(folder.Path); }
         finally
         {
             _characterMatchScope = null;
@@ -2780,11 +2649,13 @@ public partial class MainWindow : Window
                 Vm.BackgroundStatusText =
                     $"媒体缩略图 {update.Completed}/{update.Total} | 命中 {update.Cached} / 生成 {update.Generated} / 无封面 {update.NoPreview} / 跳过视频 {update.SkippedVideos} / 失败 {update.Failed}";
             });
-            var service = App.Services.GetRequiredService<IMediaThumbnailPrewarmService>();
-            var pageManager = App.Services.GetRequiredService<PageManager>();
-            var result = await service.PrewarmAsync(paths, pageManager.ThumbnailDecodeWidth, progress, token);
-            Vm.StatusText =
-                $"媒体缩略图预生成完成: 总数 {result.Total}, 命中 {result.Cached}, 生成 {result.Generated}, 无封面 {result.NoPreview}, 跳过视频 {result.SkippedVideos}, 失败 {result.Failed}";
+            var result = await Vm.PrewarmMediaThumbnailsAsync(paths, progress, token);
+            if (result.HasValue)
+            {
+                var val = result.Value;
+                Vm.StatusText =
+                    $"媒体缩略图预生成完成: 总数 {val.Total}, 命中 {val.Cached}, 生成 {val.Generated}, 无封面 {val.NoPreview}, 跳过视频 {val.SkippedVideos}, 失败 {val.Failed}";
+            }
         }
         catch (OperationCanceledException)
         {
@@ -2838,108 +2709,7 @@ public partial class MainWindow : Window
             var videos = await GetVideoFilesRecursiveAsync(rootPath);
             token.ThrowIfCancellationRequested();
 
-            if (videos.Count == 0)
-            {
-                await App.UI.InvokeAsync(() =>
-                {
-                    Vm.StatusText = "文件夹及子文件夹无视频";
-                    Vm.BackgroundStatusText = "";
-                });
-                return;
-            }
-
-            var originalFrames = App.Services.GetRequiredService<VideoOriginalFrameCacheService>();
-            var existing = 0;
-            var missingVideos = new List<string>();
-
-            await App.UI.InvokeAsync(() =>
-            {
-                Vm.StatusText = $"正在检查 {videos.Count} 个视频的原始帧缓存...";
-                Vm.BackgroundStatusText = $"视频原始帧检查 0/{videos.Count}";
-            });
-
-            for (var i = 0; i < videos.Count; i++)
-            {
-                token.ThrowIfCancellationRequested();
-
-                if (originalFrames.Exists(videos[i]))
-                    existing++;
-                else
-                    missingVideos.Add(videos[i]);
-
-                if ((i + 1) % 100 == 0 || i + 1 == videos.Count)
-                {
-                    var checkedCount = i + 1;
-                    var missingCount = missingVideos.Count;
-                    await App.UI.InvokeAsync(() =>
-                    {
-                        Vm.BackgroundStatusText =
-                            $"视频原始帧检查 {checkedCount}/{videos.Count} | 已有 {existing} / 缺失 {missingCount}";
-                    });
-                }
-            }
-
-            var missing = missingVideos.Count;
-            await App.UI.InvokeAsync(() =>
-            {
-                Vm.StatusText = $"视频原始帧: 总数 {videos.Count}, 已有 {existing}, 缺失 {missing}";
-                Vm.BackgroundStatusText = missing == 0
-                    ? ""
-                    : $"视频原始帧生成 0/{missing} | 已有 {existing} / 新增 0 / 失败 0";
-            });
-
-            if (missing == 0)
-                return;
-
-            var generated = 0;
-            var failed = 0;
-
-            for (var i = 0; i < missingVideos.Count; i++)
-            {
-                token.ThrowIfCancellationRequested();
-                var path = missingVideos[i];
-                var index = i + 1;
-
-                await App.UI.InvokeAsync(() =>
-                {
-                    Vm.BackgroundStatusText =
-                        $"视频原始帧生成 {index}/{missing} | 已有 {existing} / 新增 {generated} / 失败 {failed}";
-                });
-
-                VideoOriginalFrameResult result;
-                try
-                {
-                    result = await originalFrames.EnsureAsync(
-                        path,
-                        token,
-                        cancelExtractionOnCancellation: true);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    result = new VideoOriginalFrameResult(false, false, null, ex.Message);
-                }
-
-                if (result.Success)
-                {
-                    if (!result.AlreadyExisted)
-                        generated++;
-                }
-                else
-                {
-                    failed++;
-                    AppLogger.Warn($"VideoOriginalFrames batch failed file={path} error={result.Error}");
-                }
-            }
-
-            await App.UI.InvokeAsync(() =>
-            {
-                Vm.StatusText = $"视频原始帧完成: 总数 {videos.Count}, 已有 {existing}, 新增 {generated}, 失败 {failed}";
-                Vm.BackgroundStatusText = "";
-            });
+            await Vm.PrewarmVideoOriginalFramesAsync(videos, token);
         }
         catch (OperationCanceledException)
         {
@@ -2972,96 +2742,6 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task RunCharacterEmbeddingMatchAsync(string rootPath)
-    {
-        const string modelKey = "pixai";
-        const string modelVersion = "v0.9";
-        const string source = "CharacterEmbedding";
-
-        Vm.StatusText = "正在匹配人物 Embedding...";
-
-        try
-        {
-            var imageFiles = (await GetImageFilesRecursiveAsync(rootPath))
-                .Where(FileTypeConstants.IsImageFile)
-                .ToList();
-            if (imageFiles.Count == 0)
-            {
-                Vm.StatusText = "文件夹及子文件夹无图片";
-                return;
-            }
-
-            var embeddingRepo = App.Services.GetRequiredService<IImageEmbeddingRepository>();
-            var characterStore = App.Services.GetRequiredService<CharacterEmbeddingStore>();
-            if (characterStore.Count == 0)
-            {
-                Vm.StatusText = "角色 Embedding 库为空，请先构建角色库";
-                return;
-            }
-
-            var settings = Vm.AppSettings;
-            var embeddings = await embeddingRepo.GetByFolderPrefixAsync(rootPath, modelKey, modelVersion);
-            var imageSet = new HashSet<string>(imageFiles, StringComparer.OrdinalIgnoreCase);
-            embeddings = embeddings
-                .Where(e => imageSet.Contains(e.FilePath))
-                .ToList();
-
-            var missing = imageFiles.Count - embeddings.Count;
-            var matched = 0;
-            var written = 0;
-            var pending = new List<(long ImageMetaId, string TagName)>(100);
-            var pendingPaths = new List<string>(100);
-
-            for (var i = 0; i < embeddings.Count; i++)
-            {
-                var item = embeddings[i];
-                var matches = characterStore.SearchTop(
-                    item.Embedding,
-                    settings.CharacterMatchThreshold,
-                    Math.Clamp(settings.CharacterMaxMatchesPerImage, 1, 5));
-
-                foreach (var match in matches)
-                {
-                    pending.Add((item.ImageMetaId, match.CharacterName));
-                    pendingPaths.Add(item.FilePath);
-                }
-
-                if (matches.Count > 0)
-                    matched++;
-
-                if (pending.Count >= 100)
-                {
-                    written += await embeddingRepo.AddCharacterEmbeddingTagsAsync(pending, source);
-                    await Vm.RefreshTagsAfterExternalWriteAsync(pendingPaths, refreshCounts: false);
-                    pending.Clear();
-                    pendingPaths.Clear();
-                }
-
-                if ((i + 1) % 200 == 0 || i + 1 == embeddings.Count)
-                {
-                    Vm.BackgroundStatusText =
-                        $"人物 Embedding 匹配 {i + 1}/{embeddings.Count} | 命中 {matched} / 缺失 {missing}";
-                }
-            }
-
-            if (pending.Count > 0)
-            {
-                written += await embeddingRepo.AddCharacterEmbeddingTagsAsync(pending, source);
-                await Vm.RefreshTagsAfterExternalWriteAsync(pendingPaths, refreshCounts: false);
-            }
-
-            Vm.BackgroundStatusText = "";
-            Vm.StatusText =
-                $"人物 Embedding 匹配完成: 图片 {imageFiles.Count}, 有向量 {embeddings.Count}, 缺失 {missing}, 命中 {matched}, 写入 {written}";
-            await Vm.RefreshTagsAfterExternalWriteAsync(Array.Empty<string>());
-        }
-        catch (Exception ex)
-        {
-            Vm.BackgroundStatusText = "";
-            Vm.StatusText = $"人物 Embedding 匹配失败: {ex.Message}";
-            AppLogger.Error($"Character embedding match failed: {ex}");
-        }
-    }
 
     private static async Task<List<string>> GetImageFilesInFolderAsync(string path)
     {
@@ -3144,70 +2824,13 @@ public partial class MainWindow : Window
             : FolderOperationScope.ForFiles(filePaths ?? []);
         if (IsBlockedByTagClear(scope)) return;
 
-        var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
-
-        var settings = Vm.AppSettings;
-        controller.Configure(
-            (Core.Services.TagMode)settings.TagMode,
-            settings.SingleModelMinConfidence, 75,
-            settings.EnsemblePixaiMinConfidence,
-            settings.ArtistMatchThreshold,
-            settings.EnableCharacterRecognition,
-            settings.CharacterMatchThreshold,
-            settings.CharacterMaxMatchesPerImage,
-            settings.DeepSeekApiKey);
-
-        var messenger = App.Services.GetRequiredService<IMessenger>();
-        // 用唯一 token 替代 this，避免旧 Task.Run 的 finally 误删新 handler
-        var msgToken = new object();
-        var terminalMessage = 0;
-        messenger.Register<AutoTagProgressMessage>(msgToken, (r, m) =>
-        {
-            if (m.Phase is "Done" or "Stopped" or "Error")
-                Interlocked.Exchange(ref terminalMessage, 1);
-            App.UI.Post(() =>
-            {
-                Vm.StatusText = m.StatusText;
-            });
-        });
-
         var runVersion = Interlocked.Increment(ref _autoTagRunVersion);
         Vm.IsAutoTagRunning = true;
         _autoTagScope = scope;
         RefreshFolderMenuState();
-        Vm.StatusText = "正在准备自动打标...";
         try
         {
-            if (folder != null)
-            {
-                await controller.RunFolderAsync(folder.DbId, folder.Path, recursive);
-            }
-            else
-            {
-                await controller.RunSelectedImagesAsync(filePaths ?? new List<string>());
-            }
-
-            var processed = controller.LastProcessedPaths?.ToList() ?? new List<string>();
-            await App.UI.InvokeAsync(async () =>
-            {
-                if (processed.Count > 0)
-                {
-                    await Vm.RefreshTagsAfterExternalWriteAsync(processed);
-                    AppLogger.Info($"AutoTag tag counts refreshed processed={processed.Count}");
-                }
-
-                if (Volatile.Read(ref terminalMessage) == 0)
-                {
-                    var total = (filePaths?.Count ?? 0);
-                    Vm.StatusText = controller.LastRunCancelled
-                        ? "自动打标已停止"
-                        : processed.Count > 0
-                            ? $"打标完成 ({processed.Count}/{(total > 0 ? total : processed.Count)} 张)"
-                            : controller.LastPreparationFailed > 0
-                                ? $"打标完成（准备失败 {controller.LastPreparationFailed} 张，跳过 {controller.LastSkippedCount} 张）"
-                                : $"打标完成（跳过 {controller.LastSkippedCount} 张）";
-                }
-            });
+            await Vm.RunAutoTagAsync(folder?.DbId, folder?.Path, filePaths, recursive);
         }
         catch (Exception ex)
         {
@@ -3219,22 +2842,15 @@ public partial class MainWindow : Window
         }
         finally
         {
-            try { messenger.Unregister<AutoTagProgressMessage>(msgToken); }
-            catch (Exception ex) { AppLogger.Warn($"AutoTag unregister failed: {ex.Message}"); }
-
-            try
+            await App.UI.InvokeAsync(() =>
             {
-                await App.UI.InvokeAsync(() =>
+                if (runVersion == Volatile.Read(ref _autoTagRunVersion))
                 {
-                    if (runVersion == Volatile.Read(ref _autoTagRunVersion))
-                    {
-                        Vm.IsAutoTagRunning = false;
-                        _autoTagScope = null;
-                        RefreshFolderMenuState();
-                    }
-                });
-            }
-            catch (Exception ex) { AppLogger.Warn($"AutoTag reset IsRunning failed: {ex.Message}"); }
+                    Vm.IsAutoTagRunning = false;
+                    _autoTagScope = null;
+                    RefreshFolderMenuState();
+                }
+            });
         }
     }
 
@@ -3444,6 +3060,7 @@ public partial class MainWindow : Window
 
     private void Window_Closing(object? sender, Avalonia.Controls.WindowClosingEventArgs e)
     {
+        Vm.CancelActiveBackgroundTasks();
         _prewarmThumbnailsCts?.Cancel();
         _scrollActivityCts?.Cancel();
         _scrollActivityCts?.Dispose();
@@ -3455,7 +3072,7 @@ public partial class MainWindow : Window
         _continuousReflowCts = null;
         _continuousResizeTimer.Stop();
         SizeChanged -= OnWindowSizeChanged;
-        App.Services.GetRequiredService<PageManager>().SetScrollActivity(false);
+        Vm.PageManager.SetScrollActivity(false);
         Vm.PropertyChanged -= OnViewModelPropertyChanged;
         Vm.ContinuousDisplayRefreshRequested -= ApplyDisplayModeAsync;
         ContinuousItemsImages.LayoutUpdated -= OnContinuousItemsImagesLayoutUpdated;
@@ -3481,8 +3098,7 @@ public partial class MainWindow : Window
         var vm = new ThumbnailSettingViewModel(Vm.AppSettings, () =>
         {
             _ = Vm.ApplyThumbnailSettingsAsync();
-            var cache = App.Services.GetRequiredService<Infrastructure.Caching.ThumbnailCacheService>();
-            _ = cache.ClearAsync();
+            _ = Vm.ClearThumbnailCacheAsync();
         });
 
         var win = new Settings.ThumbnailSettingWindow { DataContext = vm };
@@ -3592,16 +3208,7 @@ public partial class MainWindow : Window
 
     private async void MenuArtistDbBuilder_Click(object? sender, RoutedEventArgs e)
     {
-        var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
-
-        if (!controller.IsModelLoaded)
-        {
-            Vm.StatusText = "正在加载打标模型...";
-            try { await controller.LoadModelAsync(); }
-            catch (Exception ex) { Vm.StatusText = $"模型加载失败: {ex.Message}"; return; }
-        }
-
-        var vm = new ViewModels.ArtistDbBuilderViewModel();
+        var vm = Vm.CreateArtistDbBuilderViewModel(LibraryBuildTarget.Artist);
 
         vm.OnSelectFolder = async _ =>
         {
@@ -3614,112 +3221,18 @@ public partial class MainWindow : Window
                 vm.ReferenceDir = result[0].Path.LocalPath;
         };
 
-        vm.OnBuildAsync = dir =>
+        var win = new Settings.ArtistDbBuilderWindow
         {
-            return Task.Run(async () =>
-            {
-                var pixai = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.PixaiTagService>();
-                var store = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.ArtistEmbeddingStore>();
-
-                // Phase 1: 扫描所有画师文件夹，比对图片数量
-                var artistDirs = Directory.GetDirectories(dir);
-                if (artistDirs.Length == 0)
-                {
-                    await App.UI.InvokeAsync(() => vm.StatusText = "未找到子文件夹");
-                    return;
-                }
-
-                var toBuild = new List<(string name, string dir, int imgCount)>();
-                int skipped = 0;
-                foreach (var artistDir in artistDirs)
-                {
-                    var artistName = Path.GetFileName(artistDir);
-                    var images = Directory.GetFiles(artistDir)
-                        .Where(f => FileTypeConstants.IsMediaFile(f))
-                        .ToList();
-                    int currentCount = images.Count;
-                    int storedCount = store.GetImageCount(artistName);
-
-                    if (storedCount == currentCount && storedCount > 0)
-                    {
-                        skipped++;
-                        continue;
-                    }
-                    toBuild.Add((artistName, artistDir, currentCount));
-                }
-
-                if (toBuild.Count == 0)
-                {
-                    await App.UI.InvokeAsync(() =>
-                        vm.StatusText = $"全部 {skipped} 位画师无需更新");
-                    return;
-                }
-
-                // Phase 2: 批量推理需要重建的画师
-                int built = 0;
-                foreach (var (artistName, artistDir, imgCount) in toBuild)
-                {
-                    built++;
-                    var label = store.GetImageCount(artistName) > 0 ? $"重建 {artistName}" : $"新增 {artistName}";
-                    var hint = $"跳过{skipped} / 处理{built}/{toBuild.Count}: {label}";
-                    await App.UI.InvokeAsync(() =>
-                    {
-                        vm.ReportProgress(built, toBuild.Count, $"{hint} ({imgCount}张)");
-                    });
-
-                    var images = Directory.GetFiles(artistDir)
-                        .Where(f => FileTypeConstants.IsMediaFile(f))
-                        .ToList();
-
-                    if (images.Count == 0) continue;
-
-                    float[]? sumEmb = null;
-                    int valid = 0;
-                    var embeddings = await ExtractEmbeddingsForLibraryAsync(pixai, images, artistName);
-                    foreach (var emb in embeddings)
-                    {
-                        if (sumEmb == null) sumEmb = new float[emb.Length];
-                        for (int j = 0; j < emb.Length; j++) sumEmb[j] += emb[j];
-                        valid++;
-                    }
-
-                    if (sumEmb != null && valid > 0)
-                    {
-                        for (int j = 0; j < sumEmb.Length; j++) sumEmb[j] /= valid;
-                        controller.RegisterArtistWithEmbeddingAsync(artistName, sumEmb, valid);
-                    }
-                }
-
-                await App.UI.InvokeAsync(() =>
-                    vm.ReportProgress(toBuild.Count, toBuild.Count,
-                        $"完成！跳过 {skipped} / 重建+新增 {toBuild.Count}，共 {controller.GetArtistStoreCount()} 位画师"));
-            });
+            DataContext = vm,
+            Title = "画师嵌入库构建工具"
         };
-
-        var win = new Settings.ArtistDbBuilderWindow { DataContext = vm };
+        win.Closing += (_, _) => vm.Cancel();
         await win.ShowDialog(this);
     }
 
     private async void MenuCharacterDbBuilder_Click(object? sender, RoutedEventArgs e)
     {
-        var controller = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.AutoTagOrchestrator>();
-
-        if (!controller.IsModelLoaded)
-        {
-            Vm.StatusText = "正在加载打标模型...";
-            try { await controller.LoadModelAsync(); }
-            catch (Exception ex) { Vm.StatusText = $"模型加载失败: {ex.Message}"; return; }
-        }
-
-        var vm = new ViewModels.ArtistDbBuilderViewModel
-        {
-            StatusText = "就绪",
-            ReferenceDescription = "每个子文件夹 = 一个角色，文件夹名 = 角色名，文件夹内为该角色的参考图",
-            LibraryTitle = "当前角色库",
-            MeanEmbeddingHint = "每个角色取所有参考图的嵌入均值",
-            RecommendedCountHint = "建议每个角色 20-50 张代表图",
-            IncrementalHint = "新角色可随时添加，自动与已有库合并"
-        };
+        var vm = Vm.CreateArtistDbBuilderViewModel(LibraryBuildTarget.Character);
 
         vm.OnSelectFolder = async _ =>
         {
@@ -3732,168 +3245,13 @@ public partial class MainWindow : Window
                 vm.ReferenceDir = result[0].Path.LocalPath;
         };
 
-        vm.OnBuildAsync = dir =>
-        {
-            return Task.Run(async () =>
-            {
-                var pixai = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.PixaiTagService>();
-                var store = App.Services.GetRequiredService<ImageManager.Infrastructure.Services.CharacterEmbeddingStore>();
-
-                var characterDirs = Directory.GetDirectories(dir);
-                if (characterDirs.Length == 0)
-                {
-                    await App.UI.InvokeAsync(() => vm.StatusText = "未找到子文件夹");
-                    return;
-                }
-
-                var toBuild = new List<(string name, string dir, int imgCount)>();
-                int skipped = 0;
-                foreach (var characterDir in characterDirs)
-                {
-                    var characterName = Path.GetFileName(characterDir);
-                    var images = Directory.GetFiles(characterDir)
-                        .Where(f => FileTypeConstants.IsMediaFile(f))
-                        .ToList();
-                    int currentCount = images.Count;
-                    int storedCount = store.GetImageCount(characterName);
-
-                    if (storedCount == currentCount && storedCount > 0)
-                    {
-                        skipped++;
-                        continue;
-                    }
-                    toBuild.Add((characterName, characterDir, currentCount));
-                }
-
-                if (toBuild.Count == 0)
-                {
-                    await App.UI.InvokeAsync(() =>
-                        vm.StatusText = $"全部 {skipped} 个角色无需更新");
-                    return;
-                }
-
-                int built = 0;
-                foreach (var (characterName, characterDir, imgCount) in toBuild)
-                {
-                    built++;
-                    var label = store.GetImageCount(characterName) > 0 ? $"重建 {characterName}" : $"新增 {characterName}";
-                    var hint = $"跳过{skipped} / 处理{built}/{toBuild.Count}: {label}";
-                    await App.UI.InvokeAsync(() =>
-                    {
-                        vm.ReportProgress(built, toBuild.Count, $"{hint} ({imgCount}张)");
-                    });
-
-                    var images = Directory.GetFiles(characterDir)
-                        .Where(f => FileTypeConstants.IsMediaFile(f))
-                        .ToList();
-
-                    if (images.Count == 0) continue;
-
-                    float[]? sumEmb = null;
-                    int valid = 0;
-                    var embeddings = await ExtractEmbeddingsForLibraryAsync(pixai, images, characterName);
-                    foreach (var emb in embeddings)
-                    {
-                        if (sumEmb == null) sumEmb = new float[emb.Length];
-                        for (int j = 0; j < emb.Length; j++) sumEmb[j] += emb[j];
-                        valid++;
-                    }
-
-                    if (sumEmb != null && valid > 0)
-                    {
-                        for (int j = 0; j < sumEmb.Length; j++) sumEmb[j] /= valid;
-                        controller.RegisterCharacterWithEmbedding(characterName, sumEmb, valid);
-                    }
-                }
-
-                await App.UI.InvokeAsync(() =>
-                    vm.ReportProgress(toBuild.Count, toBuild.Count,
-                        $"完成！跳过 {skipped} / 重建+新增 {toBuild.Count}，共 {controller.GetCharacterStoreCount()} 个角色"));
-            });
-        };
-
         var win = new Settings.ArtistDbBuilderWindow
         {
             DataContext = vm,
             Title = "角色嵌入库构建工具"
         };
+        win.Closing += (_, _) => vm.Cancel();
         await win.ShowDialog(this);
-    }
-
-    private static async Task<List<float[]>> ExtractEmbeddingsForLibraryAsync(
-        PixaiTagService pixai,
-        List<string> images,
-        string libraryItemName)
-    {
-        var result = new List<float[]>();
-        int batchSize = 2;
-        int index = 0;
-
-        while (index < images.Count)
-        {
-            var actualBatchSize = Math.Min(batchSize, images.Count - index);
-            var batch = images.Skip(index).Take(actualBatchSize).ToList();
-
-            try
-            {
-                var embs = await pixai.GetEmbeddingsBatchAsync(batch);
-                if (embs != null)
-                    result.AddRange(embs);
-
-                index += actualBatchSize;
-            }
-            catch (Exception ex) when (IsOnnxMemoryException(ex))
-            {
-                AppLogger.Warn(
-                    $"Embedding library batch memory pressure item={libraryItemName} batch={actualBatchSize}: {ex.Message}");
-                GC.Collect();
-                GC.WaitForPendingFinalizers();
-                GC.Collect();
-
-                if (actualBatchSize > 1)
-                {
-                    batchSize = Math.Max(1, actualBatchSize / 2);
-                    continue;
-                }
-
-                try
-                {
-                    var emb = await pixai.GetEmbeddingAsync(batch[0]);
-                    if (emb != null)
-                        result.Add(emb);
-                }
-                catch (Exception singleEx)
-                {
-                    AppLogger.Warn(
-                        $"Embedding library skipped image item={libraryItemName} file={Path.GetFileName(batch[0])}: {singleEx.Message}");
-                }
-
-                index++;
-            }
-            catch (Exception ex)
-            {
-                AppLogger.Warn(
-                    $"Embedding library batch failed item={libraryItemName} batch={actualBatchSize}: {ex.Message}");
-
-                if (actualBatchSize > 1)
-                {
-                    batchSize = 1;
-                    continue;
-                }
-
-                index++;
-            }
-        }
-
-        return result;
-    }
-
-    private static bool IsOnnxMemoryException(Exception ex)
-    {
-        return ex is Microsoft.ML.OnnxRuntime.OnnxRuntimeException &&
-               (ex.Message.Contains("Available memory", StringComparison.OrdinalIgnoreCase) ||
-                ex.Message.Contains("AllocateRawInternal", StringComparison.OrdinalIgnoreCase) ||
-                ex.Message.Contains("BFCArena", StringComparison.OrdinalIgnoreCase));
     }
 
     private async void MenuTagManage_Click(object? sender, RoutedEventArgs e)

@@ -34,4 +34,48 @@ public static class PathHelper
         return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
                + Path.DirectorySeparatorChar;
     }
+
+    public static bool IsPathInside(string path, string parent)
+    {
+        if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(parent)) return false;
+
+        try
+        {
+            var candidate = NormalizePathForComparison(path);
+            var root = NormalizePathForComparison(parent);
+            if (string.Equals(candidate, root, StringComparison.OrdinalIgnoreCase)) return true;
+
+            var separator = root.EndsWith(Path.DirectorySeparatorChar) || root.EndsWith(Path.AltDirectorySeparatorChar)
+                ? string.Empty
+                : Path.DirectorySeparatorChar.ToString();
+            return candidate.StartsWith(root + separator, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    public static bool IsSafeCopyOrMoveDestination(string source, string destination)
+    {
+        if (string.IsNullOrWhiteSpace(source) || string.IsNullOrWhiteSpace(destination)) return false;
+
+        try
+        {
+            var sourcePath = NormalizePathForComparison(source);
+            var destinationPath = NormalizePathForComparison(destination);
+            return !IsPathInside(destinationPath, sourcePath);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private static string NormalizePathForComparison(string path)
+    {
+        if (path.Length == 2 && path[1] == Path.VolumeSeparatorChar)
+            return path;
+        return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
 }

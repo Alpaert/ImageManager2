@@ -11,6 +11,7 @@ using ImageManager.App.Services;
 using ImageManager.App.ViewModels;
 using ImageManager.App.Views;
 using ImageManager.Common.Helpers;
+using ImageManager.Core.Models;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Caching;
 using ImageManager.Infrastructure.Data;
@@ -45,7 +46,7 @@ public partial class App : Application
         AppLogger.Memory("App.ReleaseInferenceSessions");
     }
 
-    private static ServiceProvider ConfigureServices(string cacheDir)
+    internal static ServiceProvider ConfigureServices(string cacheDir)
     {
         var services = new ServiceCollection();
 
@@ -97,7 +98,13 @@ public partial class App : Application
         services.AddSingleton<CommunityToolkit.Mvvm.Messaging.IMessenger>(
             CommunityToolkit.Mvvm.Messaging.WeakReferenceMessenger.Default);
 
-        services.AddSingleton<IImageMetaRepository, ImageMetaRepository>();
+        services.AddSingleton<IHashDataVersionTracker, HashDataVersionTracker>();
+        services.AddSingleton<ImageMetaRepository>();
+        services.AddSingleton<IImageMetaRepository>(sp => sp.GetRequiredService<ImageMetaRepository>());
+        services.AddSingleton<IImageMetaReadRepository>(sp => sp.GetRequiredService<ImageMetaRepository>());
+        services.AddSingleton<IImageMetaWriteRepository>(sp => sp.GetRequiredService<ImageMetaRepository>());
+        services.AddSingleton<IImageTagRepository>(sp => sp.GetRequiredService<ImageMetaRepository>());
+        services.AddSingleton<IImageHashRepository>(sp => sp.GetRequiredService<ImageMetaRepository>());
         services.AddSingleton<ITagRepository, TagRepository>();
         services.AddSingleton<ITagMappingRepository, TagMappingRepository>();
         services.AddSingleton<IFolderRepository, FolderRepository>();
@@ -107,12 +114,15 @@ public partial class App : Application
 
         services.AddSingleton<IHashService, HashService>();
         services.AddSingleton(new ChineseClipService(cacheDir));
+        services.AddSingleton<IChineseClipService>(sp => sp.GetRequiredService<ChineseClipService>());
         services.AddSingleton<ISimilarImageService, SimilarImageService>();
         services.AddSingleton<IVectorIndexService, VectorIndexService>();
         services.AddSingleton<IDuplicateService, DuplicateService>();
+        services.AddSingleton<IVideoService, VideoService>();
 
         // ==================== Media Processor Factory ====================
         services.AddSingleton(new VideoOriginalFrameCacheService(cacheDir));
+        services.AddSingleton<IVideoOriginalFrameCacheService>(sp => sp.GetRequiredService<VideoOriginalFrameCacheService>());
         services.AddSingleton<IMediaProcessorFactory>(sp =>
             new MediaProcessorFactory(sp.GetRequiredService<VideoOriginalFrameCacheService>()));
 
@@ -122,6 +132,7 @@ public partial class App : Application
                 cacheDir,
                 200));
         services.AddSingleton<IThumbnailCacheService>(sp => sp.GetRequiredService<ThumbnailCacheService>());
+        services.AddSingleton<IMediaMoveService, MediaMoveService>();
         services.AddSingleton<IMediaThumbnailPrewarmService, MediaThumbnailPrewarmService>();
 
         // Existing WD service
@@ -130,9 +141,15 @@ public partial class App : Application
 
         // ==================== Ensemble Tag Services ====================
         services.AddSingleton<ChineseTagLibrary>();
+        services.AddSingleton<IChineseTagLibrary>(sp => sp.GetRequiredService<ChineseTagLibrary>());
         services.AddSingleton<ArtistEmbeddingStore>();
+        services.AddSingleton<IArtistEmbeddingStore>(sp => sp.GetRequiredService<ArtistEmbeddingStore>());
         services.AddSingleton<CharacterEmbeddingStore>();
+        services.AddSingleton<ICharacterEmbeddingStore>(sp => sp.GetRequiredService<CharacterEmbeddingStore>());
         services.AddSingleton<PixaiTagService>();
+        services.AddSingleton<IImageEmbeddingExtractor>(sp => sp.GetRequiredService<PixaiTagService>());
+        services.AddSingleton<ICharacterMatchingService, CharacterMatchingService>();
+        services.AddSingleton<ILibraryBuilderService, LibraryBuilderService>();
         services.AddSingleton<WdRatingService>();
         services.AddSingleton<TagResultMerger>();
         services.AddSingleton<SingleModelTagService>();
@@ -144,12 +161,14 @@ public partial class App : Application
         services.AddSingleton<IAutoTagStateRepository, AutoTagStateRepository>();
         services.AddSingleton<AutoTagPipelineService>();
         services.AddSingleton<AutoTagOrchestrator>();
+        services.AddSingleton<IAutoTagOrchestrator>(sp => sp.GetRequiredService<AutoTagOrchestrator>());
         services.AddSingleton<DeepSeekRecommendService>();
         services.AddSingleton<IAiRecommendService>(sp => sp.GetRequiredService<DeepSeekRecommendService>());
 
 
         services.AddSingleton<PageManager>();
         services.AddSingleton<TagSearchEngine>();
+        services.AddSingleton<ITagSearchEngine>(sp => sp.GetRequiredService<TagSearchEngine>());
         services.AddSingleton<Services.ImagePreloader>();
         services.AddSingleton<MainWindowViewModel>();
 
@@ -223,9 +242,41 @@ public partial class App : Application
 
         if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
         {
+            string? startupRecoveryNotice = null;
+            try
+            {
+                var moveService = Services.GetRequiredService<IMediaMoveService>();
+                var recovered = await moveService.RecoverPendingMovesAsync();
+                if (recovered.Count > 0)
+                {
+                    int successCount = recovered.Count(r => r.Status == MediaMoveItemStatus.Success);
+                    int compFailedCount = recovered.Count(r => r.Status == MediaMoveItemStatus.CompensationFailed);
+                    int failedCount = recovered.Count(r => r.Status == MediaMoveItemStatus.Failed);
+
+                    if (compFailedCount > 0)
+                    {
+                        startupRecoveryNotice = $"启动恢复检查：存在 {compFailedCount} 项移动未完成需人工核查（已恢复 {successCount} 项）";
+                        AppLogger.Warn($"Startup recovery completed with items needing manual attention: success={successCount}, compFailed={compFailedCount}, failed={failedCount}");
+                    }
+                    else
+                    {
+                        startupRecoveryNotice = $"启动恢复完成：已恢复 {successCount} 项未完成的移动操作";
+                        AppLogger.Info($"Startup recovery succeeded: {successCount} operation(s) recovered.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Error($"Startup recovery for pending media moves failed: {ex.Message}");
+            }
+
             await ApplySavedThemeAsync();
 
             var vm = Services.GetRequiredService<MainWindowViewModel>();
+            if (!string.IsNullOrEmpty(startupRecoveryNotice))
+            {
+                vm.StatusText = startupRecoveryNotice;
+            }
             desktop.MainWindow = new MainWindow { DataContext = vm };
             desktop.MainWindow.Closed += (_, _) => desktop.Shutdown();
             desktop.Exit += (_, _) => ReleaseInferenceSessions();

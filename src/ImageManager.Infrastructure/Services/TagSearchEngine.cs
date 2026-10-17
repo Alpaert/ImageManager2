@@ -12,7 +12,7 @@ namespace ImageManager.Infrastructure.Services;
 /// Lives in Infrastructure with no dependency on Avalonia UI.
 /// Communicates results via <see cref="IMessenger"/>.
 /// </summary>
-public class TagSearchEngine : IDisposable
+public class TagSearchEngine : ITagSearchEngine, IDisposable
 {
     private readonly IImageMetaRepository _metaRepo;
     private readonly IMessenger _messenger;

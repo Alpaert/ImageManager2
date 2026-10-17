@@ -1,10 +1,10 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Threading.Channels;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
-using ImageManager.Infrastructure.Helpers;
+
 
 namespace ImageManager.Infrastructure.Services;
 

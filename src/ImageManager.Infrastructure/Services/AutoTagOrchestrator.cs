@@ -14,7 +14,7 @@ namespace ImageManager.Infrastructure.Services;
 /// Communicates progress and results via <see cref="IMessenger"/>.
 /// All UI-thread marshalling is handled by injected <see cref="IDispatcher"/>.
 /// </summary>
-public class AutoTagOrchestrator : IDisposable
+public class AutoTagOrchestrator : IAutoTagOrchestrator, IDisposable
 {
     private readonly AutoTagPipelineService _pipeline;
     private readonly IImageMetaRepository _metaRepo;
