@@ -250,7 +250,7 @@ public sealed class SearchSnapshotAndChunkingTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Search_BuildCancellationOrException_ReleasesLockAndNextSearchSucceeds()
+    public async Task Search_BuildCancellation_WhileWaitingForGate_ReleasesLockAndNextSearchSucceeds()
     {
         var fileA = CreateTestImageFile("imgA.jpg");
         var fileB = CreateTestImageFile("imgB.jpg");
@@ -260,19 +260,128 @@ public sealed class SearchSnapshotAndChunkingTests : IAsyncLifetime
 
         var candidates = new[] { fileA, fileB };
 
-        // Inject exception into hook
+        using var enteredHook = new ManualResetEventSlim(false);
+        using var proceedHook = new ManualResetEventSlim(false);
+        using var search2WaitingGate = new ManualResetEventSlim(false);
+
+        // One search starts and pauses inside PerceptualSnapshotBuildingHook
         _similarService.PerceptualSnapshotBuildingHook = () =>
-            throw new ApplicationException("Simulated transient error during build");
+        {
+            enteredHook.Set();
+            if (!proceedHook.Wait(TimeSpan.FromSeconds(5)))
+            {
+                throw new TimeoutException("proceedHook timed out waiting in PerceptualSnapshotBuildingHook");
+            }
+        };
 
-        await Assert.ThrowsAsync<ApplicationException>(() =>
-            _similarService.SearchByImageAsync(fileA, candidates, SimilaritySearchMode.Perceptual));
+        using var cts2 = new CancellationTokenSource();
+        Task<List<SimilaritySearchResult>>? search1Task = null;
+        Task<List<SimilaritySearchResult>>? search2Task = null;
 
-        // Clear fault hook
-        _similarService.PerceptualSnapshotBuildingHook = null;
+        try
+        {
+            search1Task = Task.Run(() => _similarService.SearchByImageAsync(fileA, candidates, SimilaritySearchMode.Perceptual));
+            Assert.True(enteredHook.Wait(TimeSpan.FromSeconds(5)));
+
+            // A second search is started with a CancellationToken, so it waits on the build gate semaphore
+            _similarService.PerceptualSnapshotWaitingGateHook = () =>
+            {
+                search2WaitingGate.Set();
+            };
+
+            search2Task = Task.Run(() => _similarService.SearchByImageAsync(fileA, candidates, SimilaritySearchMode.Perceptual, ct: cts2.Token));
+
+            // Explicitly assert search2 reached the gate wait state
+            Assert.True(search2WaitingGate.Wait(TimeSpan.FromSeconds(5)));
+            Assert.False(search2Task.IsCompleted);
+
+            // Cancel the second search's token. Assert the second search throws OperationCanceledException.
+            cts2.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => search2Task.WaitAsync(TimeSpan.FromSeconds(5)));
+
+            // Release the first search's hook so the first search completes
+            proceedHook.Set();
+            var results1 = await search1Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Single(results1);
+        }
+        finally
+        {
+            proceedHook.Set();
+            _similarService.PerceptualSnapshotBuildingHook = null;
+            _similarService.PerceptualSnapshotWaitingGateHook = null;
+            cts2.Cancel();
+            if (search1Task != null) { try { await search1Task.WaitAsync(TimeSpan.FromSeconds(2)); } catch { } }
+            if (search2Task != null) { try { await search2Task.WaitAsync(TimeSpan.FromSeconds(2)); } catch { } }
+        }
+
+        // Invalidate perceptual snapshot and assert gate was released so search3 succeeds without wedging
+        _similarService.InvalidatePerceptualSnapshot();
+        var results3 = await _similarService.SearchByImageAsync(fileA, candidates, SimilaritySearchMode.Perceptual).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Single(results3);
+        Assert.Equal(2, _similarService.PerceptualSnapshotBuildCount);
+    }
+
+    [Fact]
+    public async Task Search_BuildCancellation_WhileHoldingGate_ReleasesLockAndNextSearchSucceeds()
+    {
+        var fileA = CreateTestImageFile("imgA.jpg");
+        var fileB = CreateTestImageFile("imgB.jpg");
+
+        await InsertMetaAsync(fileA, perceptualHash: HashService.ComputeCombinedPerceptualHashFromFile(fileA), hashStatus: 1);
+        await InsertMetaAsync(fileB, perceptualHash: HashService.ComputeCombinedPerceptualHashFromFile(fileB), hashStatus: 1);
+
+        var candidates = new[] { fileA, fileB };
+
+        // Start a search with a CancellationTokenSource. In PerceptualSnapshotBuildingHook, cancel the token source.
+        using var cts = new CancellationTokenSource();
+        try
+        {
+            _similarService.PerceptualSnapshotBuildingHook = () => cts.Cancel();
+
+            // Assert that SearchByImageAsync throws OperationCanceledException
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                _similarService.SearchByImageAsync(fileA, candidates, SimilaritySearchMode.Perceptual, ct: cts.Token).WaitAsync(TimeSpan.FromSeconds(5)));
+        }
+        finally
+        {
+            _similarService.PerceptualSnapshotBuildingHook = null;
+        }
+
+        var results = await _similarService.SearchByImageAsync(fileA, candidates, SimilaritySearchMode.Perceptual).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Single(results);
+        Assert.Equal(2, _similarService.PerceptualSnapshotBuildCount);
+    }
+
+    [Fact]
+    public async Task Search_BuildException_WhileHoldingGate_ReleasesLockAndNextSearchSucceeds()
+    {
+        var fileA = CreateTestImageFile("imgA.jpg");
+        var fileB = CreateTestImageFile("imgB.jpg");
+
+        await InsertMetaAsync(fileA, perceptualHash: HashService.ComputeCombinedPerceptualHashFromFile(fileA), hashStatus: 1);
+        await InsertMetaAsync(fileB, perceptualHash: HashService.ComputeCombinedPerceptualHashFromFile(fileB), hashStatus: 1);
+
+        var candidates = new[] { fileA, fileB };
+
+        try
+        {
+            // Inject exception into hook
+            _similarService.PerceptualSnapshotBuildingHook = () =>
+                throw new ApplicationException("Simulated transient error during build");
+
+            // Assert SearchByImageAsync throws ApplicationException
+            await Assert.ThrowsAsync<ApplicationException>(() =>
+                _similarService.SearchByImageAsync(fileA, candidates, SimilaritySearchMode.Perceptual).WaitAsync(TimeSpan.FromSeconds(5)));
+        }
+        finally
+        {
+            _similarService.PerceptualSnapshotBuildingHook = null;
+        }
 
         // Next search must acquire gate lock and succeed normally
-        var results = await _similarService.SearchByImageAsync(fileA, candidates, SimilaritySearchMode.Perceptual);
+        var results = await _similarService.SearchByImageAsync(fileA, candidates, SimilaritySearchMode.Perceptual).WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Single(results);
+        Assert.Equal(2, _similarService.PerceptualSnapshotBuildCount);
     }
 
     [Fact]
@@ -305,8 +414,11 @@ public sealed class SearchSnapshotAndChunkingTests : IAsyncLifetime
         var fileA = CreateTestImageFile("imgA.jpg");
         var fileB = CreateTestImageFile("imgB.jpg");
 
-        await InsertMetaAsync(fileA, perceptualHash: HashService.ComputeCombinedPerceptualHashFromFile(fileA), hashStatus: 1);
-        await InsertMetaAsync(fileB, perceptualHash: HashService.ComputeCombinedPerceptualHashFromFile(fileB), hashStatus: 1);
+        var hashA = HashService.ComputeCombinedPerceptualHashFromFile(fileA);
+        var hashB = HashService.ComputeCombinedPerceptualHashFromFile(fileB);
+
+        var idA = await InsertMetaAsync(fileA, perceptualHash: hashA, hashStatus: 1);
+        var idB = await InsertMetaAsync(fileB, perceptualHash: hashB, hashStatus: 1);
 
         var candidates = new[] { fileA, fileB };
         await _similarService.SearchByImageAsync(fileA, candidates, SimilaritySearchMode.Perceptual);
@@ -314,21 +426,55 @@ public sealed class SearchSnapshotAndChunkingTests : IAsyncLifetime
 
         var initialVersion = _versionTracker.CurrentVersion;
 
-        // Simulate failed transaction in DB
+        // Install a SQLite trigger on ImageMeta to fail when updating the second record
+        const string triggerName = "trg_fail_meta_upsert";
         using (var conn = _dbFactory.CreateConnection())
-        using (var txn = conn.BeginTransaction())
         {
-            await conn.ExecuteAsync("UPDATE ImageMeta SET PerceptualHash = 'rolled_back' WHERE FilePath = @Path",
-                new { Path = fileB }, txn);
-            txn.Rollback();
+            await conn.ExecuteAsync($@"
+                CREATE TRIGGER {triggerName}
+                BEFORE UPDATE OF PerceptualHash ON ImageMeta
+                FOR EACH ROW
+                WHEN NEW.Id = {idB}
+                BEGIN
+                    SELECT RAISE(ABORT, 'Simulated upsert failure');
+                END;");
         }
 
-        // Version tracker was not incremented
-        Assert.Equal(initialVersion, _versionTracker.CurrentVersion);
+        try
+        {
+            // Call real repository write entrypoint UpsertAsync which should fail and roll back
+            var metaB = (await _metaRepo.GetHashMetadataByPathsAsync(new[] { fileB })).Single();
+            metaB.PerceptualHash = "rolled_back_hash";
 
-        // Snapshot is reused
+            var ex = await Assert.ThrowsAsync<SqliteException>(() => _metaRepo.UpsertAsync(metaB));
+            Assert.Contains("Simulated upsert failure", ex.Message);
+
+            // Version tracker was not incremented
+            Assert.Equal(initialVersion, _versionTracker.CurrentVersion);
+
+            // Verify database data was not updated
+            var freshMetaB = (await _metaRepo.GetHashMetadataByPathsAsync(new[] { fileB })).Single();
+            Assert.Equal(hashB, freshMetaB.PerceptualHash);
+
+            // Snapshot is reused without rebuilding
+            await _similarService.SearchByImageAsync(fileA, candidates, SimilaritySearchMode.Perceptual);
+            Assert.Equal(1, _similarService.PerceptualSnapshotBuildCount);
+        }
+        finally
+        {
+            using var conn = _dbFactory.CreateConnection();
+            await conn.ExecuteAsync($"DROP TRIGGER IF EXISTS {triggerName}");
+        }
+
+        // Subsequent write via repository succeeds, increments version, and triggers snapshot rebuild
+        var validMetaB = (await _metaRepo.GetHashMetadataByPathsAsync(new[] { fileB })).Single();
+        validMetaB.PerceptualHash = CreateValidPerceptualHashString('1');
+        await _metaRepo.UpsertAsync(validMetaB);
+
+        Assert.Equal(initialVersion + 1, _versionTracker.CurrentVersion);
+
         await _similarService.SearchByImageAsync(fileA, candidates, SimilaritySearchMode.Perceptual);
-        Assert.Equal(1, _similarService.PerceptualSnapshotBuildCount);
+        Assert.Equal(2, _similarService.PerceptualSnapshotBuildCount);
     }
 
     // =========================================================================
@@ -539,7 +685,7 @@ public sealed class SearchSnapshotAndChunkingTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task BatchMutations_AtomicRollbackOnFailure()
+    public async Task BatchMutations_AtomicBatchSucceeds()
     {
         var file1 = Path.Combine(_testRoot, "atom1.jpg");
         var file2 = Path.Combine(_testRoot, "atom2.jpg");
@@ -566,6 +712,76 @@ public sealed class SearchSnapshotAndChunkingTests : IAsyncLifetime
         var statuses = await _metaRepo.GetStatusMapByPathsAsync(new List<string> { file1, file2 });
         Assert.Equal(0, statuses[file1].Status);
         Assert.Equal(0, statuses[file2].Status);
+    }
+
+    [Fact]
+    public async Task BatchMutations_AtomicRollbackOnFailure_WithTrigger()
+    {
+        var file1 = Path.Combine(_testRoot, "atom_fail1.jpg");
+        var file2 = Path.Combine(_testRoot, "atom_fail2.jpg");
+
+        var id1 = await InsertMetaAsync(file1);
+        var id2 = await InsertMetaAsync(file2);
+
+        await _metaRepo.SetTagsAsync(id1, new List<string> { "tag1" });
+        await _metaRepo.SetTagsAsync(id2, new List<string> { "tag2" });
+        await _metaRepo.SetAutoTagStatusBatchAsync(new List<string> { file1, file2 }, 2);
+
+        // Verification of initial state
+        var map1 = await _metaRepo.GetTagMapByPathsAsync(new List<string> { file1, file2 });
+        Assert.True(map1.ContainsKey(file1));
+        Assert.True(map1.ContainsKey(file2));
+        var initialStatuses = await _metaRepo.GetStatusMapByPathsAsync(new List<string> { file1, file2 });
+        Assert.Equal(2, initialStatuses[file1].Status);
+        Assert.Equal(2, initialStatuses[file2].Status);
+
+        const string triggerName = "trg_fail_second_meta_clear";
+        using (var conn = _dbFactory.CreateConnection())
+        {
+            await conn.ExecuteAsync($@"
+                CREATE TRIGGER {triggerName}
+                BEFORE UPDATE OF AutoTagStatus ON ImageMeta
+                FOR EACH ROW
+                WHEN NEW.Id = {id2}
+                BEGIN
+                    SELECT RAISE(ABORT, 'Simulated failure');
+                END;");
+        }
+
+        try
+        {
+            // Call ClearTagsAndStatusBatchAsync and assert exception
+            var ex = await Assert.ThrowsAsync<SqliteException>(() =>
+                _metaRepo.ClearTagsAndStatusBatchAsync(new List<string> { file1, file2 }));
+            Assert.Contains("Simulated failure", ex.Message);
+
+            // Assert that the first record's changes were rolled back (its tags and status are still intact!)
+            var mapRollback = await _metaRepo.GetTagMapByPathsAsync(new List<string> { file1, file2 });
+            Assert.True(mapRollback.TryGetValue(file1, out var tags1) && tags1.Count > 0);
+            Assert.Equal("tag1", tags1[0]);
+            Assert.True(mapRollback.TryGetValue(file2, out var tags2) && tags2.Count > 0);
+            Assert.Equal("tag2", tags2[0]);
+
+            var statusesRollback = await _metaRepo.GetStatusMapByPathsAsync(new List<string> { file1, file2 });
+            Assert.Equal(2, statusesRollback[file1].Status);
+            Assert.Equal(2, statusesRollback[file2].Status);
+        }
+        finally
+        {
+            using var conn = _dbFactory.CreateConnection();
+            await conn.ExecuteAsync($"DROP TRIGGER IF EXISTS {triggerName}");
+        }
+
+        // Retry ClearTagsAndStatusBatchAsync after dropping trigger, asserting that it now succeeds cleanly
+        await _metaRepo.ClearTagsAndStatusBatchAsync(new List<string> { file1, file2 });
+
+        var mapClean = await _metaRepo.GetTagMapByPathsAsync(new List<string> { file1, file2 });
+        Assert.False(mapClean.TryGetValue(file1, out var cleanTags1) && cleanTags1.Count > 0);
+        Assert.False(mapClean.TryGetValue(file2, out var cleanTags2) && cleanTags2.Count > 0);
+
+        var statusesClean = await _metaRepo.GetStatusMapByPathsAsync(new List<string> { file1, file2 });
+        Assert.Equal(0, statusesClean[file1].Status);
+        Assert.Equal(0, statusesClean[file2].Status);
     }
 
     [Fact]

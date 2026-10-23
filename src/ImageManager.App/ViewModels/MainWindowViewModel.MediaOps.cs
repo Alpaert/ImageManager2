@@ -466,6 +466,7 @@ public partial class MainWindowViewModel
         int successCount = 0;
         int failedCount = 0;
 
+        _pageManager.CancelCurrentLoads();
         SuppressDeletedEvent();
         try
         {
@@ -477,7 +478,25 @@ public partial class MainWindowViewModel
                     if (!File.Exists(filePath)) continue;
                     try
                     {
-                        File.Delete(filePath);
+                        bool deleted = false;
+                        for (int attempt = 0; attempt < 5; attempt++)
+                        {
+                            try
+                            {
+                                File.Delete(filePath);
+                                deleted = true;
+                                break;
+                            }
+                            catch (IOException) when (attempt < 4)
+                            {
+                                Thread.Sleep(30);
+                            }
+                        }
+                        if (!deleted)
+                        {
+                            File.Delete(filePath);
+                        }
+
                         _thumbCache.InvalidateThumbnail(filePath);
                         lock (deletedPaths)
                         {

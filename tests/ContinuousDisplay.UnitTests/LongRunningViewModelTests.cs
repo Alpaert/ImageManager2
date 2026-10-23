@@ -124,11 +124,11 @@ public sealed class LongRunningViewModelTests
         };
 
         var buildTask = vm.BuildCommand.ExecuteAsync(null);
-        await buildStarted.Task;
+        await buildStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Cancel while running
         vm.Cancel();
-        await buildTask;
+        await buildTask.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.False(vm.IsRunning);
         Assert.Contains("取消", vm.StatusText);

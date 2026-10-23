@@ -139,6 +139,7 @@ internal sealed class SimilaritySnapshotManager : IDisposable
 
     public int PerceptualSnapshotBuildCount => Volatile.Read(ref _perceptualSnapshotBuildCount);
     public Action? PerceptualSnapshotBuildingHook { get; set; }
+    public Action? PerceptualSnapshotWaitingGateHook { get; set; }
 
     public SimilaritySnapshotManager(
         IImageHashRepository hashRepository,
@@ -249,6 +250,7 @@ internal sealed class SimilaritySnapshotManager : IDisposable
             return snapshot;
         }
 
+        PerceptualSnapshotWaitingGateHook?.Invoke();
         await _perceptualSnapshotBuildGate.WaitAsync(ct);
         try
         {

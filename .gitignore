@@ -402,3 +402,6 @@ config.toml
 
 # 验证与诊断临时目录 - 不推送
 /.verification-temp/
+
+# 验收/分析报告 - 不推送
+/reports/

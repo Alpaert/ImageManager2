@@ -764,7 +764,7 @@ public partial class MainWindowViewModel
         return _folderWorkCts.Token;
     }
 
-    private CancellationToken CurrentFolderWorkToken => Volatile.Read(ref _folderWorkCts).Token;
+    internal CancellationToken CurrentFolderWorkToken => Volatile.Read(ref _folderWorkCts).Token;
 
     private void RunBackgroundSafe(string name, CancellationToken ct, Func<CancellationToken, Task> work)
     {

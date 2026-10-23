@@ -259,6 +259,28 @@ public class ImageMetaRepository : IImageMetaRepository
                     FolderId = @FolderId, UpdatedAt = @UpdatedAt, HashStatus = @HashStatus
                 WHERE Id = @Id", meta, txn);
         }
+        else if (meta.Id > 0 && await conn.QuerySingleOrDefaultAsync<(long Id, string FilePath, long? FolderId, long LastWriteTicks, long FileSize, DateTime? UpdatedAt)>(
+            "SELECT Id, FilePath, FolderId, LastWriteTicks, FileSize, UpdatedAt FROM ImageMeta WHERE Id = @Id", new { meta.Id }, txn) is var byId && byId != default)
+        {
+            // Record was concurrently moved/renamed (its FilePath in DB is now byId.FilePath)
+            meta.Id = byId.Id;
+            bool isStale = (byId.LastWriteTicks > meta.LastWriteTicks)
+                || (byId.LastWriteTicks == meta.LastWriteTicks && byId.FileSize != meta.FileSize && byId.FileSize > 0);
+
+            if (!isStale)
+            {
+                meta.UpdatedAt = DateTime.UtcNow;
+                if (byId.FolderId.HasValue)
+                    meta.FolderId = byId.FolderId.Value;
+                await conn.ExecuteAsync(@"
+                    UPDATE ImageMeta SET
+                        FileHash = @FileHash, PerceptualHash = @PerceptualHash,
+                        Width = @Width, Height = @Height,
+                        FileSize = @FileSize, LastWriteTicks = @LastWriteTicks,
+                        FolderId = @FolderId, UpdatedAt = @UpdatedAt, HashStatus = @HashStatus
+                    WHERE Id = @Id", meta, txn);
+            }
+        }
         else
         {
             meta.CreatedAt = DateTime.UtcNow;
@@ -310,6 +332,22 @@ public class ImageMetaRepository : IImageMetaRepository
                 foreach (var (fp, id, folderId, existingFolderId) in existing)
                     existingMap[fp] = (id, folderId, existingFolderId.HasValue);
 
+                var unmatchedMetasWithId = metas
+                    .Where(m => !existingMap.ContainsKey(m.FilePath) && m.Id > 0)
+                    .Select(m => m.Id)
+                    .Distinct()
+                    .ToList();
+
+                var existingByIdMap = new Dictionary<long, (string FilePath, long? FolderId, long LastWriteTicks, long FileSize, DateTime? UpdatedAt)>();
+                if (unmatchedMetasWithId.Count > 0)
+                {
+                    var existingById = await conn.QueryAsync<(long Id, string FilePath, long? FolderId, long LastWriteTicks, long FileSize, DateTime? UpdatedAt)>(@"
+                        SELECT Id, FilePath, FolderId, LastWriteTicks, FileSize, UpdatedAt FROM ImageMeta WHERE Id IN @Ids",
+                        new { Ids = unmatchedMetasWithId }, txn);
+                    foreach (var row in existingById)
+                        existingByIdMap[row.Id] = (row.FilePath, row.FolderId, row.LastWriteTicks, row.FileSize, row.UpdatedAt);
+                }
+
                 var now = DateTime.UtcNow;
                 foreach (var meta in metas)
                 {
@@ -327,6 +365,30 @@ public class ImageMetaRepository : IImageMetaRepository
                                 FileSize = @FileSize, LastWriteTicks = @LastWriteTicks,
                                 FolderId = @FolderId, UpdatedAt = @UpdatedAt, HashStatus = @HashStatus
                             WHERE Id = @Id", meta, txn);
+                        existingByIdMap[meta.Id] = (meta.FilePath, meta.FolderId, meta.LastWriteTicks, meta.FileSize, now);
+                    }
+                    else if (meta.Id > 0 && existingByIdMap.TryGetValue(meta.Id, out var byId))
+                    {
+                        // Concurrently moved/renamed: update existing record by Id, preserving its new FilePath unless incoming data is stale
+                        meta.Id = meta.Id;
+                        bool isStale = (byId.LastWriteTicks > meta.LastWriteTicks)
+                            || (byId.LastWriteTicks == meta.LastWriteTicks && byId.FileSize != meta.FileSize && byId.FileSize > 0);
+
+                        if (!isStale)
+                        {
+                            meta.UpdatedAt = now;
+                            if (byId.FolderId.HasValue)
+                                meta.FolderId = byId.FolderId.Value;
+                            await conn.ExecuteAsync(@"
+                                UPDATE ImageMeta SET
+                                    FileHash = @FileHash, PerceptualHash = @PerceptualHash,
+                                    Width = @Width, Height = @Height,
+                                    FileSize = @FileSize, LastWriteTicks = @LastWriteTicks,
+                                    FolderId = @FolderId, UpdatedAt = @UpdatedAt, HashStatus = @HashStatus
+                                WHERE Id = @Id", meta, txn);
+                            existingByIdMap[meta.Id] = (byId.FilePath, byId.FolderId, meta.LastWriteTicks, meta.FileSize, now);
+                        existingMap[byId.FilePath] = (meta.Id, byId.FolderId, true);
+                        }
                     }
                     else
                     {
@@ -338,6 +400,8 @@ public class ImageMetaRepository : IImageMetaRepository
                             VALUES (@FilePath, @FileHash, @PerceptualHash, @Width, @Height,
                                 @FileSize, @LastWriteTicks, @FolderId, @CreatedAt, @UpdatedAt, @HashStatus);
                             SELECT last_insert_rowid();", meta, txn);
+                        existingMap[meta.FilePath] = (meta.Id, meta.FolderId, meta.FolderId.HasValue);
+                        existingByIdMap[meta.Id] = (meta.FilePath, meta.FolderId, meta.LastWriteTicks, meta.FileSize, now);
                     }
                 }
 

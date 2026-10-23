@@ -677,40 +677,52 @@ public sealed class MediaMoveTests : IAsyncLifetime
 
         var moveService = new MediaMoveService(_dbFactory, _metaRepo, _folderRepo, _thumbCache);
 
-        // Run move and simulated concurrent scan/hash concurrently
-        var moveTask = Task.Run(async () =>
-        {
-            return await moveService.MoveFilesAsync(new MediaMoveRequest([file], destDir));
-        });
+        using var scanLoadedOldObject = new ManualResetEventSlim(false);
+        var allowStaleWriteGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        // Run simulated concurrent scan/hash: load old object first, pause until move + new update finish, then attempt stale write
         var scanTask = Task.Run(async () =>
         {
             var existing = await _metaRepo.GetByPathAsync(file);
-            if (existing != null)
-            {
-                // If it ran before move completed
-                existing.FileHash = "HASH_UPDATED_CONCURRENTLY";
-                await _metaRepo.UpsertAsync(existing);
-            }
+            Assert.NotNull(existing);
+            scanLoadedOldObject.Set();
+
+            await allowStaleWriteGate.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await _metaRepo.UpsertAsync(existing!);
         });
 
-        await Task.WhenAll(moveTask, scanTask);
-        var moveResult = await moveTask;
+        Assert.True(scanLoadedOldObject.Wait(TimeSpan.FromSeconds(5)));
 
+        // Perform move while scan holds stale object reference
+        var moveResult = await moveService.MoveFilesAsync(new MediaMoveRequest([file], destDir));
         Assert.Equal(1, moveResult.SuccessCount);
 
         var targetFile = Path.Combine(destDir, "concurrent.jpg");
         Assert.True(File.Exists(targetFile));
         Assert.False(File.Exists(file));
 
+        // Update target file with newer content in DB
+        var movedMeta = await _metaRepo.GetByPathAsync(targetFile);
+        Assert.NotNull(movedMeta);
+        movedMeta!.FileHash = "HASH_NEWER_CONTENT";
+        movedMeta.FileSize = 9999;
+        movedMeta.LastWriteTicks += 50000;
+        await _metaRepo.UpsertAsync(movedMeta);
+
+        // Now release stale scan write: it must NOT overwrite newer destination metadata
+        allowStaleWriteGate.TrySetResult(true);
+        await scanTask.WaitAsync(TimeSpan.FromSeconds(5));
+
         // Old path must NOT be recreated
         var oldMeta = await _metaRepo.GetByPathAsync(file);
         Assert.Null(oldMeta);
 
-        // Destination metadata must preserve ID and tags
+        // Destination metadata must preserve ID, tags, and newer content
         var newMeta = await _metaRepo.GetByPathAsync(targetFile);
         Assert.NotNull(newMeta);
         Assert.Equal(id, newMeta!.Id);
+        Assert.Equal("HASH_NEWER_CONTENT", newMeta.FileHash);
+        Assert.Equal(9999, newMeta.FileSize);
 
         var tags = newMeta.Tags.Select(t => t.Name).ToList();
         Assert.Contains("tagA", tags);

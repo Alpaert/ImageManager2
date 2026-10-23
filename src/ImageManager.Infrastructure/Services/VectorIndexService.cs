@@ -140,16 +140,39 @@ public sealed class VectorIndexService : IVectorIndexService
         }
         finally
         {
-            _similarImageService.InvalidateVectorSnapshots();
-            if (kind == VectorIndexKind.Semantic)
-                _chineseClip.ReleaseImageSession();
-            lock (_stateLock)
+            try
             {
-                _runCancellation?.Dispose();
-                _runCancellation = null;
-                _paused = false;
+                try
+                {
+                    _similarImageService.InvalidateVectorSnapshots();
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Warn($"Failed to invalidate vector snapshots after build: {ex.Message}");
+                }
+
+                if (kind == VectorIndexKind.Semantic)
+                {
+                    try
+                    {
+                        _chineseClip.ReleaseImageSession();
+                    }
+                    catch (Exception ex)
+                    {
+                        AppLogger.Warn($"Failed to release Chinese CLIP image session: {ex.Message}");
+                    }
+                }
             }
-            Interlocked.Exchange(ref _running, 0);
+            finally
+            {
+                lock (_stateLock)
+                {
+                    _runCancellation?.Dispose();
+                    _runCancellation = null;
+                    _paused = false;
+                }
+                Interlocked.Exchange(ref _running, 0);
+            }
         }
     }
 

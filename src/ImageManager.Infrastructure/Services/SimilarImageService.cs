@@ -20,6 +20,11 @@ public sealed class SimilarImageService : ISimilarImageService, IDisposable
         get => _snapshotManager.PerceptualSnapshotBuildingHook;
         set => _snapshotManager.PerceptualSnapshotBuildingHook = value;
     }
+    internal Action? PerceptualSnapshotWaitingGateHook
+    {
+        get => _snapshotManager.PerceptualSnapshotWaitingGateHook;
+        set => _snapshotManager.PerceptualSnapshotWaitingGateHook = value;
+    }
 
     public SimilarImageService(
         IImageMetaRepository metaRepository,
