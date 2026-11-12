@@ -1,3 +1,5 @@
+﻿using SkiaSharp;
+using ImageManager.Infrastructure.Imaging;
 using ImageManager.Core.Services;
 using Microsoft.ML.OnnxRuntime.Tensors;
 
@@ -74,6 +76,15 @@ public class PixaiTagService : OnnxTagServiceBase, IImageEmbeddingExtractor
     public async Task<(List<TagPrediction> tags, float[]? embedding)> PredictWithEmbeddingAsync(string imagePath,
         CancellationToken ct = default)
     {
+        using var original = InferenceImageLoader.DecodeForInference(imagePath, InputSize * 2);
+        if (original == null)
+            return (new List<TagPrediction>(), null);
+        return await PredictWithEmbeddingAsync(original, ct);
+    }
+
+    public async Task<(List<TagPrediction> tags, float[]? embedding)> PredictWithEmbeddingAsync(SKBitmap original,
+        CancellationToken ct = default)
+    {
         if (_session == null)
             throw new InvalidOperationException("Pixai: Model not loaded");
 
@@ -82,7 +93,7 @@ public class PixaiTagService : OnnxTagServiceBase, IImageEmbeddingExtractor
         {
             var result = await Task.Run(() =>
             {
-                var tensor = Preprocess(imagePath);
+                var tensor = Preprocess(original);
                 if (tensor == null)
                     return (new List<TagPrediction>(), null);
 

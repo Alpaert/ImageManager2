@@ -1,5 +1,6 @@
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
+using SkiaSharp;
 
 namespace ImageManager.Infrastructure.Services;
 
@@ -30,7 +31,7 @@ public class WdRatingService : IDisposable
     public async Task LoadAsync(string modelPath, CancellationToken ct = default)
     {
         AppLogger.Info("加载 WD Rating 服务...");
-        await _wdService.LoadModelAsync(modelPath);
+        await _wdService.LoadModelAsync(modelPath, ct);
         AppLogger.Info("WD Rating 服务加载完成");
     }
 
@@ -44,20 +45,26 @@ public class WdRatingService : IDisposable
 
         try
         {
-            var allPredictions = await _wdService.PredictAsync(imagePath);
+            return await _wdService.PredictRatingOnlyAsync(imagePath, ct);
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error($"Rating 预测失败: {ex.Message}");
+            return SystemRating.Unknown;
+        }
+    }
 
-            float best = 0;
-            int bestIdx = 0;
-            for (int i = 0; i < 4; i++)
-            {
-                var pred = allPredictions.FirstOrDefault(p =>
-                    string.Equals(p.TagName, RatingNames[i], StringComparison.OrdinalIgnoreCase));
-                var prob = (float)pred.Confidence;
-                if (prob > best) { best = prob; bestIdx = i; }
-            }
+    public async Task<SystemRating> PredictRatingAsync(SKBitmap original, CancellationToken ct = default)
+    {
+        if (!_wdService.IsModelLoaded)
+        {
+            AppLogger.Warn("WD 模型未加载，返回 Unknown");
+            return SystemRating.Unknown;
+        }
 
-            var rating = (SystemRating)bestIdx;
-            return rating;
+        try
+        {
+            return await _wdService.PredictRatingOnlyAsync(original, ct);
         }
         catch (Exception ex)
         {

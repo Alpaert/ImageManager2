@@ -4,6 +4,7 @@ using System.IO;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Services.Inference;
 
 namespace ImageManager.Infrastructure.Services;
 
@@ -95,12 +96,14 @@ public class ArtistEmbeddingStore : IArtistEmbeddingStore
                 float factor = (float)imageCount / (imageCount + 1);
                 for (int i = 0; i < _embeddingDim; i++)
                     updated[i] = updated[i] * factor + embedding[i] / (imageCount + 1);
+                EmbeddingMath.Normalize(updated);
                 newArtists[artistName] = updated;
             }
             else
             {
                 var copy = new float[_embeddingDim];
                 Array.Copy(embedding, copy, _embeddingDim);
+                EmbeddingMath.Normalize(copy);
                 newArtists[artistName] = copy;
             }
             newCounts[artistName] = imageCount;
@@ -122,14 +125,14 @@ public class ArtistEmbeddingStore : IArtistEmbeddingStore
 
         var normalized = new float[queryEmbedding.Length];
         Array.Copy(queryEmbedding, normalized, queryEmbedding.Length);
-        Normalize(normalized);
+        EmbeddingMath.Normalize(normalized);
 
         string? bestArtist = null;
         double bestSim = -1;
 
         foreach (var (artistName, emb) in artists)
         {
-            double sim = CosineSimilarity(normalized, emb);
+            double sim = EmbeddingMath.Dot(normalized, emb);
             if (sim > bestSim)
             {
                 bestSim = sim;
@@ -160,12 +163,15 @@ public class ArtistEmbeddingStore : IArtistEmbeddingStore
         bw.Write(snapshot.Artists.Count);
         bw.Write(snapshot.EmbeddingDim);
 
+        var copy = new float[snapshot.EmbeddingDim];
         foreach (var (name, emb) in snapshot.Artists)
         {
             bw.Write(name);
             bw.Write(snapshot.ImageCounts.GetValueOrDefault(name, 1));
+            Array.Copy(emb, copy, snapshot.EmbeddingDim);
+            EmbeddingMath.Normalize(copy);
             for (int i = 0; i < snapshot.EmbeddingDim; i++)
-                bw.Write(emb[i]);
+                bw.Write(copy[i]);
         }
 
         AppLogger.Info($"画师嵌入库快照已保存: {path} version={snapshot.VersionId} artists={snapshot.Artists.Count}");
@@ -229,6 +235,7 @@ public class ArtistEmbeddingStore : IArtistEmbeddingStore
             var emb = new float[dim];
             for (int j = 0; j < dim; j++)
                 emb[j] = br.ReadSingle();
+            EmbeddingMath.Normalize(emb);
             artists[name] = emb;
             counts[name] = imgCount;
         }
@@ -308,27 +315,7 @@ public class ArtistEmbeddingStore : IArtistEmbeddingStore
         }
     }
 
-    private static double CosineSimilarity(float[] a, float[] b)
-    {
-        double dot = 0, normA = 0, normB = 0;
-        for (int i = 0; i < a.Length; i++)
-        {
-            dot += (double)a[i] * b[i];
-            normA += (double)a[i] * a[i];
-            normB += (double)b[i] * b[i];
-        }
-        if (normA < 1e-10 || normB < 1e-10) return 0;
-        return dot / (Math.Sqrt(normA) * Math.Sqrt(normB));
-    }
+    private static double CosineSimilarity(float[] a, float[] b) => EmbeddingMath.CosineSimilarity(a, b);
 
-    private static void Normalize(float[] v)
-    {
-        double norm = 0;
-        for (int i = 0; i < v.Length; i++)
-            norm += (double)v[i] * v[i];
-        if (norm < 1e-10) return;
-        float inv = (float)(1.0 / Math.Sqrt(norm));
-        for (int i = 0; i < v.Length; i++)
-            v[i] *= inv;
-    }
+    private static void Normalize(float[] v) => EmbeddingMath.Normalize(v);
 }

@@ -1,3 +1,5 @@
+﻿using SkiaSharp;
+using ImageManager.Infrastructure.Imaging;
 using System.Collections.Concurrent;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
@@ -89,7 +91,16 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
 
     public async Task<EnsembleResult> PredictWithSourcesAsync(string imagePath, CancellationToken ct = default)
     {
-        var fileName = Path.GetFileName(imagePath);
+        using var original = InferenceImageLoader.DecodeForInference(imagePath, 896);
+        if (original == null)
+        {
+            return new EnsembleResult(SystemRating.Unknown, new List<TagPrediction>(), new Dictionary<string, List<TagPrediction>>());
+        }
+        return await PredictWithSourcesAsync(original, Path.GetFileName(imagePath), ct);
+    }
+
+    public async Task<EnsembleResult> PredictWithSourcesAsync(SKBitmap original, string fileName, CancellationToken ct = default)
+    {
         int callId = Interlocked.Increment(ref _predictCount);
         bool sample = callId % MemSampleInterval == 0;
 
@@ -102,8 +113,8 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
         float[]? embedding;
         if (useParallel)
         {
-            var ratingTask = _wd.PredictRatingAsync(imagePath, ct);
-            var pixaiTask = _pixai.PredictWithEmbeddingAsync(imagePath, ct);
+            var ratingTask = _wd.PredictRatingAsync(original, ct);
+            var pixaiTask = _pixai.PredictWithEmbeddingAsync(original, ct);
             await Task.WhenAll(ratingTask, pixaiTask);
             rating = ratingTask.Result;
             (pixaiPreds, embedding) = pixaiTask.Result;
@@ -111,10 +122,10 @@ public class EnsembleTagService : IEnsembleTagService, IDisposable
         }
         else
         {
-            rating = await _wd.PredictRatingAsync(imagePath, ct);
+            rating = await _wd.PredictRatingAsync(original, ct);
             if (sample) AppLogger.Memory($"Ensemble#{callId}.AfterRating {fileName}");
 
-            (pixaiPreds, embedding) = await _pixai.PredictWithEmbeddingAsync(imagePath, ct);
+            (pixaiPreds, embedding) = await _pixai.PredictWithEmbeddingAsync(original, ct);
             if (sample) AppLogger.Memory($"Ensemble#{callId}.AfterPixai {fileName}");
         }
 

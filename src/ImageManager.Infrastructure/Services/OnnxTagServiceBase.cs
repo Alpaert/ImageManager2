@@ -1,3 +1,4 @@
+﻿using System.Diagnostics;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
 
@@ -59,7 +60,10 @@ public abstract class OnnxTagServiceBase : IDisposable
     protected readonly SemaphoreSlim _inferenceLock = new(1, 1);
     private string _modelDir = string.Empty;
     private DenseTensor<float>? _cachedTensor;
-    private CancellationTokenSource? _idleCts;
+    private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan IdleCheckInterval = TimeSpan.FromSeconds(15);
+    private CancellationTokenSource? _idleTimerCts;
+    private long _lastUsedTimestamp = Stopwatch.GetTimestamp();
     private readonly object _idleLock = new();
     private SKBitmap? _scratchBitmap;
     private bool _disposed;
@@ -82,9 +86,14 @@ public abstract class OnnxTagServiceBase : IDisposable
         try
         {
             // 取消旧空闲定时器，防止它在加载期间或之后误释放新 session
-            lock (_idleLock) { _idleCts?.Cancel(); }
+            StopIdleTimer();
 
-            if (_session != null) return;
+            if (_session != null)
+            {
+                Volatile.Write(ref _lastUsedTimestamp, Stopwatch.GetTimestamp());
+                EnsureIdleTimerStarted();
+                return;
+            }
 
             _modelDir = modelDir;
             Directory.CreateDirectory(_modelDir);
@@ -135,6 +144,9 @@ public abstract class OnnxTagServiceBase : IDisposable
                 : _tagCategories.Count(c => EnabledCategories.Contains(c));
 
             AppLogger.Info($"模型 {ModelSubDir} 加载完成 input={_inputName} shape={shape} tags={_totalTagCount} enabled={enabledCount}");
+            Volatile.Write(ref _lastUsedTimestamp, Stopwatch.GetTimestamp());
+            EnsureIdleTimerStarted();
+
             ProgressChanged?.Invoke(new AutoTagProgress(0, 0,
                 $"[{ModelSubDir}] 已加载 输入:{_inputName} 形状:{shape} 标签:{_totalTagCount} 启用:{enabledCount}"));
         }
@@ -145,6 +157,14 @@ public abstract class OnnxTagServiceBase : IDisposable
 
     public virtual async Task<List<TagPrediction>> PredictAsync(string imagePath, CancellationToken ct = default)
     {
+        using var original = InferenceImageLoader.DecodeForInference(imagePath, InputSize * 2);
+        if (original == null)
+            return new List<TagPrediction>();
+        return await PredictAsync(original, ct);
+    }
+
+    public virtual async Task<List<TagPrediction>> PredictAsync(SKBitmap original, CancellationToken ct = default)
+    {
         if (_session == null)
             throw new InvalidOperationException($"{ModelSubDir}: Model not loaded");
 
@@ -154,7 +174,7 @@ public abstract class OnnxTagServiceBase : IDisposable
             var result = await Task.Run(() =>
             {
                 ct.ThrowIfCancellationRequested();
-                var tensor = Preprocess(imagePath);
+                var tensor = Preprocess(original);
                 if (tensor == null)
                 {
                     return new List<TagPrediction>();
@@ -168,7 +188,7 @@ public abstract class OnnxTagServiceBase : IDisposable
                 // === 内存诊断：session.Run 前后（采样） ===
                 int inferId = Interlocked.Increment(ref _inferenceCount);
                 if (inferId % MemSampleInterval == 0)
-                    AppLogger.Memory($"Inference.Run #{inferId} {Path.GetFileName(imagePath)}");
+                    AppLogger.Memory($"Inference.Run #{inferId} bitmap");
 
                 using var results = _session.Run(inputs);
                 var output = results.First(r => r.Name == _outputName);
@@ -188,37 +208,81 @@ public abstract class OnnxTagServiceBase : IDisposable
 
     protected void ResetIdleTimer()
     {
+        Volatile.Write(ref _lastUsedTimestamp, Stopwatch.GetTimestamp());
+        EnsureIdleTimerStarted();
+    }
+
+    private void EnsureIdleTimerStarted()
+    {
+        var cts = Volatile.Read(ref _idleTimerCts);
+        if (cts != null && !cts.IsCancellationRequested)
+            return;
+
         lock (_idleLock)
         {
-            _idleCts?.Cancel();
-            _idleCts?.Dispose();
-            _idleCts = new CancellationTokenSource();
-            var ct = _idleCts.Token;
-            _ = Task.Run(async () =>
+            if (_disposed || _session == null) return;
+            if (_idleTimerCts == null || _idleTimerCts.IsCancellationRequested)
             {
-                try { await Task.Delay(TimeSpan.FromMinutes(1), ct); }
-                catch { return; }
-                if (!ct.IsCancellationRequested)
+                _idleTimerCts?.Dispose();
+                _idleTimerCts = new CancellationTokenSource();
+                var ct = _idleTimerCts.Token;
+                _ = Task.Run(() => IdleCheckLoopAsync(ct), ct);
+            }
+        }
+    }
+
+    private void StopIdleTimer()
+    {
+        lock (_idleLock)
+        {
+            if (_idleTimerCts != null)
+            {
+                try
                 {
-                    try { DisposeSession(); }
-                    catch (Exception ex) { AppLogger.Warn($"[{ModelSubDir}] DisposeSession 失败: {ex.Message}"); }
+                    _idleTimerCts.Cancel();
+                    _idleTimerCts.Dispose();
                 }
-            });
+                catch { }
+                _idleTimerCts = null;
+            }
+        }
+    }
+
+    private async Task IdleCheckLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(IdleCheckInterval);
+        try
+        {
+            while (!ct.IsCancellationRequested && await timer.WaitForNextTickAsync(ct))
+            {
+                if (_session == null)
+                    break;
+
+                long lastUsed = Volatile.Read(ref _lastUsedTimestamp);
+                if (Stopwatch.GetElapsedTime(lastUsed) >= IdleTimeout)
+                {
+                    DisposeSession();
+                    if (_session == null)
+                        break;
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"[{ModelSubDir}] 空闲检查循环异常: {ex.Message}");
         }
     }
 
     public void ReleaseSession()
     {
-        lock (_idleLock)
-        {
-            _idleCts?.Cancel();
-            _idleCts?.Dispose();
-            _idleCts = null;
-        }
-        DisposeSession();
+        StopIdleTimer();
+        DisposeSession(force: true);
     }
 
-    private void DisposeSession()
+    private void DisposeSession(bool force = false)
     {
         // 先获取推理锁，确保没有正在进行的推理使用 _session
         _inferenceLock.Wait();
@@ -226,7 +290,12 @@ public abstract class OnnxTagServiceBase : IDisposable
         {
             lock (_idleLock)
             {
-                if (_session == null) return;
+                if (_disposed || _session == null) return;
+                if (!force && Stopwatch.GetElapsedTime(Volatile.Read(ref _lastUsedTimestamp)) < IdleTimeout)
+                {
+                    return;
+                }
+
                 AppLogger.Info($"[{ModelSubDir}] 1 分钟未使用，释放 GPU 显存");
                 _session.Dispose();
                 _session = null;
@@ -248,16 +317,19 @@ public abstract class OnnxTagServiceBase : IDisposable
 
     protected virtual DenseTensor<float>? Preprocess(string imagePath)
     {
+        using var original = InferenceImageLoader.DecodeForInference(imagePath, InputSize * 2);
+        if (original == null) return null;
+        return Preprocess(original, Path.GetFileName(imagePath));
+    }
+
+    public virtual DenseTensor<float>? Preprocess(SKBitmap original, string? logLabel = null)
+    {
         int callId = Interlocked.Increment(ref _preprocessCount);
         bool sample = callId % MemSampleInterval == 0;
-        if (sample) AppLogger.Memory($"Preprocess.Enter #{callId} {Path.GetFileName(imagePath)}");
+        if (sample) AppLogger.Memory($"Preprocess.Enter #{callId} {logLabel ?? "bitmap"}");
 
-        SKBitmap? original = null;
         try
         {
-            original = ThumbnailGenerator.DecodeForAnalysis(imagePath, InputSize * 2);
-            if (original == null) return null;
-
             var resized = DrawToModelBitmap(original, InputSize, PreserveAspectRatio);
 
             // NCHW tensor: [1, 3, InputSize, InputSize] — reused across inferences
@@ -265,38 +337,7 @@ public abstract class OnnxTagServiceBase : IDisposable
                 _cachedTensor = new DenseTensor<float>(new[] { 1, 3, InputSize, InputSize });
             var tensor = _cachedTensor;
 
-            unsafe
-            {
-                byte* ptr = (byte*)resized.GetPixels().ToPointer();
-                int stride = resized.RowBytes;
-                int bpp = resized.BytesPerPixel;
-
-                for (int y = 0; y < InputSize; y++)
-                {
-                    for (int x = 0; x < InputSize; x++)
-                    {
-                        int offset = y * stride + x * bpp;
-                        float r, g, b;
-                        if (resized.ColorType == SKColorType.Bgra8888)
-                        {
-                            b = ptr[offset];
-                            g = ptr[offset + 1];
-                            r = ptr[offset + 2];
-                        }
-                        else
-                        {
-                            r = ptr[offset];
-                            g = ptr[offset + 1];
-                            b = ptr[offset + 2];
-                        }
-
-                        // 归一化: (pixel/255 - mean) / std
-                        tensor[0, 0, y, x] = (r / 255f - Mean[0]) / Std[0];  // R
-                        tensor[0, 1, y, x] = (g / 255f - Mean[1]) / Std[1];  // G
-                        tensor[0, 2, y, x] = (b / 255f - Mean[2]) / Std[2];  // B
-                    }
-                }
-            }
+            Inference.TensorWriters.WriteNchwRgbNormalized(resized, tensor, InputSize, Mean, Std);
 
             // 记录大对象分配，用于内存压力监控
             MemoryPressureMonitor.RecordAllocation();
@@ -308,10 +349,6 @@ public abstract class OnnxTagServiceBase : IDisposable
         {
             AppLogger.Error($"Preprocess exception: {ex.Message}");
             return null;
-        }
-        finally
-        {
-            original?.Dispose();
         }
     }
 
@@ -476,9 +513,9 @@ public abstract class OnnxTagServiceBase : IDisposable
             if (_disposed) return;
             _disposed = true;
 
-            _idleCts?.Cancel();
-            _idleCts?.Dispose();
-            _idleCts = null;
+            _idleTimerCts?.Cancel();
+            _idleTimerCts?.Dispose();
+            _idleTimerCts = null;
         }
 
         AppLogger.Info($"Dispose {ModelSubDir}");

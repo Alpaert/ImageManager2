@@ -1,4 +1,5 @@
-﻿using ImageManager.Common.Helpers;
+﻿using System.Diagnostics;
+using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Imaging;
 using Microsoft.ML.OnnxRuntime;
@@ -14,11 +15,16 @@ public class OnnxTagService : IAutoTagService, IDisposable
     private const string TagsFile = "selected_tags.csv";
     private const int InputSize = 448;
 
+    private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan IdleCheckInterval = TimeSpan.FromSeconds(15);
+    private static readonly string[] ExpectedRatingTags = ["general", "sensitive", "questionable", "explicit"];
+
     private InferenceSession? _session;
     private string _inputName = string.Empty;
     private string _outputName = string.Empty;
     private string _modelShapeInfo = string.Empty;
     private string[] _tagNames = Array.Empty<string>();
+    private bool _canUseRatingFastPath;
     private int _predictCount;
     private static readonly HttpClient _http = new();
     private readonly SemaphoreSlim _initLock = new(1, 1);
@@ -26,8 +32,12 @@ public class OnnxTagService : IAutoTagService, IDisposable
     private string _modelDir = string.Empty;
     private DenseTensor<float>? _cachedTensor;
     private SKBitmap? _scratchBitmap;
-    private CancellationTokenSource? _idleCts;
+    private CancellationTokenSource? _idleTimerCts;
     private readonly object _idleLock = new();
+    private long _lastUsedTimestamp = Stopwatch.GetTimestamp();
+    private bool _disposed;
+
+    internal bool CanUseRatingFastPath => _canUseRatingFastPath;
 
     // === 鍐呭瓨璇婃柇閲囨牱璁℃暟鍣?===
     private int _preprocessCount;
@@ -38,12 +48,17 @@ public class OnnxTagService : IAutoTagService, IDisposable
 
     public async Task LoadModelAsync(string modelPath, CancellationToken ct = default)
     {
-        await _initLock.WaitAsync();
+        await _initLock.WaitAsync(ct);
         try
         {
-            lock (_idleLock) { _idleCts?.Cancel(); }
+            StopIdleTimer();
 
-            if (_session != null) return;
+            if (_session != null)
+            {
+                Volatile.Write(ref _lastUsedTimestamp, Stopwatch.GetTimestamp());
+                EnsureIdleTimerStarted();
+                return;
+            }
 
             _modelDir = modelPath;
             Directory.CreateDirectory(_modelDir);
@@ -66,6 +81,23 @@ public class OnnxTagService : IAutoTagService, IDisposable
             _modelShapeInfo = $"[{string.Join(",", inMeta.Dimensions)}]";
             _tagNames = await Task.Run(() => ParseTagsCsv(tagsPath));
 
+            if (_tagNames.Length >= 4 &&
+                string.Equals(_tagNames[0], ExpectedRatingTags[0], StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(_tagNames[1], ExpectedRatingTags[1], StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(_tagNames[2], ExpectedRatingTags[2], StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(_tagNames[3], ExpectedRatingTags[3], StringComparison.OrdinalIgnoreCase))
+            {
+                _canUseRatingFastPath = true;
+            }
+            else
+            {
+                _canUseRatingFastPath = false;
+                AppLogger.Warn($"[wd] WD 模型前 4 个标签不符合预期评级格式 ({string.Join(", ", _tagNames.Take(4))})，禁用 Rating 快速路径");
+            }
+
+            Volatile.Write(ref _lastUsedTimestamp, Stopwatch.GetTimestamp());
+            EnsureIdleTimerStarted();
+
             ProgressChanged?.Invoke(new AutoTagProgress(0, 0,
                 $"\u6a21\u578b\u5df2\u52a0\u8f7d \u8f93\u5165:{_inputName} \u5f62\u72b6:{_modelShapeInfo} \u6807\u7b7e:{_tagNames.Length}\u4e2a"));
         }
@@ -73,6 +105,18 @@ public class OnnxTagService : IAutoTagService, IDisposable
     }
 
     public async Task<List<TagPrediction>> PredictAsync(string imagePath, CancellationToken ct = default)
+    {
+        using var original = InferenceImageLoader.DecodeForInference(imagePath, InputSize * 2);
+        if (original == null)
+        {
+            if (Interlocked.Increment(ref _predictCount) == 1)
+                ProgressChanged?.Invoke(new AutoTagProgress(0, 0, "预处理失败: 图片无法解码"));
+            return new List<TagPrediction>();
+        }
+        return await PredictAsync(original, ct);
+    }
+
+    public async Task<List<TagPrediction>> PredictAsync(SKBitmap original, CancellationToken ct = default)
     {
         await _inferenceLock.WaitAsync(ct);
         try
@@ -83,7 +127,7 @@ public class OnnxTagService : IAutoTagService, IDisposable
 
             var result = await Task.Run(() =>
             {
-                var tensor = Preprocess(imagePath);
+                var tensor = Preprocess(original);
                 if (tensor == null)
                 {
                     if (Interlocked.Increment(ref _predictCount) == 1)
@@ -132,46 +176,197 @@ public class OnnxTagService : IAutoTagService, IDisposable
         finally { _inferenceLock.Release(); }
     }
 
+    public async Task<SystemRating> PredictRatingOnlyAsync(string imagePath, CancellationToken ct = default)
+    {
+        using var original = InferenceImageLoader.DecodeForInference(imagePath, InputSize * 2);
+        if (original == null)
+        {
+            return SystemRating.General;
+        }
+        return await PredictRatingOnlyAsync(original, ct);
+    }
+
+    public async Task<SystemRating> PredictRatingOnlyAsync(SKBitmap original, CancellationToken ct = default)
+    {
+        await _inferenceLock.WaitAsync(ct);
+        try
+        {
+            var session = _session;
+            if (session == null)
+                throw new InvalidOperationException("Model not loaded");
+
+            var rating = await Task.Run(() =>
+            {
+                ct.ThrowIfCancellationRequested();
+                var tensor = Preprocess(original);
+                if (tensor == null)
+                {
+                    return SystemRating.General;
+                }
+
+                var inputs = new List<NamedOnnxValue>
+                {
+                    NamedOnnxValue.CreateFromTensor(_inputName, tensor)
+                };
+
+                using var results = session.Run(inputs);
+                var output = results[0].AsTensor<float>();
+
+                if (_canUseRatingFastPath)
+                {
+                    ReadOnlySpan<float> span = output is DenseTensor<float> dense
+                        ? dense.Buffer.Span
+                        : (ReadOnlySpan<float>)output.ToArray();
+
+                    float best = 0f;
+                    int bestIdx = 0;
+                    for (int i = 0; i < 4 && i < span.Length; i++)
+                    {
+                        float prob = span[i];
+                        if (prob > best)
+                        {
+                            best = prob;
+                            bestIdx = i;
+                        }
+                    }
+
+                    if (best <= 0f)
+                    {
+                        return SystemRating.General;
+                    }
+
+                    return (SystemRating)bestIdx;
+                }
+                else
+                {
+                    var probs = output.ToArray();
+                    float best = 0f;
+                    int bestIdx = 0;
+                    for (int i = 0; i < ExpectedRatingTags.Length; i++)
+                    {
+                        string targetTag = ExpectedRatingTags[i];
+                        for (int j = 0; j < probs.Length && j < _tagNames.Length; j++)
+                        {
+                            if (string.Equals(_tagNames[j], targetTag, StringComparison.OrdinalIgnoreCase))
+                            {
+                                float prob = probs[j];
+                                if (prob > best)
+                                {
+                                    best = prob;
+                                    bestIdx = i;
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    if (best <= 0f)
+                    {
+                        return SystemRating.General;
+                    }
+
+                    return (SystemRating)bestIdx;
+                }
+            }, ct);
+
+            ResetIdleTimer();
+            return rating;
+        }
+        finally
+        {
+            _inferenceLock.Release();
+        }
+    }
+
     private void ResetIdleTimer()
+    {
+        Volatile.Write(ref _lastUsedTimestamp, Stopwatch.GetTimestamp());
+        EnsureIdleTimerStarted();
+    }
+
+    private void EnsureIdleTimerStarted()
+    {
+        var cts = Volatile.Read(ref _idleTimerCts);
+        if (cts != null && !cts.IsCancellationRequested)
+            return;
+
+        lock (_idleLock)
+        {
+            if (_disposed || _session == null) return;
+            if (_idleTimerCts == null || _idleTimerCts.IsCancellationRequested)
+            {
+                _idleTimerCts?.Dispose();
+                _idleTimerCts = new CancellationTokenSource();
+                var ct = _idleTimerCts.Token;
+                _ = Task.Run(() => IdleCheckLoopAsync(ct), ct);
+            }
+        }
+    }
+
+    private void StopIdleTimer()
     {
         lock (_idleLock)
         {
-            _idleCts?.Cancel();
-            _idleCts?.Dispose();
-            _idleCts = new CancellationTokenSource();
-            var ct = _idleCts.Token;
-            _ = Task.Run(async () =>
+            if (_idleTimerCts != null)
             {
-                try { await Task.Delay(TimeSpan.FromMinutes(1), ct); }
-                catch { return; }
-                if (!ct.IsCancellationRequested)
+                try
                 {
-                    try { DisposeSession(); }
-                    catch (Exception ex) { AppLogger.Warn($"[wd] DisposeSession 失败: {ex.Message}"); }
+                    _idleTimerCts.Cancel();
+                    _idleTimerCts.Dispose();
                 }
-            });
+                catch { }
+                _idleTimerCts = null;
+            }
+        }
+    }
+
+    private async Task IdleCheckLoopAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(IdleCheckInterval);
+        try
+        {
+            while (!ct.IsCancellationRequested && await timer.WaitForNextTickAsync(ct))
+            {
+                if (_session == null)
+                    break;
+
+                long lastUsed = Volatile.Read(ref _lastUsedTimestamp);
+                if (Stopwatch.GetElapsedTime(lastUsed) >= IdleTimeout)
+                {
+                    DisposeSession();
+                    if (_session == null)
+                        break;
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"[wd] 空闲检查循环异常: {ex.Message}");
         }
     }
 
     public void ReleaseSession()
     {
-        lock (_idleLock)
-        {
-            _idleCts?.Cancel();
-            _idleCts?.Dispose();
-            _idleCts = null;
-        }
-        DisposeSession();
+        StopIdleTimer();
+        DisposeSession(force: true);
     }
 
-    private void DisposeSession()
+    private void DisposeSession(bool force = false)
     {
         _inferenceLock.Wait();
         try
         {
             lock (_idleLock)
             {
-                if (_session == null) return;
+                if (_disposed || _session == null) return;
+                if (!force && Stopwatch.GetElapsedTime(Volatile.Read(ref _lastUsedTimestamp)) < IdleTimeout)
+                {
+                    return;
+                }
+
                 AppLogger.Info("[wd] 1 分钟未使用，释放 GPU 显存");
                 _session.Dispose();
                 _session = null;
@@ -186,15 +381,18 @@ public class OnnxTagService : IAutoTagService, IDisposable
     }
 
     // Preprocessing: square white-pad 鈫?448 resize 鈫?float32 0-255 鈫?BGR 鈫?NHWC [1,448,448,3]
-    private DenseTensor<float>? Preprocess(string imagePath)
+    public DenseTensor<float>? Preprocess(string imagePath)
+    {
+        using var original = InferenceImageLoader.DecodeForInference(imagePath, InputSize * 2);
+        if (original == null) return null;
+        return Preprocess(original);
+    }
+
+    public DenseTensor<float>? Preprocess(SKBitmap original)
     {
         int callId = Interlocked.Increment(ref _preprocessCount);
         try
         {
-            using var original = ThumbnailGenerator.DecodeForAnalysis(imagePath, InputSize * 2);
-            if (original == null) return null;
-
-
             var resized = DrawToModelBitmap(original);
 
             // NHWC tensor: [1, 448, 448, 3], float32, 0-255 range, BGR order
@@ -319,20 +517,26 @@ public class OnnxTagService : IAutoTagService, IDisposable
     {
         lock (_idleLock)
         {
-            _idleCts?.Cancel();
-            _idleCts?.Dispose();
-            _idleCts = null;
+            if (_disposed) return;
+            _disposed = true;
+
+            _idleTimerCts?.Cancel();
+            _idleTimerCts?.Dispose();
+            _idleTimerCts = null;
         }
 
         // Wait for any in-flight inference to finish before disposing _session
         _inferenceLock.Wait();
         try
         {
-            _session?.Dispose();
-            _session = null;
-            _cachedTensor = null;
-            _scratchBitmap?.Dispose();
-            _scratchBitmap = null;
+            lock (_idleLock)
+            {
+                _session?.Dispose();
+                _session = null;
+                _cachedTensor = null;
+                _scratchBitmap?.Dispose();
+                _scratchBitmap = null;
+            }
         }
         finally { _inferenceLock.Release(); }
 

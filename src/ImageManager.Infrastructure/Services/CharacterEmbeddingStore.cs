@@ -5,6 +5,7 @@ using System.Linq;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Services.Inference;
 
 namespace ImageManager.Infrastructure.Services;
 
@@ -81,7 +82,7 @@ public class CharacterEmbeddingStore : ICharacterEmbeddingStore
 
         var normalized = new float[_embeddingDim];
         Array.Copy(embedding, normalized, _embeddingDim);
-        Normalize(normalized);
+        EmbeddingMath.Normalize(normalized);
 
         lock (_writeLock)
         {
@@ -113,14 +114,9 @@ public class CharacterEmbeddingStore : ICharacterEmbeddingStore
 
         var normalized = new float[queryEmbedding.Length];
         Array.Copy(queryEmbedding, normalized, queryEmbedding.Length);
-        Normalize(normalized);
+        EmbeddingMath.Normalize(normalized);
 
-        return chars
-            .Select(kv => (CharacterName: kv.Key, Similarity: CosineSimilarity(normalized, kv.Value)))
-            .Where(m => m.Similarity >= minSimilarity)
-            .OrderByDescending(m => m.Similarity)
-            .Take(maxResults)
-            .ToList();
+        return EmbeddingMath.FindTopK(chars, normalized, minSimilarity, maxResults);
     }
 
     public void Save(string path)
@@ -140,12 +136,15 @@ public class CharacterEmbeddingStore : ICharacterEmbeddingStore
         bw.Write(snapshot.Characters.Count);
         bw.Write(snapshot.EmbeddingDim);
 
+        var copy = new float[snapshot.EmbeddingDim];
         foreach (var (name, emb) in snapshot.Characters)
         {
             bw.Write(name);
             bw.Write(snapshot.ImageCounts.GetValueOrDefault(name, 1));
+            Array.Copy(emb, copy, snapshot.EmbeddingDim);
+            EmbeddingMath.Normalize(copy);
             for (int i = 0; i < snapshot.EmbeddingDim; i++)
-                bw.Write(emb[i]);
+                bw.Write(copy[i]);
         }
 
         AppLogger.Info($"Character embedding store snapshot saved: {path} version={snapshot.VersionId} characters={snapshot.Characters.Count}");
@@ -195,7 +194,7 @@ public class CharacterEmbeddingStore : ICharacterEmbeddingStore
             var emb = new float[dim];
             for (int j = 0; j < dim; j++)
                 emb[j] = br.ReadSingle();
-            Normalize(emb);
+            EmbeddingMath.Normalize(emb);
             chars[name] = emb;
             counts[name] = imgCount;
         }
@@ -272,27 +271,7 @@ public class CharacterEmbeddingStore : ICharacterEmbeddingStore
         }
     }
 
-    private static double CosineSimilarity(float[] a, float[] b)
-    {
-        double dot = 0, normA = 0, normB = 0;
-        for (int i = 0; i < a.Length; i++)
-        {
-            dot += (double)a[i] * b[i];
-            normA += (double)a[i] * a[i];
-            normB += (double)b[i] * b[i];
-        }
-        if (normA < 1e-10 || normB < 1e-10) return 0;
-        return dot / (Math.Sqrt(normA) * Math.Sqrt(normB));
-    }
+    private static double CosineSimilarity(float[] a, float[] b) => EmbeddingMath.CosineSimilarity(a, b);
 
-    private static void Normalize(float[] v)
-    {
-        double norm = 0;
-        for (int i = 0; i < v.Length; i++)
-            norm += (double)v[i] * v[i];
-        if (norm < 1e-10) return;
-        float inv = (float)(1.0 / Math.Sqrt(norm));
-        for (int i = 0; i < v.Length; i++)
-            v[i] *= inv;
-    }
+    private static void Normalize(float[] v) => EmbeddingMath.Normalize(v);
 }

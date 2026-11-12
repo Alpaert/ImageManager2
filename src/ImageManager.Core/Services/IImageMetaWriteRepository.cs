@@ -15,6 +15,7 @@ public interface IImageMetaWriteRepository
     Task UpdateFilePathAsync(long id, string newPath, long newFolderId);
     Task UpdateDimensionsByPathsAsync(IReadOnlyDictionary<string, (int Width, int Height)> dimensions);
     Task SetSystemRatingByPathAsync(string filePath, int rating);
+    Task SetSystemRatingBatchAsync(IReadOnlyList<(long ImageId, int Rating)> items);
     Task SetAutoTagStatusByPathAsync(string filePath, int status);
     Task SetAutoTagStatusBatchAsync(List<string> filePaths, int status);
     Task<Dictionary<string, (long Id, int Status)>> RegisterAutoTagFilesAsync(

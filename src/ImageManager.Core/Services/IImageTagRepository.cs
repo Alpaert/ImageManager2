@@ -7,6 +7,7 @@ public interface IImageTagRepository
     // Tag associations
     Task SetTagsAsync(long imageId, List<string> tags);
     Task AddAutoTagsAsync(long imageId, List<string> tagNames);
+    Task AddAutoTagsBatchAsync(IReadOnlyList<(long ImageId, IReadOnlyList<string> TagNames)> items);
     Task ReplaceAutoTagAsync(long imageId, string englishTagName, long chineseTagId);
     Task ReplaceAutoTagsBatchAsync(List<(long ImageId, string EnglishName, long ChineseId)> replacements);
     Task DeleteAutoTagFromImageAsync(long imageId, string tagName);
