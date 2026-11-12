@@ -1286,8 +1286,41 @@ public partial class MainWindow : Window
 
     private int GetContinuousAnchorIndex() => Math.Max(0, _continuousVisibleRange.StartIndex);
 
+    private double _workspaceLayoutWidth;
+
+    private void ApplyWorkspaceGeometry(double width)
+    {
+        if (width <= 0 || width == _workspaceLayoutWidth)
+            return;
+        _workspaceLayoutWidth = width;
+
+        // Match the web layout's content width and breakpoint in device-independent units.
+        var gutter = Math.Round(Math.Clamp(width * 0.021, 16, 32));
+        var stackSearch = width <= 1159;
+        RootGrid.ColumnDefinitions[0].Width = new GridLength(width <= 880 ? 184 : 210);
+        WorkspaceSearchBar.Padding = new Thickness(gutter, 10, gutter, 10);
+        WorkspaceHeader.Padding = new Thickness(gutter, 12, gutter, 8);
+        // Both native card templates already contribute 5 DIP of outer margin.
+        WorkspaceGallery.Margin = new Thickness(gutter - 5, 0, gutter - 5, 0);
+        WorkspaceFooter.Padding = new Thickness(gutter, 0, gutter, 0);
+
+        SetWorkspaceSearchRows(WorkspaceSearchModesA, WorkspaceSearchBodyA, stackSearch);
+        SetWorkspaceSearchRows(WorkspaceSearchModesC, WorkspaceSearchBodyC, stackSearch);
+    }
+
+    private static void SetWorkspaceSearchRows(Control modes, Control body, bool stacked)
+    {
+        if (modes.Parent is Grid grid)
+            grid.RowSpacing = stacked ? 5 : 0;
+        Grid.SetColumnSpan(modes, stacked ? 2 : 1);
+        Grid.SetRow(body, stacked ? 1 : 0);
+        Grid.SetColumn(body, stacked ? 0 : 1);
+        Grid.SetColumnSpan(body, stacked ? 2 : 1);
+    }
+
     private void OnWindowSizeChanged(object? sender, SizeChangedEventArgs e)
     {
+        ApplyWorkspaceGeometry(e.NewSize.Width);
         if (DataContext is not MainWindowViewModel viewModel ||
             viewModel.DisplayMode != ImageDisplayMode.Continuous)
         {
@@ -2109,6 +2142,32 @@ public partial class MainWindow : Window
 
     private bool _preserveTagSuggestionModeOnNextFocus;
 
+    private void WorkspaceTagTab_Click(object? sender, RoutedEventArgs e) =>
+        (Vm.IsSearchToolbarLayoutC ? TxtTagSearchC : TxtTagSearchA).Focus();
+
+    private async void WorkspaceSuggestions_Click(object? sender, RoutedEventArgs e)
+    {
+        if (Vm.IsTagSearchPopupOpen)
+        {
+            Vm.IsTagSearchPopupOpen = false;
+            return;
+        }
+
+        var searchBox = Vm.IsSearchToolbarLayoutC ? TxtTagSearchC : TxtTagSearchA;
+        if (searchBox.IsFocused)
+            await Vm.OnTagSearchGotFocusAsync();
+        else
+            searchBox.Focus(); // The original GotFocus handler publishes the suggestions.
+    }
+
+    private async void WorkspaceTheme_Click(object? sender, RoutedEventArgs e)
+    {
+        var dark = string.Equals(Vm.AppSettings.ThemeVariant, "Light", StringComparison.OrdinalIgnoreCase);
+        Vm.AppSettings.ThemeVariant = dark ? "Dark" : "Light";
+        App.ApplyColors(dark);
+        await Vm.SaveSettingsAsync();
+    }
+
     private async void TagSuggestion_Click(object? sender, RoutedEventArgs e)
     {
         if (sender is Button btn && btn.Tag is Core.Models.TagCount tag)
@@ -2282,6 +2341,9 @@ public partial class MainWindow : Window
         var item = (sender as Button)?.DataContext;
         await TryOpenFolderPathAsync(GetObjectString(item, "Path"));
     }
+
+    private async void WorkspaceFolderTitle_Click(object? sender, RoutedEventArgs e) =>
+        await TryOpenFolderPathAsync(Vm.CurrentFolder);
 
     private void FolderCardContextMenu_Opened(object? sender, RoutedEventArgs e)
     {

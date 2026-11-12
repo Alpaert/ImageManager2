@@ -26,7 +26,17 @@ public partial class MainWindowViewModel
         !ShowAllSubfolders && HasFolderItems;
 
     private void NotifyFolderSectionSearchStateChanged() =>
+        NotifyWorkspaceCounts();
+
+    private void NotifyWorkspaceCounts()
+    {
         OnPropertyChanged(nameof(ShowFolderSection));
+        OnPropertyChanged(nameof(WorkspaceCountText));
+    }
+
+    public string WorkspaceCountText => ShowFolderSection
+        ? $"{FolderItems.Count} 个文件夹 · {ActiveFileList.Count} 个文件"
+        : $"{ActiveFileList.Count} 个文件";
 
     public IReadOnlyList<FolderTreeNode> FolderBreadcrumbs
     {
@@ -60,6 +70,47 @@ public partial class MainWindowViewModel
 
     public bool HasBreadcrumbs => FolderBreadcrumbs.Count > 0;
 
+    public IReadOnlyList<FolderTreeNode> WorkspaceAncestorBreadcrumbs
+    {
+        get
+        {
+            var breadcrumbs = FolderBreadcrumbs;
+            return IsShowingSearchResult ? breadcrumbs : breadcrumbs.Take(breadcrumbs.Count - 1).ToArray();
+        }
+    }
+
+    public bool HasWorkspaceAncestors => WorkspaceAncestorBreadcrumbs.Count > 0;
+    public bool HasWorkspaceFolderTitle => !IsShowingSearchResult && !string.IsNullOrWhiteSpace(CurrentFolder);
+
+    public string WorkspaceTitle
+    {
+        get
+        {
+            if (IsShowingSearchResult)
+                return "搜索结果";
+            if (string.IsNullOrWhiteSpace(CurrentFolder))
+                return "文件夹浏览";
+
+            var name = FindNodeByPath(CurrentFolder)?.DisplayName;
+            if (!string.IsNullOrWhiteSpace(name))
+                return name;
+            name = Path.GetFileName(Path.TrimEndingDirectorySeparator(CurrentFolder));
+            return string.IsNullOrWhiteSpace(name) ? CurrentFolder : name;
+        }
+    }
+
+    partial void OnCurrentFolderChanged(string value) => NotifyWorkspaceLocationChanged();
+
+    private void NotifyWorkspaceLocationChanged()
+    {
+        OnPropertyChanged(nameof(FolderBreadcrumbs));
+        OnPropertyChanged(nameof(HasBreadcrumbs));
+        OnPropertyChanged(nameof(WorkspaceTitle));
+        OnPropertyChanged(nameof(WorkspaceAncestorBreadcrumbs));
+        OnPropertyChanged(nameof(HasWorkspaceAncestors));
+        OnPropertyChanged(nameof(HasWorkspaceFolderTitle));
+    }
+
     private FolderTreeNode? FindImportedRoot(string folderPath)
     {
         var normalizedFolder = NormalizePath(folderPath);
@@ -84,7 +135,7 @@ public partial class MainWindowViewModel
     partial void OnFolderItemsChanged(ObservableCollection<FolderViewItem> value)
     {
         OnPropertyChanged(nameof(HasFolderItems));
-        OnPropertyChanged(nameof(ShowFolderSection));
+        NotifyWorkspaceCounts();
         OnPropertyChanged(nameof(HasBreadcrumbs));
     }
 
@@ -208,11 +259,7 @@ public partial class MainWindowViewModel
         Dispatcher.UIThread.InvokeAsync(() => FolderItems = items).GetTask();
 
     private Task PublishFolderBreadcrumbsAsync() =>
-        Dispatcher.UIThread.InvokeAsync(() =>
-        {
-            OnPropertyChanged(nameof(FolderBreadcrumbs));
-            OnPropertyChanged(nameof(HasBreadcrumbs));
-        }).GetTask();
+        Dispatcher.UIThread.InvokeAsync(NotifyWorkspaceLocationChanged).GetTask();
 
     private static List<string> EnumerateDirectMedia(string folder)
     {

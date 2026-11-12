@@ -1,0 +1,175 @@
+<Styles xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Styles.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.ThemeDictionaries>
+                <ResourceDictionary x:Key="Dark">
+                    <SolidColorBrush x:Key="WorkspaceCanvasBrush" Color="#19191C"/>
+                    <SolidColorBrush x:Key="WorkspaceSidebarBrush" Color="#202024"/>
+                    <SolidColorBrush x:Key="WorkspaceSurfaceBrush" Color="#27272B"/>
+                    <SolidColorBrush x:Key="WorkspaceLineBrush" Color="#333338"/>
+                    <SolidColorBrush x:Key="WorkspaceTextBrush" Color="#E8E8ED"/>
+                    <SolidColorBrush x:Key="WorkspaceAccentBrush" Color="#AAA8ED"/>
+                    <SolidColorBrush x:Key="WorkspaceSelectionBrush" Color="#30303E"/>
+                    <SolidColorBrush x:Key="WorkspaceMutedBrush" Color="#A5A5AF"/>
+                    <SolidColorBrush x:Key="WorkspaceHoverBrush" Color="#2B2B31"/>
+                    <SolidColorBrush x:Key="WorkspaceBrandBrush" Color="#7671C5"/>
+                    <SolidColorBrush x:Key="WorkspaceButtonBrush" Color="#6761C5"/>
+                    <SolidColorBrush x:Key="WorkspaceButtonHoverBrush" Color="#6B60CE"/>
+                </ResourceDictionary>
+                <ResourceDictionary x:Key="Light">
+                    <SolidColorBrush x:Key="WorkspaceCanvasBrush" Color="#F6F6F7"/>
+                    <SolidColorBrush x:Key="WorkspaceSidebarBrush" Color="#EFEFF1"/>
+                    <SolidColorBrush x:Key="WorkspaceSurfaceBrush" Color="#FFFFFF"/>
+                    <SolidColorBrush x:Key="WorkspaceLineBrush" Color="#DDDDE3"/>
+                    <SolidColorBrush x:Key="WorkspaceTextBrush" Color="#292930"/>
+                    <SolidColorBrush x:Key="WorkspaceAccentBrush" Color="#6560B8"/>
+                    <SolidColorBrush x:Key="WorkspaceSelectionBrush" Color="#E4E3F2"/>
+                    <SolidColorBrush x:Key="WorkspaceMutedBrush" Color="#656571"/>
+                    <SolidColorBrush x:Key="WorkspaceHoverBrush" Color="#E5E5EA"/>
+                    <SolidColorBrush x:Key="WorkspaceBrandBrush" Color="#7671C5"/>
+                    <SolidColorBrush x:Key="WorkspaceButtonBrush" Color="#6761C5"/>
+                    <SolidColorBrush x:Key="WorkspaceButtonHoverBrush" Color="#554AAD"/>
+                </ResourceDictionary>
+            </ResourceDictionary.ThemeDictionaries>
+        </ResourceDictionary>
+    </Styles.Resources>
+
+    <!-- A wallpaper is a local Background value; clearing it restores this style. -->
+    <Style Selector="Window.workspace-window">
+        <Setter Property="Background" Value="{DynamicResource WorkspaceCanvasBrush}"/>
+    </Style>
+
+    <Style Selector="TextBlock.workspace-heading">
+        <Setter Property="FontSize" Value="21"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+        <Setter Property="Foreground" Value="{DynamicResource WorkspaceTextBrush}"/>
+        <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+    <Style Selector="TextBlock.workspace-meta">
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="Foreground" Value="{DynamicResource WorkspaceMutedBrush}"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+    <Style Selector="Button.workspace-title-link">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="Padding" Value="0"/>
+        <Setter Property="VerticalAlignment" Value="Center"/>
+        <Setter Property="HorizontalContentAlignment" Value="Left"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+        <Setter Property="Cursor" Value="Hand"/>
+    </Style>
+    <Style Selector="Button.workspace-title-link:pointerover">
+        <Setter Property="Background" Value="Transparent"/>
+    </Style>
+    <Style Selector="Button.workspace-quiet">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="BorderBrush" Value="Transparent"/>
+        <Setter Property="CornerRadius" Value="5"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="Padding" Value="8,4"/>
+        <Setter Property="MinHeight" Value="30"/>
+        <Setter Property="HorizontalContentAlignment" Value="Center"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+    <Style Selector="Button.workspace-quiet:pointerover, Button.workspace-quiet:focus-visible">
+        <Setter Property="Background" Value="{DynamicResource WorkspaceHoverBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource WorkspaceLineBrush}"/>
+    </Style>
+    <Style Selector="Button.workspace-tab, Button#FilterButton">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="BorderBrush" Value="Transparent"/>
+        <Setter Property="Foreground" Value="{DynamicResource WorkspaceMutedBrush}"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="Padding" Value="7,4"/>
+        <Setter Property="CornerRadius" Value="5"/>
+        <Setter Property="MinHeight" Value="32"/>
+        <Setter Property="HorizontalContentAlignment" Value="Center"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+    <Style Selector="Button#FilterButton">
+        <Setter Property="MinWidth" Value="80"/>
+    </Style>
+    <Style Selector="Button.workspace-tab:pointerover, Button#FilterButton:pointerover">
+        <Setter Property="Background" Value="{DynamicResource WorkspaceHoverBrush}"/>
+        <Setter Property="Foreground" Value="{DynamicResource WorkspaceTextBrush}"/>
+    </Style>
+    <Style Selector="Button.workspace-tab-active">
+        <Setter Property="Background" Value="{DynamicResource WorkspaceSelectionBrush}"/>
+        <Setter Property="Foreground" Value="{DynamicResource WorkspaceAccentBrush}"/>
+    </Style>
+    <Style Selector="Button.workspace-primary">
+        <Setter Property="Background" Value="{DynamicResource WorkspaceButtonBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource WorkspaceButtonBrush}"/>
+        <Setter Property="Foreground" Value="White"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="FontWeight" Value="SemiBold"/>
+        <Setter Property="CornerRadius" Value="5"/>
+        <Setter Property="Padding" Value="12,4"/>
+        <Setter Property="MinHeight" Value="30"/>
+        <Setter Property="HorizontalContentAlignment" Value="Center"/>
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+    <Style Selector="Button.workspace-primary:pointerover, Button.workspace-primary:focus-visible">
+        <Setter Property="Background" Value="{DynamicResource WorkspaceButtonHoverBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource WorkspaceAccentBrush}"/>
+        <Setter Property="Foreground" Value="White"/>
+    </Style>
+    <Style Selector="Button.workspace-primary:disabled">
+        <Setter Property="Opacity" Value="0.55"/>
+    </Style>
+    <Style Selector="TextBox.toolbar-compact, ComboBox.toolbar-compact">
+        <Setter Property="Background" Value="{DynamicResource WorkspaceSurfaceBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource WorkspaceLineBrush}"/>
+    </Style>
+    <Style Selector="TextBox.toolbar-compact:focus, ComboBox.toolbar-compact:focus-visible">
+        <Setter Property="BorderBrush" Value="{DynamicResource WorkspaceAccentBrush}"/>
+    </Style>
+    <Style Selector="TextBox.workspace-query">
+        <Setter Property="VerticalContentAlignment" Value="Center"/>
+    </Style>
+    <Style Selector="Button.toolbar-chip">
+        <Setter Property="Background" Value="{DynamicResource WorkspaceSelectionBrush}"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource WorkspaceLineBrush}"/>
+    </Style>
+    <Style Selector="Menu.workspace-sidebar-menu > MenuItem">
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="Padding" Value="5,4"/>
+        <Setter Property="MinHeight" Value="30"/>
+    </Style>
+    <Style Selector="TreeView.workspace-tree">
+        <Setter Property="Background" Value="Transparent"/>
+    </Style>
+    <Style Selector="TreeView.workspace-tree TreeViewItem">
+        <Setter Property="MinHeight" Value="30"/>
+        <Setter Property="CornerRadius" Value="5"/>
+    </Style>
+    <Style Selector="TreeView.workspace-tree TreeViewItem:selected /template/ Border#PART_LayoutRoot, TreeView.workspace-tree TreeViewItem:selected /template/ Border#PART_LayoutRoot:pointerover">
+        <Setter Property="Background" Value="{DynamicResource WorkspaceSelectionBrush}"/>
+        <Setter Property="BorderBrush" Value="Transparent"/>
+    </Style>
+    <Style Selector="Expander.workspace-manage">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="BorderThickness" Value="0"/>
+        <Setter Property="Padding" Value="4,5,4,0"/>
+        <Setter Property="MinHeight" Value="32"/>
+        <Setter Property="FontSize" Value="12"/>
+        <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+    </Style>
+    <Style Selector="Expander.workspace-manage /template/ ToggleButton">
+        <Setter Property="Background" Value="Transparent"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource WorkspaceLineBrush}"/>
+        <Setter Property="Padding" Value="10,0,0,0"/>
+        <Setter Property="MinHeight" Value="32"/>
+    </Style>
+    <Style Selector="Slider.workspace-zoom">
+        <Setter Property="Foreground" Value="{DynamicResource WorkspaceButtonBrush}"/>
+    </Style>
+    <Style Selector="Slider.workspace-zoom /template/ Thumb, Slider.workspace-zoom:pointerover /template/ Thumb">
+        <Setter Property="Background" Value="{DynamicResource WorkspaceButtonBrush}"/>
+        <Setter Property="Width" Value="14"/>
+        <Setter Property="Height" Value="14"/>
+    </Style>
+</Styles>

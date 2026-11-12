@@ -777,7 +777,7 @@ partial void OnCornerRadiusDipChanged(double value)
     partial void OnShowAllSubfoldersChanged(bool value)
     {
         if (value) SearchScope = 1; // auto-switch to recursive
-        OnPropertyChanged(nameof(ShowFolderSection));
+        NotifyWorkspaceCounts();
         OnPropertyChanged(nameof(IsSortScopeEnabled));
         if (string.IsNullOrEmpty(CurrentFolder)) return;
         var requestVersion = BeginFolderViewRequest();
@@ -790,6 +790,7 @@ partial void OnCornerRadiusDipChanged(double value)
     partial void OnIsShowingSearchResultChanged(bool value)
     {
         NotifyFolderSectionSearchStateChanged();
+        NotifyWorkspaceLocationChanged();
     }
 
     partial void OnFolderSearchTextChanged(string value)

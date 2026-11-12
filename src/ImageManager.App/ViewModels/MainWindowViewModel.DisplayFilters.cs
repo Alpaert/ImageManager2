@@ -60,6 +60,7 @@ public partial class MainWindowViewModel
         OnPropertyChanged(nameof(DisplayFilterUnknownText));
         OnPropertyChanged(nameof(IsDisplayFilterEmpty));
         OnPropertyChanged(nameof(ActiveFileList));
+        OnPropertyChanged(nameof(WorkspaceCountText));
         OnPropertyChanged(nameof(SearchResultInfo));
         OnPropertyChanged(nameof(HasSearchResults));
     }

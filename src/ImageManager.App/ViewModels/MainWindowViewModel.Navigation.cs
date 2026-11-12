@@ -134,6 +134,8 @@ public partial class MainWindowViewModel
         {
             node.Alias = alias;
             node.DisplayName = alias ?? System.IO.Path.GetFileName(folderPath.TrimEnd('\\', '/'));
+            if (string.Equals(NormalizePath(folderPath), NormalizePath(CurrentFolder), StringComparison.OrdinalIgnoreCase))
+                OnPropertyChanged(nameof(WorkspaceTitle));
         }
     }
 
@@ -233,7 +235,6 @@ public partial class MainWindowViewModel
         TotalPages = 0;
         CurrentFolder = folder;
         _ = RefreshFolderItemsAsync(folderWorkToken);
-        OnPropertyChanged(nameof(FolderBreadcrumbs));
         StartWatchingCurrentFolder();
         PerfLogger.Log($"[LoadFolder] 1-cleanup done {sw.ElapsedMilliseconds}ms");
         AppLogger.Memory($"LoadFolder.Cleanup {Path.GetFileName(folder)}");
