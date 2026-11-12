@@ -76,13 +76,15 @@ public sealed class ImageDisplayGeometryIndex
     private readonly int[] _lookupIndexes;
     private readonly int[] _rangeMinimumIndexes;
     private readonly int[] _rangeMaximumIndexes;
+    private readonly double[]? _rangeMaximumBottoms;
     private readonly int _rangeTreeLeafCount;
 
     private ImageDisplayGeometryIndex(
         ImageDisplayGeometryOptions options,
         ImageDisplayItemRect[] rectangles,
         double extentWidth,
-        double extentHeight)
+        double extentHeight,
+        bool exactViewport = false)
     {
         Options = options;
         _rectangles = rectangles;
@@ -108,6 +110,8 @@ public sealed class ImageDisplayGeometryIndex
             _rangeTreeLeafCount <<= 1;
         _rangeMinimumIndexes = new int[_rangeTreeLeafCount * 2];
         _rangeMaximumIndexes = new int[_rangeTreeLeafCount * 2];
+        if (exactViewport)
+            _rangeMaximumBottoms = new double[_rangeTreeLeafCount * 2];
         Array.Fill(_rangeMinimumIndexes, int.MaxValue);
         Array.Fill(_rangeMaximumIndexes, int.MinValue);
         for (var position = 0; position < _lookupIndexes.Length; position++)
@@ -115,11 +119,15 @@ public sealed class ImageDisplayGeometryIndex
             var leaf = _rangeTreeLeafCount + position;
             _rangeMinimumIndexes[leaf] = _lookupIndexes[position];
             _rangeMaximumIndexes[leaf] = _lookupIndexes[position];
+            if (_rangeMaximumBottoms is not null)
+                _rangeMaximumBottoms[leaf] = rectangles[_lookupIndexes[position]].Bottom;
         }
         for (var node = _rangeTreeLeafCount - 1; node > 0; node--)
         {
             _rangeMinimumIndexes[node] = Math.Min(_rangeMinimumIndexes[node * 2], _rangeMinimumIndexes[node * 2 + 1]);
             _rangeMaximumIndexes[node] = Math.Max(_rangeMaximumIndexes[node * 2], _rangeMaximumIndexes[node * 2 + 1]);
+            if (_rangeMaximumBottoms is not null)
+                _rangeMaximumBottoms[node] = Math.Max(_rangeMaximumBottoms[node * 2], _rangeMaximumBottoms[node * 2 + 1]);
         }
     }
 
@@ -171,6 +179,129 @@ public sealed class ImageDisplayGeometryIndex
 
         rect = default;
         return false;
+    }
+
+    /// <summary>Computes card slots using the paged thumbnail template's layout rules.</summary>
+    public static ImageDisplayGeometryIndex BuildPaged(
+        IReadOnlyList<ImageDisplayItemSize> items,
+        ImageDisplayGeometryOptions options,
+        double gridThumbnailHeight,
+        bool keepPadding,
+        double? measuredGridCellHeight = null)
+    {
+        options = Normalize(options);
+        var width = options.ContainerWidth;
+        var baseWidth = options.ThumbnailBaseWidth;
+        var rectangles = new ImageDisplayItemRect[items.Count];
+        var height = 0d;
+
+        if (options.Mode == ImageDisplayLayoutMode.Vertical)
+        {
+            var columns = Math.Max(1, (int)(width / baseWidth));
+            var columnWidth = width / columns;
+            var bottoms = new double[columns];
+            for (var index = 0; index < items.Count; index++)
+            {
+                var item = items[index];
+                var aspect = HasDimensions(item) ? item.Width / item.Height : 1;
+                var cardHeight = columnWidth / aspect + ImageDisplayGeometryOptions.TextAndChromeHeight;
+                var column = 0;
+                for (var candidate = 1; candidate < columns; candidate++)
+                {
+                    if (bottoms[candidate] < bottoms[column])
+                        column = candidate;
+                }
+                rectangles[index] = new ImageDisplayItemRect(column * columnWidth, bottoms[column], columnWidth, cardHeight);
+                bottoms[column] += cardHeight;
+            }
+            height = bottoms.Max();
+        }
+        else if (options.Mode == ImageDisplayLayoutMode.Horizontal && items.Count > 0)
+        {
+            var targetHeight = baseWidth * 180 / 160;
+            var widths = new double[items.Count];
+            var rowWidth = 0d;
+            var rowStart = 0;
+            var lastFullRowHeight = targetHeight;
+            for (var index = 0; index < items.Count; index++)
+            {
+                var cardWidth = GetPagedHorizontalWidth(items[index], targetHeight);
+                if (index > rowStart && rowWidth + cardWidth > width)
+                {
+                    lastFullRowHeight = targetHeight * width / rowWidth;
+                    height = FlushHorizontalRow(rectangles, widths, rowStart, index, rowWidth, height, targetHeight, width);
+                    rowStart = index;
+                    rowWidth = 0;
+                }
+                widths[index] = cardWidth;
+                rowWidth += cardWidth;
+            }
+
+            var finalRowHeight = lastFullRowHeight;
+            var finalRowWidth = 0d;
+            for (var index = rowStart; index < items.Count; index++)
+                finalRowWidth += GetPagedHorizontalWidth(items[index], finalRowHeight);
+            if (finalRowWidth > width)
+                finalRowHeight *= width / finalRowWidth;
+
+            var x = 0d;
+            for (var index = rowStart; index < items.Count; index++)
+            {
+                var cardWidth = GetPagedHorizontalWidth(items[index], finalRowHeight);
+                rectangles[index] = new ImageDisplayItemRect(x, height, cardWidth, finalRowHeight);
+                x += cardWidth;
+            }
+            // Match the legacy panel's measured extent for its last row.
+            height += targetHeight * width / rowWidth;
+        }
+        else if (options.Mode == ImageDisplayLayoutMode.None)
+        {
+            var cellWidth = baseWidth + ImageDisplayGeometryOptions.ItemGap;
+            var imageHeight = IsUsable(gridThumbnailHeight) ? gridThumbnailHeight : baseWidth;
+            // The inner thumbnail margin contributes 3 DIP on each side.
+            // Match the height the thumbnail template reports to the paged grid.
+            var cellHeight = measuredGridCellHeight is > 0 and < double.PositiveInfinity
+                ? measuredGridCellHeight.Value
+                : Math.Max(80, imageHeight) + (keepPadding ? 6 : 0) + ImageDisplayGeometryOptions.ItemGap;
+            var columns = Math.Max(1, (int)(width / cellWidth));
+            for (var index = 0; index < items.Count; index++)
+                rectangles[index] = new ImageDisplayItemRect(index % columns * cellWidth, index / columns * cellHeight, cellWidth, cellHeight);
+            height = Math.Ceiling((double)items.Count / columns) * cellHeight;
+        }
+
+        return new ImageDisplayGeometryIndex(options, rectangles, width, height, exactViewport: true);
+    }
+
+    private static bool HasDimensions(ImageDisplayItemSize item) => IsUsable(item.Width) && IsUsable(item.Height);
+
+    private static double GetPagedHorizontalWidth(ImageDisplayItemSize item, double rowHeight) =>
+        HasDimensions(item) ? rowHeight * item.Width / item.Height + ImageDisplayGeometryOptions.ItemGap : rowHeight * 0.75;
+
+    public int[] QueryPagedViewport(double viewportY, double viewportHeight)
+    {
+        if (_rangeMaximumBottoms is null || viewportHeight <= 0 || !double.IsFinite(viewportY))
+            return [];
+
+        var end = LowerBound(_itemTops, viewportY + viewportHeight);
+        var indexes = new List<int>();
+        CollectIntersectingIndexes(1, 0, _rangeTreeLeafCount, end, viewportY, indexes);
+        indexes.Sort();
+        return indexes.ToArray();
+    }
+
+    private void CollectIntersectingIndexes(int node, int start, int end, int limit, double y, List<int> indexes)
+    {
+        if (start >= limit || _rangeMaximumBottoms![node] <= y)
+            return;
+        if (end - start == 1)
+        {
+            indexes.Add(_lookupIndexes[start]);
+            return;
+        }
+
+        var middle = (start + end) / 2;
+        CollectIntersectingIndexes(node * 2, start, middle, limit, y, indexes);
+        CollectIntersectingIndexes(node * 2 + 1, middle, end, limit, y, indexes);
     }
 
     /// <summary>

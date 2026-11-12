@@ -1,6 +1,7 @@
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Templates;
+using Avalonia.Input;
 using Avalonia.Media;
 using Avalonia.Themes.Fluent;
 using Avalonia.Threading;
@@ -22,6 +23,7 @@ using Avalonia.Interactivity;
 
 AppBuilder.Configure<Application>().UsePlatformDetect().SetupWithoutStarting();
 Application.Current!.Styles.Add(new FluentTheme());
+ThumbnailDecodeChecks.Run();
 if (typeof(Window).IsAssignableFrom(typeof(HoverPreviewPopup)))
     throw new InvalidOperationException("Hover preview must not create a secondary Window/TopLevel.");
 var fixtureDirectory = Path.Combine(Path.GetTempPath(), "ImageManager-ContinuousTests", Guid.NewGuid().ToString("N"));
@@ -83,6 +85,8 @@ var vm = new MainWindowViewModel(null!, null!, repo, null!, null!, null!, null!,
 vm.WaterfallMode = "Horizontal";
 typeof(MainWindowViewModel).GetField("_displayFilteredFiles", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(vm, paths.ToList());
 var main = new TestMainWindow { DataContext = vm, ShowInTaskbar = false };
+ComparePagedLayouts();
+VerifyThumbnailCardRecycling();
 var handler = (PropertyChangedEventHandler)typeof(MainWindow).GetMethod("OnViewModelPropertyChanged", BindingFlags.Instance | BindingFlags.NonPublic)!.CreateDelegate(typeof(PropertyChangedEventHandler), main);
 vm.PropertyChanged += handler;
 vm.ContinuousDisplayRefreshRequested += (Func<int, Task>)typeof(MainWindow).GetMethod("ApplyDisplayModeAsync", BindingFlags.Instance | BindingFlags.NonPublic)!.CreateDelegate(typeof(Func<int, Task>), main);
@@ -349,6 +353,32 @@ try
     WaitForTask(vm.ResetDisplayFilterAsync());
     WaitForImages(actualPanel);
     if (actualItems.ItemCount != 7) throw new InvalidOperationException("Folder/filter replacement did not reach the control.");
+
+    SetFiles(paths.Take(7).Append(Path.Combine(fixtureDirectory, "filtered-out.mp4")));
+    var imageFilter = new DisplayFilterOptions("image");
+    WaitForTask(vm.ApplyDisplayFilterAsync(imageFilter));
+    WaitUntil(() => actualPanel.GeometryIndex?.Count == 7);
+    WaitForImages(actualPanel);
+    var filteredSourceBeforeDelete = vm.ContinuousImageItemSource;
+    var retainedFilteredContainer = actualPanel.GetVisualChildren().OfType<Control>()
+        .First(control => (control.DataContext as ImageViewItem)?.FilePath == paths[2]);
+    var retainedFilteredItem = (ImageViewItem)retainedFilteredContainer.DataContext!;
+    var retainedFilteredBytes = retainedFilteredItem.ThumbnailData;
+
+    WaitForTask(vm.RemoveFilesFromViewAsync(new HashSet<string>([paths[1]], StringComparer.OrdinalIgnoreCase)));
+    WaitUntil(() => actualPanel.GeometryIndex?.Count == 6 && actualItems.ItemCount == 6);
+    WaitForImages(actualPanel);
+    if (vm.DisplayFilter != imageFilter || vm.DisplayFilterSourceCount != 7 ||
+        !ReferenceEquals(filteredSourceBeforeDelete, vm.ContinuousImageItemSource) ||
+        !actualPanel.GetVisualChildren().Any(control => ReferenceEquals(control, retainedFilteredContainer)) ||
+        !ReferenceEquals(retainedFilteredItem, retainedFilteredContainer.DataContext) ||
+        retainedFilteredBytes is not { Length: > 0 } ||
+        !ReferenceEquals(retainedFilteredBytes, retainedFilteredItem.ThumbnailData))
+    {
+        throw new InvalidOperationException("Deleting a filtered item must retain continuous containers and thumbnail bytes.");
+    }
+    Console.WriteLine("PASS filtered continuous deletion retains neighboring containers and thumbnails");
+
     SetFiles(Array.Empty<string>());
     WaitForTask(vm.ResetDisplayFilterAsync());
     Pump();
@@ -356,12 +386,121 @@ try
     SetFiles(paths);
     WaitForTask(vm.ResetDisplayFilterAsync());
     WaitForImages(actualPanel);
+    page.UseViewportLoading = true;
+    page.PageSize = ImagePaging.Max;
     WaitForTask(vm.TrySetDisplayModeAsync(ImageManager.App.Models.ImageDisplayMode.Paged));
     Pump();
-    if (actualItems.IsVisible || !main.FindControl<ItemsControl>("ItemsImages")!.IsVisible)
+    var pagedItems = main.FindControl<ItemsControl>("ItemsImages")!;
+    var pagedPanel = (VirtualizingWaterfallPanel)pagedItems.ItemsPanelRoot!;
+    if (actualItems.IsVisible || !pagedItems.IsVisible)
         throw new InvalidOperationException("Returning to paged mode failed.");
+    WaitForPagedImages();
+    if (vm.Images.Count != ImagePaging.Max || pagedPanel.RealizedCount >= ImagePaging.Max / 2 ||
+        vm.Images.Any(item => !pagedPanel.PagedRetainedItems.Contains(item) &&
+            !pagedPanel.PagedPrefetchItems.Contains(item) && item.ThumbnailData is not null))
+        throw new InvalidOperationException("Paged display did not bound controls and bytes to its viewport and prefetch window.");
+
+    var pagedScroll = main.FindControl<ScrollViewer>("ThumbnailScrollViewer")!;
+    pagedScroll.Offset = default;
+    Pump();
+    var wheelPointer = new Avalonia.Input.Pointer(1, PointerType.Mouse, true);
+    SendWheel(-1);
+    SendWheel(1);
+    WaitForNextWheelFrame();
+    if (pagedScroll.Offset.Y != 0)
+        throw new InvalidOperationException("An opposite wheel event at the top failed to cancel the queued frame.");
+    SendWheel(-1);
+    SendWheel(-1);
+    SendWheel(0, deltaX: 1);
+    try { WaitUntil(() => pagedScroll.Offset.Y == 800); }
+    catch (TimeoutException exception)
+    {
+        const BindingFlags fields = BindingFlags.Instance | BindingFlags.NonPublic;
+        var motion = (SmoothScrollMotion)typeof(MainWindow).GetField("_wheelMotion", fields)!.GetValue(main)!;
+        var pending = typeof(MainWindow).GetField("_wheelFramePending", fields)!.GetValue(main);
+        throw new InvalidOperationException(
+            $"Wheel did not settle at 800 DIP. Offset={pagedScroll.Offset.Y:R}, position={motion.Position:R}, " +
+            $"target={motion.Target:R}, velocity={motion.Velocity:R}, needsFrame={motion.NeedsFrame}, pending={pending}.",
+            exception);
+    }
+    SendWheel(-1);
+    pagedScroll.Offset = new Vector(0, 250);
+    WaitForNextWheelFrame();
+    if (pagedScroll.Offset.Y != 250)
+        throw new InvalidOperationException("Wheel animation overrode a newer external scroll offset.");
+    pagedScroll.Offset = default;
+    WaitForPagedImages();
+    Console.WriteLine("PASS wheel boundary cancellation, accumulated distance, zero Y input and external offset takeover");
+
+    void SendWheel(double delta, double deltaX = 0) => pagedScroll.RaiseEvent(new PointerWheelEventArgs(
+        pagedScroll, wheelPointer, main, default, 0, new PointerPointProperties(), KeyModifiers.None, new Vector(deltaX, delta))
+    {
+        RoutedEvent = InputElement.PointerWheelChangedEvent
+    });
+
+    void WaitForNextWheelFrame()
+    {
+        var frameObserved = false;
+        main.RequestAnimationFrame(_ => frameObserved = true);
+        WaitUntil(() => frameObserved);
+    }
+
+    var middleIndex = vm.Images.Count / 2;
+    if (!pagedPanel.ScrollToIndex(middleIndex))
+        throw new InvalidOperationException("Could not navigate to the paged prefetch fixture.");
+    WaitUntil(() => pagedPanel.CurrentScrollDirection == ContinuousScrollDirection.Down &&
+        pagedPanel.PagedPrefetchItems.FirstOrDefault()?.ThumbnailData is { Length: > 0 });
+    var forwardItem = pagedPanel.PagedPrefetchItems[0];
+    if (pagedPanel.PagedPrefetchItems.Count > 48 ||
+        pagedPanel.PagedPrefetchItems.Any(item => pagedItems.ContainerFromItem(item) is not null) ||
+        pagedPanel.RealizedCount != pagedPanel.PagedRetainedItems.Count)
+        throw new InvalidOperationException("Forward paged prefetch exceeded its data-only budget.");
+
+    if (!pagedPanel.ScrollToIndex(middleIndex - 24))
+        throw new InvalidOperationException("Could not reverse the paged prefetch fixture.");
+    WaitUntil(() => pagedPanel.CurrentScrollDirection == ContinuousScrollDirection.Up &&
+        pagedPanel.PagedPrefetchItems.FirstOrDefault()?.ThumbnailData is { Length: > 0 } &&
+        forwardItem.ThumbnailData is null);
+    if (pagedPanel.PagedPrefetchItems.Count > 48 ||
+        pagedPanel.PagedPrefetchItems.Any(item => pagedItems.ContainerFromItem(item) is not null))
+        throw new InvalidOperationException("Reverse paged prefetch expanded the realized controls.");
+    pagedScroll.Offset = default;
+    WaitForPagedImages();
+    Console.WriteLine("PASS paged data-only prefetch, direction reversal and former prefetch eviction");
+
+    var firstPage = vm.Images.ToHashSet();
+    WaitForTask(vm.ShowPageAsync(1));
+    WaitForPagedImages();
+    if (vm.Images.Count != firstPage.Count || pagedPanel.PagedVisibleItems.Any(firstPage.Contains))
+        throw new InvalidOperationException("Replacing a page with the same count must realize its new items.");
+
+    var survivor = pagedPanel.PagedVisibleItems[0];
+    var deleted = pagedPanel.PagedVisibleItems[1];
+    var survivorContainer = pagedItems.ContainerFromItem(survivor);
+    var survivorBytes = survivor.ThumbnailData;
+    WaitForTask(vm.RemoveFilesFromViewAsync(new HashSet<string>([deleted.FilePath], StringComparer.OrdinalIgnoreCase)));
+    WaitForPagedImages();
+    if (vm.Images.Count != ImagePaging.Max || vm.Images.Contains(deleted) ||
+        !ReferenceEquals(survivorContainer, pagedItems.ContainerFromItem(survivor)) ||
+        !ReferenceEquals(survivorBytes, survivor.ThumbnailData))
+        throw new InvalidOperationException("Deletion and same-count refill lost a surviving paged card or its thumbnail.");
+
+    var distantItem = vm.Images[^1];
+    if (!pagedPanel.ScrollToIndex(vm.Images.Count - 1))
+        throw new InvalidOperationException("Scrolling to an unrealized paged item failed.");
+    WaitUntil(() => pagedPanel.PagedVisibleItems.Contains(distantItem) && distantItem.IsLoaded &&
+        !pagedPanel.PagedRetainedItems.Contains(survivor) && survivor.ThumbnailData is null);
+    Console.WriteLine("PASS paged viewport bounds, same-count replacement, deletion refill, distant navigation and eviction");
+
     WaitForTask(vm.TrySetDisplayModeAsync(ImageManager.App.Models.ImageDisplayMode.Continuous));
     WaitForImages(actualPanel);
+
+    void WaitForPagedImages()
+    {
+        WaitUntil(() => pagedPanel.PagedVisibleItems.Count > 1 &&
+            pagedPanel.PagedVisibleItems.All(item => item.IsLoaded && item.ThumbnailData is { Length: > 0 }));
+        Pump();
+    }
 
     // Deleting the final result follows the incremental continuous-delete path,
     // unlike filter replacement. It must remove every realized card immediately.
@@ -428,6 +567,272 @@ void WaitForImages(VirtualizingWaterfallPanel actualPanel)
 }
 void SetFiles(IEnumerable<string> files) => typeof(MainWindowViewModel)
     .GetField("_allFiles", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(vm, files.ToList());
+
+void VerifyThumbnailCardRecycling()
+{
+    var fixtures = Enumerable.Range(0, 12).Select(index => new ImageViewItem
+    {
+        FilePath = Path.Combine(fixtureDirectory, $"recycled-{index}.png"),
+        FileName = $"recycled-{index}.png",
+        Width = 100,
+        Height = 100
+    }).ToArray();
+    var firstItem = fixtures[0];
+    firstItem.ThumbnailData = encoded.ToArray();
+    firstItem.IsLoaded = true;
+    firstItem.IsSelected = true;
+    var lastItem = fixtures[^1];
+    lastItem.FilePath = Path.Combine(fixtureDirectory, "recycled-audio.mp3");
+    lastItem.FileName = "recycled-audio.mp3";
+    using var audioCover = new SkiaSharp.SKBitmap(47, 53);
+    using (var canvas = new SkiaSharp.SKCanvas(audioCover)) canvas.Clear(SkiaSharp.SKColors.Blue);
+    using var coverBytes = audioCover.Encode(SkiaSharp.SKEncodedImageFormat.Png, 100);
+    lastItem.ThumbnailData = coverBytes.ToArray();
+    lastItem.IsLoaded = true;
+
+    var panel = new VirtualizingWaterfallPanel
+    {
+        ViewportBuffer = 0,
+        GeometryIndex = ImageDisplayGeometryIndex.Build(
+            fixtures.Select(item => new ImageDisplayItemSize(item.Width, item.Height)).ToArray(),
+            new ImageDisplayGeometryOptions(ImageDisplayLayoutMode.None, 400, 300, 1))
+    };
+    var gallery = new ThumbnailItemsControl
+    {
+        ItemsSource = fixtures,
+        ItemTemplate = (IDataTemplate)main.Resources["ThumbnailItemTemplate"]!,
+        ItemsPanel = new FuncTemplate<Panel?>(() => panel)
+    };
+    var window = new Window
+    {
+        Width = 400, Height = 185, DataContext = vm, ShowInTaskbar = false,
+        Content = new ScrollViewer { Content = gallery }
+    };
+
+    try
+    {
+        window.Show();
+        WaitForCard(() => panel.RealizedCount == 1 && gallery.ContainerFromIndex(0) is Decorator { Child: Border });
+        var container = (Decorator)gallery.ContainerFromIndex(0)!;
+        var card = (Border)container.Child!;
+        var contextMenu = card.ContextMenu!;
+        var tagItem = contextMenu.Items.OfType<MenuItem>().Single(item => Equals(item.Header, "编辑 Tag"));
+        var explorerItem = contextMenu.Items.OfType<MenuItem>().Single(item => Equals(item.Header, "在资源管理器中打开"));
+        var image = card.GetVisualDescendants().OfType<AsyncThumbnailImage>().Single();
+        var selectionBorder = card.GetVisualDescendants().OfType<Border>().Single(border =>
+            border.BorderBrush is ISolidColorBrush brush && brush.Color == Color.Parse("#FF3D7FFF"));
+        WaitForCard(() => image.Source is Avalonia.Media.Imaging.Bitmap first && first.PixelSize.Width == 100);
+        contextMenu.Open(card);
+        WaitForCard(() => contextMenu.IsOpen && ReferenceEquals(tagItem.DataContext, firstItem));
+        if (!selectionBorder.IsVisible || !tagItem.IsVisible)
+            throw new InvalidOperationException("The first thumbnail did not show its selection and image commands.");
+
+        var clearedWhileRecycling = false;
+        card.DataContextChanged += (_, _) =>
+        {
+            if (card.DataContext is null && image.Source is null)
+                clearedWhileRecycling = true;
+        };
+        if (!panel.ScrollToIndex(fixtures.Length - 1) || contextMenu.IsOpen)
+            throw new InvalidOperationException("Recycling a card did not close its open context menu.");
+        if (!ReferenceEquals(container, gallery.ContainerFromIndex(fixtures.Length - 1)) ||
+            !ReferenceEquals(card, container.Child) || !ReferenceEquals(contextMenu, card.ContextMenu) ||
+            !ReferenceEquals(tagItem, contextMenu.Items.OfType<MenuItem>().Single(item => Equals(item.Header, "编辑 Tag"))) ||
+            !ReferenceEquals(image, card.GetVisualDescendants().OfType<AsyncThumbnailImage>().Single()) ||
+            !clearedWhileRecycling || image.Source is Avalonia.Media.Imaging.Bitmap stale && stale.PixelSize.Width == 100)
+            throw new InvalidOperationException("The thumbnail template was rebuilt or retained the previous item.");
+
+        WaitForCard(() => image.Source is Avalonia.Media.Imaging.Bitmap cover && cover.PixelSize.Width == 47);
+        contextMenu.Open(card);
+        WaitForCard(() => contextMenu.IsOpen && ReferenceEquals(explorerItem.DataContext, lastItem));
+        if (!ReferenceEquals(container.DataContext, lastItem) || !ReferenceEquals(card.DataContext, lastItem) ||
+            !ReferenceEquals(contextMenu.DataContext, lastItem) || selectionBorder.IsVisible || tagItem.IsVisible)
+            throw new InvalidOperationException("The recycled template did not bind the music item's image, selection and menu state.");
+
+        var getContextItem = typeof(MainWindow).GetMethod("GetCtxItem", BindingFlags.NonPublic | BindingFlags.Static)!;
+        ImageViewItem? clickedItem = null;
+        explorerItem.Click += (sender, _) => clickedItem = (ImageViewItem?)getContextItem.Invoke(null, [sender]);
+        explorerItem.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+        if (!ReferenceEquals(clickedItem, lastItem))
+            throw new InvalidOperationException("The recycled menu action targeted the previous item.");
+        contextMenu.Close();
+
+        gallery.ItemTemplate = new FuncDataTemplate<ImageViewItem>((_, _) => new TextBlock { Text = "replacement template" });
+        WaitForCard(() => gallery.GetVisualDescendants().OfType<TextBlock>().Any(text => text.Text == "replacement template"));
+    }
+    finally
+    {
+        window.Close();
+    }
+    Console.WriteLine("PASS gallery recycles card, menu, selection and async thumbnail across items and rebuilds on template change");
+
+    void WaitForCard(Func<bool> condition)
+    {
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        do
+        {
+            window.UpdateLayout();
+            Dispatcher.UIThread.RunJobs();
+            if (condition()) return;
+            Thread.Sleep(10);
+        } while (timer.Elapsed < TimeSpan.FromSeconds(5));
+        throw new TimeoutException("The recycled gallery card did not reach its expected state.");
+    }
+}
+
+void ComparePagedLayouts()
+{
+    var template = (IDataTemplate)main.Resources["ThumbnailItemTemplate"]!;
+    var thumbnailBytes = encoded.ToArray();
+    var previousMode = vm.WaterfallMode;
+    var previousPadding = vm.KeepPadding;
+    var previousAspectRatio = vm.AppSettings.ThumbnailAspectRatio;
+    try
+    {
+        foreach (var mode in new[] { "None", "Vertical", "Horizontal" })
+        foreach (var padding in new[] { false, true })
+        {
+            vm.WaterfallMode = mode;
+            vm.KeepPadding = padding;
+            vm.AppSettings.ThumbnailAspectRatio = mode == "None" ? 1.5 : previousAspectRatio;
+            var legacy = new SmartWaterfallPanel { Mode = mode, ColumnWidth = vm.ThumbnailBaseWidth };
+            var virtualized = new VirtualizingWaterfallPanel
+            {
+                IsPaged = true,
+                Mode = mode,
+                ColumnWidth = vm.ThumbnailBaseWidth,
+                GridThumbnailHeight = vm.GridThumbnailHeight,
+                KeepPadding = padding
+            };
+            var oldLayout = MeasureLayout(legacy);
+            var newLayout = MeasureLayout(virtualized);
+            if (oldLayout.Count != 400 || newLayout.Count >= 200)
+                throw new InvalidOperationException($"{mode}/{padding} did not reduce realized controls: {oldLayout.Count} -> {newLayout.Count}.");
+            if (newLayout.Cards.Count < 2 || !newLayout.Cards.ContainsKey(0) || !newLayout.Cards.ContainsKey(1))
+                throw new InvalidOperationException($"{mode}/{padding} did not arrange the long and unknown-size fixture cards.");
+            if (mode == "None" && !SameRect(oldLayout.LastGridCard, newLayout.LastGridCard))
+                throw new InvalidOperationException($"Grid card bounds drifted at the end of the page: {oldLayout.LastGridCard} -> {newLayout.LastGridCard}.");
+            foreach (var (index, actual) in newLayout.Cards)
+            {
+                if (!oldLayout.Cards.TryGetValue(index, out var expected) ||
+                    !SameRect(actual.Card, expected.Card) || !SameRect(actual.Image, expected.Image))
+                    throw new InvalidOperationException($"{mode}/{padding} card {index} changed: {expected} -> {actual}.");
+            }
+            Console.WriteLine($"PASS {mode} padding={padding} card and image bounds, controls {oldLayout.Count}->{newLayout.Count}, first layout {oldLayout.Milliseconds:F1}->{newLayout.Milliseconds:F1} ms");
+        }
+    }
+    finally
+    {
+        vm.WaterfallMode = previousMode;
+        vm.KeepPadding = previousPadding;
+        vm.AppSettings.ThumbnailAspectRatio = previousAspectRatio;
+    }
+
+    (int Count, double Milliseconds, Rect LastGridCard, Dictionary<int, (Rect Card, Rect Image, double ImageWidth, double ItemWidth)> Cards) MeasureLayout(Panel panel)
+    {
+        var fixtures = Enumerable.Range(0, 400).Select(index => new ImageViewItem
+        {
+            FileName = index.ToString(),
+            Width = index switch { 0 => 10, 1 => 0, _ => 100 + index % 100 },
+            Height = index switch { 0 => 1000, 1 => 0, _ => 100 },
+            ThumbnailData = index < 3 ? thumbnailBytes : null,
+            IsLoaded = index < 3
+        }).ToArray();
+        ItemsControl gallery = panel is SmartWaterfallPanel ? new ItemsControl() : new ThumbnailItemsControl();
+        gallery.ItemsSource = fixtures;
+        gallery.ItemTemplate = template;
+        gallery.ItemsPanel = new FuncTemplate<Panel?>(() => panel);
+        // The folder section precedes the gallery inside the same viewer.
+        var content = new StackPanel { Children = { new Border { Height = 130 }, gallery } };
+        var scroll = new ScrollViewer { Content = content };
+        var layoutWindow = new Window
+        {
+            Width = 920, Height = 640, Content = scroll, DataContext = vm, ShowInTaskbar = false
+        };
+        try
+        {
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            layoutWindow.Show();
+            layoutWindow.UpdateLayout();
+            timer.Stop();
+            var decodeTimer = System.Diagnostics.Stopwatch.StartNew();
+            while (decodeTimer.Elapsed < TimeSpan.FromSeconds(5))
+            {
+                Dispatcher.UIThread.RunJobs();
+                layoutWindow.UpdateLayout();
+                if (gallery.ContainerFromIndex(2)?.GetVisualDescendants().OfType<AsyncThumbnailImage>()
+                    .FirstOrDefault() is { Source: not null, Bounds.Width: > 0, Bounds.Height: > 0 })
+                    break;
+                Thread.Sleep(10);
+            }
+            if (gallery.ContainerFromIndex(2)?.GetVisualDescendants().OfType<AsyncThumbnailImage>()
+                .FirstOrDefault() is not { Source: not null, Bounds.Width: > 0, Bounds.Height: > 0 })
+                throw new InvalidOperationException($"{panel.GetType().Name} did not arrange the decoded image.");
+            for (var i = 0; i < 4; i++) { Dispatcher.UIThread.RunJobs(); layoutWindow.UpdateLayout(); }
+            var cards = new Dictionary<int, (Rect Card, Rect Image, double ImageWidth, double ItemWidth)>();
+            foreach (var child in panel.Children)
+            {
+                if (child.DataContext is not ImageViewItem item ||
+                    !child.IsEffectivelyVisible ||
+                    child.TranslatePoint(default, scroll) is not { } point ||
+                    point.Y >= scroll.Viewport.Height ||
+                    child.GetVisualDescendants().OfType<AsyncThumbnailImage>().FirstOrDefault() is not { } image)
+                    continue;
+                cards.Add(int.Parse(item.FileName), (child.Bounds, image.Bounds, image.Width, SmartWaterfallPanel.GetItemWidth(image)));
+            }
+            var realizedCount = panel.Children.Count;
+            var lastGridCard = default(Rect);
+            var last = fixtures.Length - 1;
+            if (panel is VirtualizingWaterfallPanel paged)
+            {
+                var allCards = paged.GetPagedItemsIntersecting(new Rect(0, 0, paged.Bounds.Width, paged.Bounds.Height));
+                if (paged.PagedRetainedItems.Contains(fixtures[last]) || !allCards.SequenceEqual(fixtures))
+                    throw new InvalidOperationException("Paged box selection missed unrealized cards.");
+                if (paged.Mode == "Vertical")
+                {
+                    var column = cards[1].Card;
+                    var beforeColumn = new Rect(column.X - 0.25, column.Y + 1, 0.25, 1);
+                    var inColumn = new Rect(column.X, column.Y + 1, 0.1, 1);
+                    var singleAxis = new Rect(column.X + 1, column.Y + 1, 0, 10);
+                    if (paged.GetPagedItemsIntersecting(beforeColumn).Contains(fixtures[1]) ||
+                        !paged.GetPagedItemsIntersecting(inColumn).Contains(fixtures[1]) ||
+                        !paged.GetPagedItemsIntersecting(singleAxis).Contains(fixtures[1]))
+                        throw new InvalidOperationException("Paged selection did not match the rounded column edge.");
+                }
+                if (!paged.ScrollToIndex(last))
+                    throw new InvalidOperationException("Could not realize the last card with folders above the gallery.");
+                layoutWindow.UpdateLayout();
+                if (gallery.ContainerFromIndex(last) is not { } lastCard ||
+                    lastCard.TranslatePoint(default, scroll) is not { } lastCardPosition ||
+                    lastCardPosition.Y >= scroll.Viewport.Height || lastCardPosition.Y + lastCard.Bounds.Height <= 0)
+                    throw new InvalidOperationException("The selected card stayed outside the viewer with folders above it.");
+                if (paged.Mode == "None")
+                    lastGridCard = lastCard.Bounds;
+                if (paged.Mode == "Vertical")
+                {
+                    var contentY = paged.TranslatePoint(default, scroll)!.Value.Y + scroll.Offset.Y;
+                    var longCardHeight = cards[0].Card.Height;
+                    var expectedLongCardOffset = Math.Clamp(contentY + (longCardHeight - scroll.Viewport.Height) / 2,
+                        0, scroll.Extent.Height - scroll.Viewport.Height);
+                    if (!paged.ScrollToIndex(0) || Math.Abs(scroll.Offset.Y - expectedLongCardOffset) > 1)
+                        throw new InvalidOperationException($"Paged search must center a tall card: {expectedLongCardOffset} vs {scroll.Offset.Y}.");
+                }
+            }
+            else if (panel is SmartWaterfallPanel { Mode: "None" })
+            {
+                lastGridCard = gallery.ContainerFromIndex(last)!.Bounds;
+            }
+            return (realizedCount, timer.Elapsed.TotalMilliseconds, lastGridCard, cards);
+        }
+        finally
+        {
+            layoutWindow.Close();
+        }
+    }
+
+    static bool SameRect(Rect a, Rect b) => Math.Abs(a.X - b.X) <= 1 &&
+        Math.Abs(a.Y - b.Y) <= 1 && Math.Abs(a.Width - b.Width) <= 1 && Math.Abs(a.Height - b.Height) <= 1;
+}
 
 public class TestMainWindow : MainWindow
 {

@@ -16,7 +16,7 @@ var messenger = new WeakReferenceMessenger();
 var repository = DispatchProxy.Create<IImageMetaRepository, MetadataProxy>();
 var fake = (MetadataProxy)(object)repository;
 var cache = new ThumbnailCacheService(null!, Path.Combine(Path.GetTempPath(), "ImageManager-FilterTests"));
-var page = new PageManager(cache, null!);
+var page = new PageManager(cache, null!, dispatcher: new ImmediateDispatcher());
 var search = new TagSearchEngine(repository, messenger, ImagePaging.Default);
 var vm = new MainWindowViewModel(null!, null!, repository, null!, null!, null!, null!, cache, page,
     search, null!, null!, null!, messenger, new ImmediateDispatcher());
@@ -586,6 +586,8 @@ Require(vm.ActiveFileList.SequenceEqual(new[] { "keep.jpg" }) && vm.DisplayFilte
     "delete during pending reset must complete publication and clear busy state");
 Console.WriteLine("PASS delete reconciles a pending reset publication");
 
+await VerifyStableFilteredPagedDeletionAsync();
+
 var crossFolderFiles = new List<string>
 {
     Path.Combine("B", "m.jpg"),
@@ -816,6 +818,111 @@ static void RequireThrows<TException>(Action action, string message) where TExce
     catch (TException) { return; }
     throw new InvalidOperationException(message);
 }
+static async Task VerifyStableFilteredPagedDeletionAsync()
+{
+    var directory = Path.Combine(Path.GetTempPath(), "ImageManager-FilteredDeletion-" + Guid.NewGuid().ToString("N"));
+    Directory.CreateDirectory(directory);
+    try
+    {
+        var messenger = new WeakReferenceMessenger();
+        var repository = DispatchProxy.Create<IImageMetaRepository, MetadataProxy>();
+        var fake = (MetadataProxy)(object)repository;
+        var thumbnail = CreateTestJpeg();
+        var processorFactory = new TestMusicProcessorFactory(thumbnail);
+        var cache = new ThumbnailCacheService(processorFactory, Path.Combine(directory, "cache"));
+        var page = new PageManager(cache, null!, dispatcher: new ImmediateDispatcher()) { PageSize = ImagePaging.Min };
+        var search = new TagSearchEngine(repository, messenger, page.PageSize);
+        var vm = new MainWindowViewModel(null!, null!, repository, null!, null!, null!, null!, cache, page,
+            search, null!, null!, null!, messenger, new ImmediateDispatcher());
+        var photos = Enumerable.Range(0, page.PageSize + 1)
+            .Select(index => Path.Combine(directory, $"landscape-{index:D3}.jpg"))
+            .ToArray();
+        var hiddenPortrait = Path.Combine(directory, "portrait.jpg");
+        var hiddenUnknown = Path.Combine(directory, "unknown.mp4");
+        var source = photos.Take(page.PageSize).Append(hiddenPortrait).Append(hiddenUnknown).Append(photos[^1]);
+        await File.WriteAllBytesAsync(photos[^1], thumbnail);
+        var dimensionReads = 0;
+        fake.Load = paths =>
+        {
+            Interlocked.Increment(ref dimensionReads);
+            return Task.FromResult(paths.Where(path => path != hiddenUnknown)
+                .ToDictionary(path => path, path => path == hiddenPortrait ? (600, 800) : (800, 600)));
+        };
+        var filter = new DisplayFilterOptions(Orientation: MediaOrientation.Landscape, IncludeUnknownDimensions: false);
+        SetFiles(vm, source.ToList());
+        vm.DisplayFilter = filter;
+        Require(await Publish(vm), "publish a stable landscape filter before deleting");
+        Paging(vm);
+        Require(vm.ActiveFileList.SequenceEqual(photos) && vm.DisplayFilterUnknownCount == 1 && vm.TotalPages == 2,
+            "fixture must exclude portrait and unknown files, while counting the unknown file");
+
+        vm.Images = new(photos.Take(page.PageSize).Select(path => new ImageViewItem
+        {
+            FilePath = path,
+            FileName = Path.GetFileName(path),
+            ThumbnailData = thumbnail,
+            IsLoaded = true,
+            Width = 800,
+            Height = 600
+        }));
+        var visibleItems = vm.Images;
+        var deleted = photos[1];
+        var survivors = visibleItems.Where(item => item.FilePath != deleted).ToArray();
+        var selectedSurvivor = survivors[1];
+        vm.ReplaceSelectedFiles([deleted, selectedSurvivor.FilePath]);
+        var readCountBeforeDelete = dimensionReads;
+        var pageChanges = 0;
+        page.PageChanged += _ => pageChanges++;
+
+        await vm.RemoveFilesFromViewAsync(new HashSet<string>([deleted], StringComparer.OrdinalIgnoreCase));
+
+        Require(pageChanges == 0 && ReferenceEquals(vm.Images, visibleItems),
+            "stable filtered deletion must update the displayed page in place");
+        var remainingPhotos = photos.Where(path => path != deleted).ToArray();
+        Require(vm.Images.Select(item => item.FilePath).SequenceEqual(remainingPhotos),
+            "filtered deletion must fill the page with the next matching item in order");
+        Require(vm.Images.Take(survivors.Length).SequenceEqual(survivors, ReferenceEqualityComparer.Instance) &&
+                survivors.All(item => ReferenceEquals(item.ThumbnailData, thumbnail) && item.IsLoaded),
+            "filtered deletion must retain each surviving card and its loaded thumbnail bytes");
+        Require(processorFactory.CoverReads == 1 && vm.Images[^1].ThumbnailData is { Length: > 0 },
+            "only the item filling the gap should require thumbnail extraction");
+        Require(vm.CurrentPage == 0 && vm.TotalPages == 1 && vm.DisplayFilter == filter &&
+                vm.DisplayFilterSourceCount == remainingPhotos.Length + 2 && vm.DisplayFilterUnknownCount == 1 &&
+                vm.SelectedFilePaths.SequenceEqual([selectedSurvivor.FilePath]) && selectedSurvivor.IsSelected,
+            "filtered deletion must keep the page, filter, selection and counts consistent");
+
+        await vm.RemoveFilesFromViewAsync(new HashSet<string>([hiddenUnknown], StringComparer.OrdinalIgnoreCase));
+        Require(vm.DisplayFilterSourceCount == remainingPhotos.Length + 1 && vm.DisplayFilterUnknownCount == 0 &&
+                vm.Images.Select(item => item.FilePath).SequenceEqual(remainingPhotos) &&
+                pageChanges == 0 && dimensionReads == readCountBeforeDelete,
+            "deleting an excluded unknown file must update counts without loading metadata or replacing the page");
+
+        await vm.RemoveFilesFromViewAsync(remainingPhotos.ToHashSet(StringComparer.OrdinalIgnoreCase));
+        Require(vm.ActiveFileList.Count == 0 && vm.Images.Count == 0 && vm.CurrentPage == 0 &&
+                vm.TotalPages == 0 && vm.IsDisplayFilterEmpty && vm.DisplayFilter == filter,
+            "deleting all filtered results must show the empty state while keeping the filter");
+        Console.WriteLine("PASS stable filtered deletion retains cards, fills the page in order and updates counts");
+
+        SetFiles(vm, photos.ToList());
+        Require(await Publish(vm), "publish two pages before deleting the sole item on the last page");
+        Paging(vm);
+        await vm.ShowPageAsync(1);
+        Require(vm.CurrentPage == 1 && vm.Images.Select(item => item.FilePath).SequenceEqual([photos[^1]]),
+            "fixture must display the last page with only one match");
+        page.CancelCurrentLoads();
+
+        await vm.RemoveFilesFromViewAsync(new HashSet<string>([photos[^1]], StringComparer.OrdinalIgnoreCase));
+        Require(vm.CurrentPage == 0 && vm.TotalPages == 1 &&
+                vm.Images.Select(item => item.FilePath).SequenceEqual(photos.Take(page.PageSize)),
+            "deleting the final item on a filtered last page must show the complete preceding page in order");
+        Console.WriteLine("PASS filtered last-page deletion displays the complete preceding page");
+    }
+    finally
+    {
+        try { Directory.Delete(directory, recursive: true); } catch { }
+    }
+}
+
 static ImageViewItem GetImageItem(object? value, string message) =>
     value as ImageViewItem ?? throw new InvalidOperationException($"Expected ImageViewItem for {message}.");
 static void SetFiles(MainWindowViewModel vm, List<string> files) => typeof(MainWindowViewModel).GetField("_allFiles", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(vm, files);

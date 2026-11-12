@@ -132,6 +132,18 @@ public class ImageMetaRepository : IImageMetaRepository
         return result;
     }
 
+    public async Task<IReadOnlyList<string>> GetFilePathsByFolderIdAsync(long folderId, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var conn = _dbFactory.CreateConnection();
+        var command = new CommandDefinition(
+            "SELECT FilePath FROM ImageMeta WHERE FolderId = @FolderId",
+            new { FolderId = folderId }, cancellationToken: cancellationToken);
+        var paths = await conn.QueryAsync<string>(command).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        return paths.AsList();
+    }
+
     public async Task<List<ImageMeta>> GetByFolderIdAsync(long folderId)
     {
         using var conn = _dbFactory.CreateConnection();

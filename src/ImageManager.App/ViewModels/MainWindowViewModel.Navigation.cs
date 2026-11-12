@@ -223,6 +223,7 @@ public partial class MainWindowViewModel
         PublishAllFiles(new());
         _displayFilteredFiles = new();
         _filteredNavigationFiles = new();
+        _displayFilterUnknownPaths.Clear();
         DisplayFilterSourceCount = 0;
         DisplayFilterUnknownCount = 0;
         NotifyDisplayFilterState();
@@ -240,9 +241,7 @@ public partial class MainWindowViewModel
         AppLogger.Memory($"LoadFolder.Cleanup {Path.GetFileName(folder)}");
 
         // 重置空闲定时器：用户停止切换 5 秒后执行维护任务
-        _idleTimer?.Stop();
-        _idleTimer = new DispatcherTimer(TimeSpan.FromSeconds(5), DispatcherPriority.Background, OnIdleTimerTick);
-        _idleTimer.Start();
+        ScheduleAutomaticMaintenance(TimeSpan.FromSeconds(5));
 
         await Task.Yield();
         if (folderWorkToken.IsCancellationRequested) return;
@@ -636,7 +635,7 @@ public partial class MainWindowViewModel
         // Load tags in background — page already visible, tags fill in asynchronously
         if (showAllSubfolders)
         {
-            RunBackgroundSafe("show-all-tags-and-hash", folderWorkToken, async token =>
+            RunBackgroundSafe("show-all-tags", folderWorkToken, async token =>
             {
                 token.ThrowIfCancellationRequested();
                 var tagMap = await _metaRepo.GetTagMapByFolderAsync(folderPath);
@@ -672,11 +671,7 @@ public partial class MainWindowViewModel
                         });
                     }
 
-                    await Task.Delay(3000, token);
-                    if (token.IsCancellationRequested ||
-                        !IsFolderViewRequestCurrent(requestVersion, folderPath, showAllSubfolders))
-                        return;
-                    await PrecomputeHashesAsync(token, (await _folderRepo.GetByPathAsync(folderPath))?.Id);
+                    // Automatic hashes are scheduled by PublishAllFiles after genuine idle.
             });
         }
     }
@@ -700,6 +695,7 @@ public partial class MainWindowViewModel
 
         var mutationVersion = Interlocked.Increment(ref _fileListMutationVersion);
         _fileSortSnapshot = snapshot?.MutationVersion == mutationVersion ? snapshot : null;
+        InvalidateAutomaticMaintenance();
     }
 
     private async Task<FileSortSnapshot> BuildFileSortSnapshotAsync(
@@ -727,6 +723,7 @@ public partial class MainWindowViewModel
 
     private int BeginFolderViewRequest()
     {
+        InvalidateAutomaticMaintenance();
         CancelDisplayFilter();
         InvalidateFileSortSnapshot();
         InvalidateContinuousDisplayGeometry();

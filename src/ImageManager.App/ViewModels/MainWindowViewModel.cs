@@ -679,6 +679,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     public void ShutdownBackgroundWork()
     {
+        _automaticMaintenance.Dispose();
         CancelActiveBackgroundTasks();
         CancelDisplayFilter();
         InvalidateContinuousDisplayGeometry();

@@ -17,8 +17,10 @@ public partial class MainWindowViewModel
     [ObservableProperty] private int _displayFilterUnknownCount;
     private List<string> _displayFilteredFiles = new();
     private List<string> _filteredNavigationFiles = new();
+    private HashSet<string> _displayFilterUnknownPaths = new(StringComparer.OrdinalIgnoreCase);
     private CancellationTokenSource? _displayFilterCts;
     private int _displayFilterVersion;
+    private int _publishedDisplayFilterVersion = -1;
 
     public bool HasDisplayFilter => DisplayFilter.IsActive;
     public bool HasTypeFilter => DisplayFilter.TypeId != null;
@@ -122,9 +124,11 @@ public partial class MainWindowViewModel
                 if (version != _displayFilterVersion || token.IsCancellationRequested) return false;
                 _displayFilteredFiles = sourceList;
                 _filteredNavigationFiles = navigationList ?? new();
+                _displayFilterUnknownPaths.Clear();
                 InvalidateContinuousDisplayGeometry();
                 DisplayFilterSourceCount = sourceList.Count;
                 DisplayFilterUnknownCount = 0;
+                _publishedDisplayFilterVersion = version;
                 PerfLogger.Log($"[SortPerf] filter_publish_ms={filterStopwatch.ElapsedMilliseconds} count={sourceList.Count} active=false");
                 if (!preserveNavigation) _currentResultIndex = 0;
                 return true;
@@ -163,9 +167,11 @@ public partial class MainWindowViewModel
             if (version != _displayFilterVersion || token.IsCancellationRequested) return false;
             _displayFilteredFiles = result.Files;
             _filteredNavigationFiles = navigation.Files;
+            _displayFilterUnknownPaths = result.UnknownDimensionsPaths ?? new(StringComparer.OrdinalIgnoreCase);
             InvalidateContinuousDisplayGeometry();
             DisplayFilterSourceCount = source.Count;
             DisplayFilterUnknownCount = result.UnknownDimensionsCount;
+            _publishedDisplayFilterVersion = version;
             PerfLogger.Log($"[SortPerf] filter_publish_ms={filterStopwatch.ElapsedMilliseconds} count={result.Files.Count} active={options.IsActive}");
             if (!preserveNavigation) _currentResultIndex = 0;
             return true;
@@ -177,6 +183,7 @@ public partial class MainWindowViewModel
             {
                 _displayFilteredFiles = new();
                 _filteredNavigationFiles = new();
+                _displayFilterUnknownPaths.Clear();
                 InvalidateContinuousDisplayGeometry();
                 DisplayFilterSourceCount = source.Count;
                 DisplayFilterUnknownCount = 0;
@@ -204,7 +211,19 @@ public partial class MainWindowViewModel
     private void SetDisplayPaging()
     {
         TotalPages = (ActiveFileList.Count + _pageManager.PageSize - 1) / _pageManager.PageSize;
-        PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
+        if (PageNumbers.Count == TotalPages) return;
+
+        // Replacing the picker items can update its two-way SelectedIndex binding.
+        var wasNavigating = _isNavigating;
+        _isNavigating = true;
+        try
+        {
+            PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
+        }
+        finally
+        {
+            _isNavigating = wasNavigating;
+        }
     }
 
     private async Task RebuildDisplayFilterAsync(int? preferredPage = null, bool renderPage = true)

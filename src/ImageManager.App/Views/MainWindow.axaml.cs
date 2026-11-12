@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Input;
 using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
@@ -38,17 +39,23 @@ public partial class MainWindow : Window
     private static extern bool GetCursorPos(out POINT lpPoint);
     private MainWindowViewModel Vm => (MainWindowViewModel)DataContext!;
 
-    private CancellationTokenSource? _scrollAnimCts;
-    private CancellationTokenSource? _scrollActivityCts;
+    private readonly DispatcherTimer _scrollIdleTimer;
+    private long _lastScrollActivity;
+    private readonly SmoothScrollMotion _wheelMotion = new();
+    private readonly WheelAnimationDiagnostics? _wheelDiagnostics = WheelAnimationDiagnostics.CreateIfEnabled();
+    private readonly Action<TimeSpan> _wheelFrameCallback;
+    private long _wheelMotionTimestamp;
+    private bool _wheelFramePending;
     private CancellationTokenSource? _continuousModeCts;
     private CancellationTokenSource? _continuousReflowCts;
     private readonly DispatcherTimer _continuousResizeTimer;
     private VirtualizingWaterfallPanel? _continuousWaterfallPanel;
+    private VirtualizingWaterfallPanel? _pagedWaterfallPanel;
+    private bool _pagedViewportUpdatePending;
     private ImageDisplayRange _continuousVisibleRange;
     private ContinuousScrollDirection _continuousScrollDirection;
     private int _continuousResizeAnchorIndex;
     private double _continuousResizeRequestedWidth;
-    private int _scrollAnimationId;
     private int _autoTagRunVersion;
     private bool _lastAutoTagRecursive;
     // Accessed only on the UI thread; reserve before the first await and release in finally.
@@ -67,6 +74,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        _wheelFrameCallback = OnWheelAnimationFrame;
         _hoverPreview = HoverPreviewContent;
         HoverPreviewHost.PlacementTarget = RootGrid;
         _hoverPreview.PointerEnteredPreview += OnHoverPreviewPointerEntered;
@@ -84,6 +92,11 @@ public partial class MainWindow : Window
         AddHandler(InputElement.KeyDownEvent, OnWindowKeyDown, RoutingStrategies.Tunnel);
         ThumbnailScrollViewer.AddHandler(ScrollViewer.PointerWheelChangedEvent,
             OnThumbnailScrollWheel, RoutingStrategies.Tunnel);
+        ThumbnailScrollViewer.AddHandler(PointerPressedEvent, OnThumbnailScrollPointerPressed, RoutingStrategies.Tunnel);
+        ThumbnailScrollViewer.ScrollChanged += OnThumbnailScrollChanged;
+        _scrollIdleTimer = new DispatcherTimer(TimeSpan.FromMilliseconds(150), DispatcherPriority.Background,
+            OnScrollIdleTimerTick);
+        ItemsImages.LayoutUpdated += OnPagedItemsImagesLayoutUpdated;
         ContinuousItemsImages.LayoutUpdated += OnContinuousItemsImagesLayoutUpdated;
         LstFolders.AddHandler(TreeViewItem.ExpandedEvent,
             (_, e) =>
@@ -225,6 +238,8 @@ public partial class MainWindow : Window
         base.OnLoaded(e);
         Vm.PropertyChanged += OnViewModelPropertyChanged;
         Vm.ContinuousDisplayRefreshRequested += ApplyDisplayModeAsync;
+        Vm.PageManager.UseViewportLoading = true;
+        Vm.PageManager.ThumbnailRefreshRequested += RefreshPagedViewportThumbnails;
         await Vm.InitializeAsync();
 
         OnlineSearchHelper.SetTempDir(Path.Combine(Vm.AppSettings.DiskCacheDirectory, "search_temp"));
@@ -235,6 +250,7 @@ public partial class MainWindow : Window
         Vm.ScrollSearchResultsToTopRequested += OnScrollSearchResultsToTop;
         Vm.TreeScrollToNodeRequested += OnTreeScrollToNode;
         AttachContinuousWaterfallPanelWhenAvailable();
+        AttachPagedWaterfallPanelWhenAvailable();
 
         // Restore startup size
         if (Vm.AppSettings.StartupWidth > 0) Width = Vm.AppSettings.StartupWidth;
@@ -298,7 +314,7 @@ public partial class MainWindow : Window
             e.Handled = true;
             var memBefore = GC.GetTotalMemory(false);
             var privBefore = System.Diagnostics.Process.GetCurrentProcess().PrivateMemorySize64 / 1048576.0;
-            MemoryPressureMonitor.CompactLoh();
+            MemoryPressureMonitor.CompactLoh(force: true);
             var memAfter = GC.GetTotalMemory(false);
             var privAfter = System.Diagnostics.Process.GetCurrentProcess().PrivateMemorySize64 / 1048576.0;
             var freedMB = (memBefore - memAfter) / 1024.0 / 1024.0;
@@ -332,13 +348,17 @@ public partial class MainWindow : Window
         await EditTagForItemAsync(target);
     }
 
-    private async void OnThumbnailScrollWheel(object? sender, PointerWheelEventArgs e)
+    private void OnThumbnailScrollWheel(object? sender, PointerWheelEventArgs e)
     {
+        if (e.Delta.Y == 0 || !double.IsFinite(e.Delta.Y))
+            return;
+
         CloseHoverPreview();
         BeginScrollActivity();
         // Ctrl+Wheel = zoom
         if (e.KeyModifiers.HasFlag(KeyModifiers.Control))
         {
+            StopWheelAnimation("zoom");
             e.Handled = true;
             double step = e.Delta.Y > 0 ? 0.5 : -0.5;
             Vm.ZoomTick = Math.Clamp(Vm.ZoomTick + step, 1, 10);
@@ -347,107 +367,120 @@ public partial class MainWindow : Window
 
         e.Handled = true;
 
-        _scrollAnimCts?.Cancel();
-        _scrollAnimCts?.Dispose();
-        _scrollAnimCts = new CancellationTokenSource();
-        var ct = _scrollAnimCts.Token;
-
-        var sv = ThumbnailScrollViewer;
-        double maxY = Math.Max(0, sv.Extent.Height - sv.Viewport.Height);
-        if (maxY <= 0) return;
-
-        double scrollAmount = e.Delta.Y * 400;
-        double startY = sv.Offset.Y;
-        double targetY = Math.Clamp(startY - scrollAmount, 0, maxY);
-
-        if (Math.Abs(targetY - startY) < 0.5) return;
-
-        const int duration = 120;
-        const int steps = 10;
-        const int interval = duration / steps;
-        int animationId = ++_scrollAnimationId;
-        int executedSteps = 0;
-        int late20 = 0;
-        int late33 = 0;
-        int lateLogCount = 0;
-        long worstGapMs = 0;
-        long totalStepGapMs = 0;
-        bool completed = false;
-        var animationStopwatch = Stopwatch.StartNew();
-        long previousStepTimestamp = animationStopwatch.ElapsedMilliseconds;
-
-        try
+        var viewer = ThumbnailScrollViewer;
+        var maxY = Math.Max(0, viewer.Extent.Height - viewer.Viewport.Height);
+        if (maxY <= 0)
         {
-            for (int i = 1; i <= steps; i++)
-            {
-                if (ct.IsCancellationRequested) break;
-
-                long currentTimestamp = animationStopwatch.ElapsedMilliseconds;
-                long gapMs = currentTimestamp - previousStepTimestamp;
-                previousStepTimestamp = currentTimestamp;
-                worstGapMs = Math.Max(worstGapMs, gapMs);
-                if (i > 1)
-                {
-                    totalStepGapMs += gapMs;
-                    if (gapMs > 20)
-                    {
-                        late20++;
-                        if (gapMs > 33) late33++;
-                        if (lateLogCount++ < 2)
-                            ScrollDiagnosticsLogger.Log($"ScrollAnim.Late id={animationId} step={i} gapMs={gapMs}");
-                    }
-                }
-
-                double t = EaseOutQuad((double)i / steps);
-                sv.Offset = new Vector(sv.Offset.X, startY + (targetY - startY) * t);
-                executedSteps++;
-                await Task.Delay(interval, ct);
-            }
-            completed = !ct.IsCancellationRequested && executedSteps == steps;
+            StopWheelAnimation("no-scroll-range");
+            return;
         }
-        catch (OperationCanceledException) { }
-        finally
+
+        var now = Stopwatch.GetTimestamp();
+        if (_wheelMotion.ObserveExternalOffset(viewer.Offset.Y))
         {
-            long elapsedMs = animationStopwatch.ElapsedMilliseconds;
-            double averageStepMs = executedSteps > 1 ? (double)totalStepGapMs / (executedSteps - 1) : 0;
-            ScrollDiagnosticsLogger.Log(
-                $"ScrollAnim.End id={animationId} status={(completed ? "completed" : "canceled")} " +
-                $"steps={executedSteps}/{steps} elapsedMs={elapsedMs} avgStepMs={averageStepMs:F1} " +
-                $"worstStepMs={worstGapMs} late20={late20} late33={late33} " +
-                $"offset={startY:F0}->{sv.Offset.Y:F0} target={targetY:F0} " +
-                $"viewport={sv.Viewport.Width:F0}x{sv.Viewport.Height:F0} " +
-                $"extent={sv.Extent.Width:F0}x{sv.Extent.Height:F0}");
+            _wheelDiagnostics?.Complete("external-offset", viewer.Offset.Y);
+            _wheelMotionTimestamp = now;
         }
+
+        AdvanceWheelMotion(now, maxY);
+        var distance = -e.Delta.Y * 400;
+        _wheelMotion.ScrollBy(distance, maxY);
+        _wheelDiagnostics?.RecordInput(now, distance);
+        if (_wheelMotion.NeedsFrame)
+            RequestWheelFrame();
+        else
+            _wheelDiagnostics?.Complete("at-boundary", viewer.Offset.Y);
+    }
+
+    private void OnThumbnailScrollPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (e.Source is not Visual source ||
+            (source is not ScrollBar && source.FindAncestorOfType<ScrollBar>() is null))
+            return;
+
+        StopWheelAnimation("scrollbar");
+        BeginScrollActivity();
+    }
+
+    private void RequestWheelFrame()
+    {
+        if (_wheelFramePending)
+            return;
+
+        _wheelFramePending = true;
+        RequestAnimationFrame(_wheelFrameCallback);
+    }
+
+    private void OnWheelAnimationFrame(TimeSpan _)
+    {
+        _wheelFramePending = false;
+        var viewer = ThumbnailScrollViewer;
+        var before = viewer.Offset.Y;
+        if (_wheelMotion.ObserveExternalOffset(before))
+        {
+            _wheelDiagnostics?.Complete("external-offset", before);
+            return;
+        }
+        if (!_wheelMotion.NeedsFrame)
+            return;
+
+        var now = Stopwatch.GetTimestamp();
+        var maxY = Math.Max(0, viewer.Extent.Height - viewer.Viewport.Height);
+        AdvanceWheelMotion(now, maxY);
+        if (before != _wheelMotion.Position)
+            viewer.Offset = new Vector(viewer.Offset.X, _wheelMotion.Position);
+        var applied = viewer.Offset.Y;
+        _wheelMotion.RecordAppliedOffset(applied);
+        _wheelDiagnostics?.RecordFrame(now, applied - before);
+
+        if (_wheelMotion.NeedsFrame)
+            RequestWheelFrame();
+        else
+            _wheelDiagnostics?.Complete("settled", applied);
+    }
+
+    private void AdvanceWheelMotion(long now, double maximumOffset)
+    {
+        var elapsed = _wheelMotionTimestamp == 0
+            ? TimeSpan.Zero
+            : Stopwatch.GetElapsedTime(_wheelMotionTimestamp, now);
+        _wheelMotionTimestamp = now;
+        _wheelMotion.Advance(elapsed, maximumOffset);
+    }
+
+    private void StopWheelAnimation(string reason = "interrupted")
+    {
+        var offset = ThumbnailScrollViewer.Offset.Y;
+        _wheelMotion.Reset(offset);
+        _wheelMotionTimestamp = 0;
+        _wheelDiagnostics?.Complete(reason, offset);
+    }
+
+    private void OnThumbnailScrollChanged(object? sender, ScrollChangedEventArgs e)
+    {
+        if (ReferenceEquals(e.Source, ThumbnailScrollViewer) && e.OffsetDelta != default)
+            BeginScrollActivity();
     }
 
     private void BeginScrollActivity()
     {
-        _scrollActivityCts?.Cancel();
-        _scrollActivityCts?.Dispose();
-        _scrollActivityCts = new CancellationTokenSource();
-        var ct = _scrollActivityCts.Token;
+        MemoryPressureMonitor.NotifyInteraction();
+        Vm.NotifyGalleryInteraction();
+        _lastScrollActivity = Stopwatch.GetTimestamp();
+        if (_scrollIdleTimer.IsEnabled)
+            return;
+
         Vm.PageManager.SetScrollActivity(true);
-        _ = EndScrollActivityWhenIdleAsync(ct);
+        _scrollIdleTimer.Start();
     }
 
-    private async Task EndScrollActivityWhenIdleAsync(CancellationToken cancellationToken)
+    private void OnScrollIdleTimerTick(object? sender, EventArgs e)
     {
-        try
-        {
-            await Task.Delay(350, cancellationToken);
-            if (cancellationToken.IsCancellationRequested) return;
-            await Dispatcher.UIThread.InvokeAsync(
-                () =>
-                {
-                    if (!cancellationToken.IsCancellationRequested)
-                        Vm.PageManager.SetScrollActivity(false);
-                },
-                DispatcherPriority.Background);
-        }
-        catch (OperationCanceledException) { }
+        if (Stopwatch.GetElapsedTime(_lastScrollActivity).TotalMilliseconds < 350)
+            return;
+        _scrollIdleTimer.Stop();
+        Vm.PageManager.SetScrollActivity(false);
     }
-
-    private static double EaseOutQuad(double t) => 1 - (1 - t) * (1 - t);
 
     // ==================== Folder Panel ====================
 
@@ -760,26 +793,15 @@ public partial class MainWindow : Window
 
     private IEnumerable<(ImageViewItem Item, Control Container)> GetVisibleThumbnailContainers()
     {
-        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var item in Vm.Images)
+        var panel = Vm.DisplayMode == ImageDisplayMode.Paged
+            ? _pagedWaterfallPanel
+            : _continuousWaterfallPanel;
+        if (panel is null)
+            yield break;
+        foreach (var container in panel.RealizedControls)
         {
-            if (ItemsImages.ContainerFromItem(item) is Control container && paths.Add(item.FilePath))
+            if (container.DataContext is ImageViewItem item)
                 yield return (item, container);
-        }
-
-        // Inspect realized controls only. The lazy continuous source must never be enumerated.
-        foreach (var control in ContinuousItemsImages.GetVisualDescendants().OfType<Control>())
-        {
-            if (control.DataContext is not ImageViewItem item ||
-                ContinuousItemsImages.ContainerFromItem(item) is not Control container ||
-                !ReferenceEquals(control, container) ||
-                !paths.Add(item.FilePath))
-            {
-                continue;
-            }
-
-            yield return (item, container);
         }
     }
 
@@ -856,6 +878,18 @@ public partial class MainWindow : Window
         SelectionRectangle.Height = h;
 
         var selRect = new Rect(x, y, w, h);
+
+        if (Vm.DisplayMode == ImageDisplayMode.Paged)
+        {
+            if (_pagedWaterfallPanel is { IsPagedViewportCurrent: true } pagedPanel &&
+                ImagePanelHost.TranslatePoint(selRect.TopLeft, pagedPanel) is { } pagedTopLeft)
+            {
+                var pagedSelection = new Rect(pagedTopLeft, selRect.Size);
+                Vm.ReplaceSelectedFiles(pagedPanel.GetPagedItemsIntersecting(pagedSelection).Select(item => item.FilePath));
+            }
+            e.Handled = true;
+            return;
+        }
 
         // Hit-test only realized containers. Do not enumerate the continuous item source.
         var selectedPaths = new List<string>();
@@ -1267,7 +1301,10 @@ public partial class MainWindow : Window
     private void OnViewModelPropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
     {
         if (e.PropertyName == nameof(MainWindowViewModel.Images))
+        {
+            StopWheelAnimation();
             CloseHoverPreview();
+        }
 
         if (e.PropertyName == nameof(MainWindowViewModel.ContinuousDisplayGeometrySnapshot))
             AttachContinuousWaterfallPanelWhenAvailable();
@@ -1439,6 +1476,7 @@ public partial class MainWindow : Window
 
     private async Task ApplyDisplayModeAsync(int preferredIndex)
     {
+        StopWheelAnimation();
         _continuousReflowCts?.Cancel();
         _continuousReflowCts = null;
         _continuousModeCts?.Cancel();
@@ -1451,10 +1489,13 @@ public partial class MainWindow : Window
             _continuousResizeTimer.Stop();
             ContinuousItemsImages.IsVisible = false;
             ItemsImages.IsVisible = true;
+            QueuePagedViewportUpdate();
             return;
         }
 
+        Vm.PageManager.ClearPagedViewport();
         ItemsImages.IsVisible = false;
+        _pagedWaterfallPanel?.ResetPagedViewport();
         ContinuousItemsImages.IsVisible = true;
         await Dispatcher.UIThread.InvokeAsync(() => ContinuousItemsImages.UpdateLayout());
         if (token.IsCancellationRequested || Vm.DisplayMode != ImageDisplayMode.Continuous)
@@ -1468,6 +1509,47 @@ public partial class MainWindow : Window
         // ScrollViewer clamps a requested anchor to the previous (often zero) extent.
         ContinuousItemsImages.UpdateLayout();
         _continuousWaterfallPanel?.ScrollToIndex(Math.Clamp(preferredIndex, 0, Vm.ActiveFileList.Count - 1));
+    }
+
+    private void OnPagedItemsImagesLayoutUpdated(object? sender, EventArgs e) =>
+        AttachPagedWaterfallPanelWhenAvailable();
+
+    private void AttachPagedWaterfallPanelWhenAvailable()
+    {
+        if (ItemsImages.ItemsPanelRoot is not VirtualizingWaterfallPanel panel || ReferenceEquals(panel, _pagedWaterfallPanel))
+            return;
+        if (_pagedWaterfallPanel is not null)
+            _pagedWaterfallPanel.PagedViewportChanged -= OnPagedViewportChanged;
+        _pagedWaterfallPanel = panel;
+        panel.PagedViewportChanged += OnPagedViewportChanged;
+        QueuePagedViewportUpdate();
+    }
+
+    private void OnPagedViewportChanged(object? sender, EventArgs e) => QueuePagedViewportUpdate();
+
+    private void QueuePagedViewportUpdate()
+    {
+        if (_pagedViewportUpdatePending)
+            return;
+
+        _pagedViewportUpdatePending = true;
+        Dispatcher.UIThread.Post(() =>
+        {
+            _pagedViewportUpdatePending = false;
+            UpdatePagedViewport(forceRefresh: false);
+        }, DispatcherPriority.Background);
+    }
+
+    private bool RefreshPagedViewportThumbnails() => UpdatePagedViewport(forceRefresh: true);
+
+    private bool UpdatePagedViewport(bool forceRefresh)
+    {
+        if (_pagedWaterfallPanel is not { IsPagedViewportCurrent: true } panel || Vm.DisplayMode != ImageDisplayMode.Paged)
+            return false;
+
+        Vm.PageManager.UpdatePagedViewport(Vm.Images, panel.PagedVisibleItems, panel.PagedRetainedItems,
+            forceRefresh, prefetchItems: panel.PagedPrefetchItems);
+        return true;
     }
 
     private void AttachContinuousWaterfallPanelWhenAvailable()
@@ -2274,12 +2356,6 @@ public partial class MainWindow : Window
         catch { return null; }
     }
 
-    private double GetMediaContentOffsetY()
-    {
-        var transform = ItemsImages.TransformToVisual(ThumbnailScrollViewer);
-        return transform?.Transform(default).Y + ThumbnailScrollViewer.Offset.Y ?? 0;
-    }
-
     private async Task<bool> TryOpenFolderPathAsync(string? path)
     {
         if (string.IsNullOrWhiteSpace(path)) return false;
@@ -3014,16 +3090,19 @@ public partial class MainWindow : Window
 
     private void OnScrollRestore()
     {
+        StopWheelAnimation();
         ThumbnailScrollViewer.Offset = new Vector(0, Vm.PreSearchScrollOffset);
     }
 
     private void OnScrollSearchResultsToTop()
     {
+        StopWheelAnimation();
         ThumbnailScrollViewer.Offset = new Vector(0, 0);
     }
 
-    private async void OnScrollToSelected()
+    private void OnScrollToSelected()
     {
+        StopWheelAnimation();
         if (Vm.DisplayMode == ImageDisplayMode.Continuous)
         {
             var selectedPath = Vm.SelectedFilePaths.FirstOrDefault();
@@ -3036,64 +3115,19 @@ public partial class MainWindow : Window
             return;
         }
 
-        // SmartWaterfallPanel 对视口外 child 跳过 Arrange，Bounds 为空，BringIntoView 失效。
-        // 改为先从 Panel 查询目标行 Y、直接驱动 ScrollViewer.Offset，再用 BringIntoView 微调。
-        // 跨文件夹首次跳转时 Images 集合刚被替换为新 ObservableCollection，ItemsControl 需要
-        // 至少一次 layout pass 才能生成 child 容器。重试覆盖 ~2 秒，含缩略图异步解码窗口。
-        const int maxAttempts = 40;
-        const int delayMs = 50;
-
-        string? failReason = null;
-        for (var attempt = 0; attempt < maxAttempts; attempt++)
+        Dispatcher.UIThread.Post(() =>
         {
-            var scrolled = await App.UI.InvokeAsync(() =>
-            {
-                var selected = Vm.GetSelectedRealizedItems().FirstOrDefault();
-                if (selected == null) { failReason = "no-selected"; return true; }
-
-                // 强制 ItemsControl 与 Panel 完整跑一次 Measure
-                ItemsImages.InvalidateMeasure();
-                if (ItemsImages.ItemsPanelRoot is SmartWaterfallPanel p0)
-                    p0.InvalidateMeasure();
-                ItemsImages.UpdateLayout();
-                Dispatcher.UIThread.RunJobs(DispatcherPriority.Render);
-
-                if (ItemsImages.ContainerFromItem(selected) is not Control container)
-                { failReason = "no-container"; return false; }
-                if (ItemsImages.ItemsPanelRoot is not SmartWaterfallPanel panel)
-                { failReason = "no-panel"; return false; }
-                if (!panel.TryGetItemY(container, out var y, out var h))
-                { failReason = "no-layout"; return false; }
-
-                var viewportH = ThumbnailScrollViewer.Viewport.Height;
-                var extentH = ThumbnailScrollViewer.Extent.Height;
-                if (viewportH <= 0) { failReason = "no-viewport"; return false; }
-
-                var maxOffset = Math.Max(0, extentH - viewportH);
-                var target = Math.Max(0, Math.Min(maxOffset,
-                    GetMediaContentOffsetY() + y - (viewportH - h) / 2));
-                ThumbnailScrollViewer.Offset = new Vector(0, target);
-                System.Diagnostics.Debug.WriteLine(
-                    $"[ImageScroll] OK attempt={attempt} y={y:F1} h={h:F1} target={target:F1} ext={extentH:F1} vp={viewportH:F1}");
-                return true;
-            });
-
-            if (scrolled)
-            {
-                await Task.Delay(delayMs);
-                await App.UI.InvokeAsync(() =>
-                {
-                    var selected = Vm.GetSelectedRealizedItems().FirstOrDefault();
-                    if (selected != null && ItemsImages.ContainerFromItem(selected) is Control c)
-                        c.BringIntoView();
-                });
+            if (Vm.DisplayMode != ImageDisplayMode.Paged)
                 return;
-            }
 
-            await Task.Delay(delayMs);
-        }
-
-        System.Diagnostics.Debug.WriteLine($"[ImageScroll] FAILED reason={failReason ?? "unknown"}");
+            var selected = Vm.GetSelectedRealizedItems().FirstOrDefault();
+            var index = selected is null ? -1 : Vm.Images.IndexOf(selected);
+            if (index < 0)
+                return;
+            ThumbnailScrollViewer.UpdateLayout();
+            AttachPagedWaterfallPanelWhenAvailable();
+            _pagedWaterfallPanel?.ScrollToIndex(index);
+        }, DispatcherPriority.Loaded);
     }
 
     private async void OnTreeScrollToNode(ViewModels.FolderTreeNode node)
@@ -3124,9 +3158,17 @@ public partial class MainWindow : Window
     {
         Vm.CancelActiveBackgroundTasks();
         _prewarmThumbnailsCts?.Cancel();
-        _scrollActivityCts?.Cancel();
-        _scrollActivityCts?.Dispose();
-        _scrollActivityCts = null;
+        StopWheelAnimation();
+        _scrollIdleTimer.Stop();
+        ThumbnailScrollViewer.ScrollChanged -= OnThumbnailScrollChanged;
+        Vm.PageManager.ThumbnailRefreshRequested -= RefreshPagedViewportThumbnails;
+        Vm.PageManager.ClearPagedViewport();
+        ItemsImages.LayoutUpdated -= OnPagedItemsImagesLayoutUpdated;
+        if (_pagedWaterfallPanel is not null)
+        {
+            _pagedWaterfallPanel.PagedViewportChanged -= OnPagedViewportChanged;
+            _pagedWaterfallPanel = null;
+        }
         _continuousModeCts?.Cancel();
         _continuousModeCts?.Dispose();
         _continuousModeCts = null;

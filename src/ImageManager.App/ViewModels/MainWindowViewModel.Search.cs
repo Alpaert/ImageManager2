@@ -298,38 +298,36 @@ public partial class MainWindowViewModel
         }
     }
 
-    /// <summary>Remove deleted files incrementally, keeping existing thumbnails intact</summary>
+    /// <summary>Remove deleted files incrementally, keeping existing thumbnails intact.</summary>
     public async Task RemoveFilesFromViewAsync(HashSet<string> deletedPaths)
     {
-        // Guard against OnCurrentPageChanged firing ShowPageAsync during paging updates
-        _isNavigating = true;
-        try
-        {
+        if (deletedPaths.Count == 0) return;
 
-        var filterWasPending = IsDisplayFilterBusy;
+        var hasFilterSnapshot = HasDisplayFilter || _publishedDisplayFilterVersion >= 0;
+        var filterNeedsRebuild = IsDisplayFilterBusy ||
+            (hasFilterSnapshot && _publishedDisplayFilterVersion != _displayFilterVersion);
+        var page = CurrentPage;
         var wasContinuous = DisplayMode == ImageDisplayMode.Continuous;
         var continuousAnchor = _continuousVisibleRange.StartIndex;
         var continuousSource = wasContinuous ? ContinuousImageItemSource : null;
         var continuousSnapshot = wasContinuous ? ContinuousDisplayGeometrySnapshot : null;
+        var resultFiles = ResultNavigationFiles;
+        var selectedResult = _currentResultIndex >= 0 && _currentResultIndex < resultFiles.Count
+            ? resultFiles[_currentResultIndex]
+            : null;
+
         if (wasContinuous && continuousAnchor > 0)
-        {
-            var deletedBeforeAnchor = ActiveFileList
-                .Take(Math.Min(continuousAnchor, ActiveFileList.Count))
-                .Count(deletedPaths.Contains);
-            continuousAnchor = Math.Max(0, continuousAnchor - deletedBeforeAnchor);
-        }
+            continuousAnchor -= ActiveFileList.Take(continuousAnchor).Count(deletedPaths.Contains);
+
         CancelDisplayFilter();
-        IsDisplayFilterBusy = false;
-        // Remove from master lists and both published snapshots.
-        if (!ReferenceEquals(_displayFilteredFiles, _allFiles))
-            _displayFilteredFiles.RemoveAll(p => deletedPaths.Contains(p));
-        _filteredNavigationFiles.RemoveAll(p => deletedPaths.Contains(p));
+        var deletionVersion = _displayFilterVersion;
+        var activeFiles = ActiveFileList.Where(path => !deletedPaths.Contains(path)).ToList();
+        _displayFilteredFiles = activeFiles;
+        _filteredNavigationFiles = _filteredNavigationFiles.Where(path => !deletedPaths.Contains(path)).ToList();
         PublishAllFiles(_allFiles.Where(path => !deletedPaths.Contains(path)).ToList());
         _selectedFilePaths.RemoveWhere(deletedPaths.Contains);
-        if (!wasContinuous || HasDisplayFilter || filterWasPending)
-            InvalidateContinuousDisplayGeometry();
-        if (_tagSearch.SearchResultFiles.Count > 0
-            && _tagSearch.SearchResultFiles.RemoveAll(p => deletedPaths.Contains(p)) > 0)
+
+        if (_tagSearch.SearchResultFiles.RemoveAll(deletedPaths.Contains) > 0)
             _tagSearch.NotifySearchResultFilesChanged();
         if (_tagSearch.IsSuggestionCoTagMode)
         {
@@ -337,129 +335,129 @@ public partial class MainWindowViewModel
             _ = _tagSearch.RefreshCurrentCoTagSuggestionsAsync();
         }
 
-        if (HasDisplayFilter || filterWasPending)
+        // A request that had not published its results must finish with the new source list.
+        if (filterNeedsRebuild)
         {
             CaptureSelectionForNextPageRefresh();
-            await RebuildDisplayFilterAsync(CurrentPage);
+            await RebuildDisplayFilterAsync(page);
             return;
         }
 
+        _publishedDisplayFilterVersion = deletionVersion;
+        _displayFilterUnknownPaths.ExceptWith(deletedPaths);
+        DisplayFilterUnknownCount = _displayFilterUnknownPaths.Count;
         DisplayFilterSourceCount = (IsShowingSearchResult ? _tagSearch.SearchResultFiles : _allFiles).Count;
-        NotifyDisplayFilterState();
-        // Recalculate paging
-        var files = ActiveFileList;
-        TotalPages = files.Count == 0 ? 0 : (files.Count + _pageManager.PageSize - 1) / _pageManager.PageSize;
-        PageNumbers = new ObservableCollection<int>(Enumerable.Range(1, TotalPages));
 
-        // Clamp current page
-        if (CurrentPage >= TotalPages && TotalPages > 0)
-            CurrentPage = TotalPages - 1;
+        var remainingResults = ResultNavigationFiles;
+        var preservedResultIndex = selectedResult is null
+            ? -1
+            : remainingResults.FindIndex(path => string.Equals(path, selectedResult, StringComparison.OrdinalIgnoreCase));
+        _currentResultIndex = preservedResultIndex >= 0
+            ? preservedResultIndex
+            : Math.Clamp(_currentResultIndex, 0, Math.Max(0, remainingResults.Count - 1));
+        if (selectedResult is not null && deletedPaths.Contains(selectedResult))
+            Interlocked.Increment(ref _resultNavigationVersion);
 
-        if (wasContinuous && continuousSource is not null && continuousSnapshot is not null)
+        // Keep page picker bindings from launching a full reload while the count changes.
+        var wasNavigating = _isNavigating;
+        _isNavigating = true;
+        try
         {
-            CancelContinuousGeometryWorkPreservingSource();
-            if (await ApplyContinuousDeletionAsync(continuousSource, continuousSnapshot, deletedPaths))
-            {
-                _pageManager.InvalidateCache();
-                return;
-            }
-
-            // The source may have been replaced by another result update while the
-            // CPU-only geometry rebuild was running. Fall back to the normal full
-            // continuous refresh in that case rather than publishing stale indexes.
-            InvalidateContinuousDisplayGeometry();
+            SetDisplayPaging();
+            CurrentPage = Math.Clamp(page, 0, Math.Max(0, TotalPages - 1));
         }
+        finally
+        {
+            _isNavigating = wasNavigating;
+        }
+        NotifyDisplayFilterState();
 
         if (TotalPages == 0)
         {
-            Images = new ObservableCollection<ImageViewItem>();
-            _pageManager.InvalidateCache();
-            return;
+            Images.Clear();
+            LoadedInfoText = string.Empty;
+            StatusText = HasDisplayFilter ? "没有符合当前筛选的文件" : "没有可显示的文件";
         }
 
         if (wasContinuous)
         {
-            // Continuous mode owns its virtualized source; the page Items collection
-            // is not the visible surface. Rebuild the source after invalidation so a
-            // single deletion does not leave the whole continuous view blank.
             _pageManager.InvalidateCache();
-            if (ContinuousDisplayRefreshRequested is { } refresh)
-                await refresh(Math.Clamp(continuousAnchor, 0, ActiveFileList.Count - 1));
+            if (continuousSource is not null && continuousSnapshot is not null)
+            {
+                CancelContinuousGeometryWorkPreservingSource();
+                if (await ApplyContinuousDeletionAsync(continuousSource, continuousSnapshot, deletedPaths))
+                    return;
+            }
+
+            // A newer filter, deletion, or mode switch now owns the view.
+            if (deletionVersion != _displayFilterVersion || !ReferenceEquals(activeFiles, ActiveFileList) ||
+                DisplayMode != ImageDisplayMode.Continuous)
+                return;
+
+            InvalidateContinuousDisplayGeometry();
+            if (activeFiles.Count > 0 && ContinuousDisplayRefreshRequested is { } refresh)
+                await refresh(Math.Clamp(continuousAnchor, 0, activeFiles.Count - 1));
             return;
         }
 
-        // Find deleted positions in Images (sorted ascending)
-        var removedIndices = new List<int>();
-        for (int i = 0; i < Images.Count; i++)
+        InvalidateContinuousDisplayGeometry();
+        if (TotalPages == 0)
         {
-            if (deletedPaths.Contains(Images[i].FilePath))
-                removedIndices.Add(i);
+            _pageManager.InvalidateCache();
+            return;
         }
 
-        // Build gap-fill file paths from ActiveFileList that aren't already in Images
-        int pageStart = CurrentPage * _pageManager.PageSize;
-        var existingPaths = new HashSet<string>(Images.Select(i => i.FilePath), StringComparer.OrdinalIgnoreCase);
-        var gapPaths = new List<string>();
-        for (int i = 0; i < _pageManager.PageSize && gapPaths.Count < removedIndices.Count; i++)
-        {
-            int idx = pageStart + i;
-            if (idx >= files.Count) break;
-            var path = files[idx];
-            if (existingPaths.Contains(path)) continue;
-            gapPaths.Add(path);
-            existingPaths.Add(path);
-        }
-
-        // Reuse existing ImageViewItem objects — mutate in-place to avoid CollectionChanged
-        int reuseCount = Math.Min(removedIndices.Count, gapPaths.Count);
-        var reloadItems = new List<ImageViewItem>();
-        for (int i = 0; i < reuseCount; i++)
-        {
-            var item = Images[removedIndices[i]];
-            item.FilePath = gapPaths[i];
-            item.FileName = System.IO.Path.GetFileName(gapPaths[i]);
-            item.Tags = GetTagsForFile(gapPaths[i]);
-            item.IsLoading = true;
-            item.IsLoaded = false;
-            item.IsSelected = false;
-            item.ThumbnailData = null;
-            item.Width = 1;
-            item.Height = 1;
-            reloadItems.Add(item);
-        }
-
-        // If more deleted than gap-fill, remove extras
-        for (int i = removedIndices.Count - 1; i >= reuseCount; i--)
-            Images.RemoveAt(removedIndices[i]);
-
-        // If more gap-fill than deleted, add new items at the end
-        for (int i = reuseCount; i < gapPaths.Count; i++)
-        {
-            var path = gapPaths[i];
-            var item = new ImageViewItem
-            {
-                FilePath = path,
-                FileName = System.IO.Path.GetFileName(path),
-                Tags = GetTagsForFile(path),
-                IsLoading = true
-            };
-            Images.Add(item);
-            reloadItems.Add(item);
-        }
-
-        // Load thumbnails for gap-fill items
-        if (reloadItems.Count > 0)
-            await _pageManager.LoadThumbnailsForItemsAsync(reloadItems);
-
-        // Clear all cached pages except current (stale after deletion), then store current
-        _pageManager.InvalidateCacheExceptPage(CurrentPage, Images.ToList());
-        }
-        finally
-        {
-            _isNavigating = false;
-        }
+        await UpdatePagedDisplayAfterDeletionAsync();
     }
 
+    private async Task UpdatePagedDisplayAfterDeletionAsync()
+    {
+        var desiredPage = ActiveFileList.Skip(CurrentPage * _pageManager.PageSize)
+            .Take(_pageManager.PageSize).ToList();
+        var desiredPaths = desiredPage.ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        for (var i = Images.Count - 1; i >= 0; i--)
+        {
+            if (!desiredPaths.Contains(Images[i].FilePath))
+                Images.RemoveAt(i);
+        }
+
+        // Keep cards bound to their files and place incoming thumbnails in sort order.
+        for (var i = 0; i < desiredPage.Count; i++)
+        {
+            var path = desiredPage[i];
+            var existingIndex = i;
+            while (existingIndex < Images.Count &&
+                   !string.Equals(Images[existingIndex].FilePath, path, StringComparison.OrdinalIgnoreCase))
+            {
+                existingIndex++;
+            }
+
+            if (existingIndex == Images.Count)
+            {
+                Images.Insert(i, new ImageViewItem
+                {
+                    FilePath = path,
+                    FileName = Path.GetFileName(path),
+                    Tags = GetTagsForFile(path),
+                    IsSelected = IsFileSelected(path),
+                    IsLoading = true
+                });
+            }
+            else if (existingIndex != i)
+            {
+                Images.Move(existingIndex, i);
+            }
+        }
+        while (Images.Count > desiredPage.Count)
+            Images.RemoveAt(Images.Count - 1);
+
+        LoadedInfoText = $"当前页: {CurrentPage + 1}/{TotalPages}  每页 {_pageManager.PageSize} 张";
+        var pageItems = Images.ToList();
+        // Publish the corrected page before loading; later navigation owns its own cache.
+        _pageManager.InvalidateCacheExceptPage(CurrentPage, pageItems);
+        await _pageManager.LoadThumbnailsForItemsAsync(pageItems);
+    }
 
     // ==================== Sort ====================
 

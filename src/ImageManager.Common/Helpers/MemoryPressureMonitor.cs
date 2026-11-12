@@ -1,190 +1,127 @@
 using System;
 using System.Diagnostics;
+using System.Runtime;
 using System.Threading;
 
 namespace ImageManager.Common.Helpers;
 
-/// <summary>
-/// LOH 碎片化自适应管理。
-/// 64位 GC 默认不压缩 LOH → SKBitmap 解码碎片累积 → commit exhaustion。
-/// 用 Private/Heap 比值作为碎片代理指标，四级压力自适应触发 Gen2+LOH 压缩。
-/// </summary>
+/// <summary>Samples pressure away from the UI. Native memory is not LOH fragmentation.</summary>
 public static class MemoryPressureMonitor
 {
     public enum PressureLevel { Low, Medium, High, Critical }
-    private const double MediumCommitMB = 5200;
-    private const double HighCommitMB = 6500;
-    private const double CriticalCommitMB = 8000;
-    private const double MinHeapForFragmentationMB = 512;
-
-    // ==================== 状态 ====================
-    private static readonly object _lock = new();
-    private static long _largeAllocCount;
-    private static long _lastCompactAtCount;
-    private static PressureLevel _cachedLevel = PressureLevel.Low;
-    private static DateTime _lastLevelRefresh = DateTime.MinValue;
-    private static readonly TimeSpan LevelRefreshInterval = TimeSpan.FromSeconds(5);
-    private static readonly SemaphoreSlim _compactGate = new(1, 1);
-
-    // ==================== 公开属性 ====================
+    private const double MediumCommitMB = 5200, HighCommitMB = 6500, CriticalCommitMB = 8000;
+    private static readonly SemaphoreSlim CompactGate = new(1, 1);
+    private static readonly MemoryCollectionPolicy CollectionPolicy = new();
+    private static int _cachedLevel, _samplePending;
+    private static long _lastSampleMs = long.MinValue / 2;
+    private static long _lastInteractionMs = Environment.TickCount64;
+    private static double _commitMB;
 
     public static PressureLevel Current
     {
         get
         {
-            if (DateTime.UtcNow - _lastLevelRefresh > LevelRefreshInterval)
-                RefreshPressureLevel();
-            return _cachedLevel;
+            if (Environment.TickCount64 - Interlocked.Read(ref _lastSampleMs) >= 5_000 &&
+                Interlocked.CompareExchange(ref _samplePending, 1, 0) == 0)
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    try { RefreshPressureLevel(); }
+                    finally { Volatile.Write(ref _samplePending, 0); }
+                });
+            return (PressureLevel)Volatile.Read(ref _cachedLevel);
         }
     }
 
-    /// <summary>碎片评分: (PrivateMB - HeapMB) / HeapMB。值越大碎片越严重。</summary>
-    public static double FragmentationScore => ComputeScore();
-
-    /// <summary>当前 Private commit (MB)</summary>
-    public static double CommitChargeMB
+    /// <summary>Last GC's measured managed-heap fragmentation ratio, not private/heap.</summary>
+    public static double FragmentationScore
     {
         get
         {
-            try { return Process.GetCurrentProcess().PrivateMemorySize64 / 1048576.0; }
-            catch { return 0; }
+            var info = GC.GetGCMemoryInfo();
+            return info.FragmentedBytes / (double)Math.Max(1L, info.HeapSizeBytes);
         }
     }
 
-    // ==================== 决策 API ====================
-
-    /// <summary>是否应该执行 LOH 压缩（调用方在分配大对象后调用）</summary>
-    public static bool ShouldCompactNow()
+    /// <summary>Last background sample of private commit in MiB.</summary>
+    public static double CommitChargeMB => Volatile.Read(ref _commitMB);
+    public static void NotifyInteraction() => Interlocked.Exchange(ref _lastInteractionMs, Environment.TickCount64);
+    public static bool ShouldCompactNow() => Current >= PressureLevel.High;
+    public static int RecommendedPageSize(int normalSize) => Current switch
     {
-        var level = Current;
-        long count = Interlocked.Read(ref _largeAllocCount);
-        long lastCompact = Interlocked.Read(ref _lastCompactAtCount);
-        long sinceLast = count - lastCompact;
-
-        return level switch
-        {
-            PressureLevel.Low => false,
-            PressureLevel.Medium => sinceLast >= 50,
-            PressureLevel.High => sinceLast >= 20,
-            PressureLevel.Critical => sinceLast >= 5,
-            _ => false
-        };
-    }
-
-    public static int RecommendedPageSize(int normalSize)
+        PressureLevel.Critical => normalSize / 2,
+        PressureLevel.High => normalSize * 3 / 4,
+        _ => normalSize
+    };
+    public static int RecommendedCacheLimit(int normal) => Current switch
     {
-        return Current switch
-        {
-            PressureLevel.Critical => normalSize / 2,
-            PressureLevel.High => normalSize * 3 / 4,
-            _ => normalSize
-        };
-    }
+        PressureLevel.Critical => normal / 4,
+        PressureLevel.High => normal / 2,
+        _ => normal
+    };
+    // Kept for allocation callers; pressure no longer depends on allocation counts.
+    public static void RecordAllocation() { }
 
-    public static int RecommendedCacheLimit(int normal)
+    /// <summary>
+    /// Automatic calls require sustained pressure, idle time and a cooldown.
+    /// force is reserved for the manual command. Worker-initiated GC still pauses the UI.
+    /// </summary>
+    public static void CompactLoh(bool force = false)
     {
-        return Current switch
-        {
-            PressureLevel.Critical => normal / 4,
-            PressureLevel.High => normal / 2,
-            _ => normal
-        };
-    }
-
-    // ==================== 操作 API ====================
-
-    /// <summary>记录一次大对象分配（缩略图生成、张量分配等）</summary>
-    public static void RecordAllocation()
-    {
-        Interlocked.Increment(ref _largeAllocCount);
-    }
-
-    /// <summary>执行 Gen2 + LOH 压缩（在后台线程执行，不阻塞调用者）</summary>
-    public static void CompactLoh()
-    {
-        var levelBefore = Current;
-        double scoreBefore = ComputeScore();
-        double commitBefore = CommitChargeMB;
-
-        // 在后台线程执行以避免阻塞 UI
+        if (!CompactGate.Wait(0)) return;
         ThreadPool.QueueUserWorkItem(_ =>
         {
-            if (!_compactGate.Wait(0)) return;
             try
             {
-                for (int i = 0; i < 2; i++)
-                {
-                    GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
-                    GC.WaitForPendingFinalizers();
-                }
-                Interlocked.Exchange(ref _lastCompactAtCount, Interlocked.Read(ref _largeAllocCount));
-                // 强制刷新缓存
-                _lastLevelRefresh = DateTime.MinValue;
-
-                double scoreAfter = ComputeScore();
-                double commitAfter = CommitChargeMB;
-                double freedMB = commitBefore - commitAfter;
-                AppLogger.Memory($"LohCompact level={levelBefore}->{Current} " +
-                    $"score={scoreBefore:F1}->{scoreAfter:F1} " +
-                    $"commit={commitBefore:F0}->{commitAfter:F0}MB " +
-                    $"freed={freedMB:F1}MB");
+                RefreshPressureLevel();
+                var now = Environment.TickCount64;
+                var level = (PressureLevel)Volatile.Read(ref _cachedLevel);
+                if (!force && !CollectionPolicy.ShouldCollect(level, now, Interlocked.Read(ref _lastInteractionMs)))
+                    return;
+                var before = CommitChargeMB;
+                if (!force && level != PressureLevel.Critical &&
+                    Environment.TickCount64 - Interlocked.Read(ref _lastInteractionMs) < 5_000)
+                    return;
+                CollectOnce();
+                RefreshPressureLevel();
+                AppLogger.Memory($"MemoryCollect manual={force} level={level} commit={before:F0}->{CommitChargeMB:F0}MB");
             }
-            catch { }
-            finally { _compactGate.Release(); }
+            catch (Exception ex) { AppLogger.Warn($"Memory collection failed: {ex.Message}"); }
+            finally { CompactGate.Release(); }
         });
     }
 
-    /// <summary>Critical 级别紧急回收：清空调用方提供的清理动作 + 压缩</summary>
     public static void EmergencyCleanup(Action? cleanupAction = null)
     {
-        AppLogger.Memory($"EmergencyCleanup level={Current} score={ComputeScore():F1}");
         cleanupAction?.Invoke();
-        // 同步执行 — Critical 时性能已严重恶化，优先回收
-        for (int i = 0; i < 3; i++)
-        {
-            GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, true, true);
-            GC.WaitForPendingFinalizers();
-        }
-        Interlocked.Exchange(ref _lastCompactAtCount, Interlocked.Read(ref _largeAllocCount));
-        _lastLevelRefresh = DateTime.MinValue;
-        AppLogger.Memory($"EmergencyCleanup done level={Current}");
-    }
-
-    // ==================== 内部 ====================
-
-    private static double ComputeScore()
-    {
+        if (!CompactGate.Wait(0)) return;
         try
         {
-            double heap = GC.GetTotalMemory(false) / 1048576.0;
-            double priv = Process.GetCurrentProcess().PrivateMemorySize64 / 1048576.0;
-            double denom = Math.Max(1, heap);
-            return (priv - heap) / denom;
+            CollectOnce();
+            RefreshPressureLevel();
+            AppLogger.Memory($"EmergencyCleanup done level={(PressureLevel)Volatile.Read(ref _cachedLevel)}");
         }
-        catch { return 0; }
+        finally { CompactGate.Release(); }
+    }
+
+    private static void CollectOnce()
+    {
+        CollectionPolicy.RecordCollection(Environment.TickCount64);
+        GCSettings.LargeObjectHeapCompactionMode = GCLargeObjectHeapCompactionMode.CompactOnce;
+        GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
     }
 
     private static void RefreshPressureLevel()
     {
-        lock (_lock)
+        try
         {
-            if (DateTime.UtcNow - _lastLevelRefresh <= LevelRefreshInterval)
-                return;
-            _lastLevelRefresh = DateTime.UtcNow;
-
-            double commitMB = CommitChargeMB;
-            double heapMB = GC.GetTotalMemory(false) / 1048576.0;
-            double score = ComputeScore();
-            bool scoreIsMeaningful = heapMB >= MinHeapForFragmentationMB;
-
-            if (commitMB >= CriticalCommitMB)
-                _cachedLevel = PressureLevel.Critical;
-            else if (commitMB >= HighCommitMB || (scoreIsMeaningful && commitMB >= MediumCommitMB && score > 30))
-                _cachedLevel = PressureLevel.High;
-            else if (commitMB >= MediumCommitMB || (scoreIsMeaningful && commitMB >= 4000 && score > 10))
-                _cachedLevel = PressureLevel.Medium;
-            else
-                _cachedLevel = PressureLevel.Low;
+            using var process = Process.GetCurrentProcess();
+            var commit = process.PrivateMemorySize64 / 1048576.0;
+            Volatile.Write(ref _commitMB, commit);
+            Volatile.Write(ref _cachedLevel, (int)(commit >= CriticalCommitMB ? PressureLevel.Critical :
+                commit >= HighCommitMB ? PressureLevel.High : commit >= MediumCommitMB ? PressureLevel.Medium : PressureLevel.Low));
+            CollectionPolicy.ObservePressure((PressureLevel)Volatile.Read(ref _cachedLevel), Environment.TickCount64);
+            Interlocked.Exchange(ref _lastSampleMs, Environment.TickCount64);
         }
+        catch { Interlocked.Exchange(ref _lastSampleMs, Environment.TickCount64); }
     }
 }

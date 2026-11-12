@@ -5,6 +5,7 @@
         xmlns:models="using:ImageManager.Core.Models"
         xmlns:controls="using:ImageManager.App.Controls"
         xmlns:conv="using:ImageManager.App.Converters"
+        xmlns:avconv="using:Avalonia.Data.Converters"
         x:Class="ImageManager.App.Views.MainWindow"
         x:DataType="vm:MainWindowViewModel"
         Title="图片管理工具"
@@ -77,12 +78,18 @@
 						<Grid MinHeight="80">
 							<!-- Placeholder color background while loading -->
 							<Border Background="{Binding PlaceholderColor, Converter={StaticResource HexToBrush}}"
-									IsVisible="{Binding IsNotLoaded}"
-									CornerRadius="2"/>
+									CornerRadius="2">
+                                <Border.IsVisible>
+                                    <MultiBinding Converter="{x:Static avconv:BoolConverters.And}">
+                                        <Binding Path="!HasThumbnail" ElementName="GalleryThumbnail"/>
+                                        <Binding Path="!HasNoPreview"/>
+                                    </MultiBinding>
+                                </Border.IsVisible>
+                            </Border>
 							<!-- Main image — fills entire thumbnail box -->
-							<Image Width="{Binding $self.(controls:SmartWaterfallPanel.ItemWidth)}"
+							<controls:AsyncThumbnailImage x:Name="GalleryThumbnail" Width="{Binding $self.(controls:SmartWaterfallPanel.ItemWidth)}"
 									Height="{Binding $parent[Window].DataContext.GridThumbnailHeight}"
-									Source="{Binding ThumbnailData, Converter={StaticResource BytesToBitmap}}"
+									ThumbnailData="{Binding ThumbnailData}"
 									Stretch="{Binding $parent[Window].DataContext.ThumbnailImageStretch}"/>
 							<!-- Music files without embedded artwork retain the card layout and show a clear in-place placeholder. -->
 							<Panel IsVisible="{Binding ShowMusicPlaceholder}"
@@ -745,18 +752,20 @@
 							   Foreground="{DynamicResource SecondaryFgBrush}"/>
 				</Border>
 
-                <ItemsControl x:Name="ItemsImages" Grid.Row="2" ItemsSource="{Binding Images}"
+                <controls:ThumbnailItemsControl x:Name="ItemsImages" Grid.Row="2" ItemsSource="{Binding Images}"
                               ItemTemplate="{StaticResource ThumbnailItemTemplate}">
                 <ItemsControl.ItemsPanel>
                     <ItemsPanelTemplate>
-                        <controls:SmartWaterfallPanel
+                        <controls:VirtualizingWaterfallPanel IsPaged="True" ViewportBuffer="800"
                             Mode="{Binding $parent[Window].DataContext.WaterfallMode}"
-                            ColumnWidth="{Binding $parent[Window].DataContext.ThumbnailBaseWidth}"/>
+                            ColumnWidth="{Binding $parent[Window].DataContext.ThumbnailBaseWidth}"
+                            GridThumbnailHeight="{Binding $parent[Window].DataContext.GridThumbnailHeight}"
+                            KeepPadding="{Binding $parent[Window].DataContext.KeepPadding}"/>
                     </ItemsPanelTemplate>
                 </ItemsControl.ItemsPanel>
-            </ItemsControl>
+            </controls:ThumbnailItemsControl>
 
-                <ItemsControl x:Name="ContinuousItemsImages" Grid.Row="2"
+                <controls:ThumbnailItemsControl x:Name="ContinuousItemsImages" Grid.Row="2"
                               ItemsSource="{Binding ContinuousImageItemSource}"
                               ItemTemplate="{StaticResource ThumbnailItemTemplate}"
                               IsVisible="False">
@@ -767,7 +776,7 @@
                                 ViewportBuffer="800"/>
                         </ItemsPanelTemplate>
                     </ItemsControl.ItemsPanel>
-                </ItemsControl>
+                </controls:ThumbnailItemsControl>
 
                 <!-- Selection rectangle overlay -->
                 <Rectangle x:Name="SelectionRectangle"

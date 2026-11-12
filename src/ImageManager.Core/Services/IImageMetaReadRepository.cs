@@ -8,6 +8,8 @@ public interface IImageMetaReadRepository
     Task<ImageMeta?> GetByPathAsync(string filePath);
     Task<List<ImageMeta>> GetByFolderAsync(string folderPath, bool recursive = true);
     Task<List<ImageMeta>> GetByFolderIdAsync(long folderId);
+    /// <summary>Paths with the exact FolderId membership, without materializing metadata or tags.</summary>
+    Task<IReadOnlyList<string>> GetFilePathsByFolderIdAsync(long folderId, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<ImageSortMetadata>> GetSortMetadataByFolderAsync(
         string folderPath,
         bool recursive,

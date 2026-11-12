@@ -157,6 +157,8 @@ public class TestMetaProxy : DispatchProxy
 
         switch (method.Name)
         {
+            case "GetFilePathsByFolderIdAsync":
+                return Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
             case "GetSortMetadataByFolderAsync":
                 return Task.FromResult<IReadOnlyList<ImageSortMetadata>>(Array.Empty<ImageSortMetadata>());
             case "GetSortMetadataByPathsAsync":
@@ -750,8 +752,8 @@ public sealed class MainWindowTestContext : IDisposable
 
         Messenger = new WeakReferenceMessenger();
         CacheService = new ThumbnailCacheService(new MediaProcessorFactory(null!), TempCacheDirectory);
-        PageManager = new PageManager(CacheService, FolderRepo, MetaRepo);
         Dispatcher = new ImmediateDispatcher();
+        PageManager = new PageManager(CacheService, FolderRepo, MetaRepo, Dispatcher);
 
         lock (_staticAppLock)
         {

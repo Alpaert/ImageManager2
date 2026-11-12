@@ -266,6 +266,7 @@ public partial class MainWindowViewModel
         ContinuousDisplayGeometrySnapshot snapshot,
         HashSet<string> deletedPaths)
     {
+        var activeFiles = ActiveFileList;
         var remainingPaths = snapshot.Paths
             .Where(path => !deletedPaths.Contains(path))
             .ToArray();
@@ -275,7 +276,8 @@ public partial class MainWindowViewModel
             .Select(entry => snapshot.Sizes[entry.index])
             .ToArray();
 
-        if (snapshot.Paths.Count != source.Count || remainingPaths.Length != remainingSizes.Length)
+        if (snapshot.Paths.Count != source.Count || remainingPaths.Length != remainingSizes.Length ||
+            !remainingPaths.SequenceEqual(activeFiles, StringComparer.OrdinalIgnoreCase))
             return false;
 
         var requestVersion = _continuousDisplayGeometryVersion;
@@ -286,6 +288,7 @@ public partial class MainWindowViewModel
         if (requestVersion != _continuousDisplayGeometryVersion ||
             !ReferenceEquals(snapshot, ContinuousDisplayGeometrySnapshot) ||
             !ReferenceEquals(source, ContinuousImageItemSource) ||
+            !ReferenceEquals(activeFiles, ActiveFileList) ||
             DisplayMode != ImageDisplayMode.Continuous)
             return false;
 
@@ -297,7 +300,7 @@ public partial class MainWindowViewModel
         // range can therefore contain a newly visible item that the previous
         // range had not loaded; force the next panel range publication to queue
         // only those missing thumbnails without clearing retained image bytes.
-        CancelContinuousViewportThumbnailLoad();
+        InvalidateContinuousThumbnailRanges();
 
         var dimensionHitCount = remainingSizes.Count(size => size.Width > 1 && size.Height > 1);
         ContinuousDisplayGeometrySnapshot = new ContinuousDisplayGeometrySnapshot(
@@ -402,6 +405,9 @@ public partial class MainWindowViewModel
     private static bool HasUsableDimensions((int Width, int Height) size) =>
         size.Width > 1 && size.Height > 1;
 
+    private ImageDisplayRange _continuousRetainedRange;
+    private ContinuousScrollDirection _continuousPrefetchDirection;
+
     /// <summary>
     /// Coordinates state retained by the continuous panel. The panel has already
     /// materialized its bounded range before reporting it, so visible thumbnail
@@ -414,38 +420,29 @@ public partial class MainWindowViewModel
         ContinuousScrollDirection scrollDirection = ContinuousScrollDirection.None)
     {
         var source = ContinuousImageItemSource;
-        if (source is null)
+        if (DisplayMode != ImageDisplayMode.Continuous || source is null)
             return;
 
-        var previousSource = _continuousViewportSource;
-        var previousVisibleRange = _continuousVisibleRange;
-        var prefetchRange = GetContinuousPrefetchRange(
-            ReferenceEquals(previousSource, source) ? previousVisibleRange : default,
-            visibleRange,
-            scrollDirection,
-            source.Count);
-        source.UpdateRetainedRange(CombineRanges(retainedRange, prefetchRange, source.Count));
-
-        if (ReferenceEquals(previousSource, source)
-            && previousVisibleRange == visibleRange
-            && _continuousPrefetchRange == prefetchRange)
+        if (!ReferenceEquals(_continuousViewportSource, source))
         {
-            return;
+            CancelContinuousViewportThumbnailLoad();
+            _continuousViewportSource = source;
         }
 
-        CancelContinuousViewportThumbnailLoad();
-        _continuousViewportSource = source;
-        _continuousVisibleRange = visibleRange;
-        _continuousPrefetchRange = prefetchRange;
-        if (visibleRange.IsEmpty)
+        var prefetchRange = GetContinuousPrefetchRange(visibleRange, scrollDirection, source.Count);
+        if (_continuousViewportThumbnailCts is not null && _continuousVisibleRange == visibleRange &&
+            _continuousRetainedRange == retainedRange && _continuousPrefetchRange == prefetchRange &&
+            _continuousPrefetchDirection == scrollDirection)
             return;
 
-        var cts = new CancellationTokenSource();
-        _continuousViewportThumbnailCts = cts;
-        var visibleItems = source.GetCachedItems(visibleRange);
-        var prefetchItems = source.GetOrCreateItems(prefetchRange);
-        _pageManager.LoadViewportThumbnailsForItems(visibleItems, cts.Token);
-        _pageManager.LoadPrefetchThumbnailsForItems(prefetchItems, cts.Token);
+        source.UpdateRetainedRange(CombineRanges(retainedRange, prefetchRange, source.Count));
+        _continuousVisibleRange = visibleRange;
+        _continuousRetainedRange = retainedRange;
+        _continuousPrefetchRange = prefetchRange;
+        _continuousPrefetchDirection = scrollDirection;
+
+        var cts = _continuousViewportThumbnailCts ??= new CancellationTokenSource();
+        PublishContinuousThumbnailWindow(source, cts.Token);
     }
 
     private bool RefreshContinuousViewportThumbnailsAfterZoom()
@@ -455,16 +452,6 @@ public partial class MainWindowViewModel
 
         // The virtualizing panel owns which items exist. Keep the old bytes on its
         // current visible and prefetch items until each replacement has succeeded.
-        var visibleRange = _continuousVisibleRange;
-        var prefetchRange = _continuousPrefetchRange;
-        var visibleItems = source.GetCachedItems(visibleRange);
-        var visiblePaths = new HashSet<string>(
-            visibleItems.Select(item => item.FilePath),
-            StringComparer.OrdinalIgnoreCase);
-        var prefetchItems = source.GetOrCreateItems(prefetchRange)
-            .Where(item => !visiblePaths.Contains(item.FilePath))
-            .ToArray();
-
         // Retained items are already materialized but may cross into the viewport
         // before being evicted. Mark them now, then schedule only active ranges.
         foreach (var item in source.GetAllCachedItems())
@@ -481,18 +468,29 @@ public partial class MainWindowViewModel
             }
         }
 
-        CancelContinuousViewportThumbnailLoad();
-        _continuousViewportSource = source;
-        _continuousVisibleRange = visibleRange;
-        _continuousPrefetchRange = prefetchRange;
-        if (visibleRange.IsEmpty)
+        if (!ReferenceEquals(_continuousViewportSource, source))
             return true;
 
+        _continuousViewportThumbnailCts?.Cancel();
+        _continuousViewportThumbnailCts?.Dispose();
         var cts = new CancellationTokenSource();
         _continuousViewportThumbnailCts = cts;
-        _pageManager.LoadViewportThumbnailsForItems(visibleItems, cts.Token);
-        _pageManager.LoadPrefetchThumbnailsForItems(prefetchItems, cts.Token);
+        PublishContinuousThumbnailWindow(source, cts.Token, forceRefresh: true);
         return true;
+    }
+
+    private void PublishContinuousThumbnailWindow(
+        ContinuousImageItemSource source,
+        CancellationToken cancellationToken,
+        bool forceRefresh = false)
+    {
+        var visible = source.GetCachedItems(_continuousVisibleRange);
+        var retained = source.GetCachedItems(_continuousRetainedRange);
+        var prefetch = source.GetOrCreateItems(_continuousPrefetchRange);
+        if (_continuousPrefetchDirection == ContinuousScrollDirection.Up)
+            prefetch = prefetch.Reverse().ToArray();
+
+        _pageManager.UpdateContinuousThumbnailWindow(visible, retained, prefetch, cancellationToken, forceRefresh);
     }
 
     /// <summary>
@@ -519,27 +517,28 @@ public partial class MainWindowViewModel
         _continuousViewportThumbnailCts?.Cancel();
         _continuousViewportThumbnailCts?.Dispose();
         _continuousViewportThumbnailCts = null;
+        _pageManager.ClearContinuousViewport();
         _continuousViewportSource = null;
-        _continuousVisibleRange = default;
-        _continuousPrefetchRange = default;
+        InvalidateContinuousThumbnailRanges();
     }
 
-    private static ImageDisplayRange GetContinuousPrefetchRange(
-        ImageDisplayRange previousVisibleRange,
+    private void InvalidateContinuousThumbnailRanges()
+    {
+        _continuousVisibleRange = default;
+        _continuousRetainedRange = default;
+        _continuousPrefetchRange = default;
+        _continuousPrefetchDirection = ContinuousScrollDirection.None;
+    }
+
+    internal static ImageDisplayRange GetContinuousPrefetchRange(
         ImageDisplayRange visibleRange,
         ContinuousScrollDirection scrollDirection,
         int totalCount)
     {
-        if (visibleRange.IsEmpty || previousVisibleRange.IsEmpty || totalCount <= 0)
+        if (visibleRange.IsEmpty || totalCount <= 0)
             return default;
 
-        var count = Math.Max(1, (int)Math.Ceiling(visibleRange.Count * (2d / 3d)));
-        if (scrollDirection == ContinuousScrollDirection.Down)
-        {
-            var start = Math.Clamp(visibleRange.EndExclusive, 0, totalCount);
-            return new ImageDisplayRange(start, Math.Min(count, totalCount - start));
-        }
-
+        var count = (int)Math.Min(64, 3L * visibleRange.Count);
         if (scrollDirection == ContinuousScrollDirection.Up)
         {
             var end = Math.Clamp(visibleRange.StartIndex, 0, totalCount);
@@ -547,7 +546,8 @@ public partial class MainWindowViewModel
             return new ImageDisplayRange(start, end - start);
         }
 
-        return default;
+        var next = Math.Clamp(visibleRange.EndExclusive, 0, totalCount);
+        return new ImageDisplayRange(next, Math.Min(count, totalCount - next));
     }
 
     private static ImageDisplayRange CombineRanges(
@@ -673,6 +673,8 @@ public partial class MainWindowViewModel
             return false;
         }
 
+        if (DisplayMode == ImageDisplayMode.Continuous)
+            CancelContinuousViewportThumbnailLoad();
         _pageManager.CancelCurrentLoads();
         DisplayMode = mode;
         OnPropertyChanged(nameof(IsPagedDisplay));
@@ -702,23 +704,8 @@ public partial class MainWindowViewModel
     private void DeferHashPrecomputeForPaging()
     {
         _deferMaintenanceUntilUtc = DateTime.UtcNow.AddSeconds(15);
-        var cts = Volatile.Read(ref _hashCts);
-        if (cts != null)
-        {
-            try
-            {
-                cts.Cancel();
-                AppLogger.Memory("HashPrecompute deferred by paging");
-            }
-            catch { }
-        }
-
-        if (!string.IsNullOrEmpty(CurrentFolder))
-        {
-            _idleTimer?.Stop();
-            _idleTimer = new DispatcherTimer(TimeSpan.FromSeconds(15), DispatcherPriority.Background, OnIdleTimerTick);
-            _idleTimer.Start();
-        }
+        NotifyGalleryInteraction();
+        ScheduleAutomaticMaintenance(TimeSpan.FromSeconds(15));
     }
 
     // ==================== Thumbnail Zoom ====================

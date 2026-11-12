@@ -3,7 +3,11 @@ using ImageManager.Core.Models;
 
 namespace ImageManager.App.Services;
 
-public sealed record DisplayFilterResult(List<string> Files, int UnknownDimensionsCount);
+public sealed record DisplayFilterResult(List<string> Files, int UnknownDimensionsCount)
+{
+    // Includes unknown candidates hidden by the orientation filter.
+    internal HashSet<string>? UnknownDimensionsPaths { get; init; }
+}
 
 /// <summary>Preserves source order; type-only filtering never reads metadata or opens files.</summary>
 public static class DisplayFileFilter
@@ -37,7 +41,7 @@ public static class DisplayFileFilter
         var dimensions = await loadDimensions(candidates, cancellationToken).ConfigureAwait(false);
         cancellationToken.ThrowIfCancellationRequested();
         var filtered = new List<string>();
-        var unknown = 0;
+        var unknownPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var path in candidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -52,7 +56,7 @@ public static class DisplayFileFilter
             }
             if (size.Width <= 0 || size.Height <= 0)
             {
-                unknown++;
+                unknownPaths.Add(path);
                 if (options.IncludeUnknownDimensions) filtered.Add(path);
                 continue;
             }
@@ -64,7 +68,7 @@ public static class DisplayFileFilter
                 _ => true
             }) filtered.Add(path);
         }
-        return new(filtered, unknown);
+        return new(filtered, unknownPaths.Count) { UnknownDimensionsPaths = unknownPaths };
     }
 
     private static bool MatchesContentRating(int rating, ContentRatingFilter selected) => rating switch

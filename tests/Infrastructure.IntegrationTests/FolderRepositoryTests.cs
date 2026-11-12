@@ -41,6 +41,29 @@ public sealed class FolderRepositoryTests : IDisposable
     }
 
     [Fact]
+    public async Task PathProjectionPreservesExactFolderMembershipAndDoesNotReadTags()
+    {
+        using var conn = _dbFactory.CreateConnection();
+        using var command = conn.CreateCommand();
+        command.CommandText = """
+            INSERT INTO ImageMeta (FilePath, FolderId) VALUES
+                ('C:\\scope\\one.png', 17), ('C:\\scope\\sub\\two.png', 17),
+                ('C:\\scope\\unlinked.png', 0), ('C:\\scope\\other.png', 18);
+            """;
+        await command.ExecuteNonQueryAsync();
+        var oldPaths = (await _metaRepo.GetByFolderIdAsync(17)).Select(m => m.FilePath).OrderBy(p => p).ToArray();
+        // A path-only lookup must not depend on the tag tables at all.
+        command.CommandText = "DROP TABLE ImageTag;";
+        await command.ExecuteNonQueryAsync();
+        var paths = await _metaRepo.GetFilePathsByFolderIdAsync(17);
+        Assert.Equal(oldPaths, paths.OrderBy(p => p));
+        Assert.Empty(await _metaRepo.GetFilePathsByFolderIdAsync(999));
+        using var canceled = new CancellationTokenSource();
+        canceled.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => _metaRepo.GetFilePathsByFolderIdAsync(17, canceled.Token));
+    }
+
+    [Fact]
     public async Task AddAsync_And_GetAllAsync_PersistsFolders()
     {
         var path = Path.Combine(_testRoot, "my_folder");
