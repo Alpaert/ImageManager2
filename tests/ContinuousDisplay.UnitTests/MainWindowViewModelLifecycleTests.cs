@@ -116,7 +116,6 @@ public sealed class MainWindowViewModelLifecycleTests
 
         ctx.SettingsRepo.Settings.WaterfallMode = "Vertical";
         ctx.SettingsRepo.Settings.VerticalZoomLevel = 4.5;
-        ctx.SettingsRepo.Settings.SearchToolbarLayout = "C";
 
         // Act: InitializeAsync loads from repository and invokes SyncUISettingsFromAppData
         await ctx.ViewModel.InitializeAsync();
@@ -124,16 +123,9 @@ public sealed class MainWindowViewModelLifecycleTests
         // Assert
         Assert.Equal("Vertical", ctx.ViewModel.WaterfallMode);
         Assert.Equal(4.5, ctx.ViewModel.ZoomTick);
-        Assert.Equal("C", ctx.ViewModel.SearchToolbarLayout);
-        Assert.True(ctx.ViewModel.IsSearchToolbarLayoutC);
 
         // Switch to Horizontal
         ctx.ViewModel.SwitchWaterfallMode("Horizontal");
         Assert.Equal("Horizontal", ctx.ViewModel.WaterfallMode);
-
-        // Set SearchToolbarLayout back to A
-        ctx.ViewModel.SetSearchToolbarLayout("A");
-        Assert.Equal("A", ctx.ViewModel.SearchToolbarLayout);
-        Assert.True(ctx.ViewModel.IsSearchToolbarLayoutA);
     }
 }

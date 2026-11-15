@@ -6,6 +6,13 @@ public interface IImageMetaReadRepository
 {
     Task<ImageMeta?> GetByIdAsync(long id);
     Task<ImageMeta?> GetByPathAsync(string filePath);
+    async Task<ImageMeta?> GetByPathAsync(string filePath, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var result = await GetByPathAsync(filePath).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+        return result;
+    }
     Task<List<ImageMeta>> GetByFolderAsync(string folderPath, bool recursive = true);
     Task<List<ImageMeta>> GetByFolderIdAsync(long folderId);
     /// <summary>Paths with the exact FolderId membership, without materializing metadata or tags.</summary>

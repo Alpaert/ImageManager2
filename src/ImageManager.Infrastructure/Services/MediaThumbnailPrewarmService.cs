@@ -47,10 +47,9 @@ public sealed class MediaThumbnailPrewarmService : IMediaThumbnailPrewarmService
                 ThumbnailCacheLoadResult result;
                 if (FileTypeConstants.IsVideoFile(path))
                 {
-                    var originalFramePath = _videoOriginalFrames.GetOriginalFramePath(path);
                     var hadOriginalFrame = _videoOriginalFrames.Exists(path);
                     result = await _thumbnailCache.TryCreateThumbnailFromExistingVideoOriginalFrameAsync(
-                        path, originalFramePath, decodeWidth, ct).ConfigureAwait(false);
+                        path, string.Empty, decodeWidth, ct).ConfigureAwait(false);
                     if (result.Data is null && !hadOriginalFrame)
                         counts.IncrementSkippedVideos();
                     else

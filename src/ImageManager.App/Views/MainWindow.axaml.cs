@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using Avalonia;
+using Avalonia.Automation;
 using Avalonia.Controls;
 using Avalonia.Controls.Primitives;
 using Avalonia.Input;
@@ -56,6 +57,14 @@ public partial class MainWindow : Window
     private ContinuousScrollDirection _continuousScrollDirection;
     private int _continuousResizeAnchorIndex;
     private double _continuousResizeRequestedWidth;
+    private ContinuousResizeAnchor? _continuousResizeAnchor;
+    private double? _restoredContinuousOffset;
+    private bool _continuousInitialLayoutRunning;
+    private bool _windowCloseStarted;
+    private bool _windowCloseReady;
+
+    private sealed record ContinuousResizeAnchor(
+        ContinuousImageItemSource Source, string Path, int Index, double RelativeY);
     private int _autoTagRunVersion;
     private bool _lastAutoTagRecursive;
     // Accessed only on the UI thread; reserve before the first await and release in finally.
@@ -74,11 +83,11 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        InitializeRegionSearch();
+        DetailsPaneView.ActionRequested += OnDetailAction;
         _wheelFrameCallback = OnWheelAnimationFrame;
         _hoverPreview = HoverPreviewContent;
         HoverPreviewHost.PlacementTarget = RootGrid;
-        _hoverPreview.PointerEnteredPreview += OnHoverPreviewPointerEntered;
-        _hoverPreview.PointerExitedPreview += OnHoverPreviewPointerExited;
         _continuousResizeTimer = new DispatcherTimer(
             TimeSpan.FromMilliseconds(16),
             DispatcherPriority.Background,
@@ -237,10 +246,13 @@ public partial class MainWindow : Window
     {
         base.OnLoaded(e);
         Vm.PropertyChanged += OnViewModelPropertyChanged;
+        Vm.DetailsPane.PropertyChanged += OnDetailPanePropertyChanged;
         Vm.ContinuousDisplayRefreshRequested += ApplyDisplayModeAsync;
         Vm.PageManager.UseViewportLoading = true;
         Vm.PageManager.ThumbnailRefreshRequested += RefreshPagedViewportThumbnails;
         await Vm.InitializeAsync();
+        if (_windowCloseStarted)
+            return;
 
         OnlineSearchHelper.SetTempDir(Path.Combine(Vm.AppSettings.DiskCacheDirectory, "search_temp"));
         OnlineSearchHelper.CleanupOldTempFiles();
@@ -255,6 +267,7 @@ public partial class MainWindow : Window
         // Restore startup size
         if (Vm.AppSettings.StartupWidth > 0) Width = Vm.AppSettings.StartupWidth;
         if (Vm.AppSettings.StartupHeight > 0) Height = Vm.AppSettings.StartupHeight;
+        ApplyWorkspaceGeometry(ClientSize.Width, ClientSize.Height);
 
         ApplyWallpaper();
 
@@ -274,6 +287,34 @@ public partial class MainWindow : Window
 
     private async void OnWindowKeyDown(object? sender, KeyEventArgs e)
     {
+        if (DataContext is MainWindowViewModel { IsRegionSearchActive: true })
+        {
+            if (e.Key == Key.Escape)
+            {
+                e.Handled = true;
+                if (RegionLimitButton.Flyout?.IsOpen == true) RegionLimitButton.Flyout.Hide();
+                else if (Vm.DetailsPane.IsOpen)
+                    SetRegionDetailsPaneOpen(false);
+                else await ExitRegionSearchAsync();
+                return;
+            }
+            if (RegionSearchEditor.IsKeyboardFocusWithin) return;
+            if (e.Key == Key.V && e.KeyModifiers == KeyModifiers.Control && e.Source is not TextBox)
+            {
+                e.Handled = true;
+                await RegionSearchEditor.PasteImageAsync();
+                return;
+            }
+        }
+        if (e.Source is Visual source &&
+            (ReferenceEquals(source, PreviewToggle) || ReferenceEquals(source, RegionPreviewToggle) ||
+             source.FindAncestorOfType<DetailPreviewPane>(includeSelf: true) is not null ||
+             source.FindAncestorOfType<ResponsiveBreadcrumbBar>(includeSelf: true) is not null ||
+             ReferenceEquals(source, DetailSplitter) ||
+             source is Control control && (control.Classes.Contains("detail-pane-menu-item") ||
+                                           control.Classes.Contains("breadcrumb-menu-item"))))
+            return;
+
         if (e.Key == Key.Escape)
             CloseHoverPreview();
 
@@ -354,6 +395,7 @@ public partial class MainWindow : Window
             return;
 
         CloseHoverPreview();
+        _continuousResizeAnchor = null;
         BeginScrollActivity();
         // Ctrl+Wheel = zoom
         if (e.KeyModifiers.HasFlag(KeyModifiers.Control))
@@ -399,6 +441,7 @@ public partial class MainWindow : Window
             return;
 
         StopWheelAnimation("scrollbar");
+        _continuousResizeAnchor = null;
         BeginScrollActivity();
     }
 
@@ -458,8 +501,22 @@ public partial class MainWindow : Window
 
     private void OnThumbnailScrollChanged(object? sender, ScrollChangedEventArgs e)
     {
-        if (ReferenceEquals(e.Source, ThumbnailScrollViewer) && e.OffsetDelta != default)
+        if (!ReferenceEquals(e.Source, ThumbnailScrollViewer))
+            return;
+
+        if (e.OffsetDelta != default)
+        {
             BeginScrollActivity();
+            if (e.ExtentDelta == default && e.ViewportDelta == default &&
+                _restoredContinuousOffset != ThumbnailScrollViewer.Offset.Y)
+                _continuousResizeAnchor = null;
+            _restoredContinuousOffset = null;
+        }
+
+        if (Math.Abs(e.ViewportDelta.X) >= 0.01 &&
+            DataContext is MainWindowViewModel { DisplayMode: ImageDisplayMode.Continuous } &&
+            GetContinuousContainerWidth() > 0)
+            QueueContinuousGeometryReflow(GetContinuousAnchorIndex());
     }
 
     private void BeginScrollActivity()
@@ -826,6 +883,7 @@ public partial class MainWindow : Window
         _selectedFolderCard = folder;
         folder.IsSelected = true;
         Vm.ReplaceSelectedFiles(Array.Empty<string>());
+        Vm.FocusDetailFolder(folder.FolderPath);
     }
 
     private void ImagePanelHost_PointerPressed(object? sender, Avalonia.Input.PointerPressedEventArgs e)
@@ -962,6 +1020,8 @@ public partial class MainWindow : Window
         {
             // Toggle selection
             Vm.SetFileSelected(item.FilePath, !Vm.IsFileSelected(item.FilePath));
+            if (Vm.IsFileSelected(item.FilePath))
+                Vm.FocusDetailFile(item.FilePath);
             SetLastSelectedIndex(item.FilePath);
         }
         else if (shift && _lastSelectedIndex >= 0)
@@ -972,6 +1032,7 @@ public partial class MainWindow : Window
             int start = Math.Min(_lastSelectedIndex, clickedIdx);
             int end = Math.Max(_lastSelectedIndex, clickedIdx);
             Vm.ReplaceSelectedFiles(Vm.ActiveFileList.Skip(start).Take(end - start + 1));
+            Vm.FocusDetailFile(item.FilePath);
         }
         else
         {
@@ -984,6 +1045,7 @@ public partial class MainWindow : Window
             else
             {
                 Vm.ReplaceSelectedFiles(new[] { item.FilePath });
+                Vm.FocusDetailFile(item.FilePath);
                 SetLastSelectedIndex(item.FilePath);
             }
         }
@@ -997,6 +1059,7 @@ public partial class MainWindow : Window
         if (item != _pendingClick) return;
 
         Vm.ReplaceSelectedFiles(new[] { item.FilePath });
+        Vm.FocusDetailFile(item.FilePath);
         SetLastSelectedIndex(item.FilePath);
         _pendingClick = null;
     }
@@ -1027,8 +1090,6 @@ public partial class MainWindow : Window
     private void ReleaseHoverPreviewPopup()
     {
         var popup = _hoverPreview;
-        popup.PointerEnteredPreview -= OnHoverPreviewPointerEntered;
-        popup.PointerExitedPreview -= OnHoverPreviewPointerExited;
         HoverPreviewHost.IsOpen = false;
         popup.ResetPreviewSurface();
     }
@@ -1196,16 +1257,6 @@ public partial class MainWindow : Window
         }
     }
 
-    private void OnHoverPreviewPointerEntered(object? sender, EventArgs e)
-    {
-        StopHoverPreviewCloseTimer();
-    }
-
-    private void OnHoverPreviewPointerExited(object? sender, EventArgs e)
-    {
-        ScheduleHoverPreviewClose();
-    }
-
     private PixelRect GetScreenRect(Border source)
     {
         var topLeft = source.PointToScreen(new Point(0, 0));
@@ -1244,19 +1295,11 @@ public partial class MainWindow : Window
         var sourceRect = _hoverPreviewSource != null
             ? GetScreenRect(_hoverPreviewSource)
             : _hoverPreviewSourceRect;
-        if (sourceRect is { } source && ContainsExpanded(source, cursor, 8))
-            return true;
-
-        if (_hoverPreview?.CurrentScreenRect is { } popup && ContainsExpanded(popup, cursor, 8))
+        if (sourceRect is { } source && cursor.X >= source.X && cursor.X < source.Right &&
+            cursor.Y >= source.Y && cursor.Y < source.Bottom)
             return true;
 
         return false;
-    }
-
-    private static bool ContainsExpanded(PixelRect rect, PixelPoint point, int padding)
-    {
-        return point.X >= rect.X - padding && point.X <= rect.Right + padding &&
-               point.Y >= rect.Y - padding && point.Y <= rect.Bottom + padding;
     }
 
     private void ScheduleHoverPreviewClose()
@@ -1323,26 +1366,158 @@ public partial class MainWindow : Window
 
     private int GetContinuousAnchorIndex() => Math.Max(0, _continuousVisibleRange.StartIndex);
 
-    private double _workspaceLayoutWidth;
+    private IPointer? _detailResizePointer;
+    private double _detailDragStartX;
+    private double _detailDragStartWidth;
+    private double? _detailDragWidth;
+    private DetailPaneLayout _workspaceLayout;
 
-    private void ApplyWorkspaceGeometry(double width)
+    private void ApplyWorkspaceGeometry(double width, double height)
     {
-        if (width <= 0 || width == _workspaceLayoutWidth)
+        if (width <= 0 || DataContext is not MainWindowViewModel viewModel)
             return;
-        _workspaceLayoutWidth = width;
 
-        // Match the web layout's content width and breakpoint in device-independent units.
-        var gutter = Math.Round(Math.Clamp(width * 0.021, 16, 32));
-        var stackSearch = width <= 1159;
-        RootGrid.ColumnDefinitions[0].Width = new GridLength(width <= 880 ? 184 : 210);
-        WorkspaceSearchBar.Padding = new Thickness(gutter, 10, gutter, 10);
+        var details = viewModel.DetailsPane;
+        var regionSearch = viewModel.IsRegionSearchActive;
+        var sidebar = regionSearch ? 0 : width <= 880 ? 184 : 210;
+        var layout = DetailPaneLayout.Calculate(width, sidebar, details.IsOpen,
+            _detailDragWidth ?? details.PreferredWidth, regionSearch);
+        if (Math.Abs(_workspaceLayout.GalleryWidth - layout.GalleryWidth) >= 1)
+            CaptureContinuousResizeAnchor();
+
+        _workspaceLayout = layout;
+        RootGrid.ColumnDefinitions[0].Width = new GridLength(sidebar);
+        RootGrid.ColumnDefinitions[2].Width = new GridLength(layout.SplitterWidth);
+        RootGrid.ColumnDefinitions[3].Width = new GridLength(layout.IsOverlay ? 0 : layout.PaneWidth);
+        Grid.SetColumn(DetailsPaneView, layout.IsOverlay ? 1 : 3);
+        DetailsPaneView.ApplySize(layout.PaneWidth, height, layout.IsOverlay);
+        DetailsPaneView.IsVisible = details.IsOpen;
+        DetailSplitter.IsVisible = layout.SplitterWidth > 0;
+        var regionInputWidth = Math.Min(Math.Clamp(width * .4, 300, 620), layout.GalleryWidth / 2);
+        WorkspaceGallery.ColumnDefinitions[0].Width = new GridLength(regionSearch ? regionInputWidth : 0);
+        Grid.SetRow(DetailsPaneView, regionSearch ? 2 : 1);
+        Grid.SetRowSpan(DetailsPaneView, regionSearch ? 1 : 3);
+        Grid.SetRow(DetailSplitter, regionSearch ? 2 : 1);
+        Grid.SetRowSpan(DetailSplitter, regionSearch ? 1 : 3);
+        AutomationProperties.SetName(DetailSplitter, $"调整预览栏宽度，当前 {layout.PaneWidth:0} DIP");
+        var toggleText = details.IsOpen ? "收起预览栏" : "展开预览栏";
+        AutomationProperties.SetName(PreviewToggle, toggleText);
+        ToolTip.SetTip(PreviewToggle, toggleText);
+        AutomationProperties.SetName(RegionPreviewToggle, toggleText);
+        ToolTip.SetTip(RegionPreviewToggle, toggleText);
+        PreviewToggleLabel.IsVisible = width > 720;
+
+        var searchGutter = Math.Round(Math.Clamp(width * 0.021, 16, 32));
+        var narrowGallery = layout.GalleryWidth <= 520;
+        var gutter = narrowGallery ? 12 : searchGutter;
+        WorkspaceSearchBar.Padding = new Thickness(searchGutter, 10, searchGutter, 10);
         WorkspaceHeader.Padding = new Thickness(gutter, 12, gutter, 8);
         // Both native card templates already contribute 5 DIP of outer margin.
         WorkspaceGallery.Margin = new Thickness(gutter - 5, 0, gutter - 5, 0);
         WorkspaceFooter.Padding = new Thickness(gutter, 0, gutter, 0);
+        WorkspaceZoomSlider.Width = narrowGallery ? 52 : 80;
+        WorkspaceLoadedInfo.MaxWidth = narrowGallery ? 90 : double.PositiveInfinity;
 
+        Grid.SetColumn(WorkspaceViewActions, narrowGallery ? 0 : 1);
+        Grid.SetRow(WorkspaceViewActions, narrowGallery ? 1 : 0);
+        WorkspaceViewActions.Margin = narrowGallery ? new Thickness(0, 3, 0, 0) : new Thickness(8, 0, 0, 0);
+
+        var stackSearch = width - sidebar <= 1009;
         SetWorkspaceSearchRows(WorkspaceSearchModesA, WorkspaceSearchBodyA, stackSearch);
-        SetWorkspaceSearchRows(WorkspaceSearchModesC, WorkspaceSearchBodyC, stackSearch);
+    }
+
+    private void OnDetailPanePropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(DetailPaneViewModel.IsOpen) or nameof(DetailPaneViewModel.PreferredWidth))
+            ApplyWorkspaceGeometry(ClientSize.Width, ClientSize.Height);
+    }
+
+    private void PreviewToggle_Click(object? sender, RoutedEventArgs e)
+    {
+        if (Vm.IsRegionSearchActive)
+            SetRegionDetailsPaneOpen(!Vm.DetailsPane.IsOpen);
+        else
+        {
+            CloseHoverPreview();
+            Vm.SetDetailsPaneOpen(!Vm.DetailsPane.IsOpen);
+        }
+    }
+
+    private void DetailSplitter_PointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (!e.GetCurrentPoint(DetailSplitter).Properties.IsLeftButtonPressed)
+            return;
+
+        DetailSplitter.Focus();
+        CloseHoverPreview();
+        e.Handled = true;
+        if (e.ClickCount == 2)
+        {
+            Vm.SetDetailsPaneWidth(DetailPaneLayout.DefaultWidth);
+            return;
+        }
+
+        _detailResizePointer = e.Pointer;
+        _detailDragStartX = e.GetPosition(RootGrid).X;
+        _detailDragStartWidth = _workspaceLayout.PaneWidth;
+        e.Pointer.Capture(DetailSplitter);
+    }
+
+    private void DetailSplitter_PointerMoved(object? sender, PointerEventArgs e)
+    {
+        if (!ReferenceEquals(_detailResizePointer, e.Pointer))
+            return;
+
+        var delta = _detailDragStartX - e.GetPosition(RootGrid).X;
+        if (_detailDragWidth is null && Math.Abs(delta) < 1)
+            return;
+        _detailDragWidth = DetailPaneLayout.NormalizePreferredWidth(_detailDragStartWidth + delta);
+        ApplyWorkspaceGeometry(ClientSize.Width, ClientSize.Height);
+        e.Handled = true;
+    }
+
+    private void DetailSplitter_PointerReleased(object? sender, PointerReleasedEventArgs e)
+    {
+        if (!ReferenceEquals(_detailResizePointer, e.Pointer))
+            return;
+        CommitDetailResize();
+        e.Pointer.Capture(null);
+        e.Handled = true;
+    }
+
+    private void DetailSplitter_PointerCaptureLost(object? sender, PointerCaptureLostEventArgs e)
+    {
+        if (ReferenceEquals(_detailResizePointer, e.Pointer))
+            CommitDetailResize();
+    }
+
+    private void CommitDetailResize()
+    {
+        _detailResizePointer = null;
+        if (_detailDragWidth is not { } width)
+            return;
+        _detailDragWidth = null;
+        CommitDetailPaneWidth(width);
+        if (!_windowCloseStarted && Vm.DisplayMode == ImageDisplayMode.Continuous &&
+            Vm.ContinuousDisplayGeometryIndex is not null)
+            QueueContinuousGeometryReflow(GetContinuousAnchorIndex());
+    }
+
+    private void DetailSplitter_KeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.KeyModifiers != KeyModifiers.None || e.Key is not (Key.Left or Key.Right))
+            return;
+        var delta = e.Key == Key.Left ? DetailPaneLayout.KeyboardStep : -DetailPaneLayout.KeyboardStep;
+        CommitDetailPaneWidth(_workspaceLayout.PaneWidth + delta);
+        e.Handled = true;
+    }
+
+    private void CommitDetailPaneWidth(double width)
+    {
+        var regionSearch = Vm.IsRegionSearchActive;
+        var sidebar = regionSearch ? 0 : ClientSize.Width <= 880 ? 184 : 210;
+        Vm.SetDetailsPaneWidth(DetailPaneLayout.AdjustPreferredWidth(ClientSize.Width,
+            sidebar, Vm.DetailsPane.PreferredWidth, width, regionSearch));
     }
 
     private static void SetWorkspaceSearchRows(Control modes, Control body, bool stacked)
@@ -1355,27 +1530,14 @@ public partial class MainWindow : Window
         Grid.SetColumnSpan(body, stacked ? 2 : 1);
     }
 
-    private void OnWindowSizeChanged(object? sender, SizeChangedEventArgs e)
+    private void OnWindowSizeChanged(object? sender, SizeChangedEventArgs e) =>
+        ApplyWorkspaceGeometry(e.NewSize.Width, e.NewSize.Height);
+
+    private void QueueContinuousGeometryReflow(int anchorIndex)
     {
-        ApplyWorkspaceGeometry(e.NewSize.Width);
-        if (DataContext is not MainWindowViewModel viewModel ||
-            viewModel.DisplayMode != ImageDisplayMode.Continuous)
-        {
-            return;
-        }
-
-        var width = GetContinuousContainerWidth();
-        if (width <= 0 || (viewModel.ContinuousDisplayGeometryIndex is { } geometry &&
-            Math.Abs(width - geometry.Options.ContainerWidth) < 1))
-            return;
-
-        QueueContinuousGeometryReflow(GetContinuousAnchorIndex(), width);
-    }
-
-    private void QueueContinuousGeometryReflow(int anchorIndex, double? requestedWidth = null)
-    {
+        CaptureContinuousResizeAnchor();
         _continuousResizeAnchorIndex = anchorIndex;
-        _continuousResizeRequestedWidth = requestedWidth ?? GetContinuousContainerWidth();
+        _continuousResizeRequestedWidth = GetContinuousContainerWidth();
         if (!_continuousResizeTimer.IsEnabled)
             _continuousResizeTimer.Start();
     }
@@ -1383,7 +1545,8 @@ public partial class MainWindow : Window
     private void OnContinuousResizeTimerTick(object? sender, EventArgs e)
     {
         _continuousResizeTimer.Stop();
-        if (DataContext is not MainWindowViewModel viewModel ||
+        if (_continuousInitialLayoutRunning || _windowCloseStarted ||
+            DataContext is not MainWindowViewModel viewModel ||
             viewModel.DisplayMode != ImageDisplayMode.Continuous)
         {
             return;
@@ -1395,6 +1558,11 @@ public partial class MainWindow : Window
         if (width <= 0)
             return;
 
+        // The in-flight calculation may publish an intermediate width even if
+        // the newest request equals the old geometry. Keep its anchor until it finishes.
+        if (_continuousReflowCts is not null)
+            return;
+
         if (viewModel.ContinuousDisplayGeometryIndex is { } geometry)
         {
             if (NeedsContinuousGeometryReflow(viewModel, geometry, width))
@@ -1402,11 +1570,12 @@ public partial class MainWindow : Window
                 // Do not cancel work that is already arranging the previous frame.
                 // Constant cancellation while the user drags makes the view appear
                 // frozen; when it completes, the latest requested width is queued.
-                if (_continuousReflowCts is not null)
-                    return;
-
                 _continuousReflowCts = new CancellationTokenSource();
-                _ = ReflowContinuousDisplayAsync(width, _continuousResizeAnchorIndex, _continuousReflowCts);
+                _ = ReflowContinuousDisplayAsync(width, _continuousReflowCts);
+            }
+            else if (_detailDragWidth is null)
+            {
+                _continuousResizeAnchor = null;
             }
             return;
         }
@@ -1422,9 +1591,66 @@ public partial class MainWindow : Window
         return width > 0 ? width : ImagePanelHost.Bounds.Width;
     }
 
+    private void CaptureContinuousResizeAnchor()
+    {
+        if (_continuousResizeAnchor is not null || _wheelMotion.NeedsFrame ||
+            Vm.DisplayMode != ImageDisplayMode.Continuous ||
+            Vm.ContinuousImageItemSource is not { } source ||
+            Vm.ContinuousDisplayGeometrySnapshot is not { } snapshot ||
+            Vm.ContinuousDisplayGeometryIndex is not { } geometry ||
+            _continuousWaterfallPanel?.TranslatePoint(default, ThumbnailScrollViewer) is not { } panelOrigin)
+            return;
+
+        // The panel starts after the folder section inside the same scroll surface.
+        // Its position in the viewer also incorporates the current scroll offset.
+        var viewportY = -panelOrigin.Y;
+        var viewportHeight = ThumbnailScrollViewer.Viewport.Height;
+        var range = geometry.QueryViewport(viewportY, viewportHeight);
+        for (var index = range.StartIndex; index < range.StartIndex + range.Count && index < snapshot.Paths.Count; index++)
+        {
+            if (geometry.TryGetItemRect(index, out var rect) &&
+                rect.Bottom > viewportY && rect.Y < viewportY + viewportHeight)
+            {
+                _continuousResizeAnchor = new(source, snapshot.Paths[index], index, rect.Y - viewportY);
+                break;
+            }
+        }
+    }
+
+    private void RestoreContinuousResizeAnchor()
+    {
+        if (_continuousResizeAnchor is not { } anchor ||
+            !ReferenceEquals(anchor.Source, Vm.ContinuousImageItemSource) ||
+            Vm.ContinuousDisplayGeometrySnapshot is not { Paths.Count: > 0 } snapshot ||
+            Vm.ContinuousDisplayGeometryIndex is not { } geometry ||
+            _continuousWaterfallPanel?.TranslatePoint(default, ThumbnailScrollViewer) is not { } panelOrigin)
+            return;
+
+        var index = Math.Min(anchor.Index, snapshot.Paths.Count - 1);
+        if (!StringComparer.OrdinalIgnoreCase.Equals(snapshot.Paths[index], anchor.Path))
+        {
+            var resolved = FindActiveFileIndex(anchor.Path);
+            if ((uint)resolved < (uint)snapshot.Paths.Count &&
+                StringComparer.OrdinalIgnoreCase.Equals(snapshot.Paths[resolved], anchor.Path))
+                index = resolved;
+        }
+
+        if (!geometry.TryGetItemRect(index, out var rect))
+            return;
+
+        var viewer = ThumbnailScrollViewer;
+        var contentY = panelOrigin.Y + viewer.Offset.Y;
+        var targetY = Math.Clamp(contentY + rect.Y - anchor.RelativeY, 0,
+            Math.Max(0, viewer.Extent.Height - viewer.Viewport.Height));
+        if (viewer.Offset.Y != targetY)
+        {
+            _restoredContinuousOffset = targetY;
+            viewer.Offset = new Vector(viewer.Offset.X, targetY);
+        }
+    }
+
     private async Task ReflowContinuousDisplayAsync(
         double width,
-        int preferredIndex,
         CancellationTokenSource cts)
     {
         try
@@ -1439,7 +1665,7 @@ public partial class MainWindow : Window
             // Reflow keeps the old source and thumbnail cache alive. Updating layout
             // before scrolling publishes the new extent and prevents offset clamping.
             ContinuousItemsImages.UpdateLayout();
-            _continuousWaterfallPanel?.ScrollToIndex(Math.Clamp(preferredIndex, 0, Vm.ActiveFileList.Count - 1));
+            RestoreContinuousResizeAnchor();
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
         {
@@ -1455,13 +1681,14 @@ public partial class MainWindow : Window
 
             // Coalesce all size notifications that arrived while this CPU-only
             // layout was running into one follow-up frame at the newest width.
-            if (completedCurrentReflow && !wasCancelled &&
-                Vm.DisplayMode == ImageDisplayMode.Continuous &&
-                Vm.ContinuousDisplayGeometryIndex is { } geometry &&
-                NeedsContinuousGeometryReflow(Vm, geometry, GetContinuousContainerWidth()) &&
-                !_continuousResizeTimer.IsEnabled)
+            if (completedCurrentReflow && !wasCancelled)
             {
-                QueueContinuousGeometryReflow(_continuousResizeAnchorIndex);
+                if (Vm.DisplayMode == ImageDisplayMode.Continuous &&
+                    Vm.ContinuousDisplayGeometryIndex is { } geometry &&
+                    NeedsContinuousGeometryReflow(Vm, geometry, GetContinuousContainerWidth()))
+                    QueueContinuousGeometryReflow(_continuousResizeAnchorIndex);
+                else if (_detailDragWidth is null)
+                    _continuousResizeAnchor = null;
             }
         }
     }
@@ -1477,6 +1704,8 @@ public partial class MainWindow : Window
     private async Task ApplyDisplayModeAsync(int preferredIndex)
     {
         StopWheelAnimation();
+        _continuousResizeAnchor = null;
+        _continuousInitialLayoutRunning = false;
         _continuousReflowCts?.Cancel();
         _continuousReflowCts = null;
         _continuousModeCts?.Cancel();
@@ -1493,22 +1722,37 @@ public partial class MainWindow : Window
             return;
         }
 
-        Vm.PageManager.ClearPagedViewport();
-        ItemsImages.IsVisible = false;
-        _pagedWaterfallPanel?.ResetPagedViewport();
-        ContinuousItemsImages.IsVisible = true;
-        await Dispatcher.UIThread.InvokeAsync(() => ContinuousItemsImages.UpdateLayout());
-        if (token.IsCancellationRequested || Vm.DisplayMode != ImageDisplayMode.Continuous)
-            return;
-        var width = GetContinuousContainerWidth();
-        if (!await Vm.PrepareContinuousDisplayGeometryAsync(width, token) || token.IsCancellationRequested)
-            return;
+        _continuousInitialLayoutRunning = true;
+        try
+        {
+            Vm.PageManager.ClearPagedViewport();
+            ItemsImages.IsVisible = false;
+            _pagedWaterfallPanel?.ResetPagedViewport();
+            ContinuousItemsImages.IsVisible = true;
+            await Dispatcher.UIThread.InvokeAsync(() => ContinuousItemsImages.UpdateLayout());
+            if (token.IsCancellationRequested || Vm.DisplayMode != ImageDisplayMode.Continuous)
+                return;
+            var width = GetContinuousContainerWidth();
+            if (!await Vm.PrepareContinuousDisplayGeometryAsync(width, token) || token.IsCancellationRequested)
+                return;
 
-        AttachContinuousWaterfallPanelWhenAvailable();
-        // Publish the new scroll extent before setting Offset, otherwise the
-        // ScrollViewer clamps a requested anchor to the previous (often zero) extent.
-        ContinuousItemsImages.UpdateLayout();
-        _continuousWaterfallPanel?.ScrollToIndex(Math.Clamp(preferredIndex, 0, Vm.ActiveFileList.Count - 1));
+            AttachContinuousWaterfallPanelWhenAvailable();
+            // Publish the new scroll extent before setting Offset, otherwise the
+            // ScrollViewer clamps a requested anchor to the previous (often zero) extent.
+            ContinuousItemsImages.UpdateLayout();
+            if (Vm.ActiveFileList.Count > 0)
+                _continuousWaterfallPanel?.ScrollToIndex(Math.Clamp(preferredIndex, 0, Vm.ActiveFileList.Count - 1));
+        }
+        finally
+        {
+            if (!token.IsCancellationRequested)
+            {
+                _continuousInitialLayoutRunning = false;
+                if (Vm.ContinuousDisplayGeometryIndex is { } geometry &&
+                    NeedsContinuousGeometryReflow(Vm, geometry, GetContinuousContainerWidth()))
+                    QueueContinuousGeometryReflow(GetContinuousAnchorIndex());
+            }
+        }
     }
 
     private void OnPagedItemsImagesLayoutUpdated(object? sender, EventArgs e) =>
@@ -1668,16 +1912,21 @@ public partial class MainWindow : Window
         CloseHoverPreview();
         if (sender is not Avalonia.Controls.Border border) return;
         if (border.DataContext is not ImageViewItem item) return;
-        if (!File.Exists(item.FilePath)) return;
+        await OpenMediaFileAsync(item.FilePath);
+    }
+
+    private async Task OpenMediaFileAsync(string filePath)
+    {
+        if (!File.Exists(filePath)) return;
 
         // Video and music: open with their system-default player.
-        if (FileTypeConstants.IsVideoFile(item.FilePath) || FileTypeConstants.IsMusicFile(item.FilePath))
+        if (FileTypeConstants.IsVideoFile(filePath) || FileTypeConstants.IsMusicFile(filePath))
         {
             try
             {
                 var psi = new System.Diagnostics.ProcessStartInfo
                 {
-                    FileName = item.FilePath,
+                    FileName = filePath,
                     UseShellExecute = true
                 };
                 System.Diagnostics.Process.Start(psi);
@@ -1690,7 +1939,7 @@ public partial class MainWindow : Window
         else
         {
             // Image: use built-in preview window
-            await OpenPreviewForFileAsync(item.FilePath);
+            await OpenPreviewForFileAsync(filePath);
         }
     }
 
@@ -1701,7 +1950,7 @@ public partial class MainWindow : Window
         (sender as Avalonia.Controls.MenuItem)?.DataContext as ImageViewItem;
 
     private List<string> GetSelectedFilePaths() =>
-        Vm.SelectedFilePaths
+        Vm.GetValidSelectedFilePaths()
             .Where(path => !string.IsNullOrWhiteSpace(path))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -1771,10 +2020,7 @@ public partial class MainWindow : Window
         if (clicked == null) return;
 
         var paths = GetTargetFilePathsForContextMenu(clicked);
-        var items = CreateTemporaryImageItems(paths);
-        items.AddRange(Vm.GetMaterializedThumbnailItems(paths));
-        await Vm.PageManager.RegenerateThumbnailsAsync(items);
-        Vm.StatusText = $"已重新生成 {paths.Count} 个缩略图";
+        await RegenerateThumbnailsForFilesAsync(paths);
     }
 
     private async void MenuRegenerateMusicCover_Click(object? sender, RoutedEventArgs e)
@@ -1786,16 +2032,24 @@ public partial class MainWindow : Window
             .Where(FileTypeConstants.IsMusicFile)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
-        var items = CreateTemporaryImageItems(paths);
-        if (items.Count == 0) return;
-
-        items.AddRange(Vm.GetMaterializedThumbnailItems(paths));
-
-        await Vm.PageManager.RegenerateThumbnailsAsync(items);
-        Vm.StatusText = $"已重新读取 {paths.Count} 个音乐文件的封面";
+        await RegenerateThumbnailsForFilesAsync(paths, musicCover: true);
     }
 
-    private async Task<bool> EditTagForItemAsync(ImageViewItem item)
+    private async Task RegenerateThumbnailsForFilesAsync(IReadOnlyList<string> paths, bool musicCover = false)
+    {
+        if (paths.Count == 0) return;
+        var items = CreateTemporaryImageItems(paths);
+        items.AddRange(Vm.GetMaterializedThumbnailItems(paths));
+
+        var result = await Vm.PageManager.RegenerateThumbnailsAsync(items);
+        Vm.RefreshDetailsForFiles(paths, reloadThumbnail: true);
+        Vm.StatusText = $"{(musicCover ? "音乐封面" : "缩略图")}：已生成 {result.Generated} 个" +
+            (result.NoArtwork > 0 ? $"，无封面 {result.NoArtwork} 个" : "") +
+            (result.Failed > 0 ? $"，失败或取消 {result.Failed} 个" : "") +
+            (result.InvalidationNotSaved > 0 ? "；缓存失效状态未保存，重启后可能恢复旧缓存" : "");
+    }
+
+    private async Task<bool> EditTagForItemAsync(ImageViewItem item, Point? placement = null)
     {
         var allTags = Vm.GetAllTagCountsSnapshot();
 
@@ -1823,9 +2077,9 @@ public partial class MainWindow : Window
         var win = new Settings.TagEditWindow { DataContext = tagVm };
         win.WindowStartupLocation = WindowStartupLocation.Manual;
         PixelPoint screenPos;
-        if (_lastClickScreenPos.HasValue)
+        if ((placement ?? _lastClickScreenPos) is { } position)
         {
-            screenPos = this.PointToScreen(_lastClickScreenPos.Value);
+            screenPos = this.PointToScreen(position);
         }
         else
         {
@@ -1982,10 +2236,30 @@ public partial class MainWindow : Window
             Vm.SelectSimilarityMode((SimilaritySearchMode)mode);
         }
 
-        Vm.StatusText = "正在全文件夹搜索相似图片...";
+        await SearchSimilarForFileAsync(baseItem.FilePath);
+    }
+
+    private async void MenuRegionSearch_Click(object? sender, RoutedEventArgs e)
+    {
+        if (GetCtxItem(sender) is { } item)
+            await OpenRegionSearchAsync(item.FilePath);
+    }
+
+    private async void ExternalRegionSearch_Click(object? sender, RoutedEventArgs e)
+    {
+        ImageSearchButtonA.Flyout?.Hide();
+        await OpenRegionSearchAsync(null);
+    }
+
+    private async Task SearchSimilarForFileAsync(string path, SimilaritySearchMode? requestedMode = null)
+    {
+        var version = ++_regionOpenVersion;
+        var mode = requestedMode ?? (SimilaritySearchMode)Math.Clamp(Vm.SelectedSimilarityMode, 0, 3);
+        ImageSearchButtonA.Flyout?.Hide();
+        CloseHoverPreview();
         Vm.PreSearchScrollOffset = ThumbnailScrollViewer.Offset.Y;
-        // Run on background thread to avoid UI freeze
-        await Vm.SearchSimilarCommand.ExecuteAsync(baseItem.FilePath);
+        await Vm.SearchWholeImageAsync(path, mode,
+            () => !_windowCloseStarted && version == _regionOpenVersion);
     }
 
     private async void MenuVectorIndexSettings_Click(object? sender, RoutedEventArgs e)
@@ -2036,32 +2310,134 @@ public partial class MainWindow : Window
     {
         var clicked = GetCtxItem(sender);
         if (clicked == null) return;
-        var filePaths = GetTargetFilePathsForContextMenu(clicked);
-
-        var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
-        {
-            Title = "选择要复制到的目标文件夹", AllowMultiple = false
-        });
-        if (folders.Count == 0) return;
-
-        var targetDir = folders[0].Path.LocalPath;
-        await Vm.CopyFilesAsync(filePaths, targetDir);
+        await TransferFilesToFolderAsync(GetTargetFilePathsForContextMenu(clicked), move: false);
     }
 
     private async void MenuMoveFileToFolder_Click(object? sender, RoutedEventArgs e)
     {
         var clicked = GetCtxItem(sender);
         if (clicked == null) return;
-        var filePaths = GetTargetFilePathsForContextMenu(clicked);
+        await TransferFilesToFolderAsync(GetTargetFilePathsForContextMenu(clicked), move: true);
+    }
 
+    private async Task TransferFilesToFolderAsync(IReadOnlyList<string> filePaths, bool move)
+    {
         var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
         {
-            Title = "选择要移动到的目标文件夹（剪贴）", AllowMultiple = false
+            Title = move ? "选择要移动到的目标文件夹（剪贴）" : "选择要复制到的目标文件夹",
+            AllowMultiple = false
         });
         if (folders.Count == 0) return;
 
         var targetDir = folders[0].Path.LocalPath;
-        await Vm.MoveFilesAsync(filePaths, targetDir);
+        if (move)
+            await Vm.MoveFilesAsync(filePaths, targetDir);
+        else
+            await Vm.CopyFilesAsync(filePaths, targetDir);
+    }
+
+    private async void OnDetailAction(DetailPaneAction action, string? path)
+    {
+        if (_windowCloseStarted)
+            return;
+        if (action == DetailPaneAction.Collapse)
+        {
+            if (Vm.IsRegionSearchActive)
+            {
+                SetRegionDetailsPaneOpen(false);
+                RegionPreviewToggle.Focus();
+            }
+            else
+            {
+                Vm.SetDetailsPaneOpen(false);
+                PreviewToggle.Focus();
+            }
+            return;
+        }
+
+        if (path is null || !Vm.DetailsPane.IsOpen ||
+            !StringComparer.OrdinalIgnoreCase.Equals(path, Vm.DetailsPane.CurrentPath) ||
+            (!Vm.DetailsPane.IsFolder && FindActiveFileIndex(path) < 0))
+            return;
+
+        try
+        {
+            if (Vm.DetailsPane.IsFolder)
+            {
+                switch (action)
+                {
+                    case DetailPaneAction.Open:
+                        await TryOpenFolderPathAsync(path);
+                        break;
+                    case DetailPaneAction.CopyPath when Clipboard is { } folderClipboard:
+                        await folderClipboard.SetTextAsync(path);
+                        Vm.StatusText = "已复制文件夹路径";
+                        break;
+                    case DetailPaneAction.Explorer when Directory.Exists(path):
+                        Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+                        break;
+                    case DetailPaneAction.RefreshFolder:
+                    case DetailPaneAction.RetryPreview:
+                        Vm.RefreshFolderDetails(path);
+                        break;
+                }
+                return;
+            }
+            switch (action)
+            {
+                case DetailPaneAction.Open:
+                    await OpenMediaFileAsync(path);
+                    break;
+                case DetailPaneAction.EditTags when Vm.DetailsPane.CanEditTags:
+                    var item = new ImageViewItem { FilePath = path, FileName = Path.GetFileName(path) };
+                    var position = DetailsPaneView.TranslatePoint(new Point(15, 49), this);
+                    await EditTagForItemAsync(item, position);
+                    break;
+                case DetailPaneAction.RegionSearch:
+                    await OpenRegionSearchAsync(path);
+                    break;
+                case DetailPaneAction.SimilarContent:
+                    await OpenRegionImageSearchAsync(path);
+                    break;
+                case DetailPaneAction.Perceptual:
+                case DetailPaneAction.Semantic:
+                case DetailPaneAction.Atmosphere:
+                case DetailPaneAction.Color:
+                    if (!FileTypeConstants.IsImageFile(path))
+                        break;
+                    Vm.SelectSimilarityMode(Enum.Parse<SimilaritySearchMode>(action.ToString()));
+                    await SearchSimilarForFileAsync(path);
+                    break;
+                case DetailPaneAction.CopyPath:
+                    if (Clipboard is { } clipboard)
+                    {
+                        await clipboard.SetTextAsync(path);
+                        Vm.StatusText = "已复制当前文件路径";
+                    }
+                    break;
+                case DetailPaneAction.Explorer when File.Exists(path):
+                    OpenInExplorer(path);
+                    break;
+                case DetailPaneAction.CopyToFolder:
+                case DetailPaneAction.MoveToFolder:
+                    await TransferFilesToFolderAsync([path], move: action == DetailPaneAction.MoveToFolder);
+                    break;
+                case DetailPaneAction.RegenerateThumbnail:
+                    await RegenerateThumbnailsForFilesAsync([path], FileTypeConstants.IsMusicFile(path));
+                    break;
+                case DetailPaneAction.RetryPreview:
+                    Vm.DetailsPane.RetryPreview();
+                    break;
+                case DetailPaneAction.RetrySave:
+                    await Vm.DetailsPane.RetrySaveAsync();
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error($"预览栏操作失败: {ex.Message}");
+            Vm.StatusText = $"操作失败：{ex.Message}";
+        }
     }
 
     private async void MenuRefreshFolder_Click(object? sender, RoutedEventArgs e)
@@ -2130,7 +2506,7 @@ public partial class MainWindow : Window
     }
 
     /// <summary>Extract the first image file path from DragEventArgs</summary>
-    private static string? ExtractFirstImagePath(Avalonia.Input.DragEventArgs e)
+    internal static string? ExtractFirstImagePath(Avalonia.Input.DragEventArgs e)
     {
         var dt = e.DataTransfer;
         if (dt == null) return null;
@@ -2212,11 +2588,12 @@ public partial class MainWindow : Window
 
     private async void DragSearchZone_Drop(object? sender, Avalonia.Input.DragEventArgs e)
     {
+        if (e.Handled) return;
+        e.Handled = true;
         var firstImage = ExtractFirstImagePath(e);
         if (firstImage != null)
         {
-            Vm.PreSearchScrollOffset = ThumbnailScrollViewer.Offset.Y;
-            await Vm.SearchSimilarCommand.ExecuteAsync(firstImage);
+            await HandleImageSearchDropAsync(firstImage);
         }
     }
 
@@ -2225,7 +2602,7 @@ public partial class MainWindow : Window
     private bool _preserveTagSuggestionModeOnNextFocus;
 
     private void WorkspaceTagTab_Click(object? sender, RoutedEventArgs e) =>
-        (Vm.IsSearchToolbarLayoutC ? TxtTagSearchC : TxtTagSearchA).Focus();
+        TxtTagSearchA.Focus();
 
     private async void WorkspaceSuggestions_Click(object? sender, RoutedEventArgs e)
     {
@@ -2235,7 +2612,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var searchBox = Vm.IsSearchToolbarLayoutC ? TxtTagSearchC : TxtTagSearchA;
+        var searchBox = TxtTagSearchA;
         if (searchBox.IsFocused)
             await Vm.OnTagSearchGotFocusAsync();
         else
@@ -2272,7 +2649,7 @@ public partial class MainWindow : Window
             }
 
             // Return focus to search box so Enter triggers search, not another cycle
-            var searchBox = Vm.IsSearchToolbarLayoutC ? TxtTagSearchC : TxtTagSearchA;
+            var searchBox = TxtTagSearchA;
             _preserveTagSuggestionModeOnNextFocus = true;
             searchBox.Focus();
             searchBox.CaretIndex = searchBox.Text?.Length ?? 0;
@@ -2412,11 +2789,8 @@ public partial class MainWindow : Window
             SelectFolderCard(folder);
     }
 
-    private async void FolderBreadcrumb_Click(object? sender, RoutedEventArgs e)
-    {
-        var item = (sender as Button)?.DataContext;
-        await TryOpenFolderPathAsync(GetObjectString(item, "Path"));
-    }
+    private async void FolderBreadcrumb_NavigateRequested(object? sender, BreadcrumbNavigationEventArgs e) =>
+        await TryOpenFolderPathAsync(e.Path);
 
     private async void WorkspaceFolderTitle_Click(object? sender, RoutedEventArgs e) =>
         await TryOpenFolderPathAsync(Vm.CurrentFolder);
@@ -2446,6 +2820,7 @@ public partial class MainWindow : Window
         var paths = FolderContentOperations.EnumerateMediaFiles(_folderCardPath, recursive.Value);
         var items = CreateTemporaryImageItems(paths);
         await Vm.PageManager.RegenerateThumbnailsAsync(items);
+        Vm.RefreshDetailsForFiles(items.Select(item => item.FilePath), reloadThumbnail: true);
         await Vm.RefreshFolderItemsAsync();
         Vm.StatusText = $"已重新生成 {items.Count} 个缩略图";
     }
@@ -3052,12 +3427,10 @@ public partial class MainWindow : Window
     {
         var vm = new AppearanceSettingViewModel(
             Vm.AppSettings.ThemeVariant,
-            Vm.AppSettings.SearchToolbarLayout,
             Vm.DisplayMode,
-            (theme, layout, displayMode) =>
+            (theme, displayMode) =>
             {
                 Vm.AppSettings.ThemeVariant = theme;
-                Vm.SetSearchToolbarLayout(layout);
                 App.ApplyColors(!string.Equals(theme, "Light", StringComparison.OrdinalIgnoreCase));
                 _ = ApplyAppearanceDisplayModeAsync(displayMode);
             });
@@ -3083,6 +3456,7 @@ public partial class MainWindow : Window
                 Vm.AppSettings.PerceptualSearchResultMode = mode;
                 Vm.AppSettings.SimilaritySearchResultLimit = resultLimit;
                 await Vm.SaveSettingsAsync();
+                await Vm.RefreshRegionSearchSettingsAsync();
             });
         var window = new Settings.SearchSettingWindow { DataContext = viewModel };
         await window.ShowDialog(this);
@@ -3090,18 +3464,21 @@ public partial class MainWindow : Window
 
     private void OnScrollRestore()
     {
+        _continuousResizeAnchor = null;
         StopWheelAnimation();
         ThumbnailScrollViewer.Offset = new Vector(0, Vm.PreSearchScrollOffset);
     }
 
     private void OnScrollSearchResultsToTop()
     {
+        _continuousResizeAnchor = null;
         StopWheelAnimation();
         ThumbnailScrollViewer.Offset = new Vector(0, 0);
     }
 
     private void OnScrollToSelected()
     {
+        _continuousResizeAnchor = null;
         StopWheelAnimation();
         if (Vm.DisplayMode == ImageDisplayMode.Continuous)
         {
@@ -3154,10 +3531,25 @@ public partial class MainWindow : Window
 
     // ==================== Window Closing ====================
 
-    private void Window_Closing(object? sender, Avalonia.Controls.WindowClosingEventArgs e)
+    private async void Window_Closing(object? sender, Avalonia.Controls.WindowClosingEventArgs e)
     {
+        if (_windowCloseReady || DataContext is not MainWindowViewModel)
+            return;
+
+        e.Cancel = true;
+        if (_windowCloseStarted)
+            return;
+
+        _windowCloseStarted = true;
+        ++_regionOpenVersion;
+        RegionSearchEditor.CancelInteraction();
+        Vm.SuspendRegionSearch();
+        CommitDetailResize();
+        DetailsPaneView.ActionRequested -= OnDetailAction;
+        Vm.DetailsPane.PropertyChanged -= OnDetailPanePropertyChanged;
         Vm.CancelActiveBackgroundTasks();
         _prewarmThumbnailsCts?.Cancel();
+        _videoOriginalFrameBatchCts?.Cancel();
         StopWheelAnimation();
         _scrollIdleTimer.Stop();
         ThumbnailScrollViewer.ScrollChanged -= OnThumbnailScrollChanged;
@@ -3194,8 +3586,39 @@ public partial class MainWindow : Window
         Vm.ScrollSearchResultsToTopRequested -= OnScrollSearchResultsToTop;
         Vm.TreeScrollToNodeRequested -= OnTreeScrollToNode;
         Vm.ShutdownBackgroundWork();
-        App.ReleaseInferenceSessions();
-        _ = Vm.SaveSettingsAsync();
+        App.ReleasePreviewServices();
+        try
+        {
+            if (!await ImageManager.Infrastructure.Video.FFmpegManager.ShutdownOwnedProcessesAsync(TimeSpan.FromSeconds(5)))
+                AppLogger.Warn("部分媒体提取进程未能在关闭等待期内退出");
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"等待媒体提取进程退出失败: {ex.Message}");
+        }
+        try
+        {
+            await Task.Run(App.ReleaseInferenceSessions).WaitAsync(TimeSpan.FromSeconds(5));
+        }
+        catch (TimeoutException)
+        {
+            AppLogger.Warn("退出时模型仍在释放，结束等待。");
+        }
+        try
+        {
+            await Vm.FlushDetailsPaneSettingsAsync();
+            await Vm.SaveSettingsAsync();
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error($"关闭时保存设置失败: {ex.Message}");
+        }
+        finally
+        {
+            await Task.Yield();
+            _windowCloseReady = true;
+            Close();
+        }
     }
     private async void MenuThumbnailSettings_Click(object? sender, RoutedEventArgs e)
     {

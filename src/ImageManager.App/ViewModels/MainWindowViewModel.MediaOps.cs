@@ -69,6 +69,7 @@ public partial class MainWindowViewModel
 
     public void CancelActiveBackgroundTasks()
     {
+        SuspendRegionSearch();
         lock (_backgroundTasksLock)
         {
             try { _characterMatchCts?.Cancel(); } catch { }
@@ -205,19 +206,29 @@ public partial class MainWindowViewModel
         {
             var result = await moveService.MoveFilesAsync(new MediaMoveRequest(filePaths, targetDir), progress, cancellationToken: token);
 
+            // A canceled batch may still have completed individual moves. Publish those first.
+            var moved = result.Items.Where(item => item.Status == MediaMoveItemStatus.Success).ToArray();
+            foreach (var item in moved)
+            {
+                _folderDetailsService?.Invalidate(item.SourcePath);
+                if (item.TargetPath != null) _folderDetailsService?.Invalidate(item.TargetPath);
+            }
+            await RemoveFilesFromViewAsync(moved.Select(item => item.SourcePath).ToHashSet(StringComparer.OrdinalIgnoreCase));
+
             if (token.IsCancellationRequested)
             {
                 StatusText = "文件移动已取消";
                 return;
             }
 
-            bool currentFolderAffected = !string.IsNullOrWhiteSpace(CurrentFolder) &&
+            bool currentFolderAffected = !IsShowingSearchResult && !string.IsNullOrWhiteSpace(CurrentFolder) &&
                 (string.Equals(Path.GetFullPath(targetDir).TrimEnd('\\', '/'), Path.GetFullPath(CurrentFolder).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase) ||
-                 filePaths.Any(f => string.Equals(Path.GetDirectoryName(Path.GetFullPath(f))?.TrimEnd('\\', '/'), Path.GetFullPath(CurrentFolder).TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase)));
+                 (ShowAllSubfolders && Path.GetFullPath(targetDir).StartsWith(Path.GetFullPath(CurrentFolder).TrimEnd('\\', '/') + Path.DirectorySeparatorChar,
+                     StringComparison.OrdinalIgnoreCase)));
 
             if (currentFolderAffected)
             {
-                await LoadFolderAsync(CurrentFolder);
+                await RefreshCurrentFolderFromDiskAsync("move");
             }
 
             StatusText = FormatMoveBatchResult(result, targetDir);

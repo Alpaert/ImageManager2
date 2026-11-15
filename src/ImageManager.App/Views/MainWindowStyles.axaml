@@ -78,6 +78,18 @@
         <Setter Property="Background" Value="{DynamicResource WorkspaceHoverBrush}"/>
         <Setter Property="BorderBrush" Value="{DynamicResource WorkspaceLineBrush}"/>
     </Style>
+    <Style Selector="Button.workspace-preview-active">
+        <Setter Property="Background" Value="{DynamicResource WorkspaceSelectionBrush}"/>
+        <Setter Property="Foreground" Value="{DynamicResource WorkspaceAccentBrush}"/>
+    </Style>
+    <Style Selector="Border.workspace-preview-splitter Border.workspace-preview-grip">
+        <Setter Property="Background" Value="{DynamicResource WorkspaceMutedBrush}"/>
+        <Setter Property="Opacity" Value="0.3"/>
+    </Style>
+    <Style Selector="Border.workspace-preview-splitter:pointerover Border.workspace-preview-grip, Border.workspace-preview-splitter:focus-visible Border.workspace-preview-grip">
+        <Setter Property="Background" Value="{DynamicResource WorkspaceAccentBrush}"/>
+        <Setter Property="Opacity" Value="1"/>
+    </Style>
     <Style Selector="Button.workspace-tab, Button#FilterButton">
         <Setter Property="Background" Value="Transparent"/>
         <Setter Property="BorderBrush" Value="Transparent"/>

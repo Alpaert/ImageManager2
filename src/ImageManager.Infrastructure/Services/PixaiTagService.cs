@@ -1,6 +1,7 @@
 ﻿using SkiaSharp;
 using ImageManager.Infrastructure.Imaging;
 using ImageManager.Core.Services;
+using Microsoft.ML.OnnxRuntime;
 using Microsoft.ML.OnnxRuntime.Tensors;
 
 namespace ImageManager.Infrastructure.Services;
@@ -12,6 +13,26 @@ namespace ImageManager.Infrastructure.Services;
 /// </summary>
 public class PixaiTagService : OnnxTagServiceBase, IImageEmbeddingExtractor
 {
+    private int _searchSessions;
+    protected override TimeSpan ModelIdleTimeout => Volatile.Read(ref _searchSessions) > 0
+        ? TimeSpan.FromMinutes(3) : base.ModelIdleTimeout;
+
+    internal IDisposable BeginSearchSession()
+    {
+        Interlocked.Increment(ref _searchSessions);
+        return new SearchSession(this);
+    }
+
+    private sealed class SearchSession(PixaiTagService owner) : IDisposable
+    {
+        private PixaiTagService? _owner = owner;
+        public void Dispose()
+        {
+            var released = Interlocked.Exchange(ref _owner, null);
+            if (released is not null) Interlocked.Decrement(ref released._searchSessions);
+        }
+    }
+
     protected override string ModelRepo => "deepghs/pixai-tagger-v0.9-onnx";
     protected override string ModelFileName => "model.onnx";
     protected override string TagsFileName => "selected_tags.csv";
@@ -68,6 +89,43 @@ public class PixaiTagService : OnnxTagServiceBase, IImageEmbeddingExtractor
 
             ResetIdleTimer();
             return result;
+        }
+        finally { _inferenceLock.Release(); }
+    }
+
+    internal async Task<float[]> EncodeSearchRegionAsync(
+        SKBitmap bitmap, string modelDirectory, CancellationToken ct)
+    {
+        await _inferenceLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!IsModelLoaded)
+                await LoadModelAsync(modelDirectory, ct).ConfigureAwait(false);
+
+            var session = _session ?? throw new InvalidOperationException("PixAI 模型未加载。");
+            var vector = await Task.Run(() =>
+            {
+                ct.ThrowIfCancellationRequested();
+                var tensor = Preprocess(bitmap)
+                    ?? throw new InvalidDataException("无法预处理 PixAI 查询选区。");
+                using var options = new RunOptions();
+                using var cancellation = ct.UnsafeRegister(static state =>
+                    ((RunOptions)state!).Terminate = true, options);
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    var input = NamedOnnxValue.CreateFromTensor(_inputName, tensor);
+                    using var output = session.Run([input], ["embedding"], options);
+                    ct.ThrowIfCancellationRequested();
+                    return output.Single().AsTensor<float>().ToArray();
+                }
+                catch (OnnxRuntimeException) when (ct.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException(ct);
+                }
+            }, ct).ConfigureAwait(false);
+            ResetIdleTimer();
+            return vector;
         }
         finally { _inferenceLock.Release(); }
     }

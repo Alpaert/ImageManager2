@@ -2,6 +2,7 @@ using System.Collections.ObjectModel;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using ImageManager.App.Models;
+using ImageManager.App.Services;
 using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 
@@ -334,15 +335,18 @@ public partial class MainWindowViewModel
             await Dispatcher.UIThread.InvokeAsync(() => item.IsLoadingThumbnail = true).GetTask();
             // Cache probing includes synchronous disk I/O; keep it off the UI
             // continuation while a large folder grid is being populated.
-            var result = await Task.Run(
-                () => _thumbCache.GetOrCreateThumbnailAsync(item.CoverMediaPath, decodeWidth, cancellationToken),
-                cancellationToken);
+            var result = await FolderCoverLoader.LoadAsync(
+                _thumbCache, item.CoverMediaPath, decodeWidth, cancellationToken);
             await Dispatcher.UIThread.InvokeAsync(() =>
             {
                 if (!cancellationToken.IsCancellationRequested &&
                     requestVersion == Volatile.Read(ref _folderThumbnailRequestVersion) &&
                     string.Equals(folder, CurrentFolder, StringComparison.OrdinalIgnoreCase))
+                {
                     item.ThumbnailData = result.Data;
+                    if (DetailsPane.IsFolder && StringComparer.OrdinalIgnoreCase.Equals(DetailsPane.CurrentPath, item.FolderPath))
+                        DetailsPane.ShowFolder(item.FolderPath, result.Data, item.CoverMediaPath);
+                }
             }).GetTask();
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }

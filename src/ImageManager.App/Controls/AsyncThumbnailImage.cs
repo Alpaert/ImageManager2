@@ -21,6 +21,8 @@ public sealed class AsyncThumbnailImage : Image
 
     public static readonly DirectProperty<AsyncThumbnailImage, bool> HasThumbnailProperty =
         AvaloniaProperty.RegisterDirect<AsyncThumbnailImage, bool>(nameof(HasThumbnail), image => image.HasThumbnail);
+    public static readonly DirectProperty<AsyncThumbnailImage, bool> HasDecodeErrorProperty =
+        AvaloniaProperty.RegisterDirect<AsyncThumbnailImage, bool>(nameof(HasDecodeError), image => image.HasDecodeError);
 
     private DecodedThumbnailCache<Bitmap>.Lease? _displayed;
     private byte[]? _displayedData;
@@ -29,6 +31,7 @@ public sealed class AsyncThumbnailImage : Image
     private object? _item;
     private bool _attached;
     private bool _hasThumbnail;
+    private bool _hasDecodeError;
 
     protected override Type StyleKeyOverride => typeof(Image);
 
@@ -39,6 +42,9 @@ public sealed class AsyncThumbnailImage : Image
     }
 
     public bool HasThumbnail => _hasThumbnail;
+    public bool HasDecodeError => _hasDecodeError;
+
+    private void SetDecodeError(bool value) => SetAndRaise(HasDecodeErrorProperty, ref _hasDecodeError, value);
 
     public static void TrimIdleCache() => Cache.TrimIdle(0);
 
@@ -72,6 +78,7 @@ public sealed class AsyncThumbnailImage : Image
         _attached = false;
         CancelPending();
         ShowThumbnail(null, null);
+        SetDecodeError(false);
         _item = null;
         base.OnDetachedFromVisualTree(e);
     }
@@ -87,6 +94,7 @@ public sealed class AsyncThumbnailImage : Image
             _item = context;
             CancelPending();
             ShowThumbnail(null, null);
+            SetDecodeError(false);
         }
 
         var data = ThumbnailData;
@@ -94,6 +102,7 @@ public sealed class AsyncThumbnailImage : Image
         {
             CancelPending();
             ShowThumbnail(null, null);
+            SetDecodeError(false);
             return;
         }
 
@@ -106,8 +115,12 @@ public sealed class AsyncThumbnailImage : Image
             return;
         CancelPending();
         if (ReferenceEquals(data, _displayedData))
+        {
+            SetDecodeError(false);
             return;
+        }
 
+        SetDecodeError(false);
         // A realized/recycled card can already have a ready bitmap for the
         // same bytes. Publish it before the next render on the UI thread.
         if (Cache.TryAcquireReady(data) is { } ready)
@@ -155,10 +168,16 @@ public sealed class AsyncThumbnailImage : Image
 
                 _pending = null;
                 _pendingData = null;
-                if (lease is null || !_attached || DataContext is not ImageViewItem item
+                if (token.IsCancellationRequested || !_attached || DataContext is not ImageViewItem item
                     || !ReferenceEquals(_item, item) || !ReferenceEquals(data, item.ThumbnailData)
                     || !ReferenceEquals(data, ThumbnailData))
                     return;
+
+                if (lease is null)
+                {
+                    SetDecodeError(true);
+                    return;
+                }
 
                 var ready = lease;
                 lease = null;

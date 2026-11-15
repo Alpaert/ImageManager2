@@ -24,6 +24,8 @@
                            FontSize="11" VerticalAlignment="Center"/>
             </StackPanel>
             <!-- Reserved name error -->
+            <TextBlock Text="标签重命名和合并作用于整个图库，立即生效；取消本窗口不会撤销。"
+                       Foreground="{DynamicResource MutedFgBrush}" FontSize="11" TextWrapping="Wrap"/>
             <TextBlock Text="{Binding ErrorMessage}"
                        Foreground="#EF4444" FontSize="12"
                        IsVisible="{Binding ErrorMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
@@ -52,7 +54,7 @@
                                         Click="AutoTag_Click" Tag="{Binding Name}">
                                     <Button.ContextMenu>
                                         <ContextMenu>
-                                            <MenuItem Header="重命名" Click="AutoTag_Rename_Click"
+                                            <MenuItem Header="全库重命名…" Click="AutoTag_Rename_Click"
                                                       Tag="{Binding Name}"/>
                                         </ContextMenu>
                                     </Button.ContextMenu>

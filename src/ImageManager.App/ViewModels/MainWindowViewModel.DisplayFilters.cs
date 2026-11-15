@@ -50,6 +50,7 @@ public partial class MainWindowViewModel
 
     private void NotifyDisplayFilterState()
     {
+        QueueDetailsSelectionRefresh();
         OnPropertyChanged(nameof(HasDisplayFilter));
         OnPropertyChanged(nameof(HasTypeFilter));
         OnPropertyChanged(nameof(HasOrientationFilter));
@@ -129,6 +130,7 @@ public partial class MainWindowViewModel
                 DisplayFilterSourceCount = sourceList.Count;
                 DisplayFilterUnknownCount = 0;
                 _publishedDisplayFilterVersion = version;
+                ReconcileSelectionWithPublishedResults();
                 PerfLogger.Log($"[SortPerf] filter_publish_ms={filterStopwatch.ElapsedMilliseconds} count={sourceList.Count} active=false");
                 if (!preserveNavigation) _currentResultIndex = 0;
                 return true;
@@ -172,6 +174,7 @@ public partial class MainWindowViewModel
             DisplayFilterSourceCount = source.Count;
             DisplayFilterUnknownCount = result.UnknownDimensionsCount;
             _publishedDisplayFilterVersion = version;
+            ReconcileSelectionWithPublishedResults();
             PerfLogger.Log($"[SortPerf] filter_publish_ms={filterStopwatch.ElapsedMilliseconds} count={result.Files.Count} active={options.IsActive}");
             if (!preserveNavigation) _currentResultIndex = 0;
             return true;

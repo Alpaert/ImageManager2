@@ -43,27 +43,30 @@ public partial class MainWindowViewModel
     [RelayCommand]
     private async Task RemoveFolderAsync()
     {
-        if (SelectedFolderNode == null) return;
+        var folder = SelectedFolderNode;
+        if (folder == null) return;
 
-        if (SelectedFolderNode.DbId > 0 || !string.IsNullOrEmpty(SelectedFolderNode.Path))
+        if (folder.DbId > 0 || !string.IsNullOrEmpty(folder.Path))
         {
             try
             {
-                if (SelectedFolderNode.DbId > 0)
+                if (folder.DbId > 0)
                 {
-                    var unlinked = await _metaRepo.UnlinkFolderIdAsync(SelectedFolderNode.DbId);
-                    AppLogger.Info($"RemoveFolder unlink folderId={SelectedFolderNode.DbId} path={SelectedFolderNode.Path} count={unlinked}");
+                    var unlinked = await _metaRepo.UnlinkFolderIdAsync(folder.DbId);
+                    AppLogger.Info($"RemoveFolder unlink folderId={folder.DbId} path={folder.Path} count={unlinked}");
                 }
 
-                var metas = await _metaRepo.GetByFolderAsync(SelectedFolderNode.Path);
-                foreach (var meta in metas)
-                    _thumbCache.InvalidateThumbnail(meta.FilePath);
+                var metas = await _metaRepo.GetByFolderAsync(folder.Path);
+                await Task.Run(() =>
+                {
+                    foreach (var meta in metas) _thumbCache.InvalidateThumbnail(meta.FilePath);
+                });
             }
             catch { }
         }
 
-        await _folderRepo.RemoveAsync(SelectedFolderNode.Path);
-        FolderTree.Remove(SelectedFolderNode);
+        await _folderRepo.RemoveAsync(folder.Path);
+        FolderTree.Remove(folder);
         await SaveSettingsAsync();
     }
 
@@ -195,6 +198,7 @@ public partial class MainWindowViewModel
 
     public async Task LoadFolderAsync(string folder, string? preferredFilePath = null, Func<bool>? isCurrent = null)
     {
+        if (IsRegionSearchActive) await ExitRegionSearchSessionAsync();
         var sw = Stopwatch.StartNew();
         PerfLogger.Log($"[LoadFolder] START folder={Path.GetFileName(folder)} showAll={ShowAllSubfolders}");
         var requestVersion = BeginFolderViewRequest();
@@ -370,6 +374,7 @@ public partial class MainWindowViewModel
         foreach (var path in selected)
             _selectedFilePaths.Add(path);
         _pendingSelectionRestorePaths = selected.Count > 0 ? selected : null;
+        QueueDetailsSelectionRefresh();
     }
 
     private void RestorePendingSelection(IEnumerable<ImageViewItem> items)
@@ -386,6 +391,7 @@ public partial class MainWindowViewModel
                 item.IsSelected = true;
             }
         }
+        QueueDetailsSelectionRefresh();
     }
 
     private static void ClearHighlightRecursive(FolderTreeNode node)

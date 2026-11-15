@@ -43,7 +43,20 @@ public partial class App : Application
         catch (Exception ex) { AppLogger.Warn($"Release WD session failed: {ex.Message}"); }
         try { Services.GetService<PixaiTagService>()?.ReleaseSession(); }
         catch (Exception ex) { AppLogger.Warn($"Release PixAI session failed: {ex.Message}"); }
+        try { Services.GetService<SscdEmbeddingService>()?.ReleaseSession(); }
+        catch (Exception ex) { AppLogger.Warn($"Release SSCD session failed: {ex.Message}"); }
         AppLogger.Memory("App.ReleaseInferenceSessions");
+    }
+
+    public static void ReleasePreviewServices()
+    {
+        if (Services == null) return;
+        try { (Services.GetService<ThumbnailCacheService>() as IDisposable)?.Dispose(); }
+        catch (Exception ex) { AppLogger.Warn($"Preview cache shutdown failed: {ex.Message}"); }
+        try { (Services.GetService<VideoOriginalFrameCacheService>() as IDisposable)?.Dispose(); }
+        catch (Exception ex) { AppLogger.Warn($"Video frame shutdown failed: {ex.Message}"); }
+        try { (Services.GetService<IFolderDetailsService>() as IDisposable)?.Dispose(); }
+        catch (Exception ex) { AppLogger.Warn($"Folder scan shutdown failed: {ex.Message}"); }
     }
 
     internal static ServiceProvider ConfigureServices(string cacheDir)
@@ -110,12 +123,24 @@ public partial class App : Application
         services.AddSingleton<IFolderRepository, FolderRepository>();
         services.AddSingleton<ISettingsRepository, SettingsRepository>();
         services.AddSingleton<ICharacterTagSuppressionRepository, CharacterTagSuppressionRepository>();
-        services.AddSingleton<IImageEmbeddingRepository, ImageEmbeddingRepository>();
+        services.AddSingleton<ImageEmbeddingRepository>();
+        services.AddSingleton<IImageEmbeddingRepository>(sp => sp.GetRequiredService<ImageEmbeddingRepository>());
 
         services.AddSingleton<IHashService, HashService>();
         services.AddSingleton(new ChineseClipService(cacheDir));
         services.AddSingleton<IChineseClipService>(sp => sp.GetRequiredService<ChineseClipService>());
         services.AddSingleton<ISimilarImageService, SimilarImageService>();
+        var modelsRoot = System.IO.Path.Combine(cacheDir, "models");
+        services.AddSingleton(new SscdEmbeddingService(modelsRoot));
+        services.AddSingleton<SscdIndexWriter>();
+        services.AddSingleton(_ => new RegionCandidateSnapshotCache(dbPath));
+        services.AddSingleton<IRegionSearchService>(sp => new RegionSearchService(
+            sp.GetRequiredService<IImageEmbeddingRepository>(),
+            sp.GetRequiredService<ImageEmbeddingRepository>(),
+            sp.GetRequiredService<SscdEmbeddingService>(),
+            sp.GetRequiredService<PixaiTagService>(),
+            modelsRoot,
+            sp.GetRequiredService<RegionCandidateSnapshotCache>()));
         services.AddSingleton<IVectorIndexService, VectorIndexService>();
         services.AddSingleton<IDuplicateService, DuplicateService>();
         services.AddSingleton<IVideoService, VideoService>();
@@ -132,6 +157,8 @@ public partial class App : Application
                 cacheDir,
                 200));
         services.AddSingleton<IThumbnailCacheService>(sp => sp.GetRequiredService<ThumbnailCacheService>());
+        services.AddSingleton<IMediaPreviewService>(sp => sp.GetRequiredService<ThumbnailCacheService>());
+        services.AddSingleton<IFolderDetailsService, FolderDetailsService>();
         services.AddSingleton<IMediaMoveService, MediaMoveService>();
         services.AddSingleton<IMediaThumbnailPrewarmService, MediaThumbnailPrewarmService>();
 
@@ -279,7 +306,9 @@ public partial class App : Application
             }
             desktop.MainWindow = new MainWindow { DataContext = vm };
             desktop.MainWindow.Closed += (_, _) => desktop.Shutdown();
-            desktop.Exit += (_, _) => ReleaseInferenceSessions();
+            // MainWindow closes after bounded background inference cleanup.
+            // Repeating it here would put the native wait back on the UI thread.
+            desktop.Exit += (_, _) => ReleasePreviewServices();
             desktop.MainWindow.Show();
         }
 

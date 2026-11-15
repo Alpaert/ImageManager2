@@ -40,6 +40,25 @@ public class ImageMetaRepository : IImageMetaRepository
         return meta;
     }
 
+    public Task<ImageMeta?> GetByPathAsync(string filePath, CancellationToken cancellationToken)
+        => Task.Run(async () =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            // Preview reads must not inherit the 30-second writer busy timeout.
+            using var conn = _dbFactory.CreateConnection(commandTimeout: 2);
+            var meta = await conn.QuerySingleOrDefaultAsync<ImageMeta>(new CommandDefinition(
+                "SELECT * FROM ImageMeta WHERE FilePath = @FilePath COLLATE NOCASE",
+                new { FilePath = filePath }, commandTimeout: 2, cancellationToken: cancellationToken));
+            cancellationToken.ThrowIfCancellationRequested();
+            if (meta != null)
+                meta.Tags = (await conn.QueryAsync<TagCount>(new CommandDefinition(
+                    "SELECT t.Name, 0 as Count FROM Tag t INNER JOIN ImageTag it ON t.Id = it.TagId " +
+                    "WHERE it.ImageMetaId = @MetaId ORDER BY t.Name", new { MetaId = meta.Id },
+                    commandTimeout: 2, cancellationToken: cancellationToken))).ToList();
+            cancellationToken.ThrowIfCancellationRequested();
+            return meta;
+        }, cancellationToken);
+
     public async Task<List<ImageMeta>> GetByFolderAsync(string folderPath, bool recursive = true)
     {
         using var conn = _dbFactory.CreateConnection();

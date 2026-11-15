@@ -21,9 +21,34 @@ using System.ComponentModel;
 using Microsoft.Extensions.DependencyInjection;
 using Avalonia.Interactivity;
 
+internal static class NativeCheckProgram
+{
+[STAThread]
+private static void Main(string[] args)
+{
 AppBuilder.Configure<Application>().UsePlatformDetect().SetupWithoutStarting();
 Application.Current!.Styles.Add(new FluentTheme());
+if (args.Contains("--region-search-responsiveness-only"))
+{
+    RegionSearchResponsivenessChecks.Run();
+    return;
+}
+if (args.Contains("--region-search-only"))
+{
+    RegionSearchNativeChecks.Run();
+    return;
+}
+if (args.Contains("--region-publish-only"))
+{
+    RegionSearchPublishChecks.Run();
+    return;
+}
+BreadcrumbNativeChecks.Run();
+if (args.Contains("--breadcrumb-only")) return;
+if (Environment.GetEnvironmentVariable("IM_SCROLL_FRAME_DIAGNOSTICS") == "1")
+    ImageManager.Common.Helpers.AppLogger.Init(Path.Combine(Path.GetTempPath(), "ImageManager-detail-native-diag"));
 ThumbnailDecodeChecks.Run();
+DetailPaneNativeChecks.Run();
 if (typeof(Window).IsAssignableFrom(typeof(HoverPreviewPopup)))
     throw new InvalidOperationException("Hover preview must not create a secondary Window/TopLevel.");
 var fixtureDirectory = Path.Combine(Path.GetTempPath(), "ImageManager-ContinuousTests", Guid.NewGuid().ToString("N"));
@@ -71,35 +96,44 @@ try
 }
 finally { window.Close(); }
 
+Console.WriteLine("CHECK create gallery fixture services");
 var repo = DispatchProxy.Create<IImageMetaRepository, MetadataProxy>();
 var metadataProxy = (MetadataProxy)(object)repo;
 var messenger = new WeakReferenceMessenger();
 var cache = new ThumbnailCacheService(new MediaProcessorFactory(null!), Path.Combine(fixtureDirectory, "cache"));
-var page = new PageManager(cache, null!);
+// Stable fixture dimensions keep the motion test independent of asynchronous
+// placeholder size repair (covered by the separate invalid-dimensions checks).
+var page = new PageManager(cache, null!, metaRepo: repo);
 var dispatcher = new ImageManager.App.Helpers.AvaloniaDispatcher();
 typeof(ImageManager.App.App).GetProperty("Services")!.SetValue(null, new ServiceCollection().AddSingleton(page).BuildServiceProvider());
 typeof(ImageManager.App.App).GetProperty("UI")!.SetValue(null, dispatcher);
 var tagSearchEngine = new TagSearchEngine(repo, messenger, ImagePaging.Default);
+Console.WriteLine("CHECK create main view model");
 var vm = new MainWindowViewModel(null!, null!, repo, null!, null!, null!, null!, cache, page,
     tagSearchEngine, null!, null!, null!, messenger, dispatcher);
 vm.WaterfallMode = "Horizontal";
 typeof(MainWindowViewModel).GetField("_displayFilteredFiles", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(vm, paths.ToList());
+Console.WriteLine("CHECK create main window");
 var main = new TestMainWindow { DataContext = vm, ShowInTaskbar = false };
-ComparePagedLayouts();
+Console.WriteLine("CHECK compare paged layouts");
+if (!args.Contains("--skip-layout-comparison")) ComparePagedLayouts();
 VerifyThumbnailCardRecycling();
 var handler = (PropertyChangedEventHandler)typeof(MainWindow).GetMethod("OnViewModelPropertyChanged", BindingFlags.Instance | BindingFlags.NonPublic)!.CreateDelegate(typeof(PropertyChangedEventHandler), main);
 vm.PropertyChanged += handler;
+vm.DetailsPane.PropertyChanged += (PropertyChangedEventHandler)typeof(MainWindow)
+    .GetMethod("OnDetailPanePropertyChanged", BindingFlags.Instance | BindingFlags.NonPublic)!
+    .CreateDelegate(typeof(PropertyChangedEventHandler), main);
 vm.ContinuousDisplayRefreshRequested += (Func<int, Task>)typeof(MainWindow).GetMethod("ApplyDisplayModeAsync", BindingFlags.Instance | BindingFlags.NonPublic)!.CreateDelegate(typeof(Func<int, Task>), main);
 try
 {
     main.Show();
     Pump();
+    VerifyWorkspaceDetailsGeometry();
+    BreadcrumbNativeChecks.VerifyWorkspace(main, vm);
     var hoverPreview = main.FindControl<HoverPreviewPopup>("HoverPreviewContent")!;
     var hoverHost = main.FindControl<Avalonia.Controls.Primitives.Popup>("HoverPreviewHost")!;
     var tagPopupA = main.FindControl<Avalonia.Controls.Primitives.Popup>("TagSearchSuggestionsPopupA")!;
-    var tagPopupC = main.FindControl<Avalonia.Controls.Primitives.Popup>("TagSearchSuggestionsPopupC")!;
-    if (hoverHost.TakesFocusFromNativeControl || tagPopupA.TakesFocusFromNativeControl ||
-        tagPopupC.TakesFocusFromNativeControl)
+    if (hoverHost.TakesFocusFromNativeControl || tagPopupA.TakesFocusFromNativeControl)
         throw new InvalidOperationException("Tag and hover popups must not take native focus when opened.");
     var hoverAnchor = main.PointToScreen(new Point(600, 350));
     var hoverPosition = hoverPreview.Present(
@@ -193,7 +227,7 @@ try
     Console.WriteLine("PASS focus co-tags, in-memory typing/filtering, clear restore, and no duplicate queries");
     var dialog = new ImageManager.App.Views.Settings.AppearanceSettingWindow
     {
-        DataContext = new AppearanceSettingViewModel("Dark", "Expanded", ImageManager.App.Models.ImageDisplayMode.Paged, (_, _, _) => { })
+        DataContext = new AppearanceSettingViewModel("Dark", ImageManager.App.Models.ImageDisplayMode.Paged, (_, _) => { })
     };
     _ = dialog.ShowDialog(main);
     var switchTask = vm.TrySetDisplayModeAsync(ImageManager.App.Models.ImageDisplayMode.Continuous);
@@ -239,6 +273,107 @@ try
                 throw new InvalidOperationException($"Navigation failed: target={index}, visible={actualPanel.CurrentVisibleRange}");
         }
         Console.WriteLine($"PASS {mode}: first/middle/last viewport contains decoded images; realized={actualPanel.RealizedCount}");
+        VerifyDetailResizeAnchor();
+    }
+
+    void VerifyDetailResizeAnchor()
+    {
+        var gallery = main.FindControl<ScrollViewer>("ThumbnailScrollViewer")!;
+        actualPanel.ScrollToIndex(5000);
+        Pump();
+        gallery.Offset += new Vector(0, 37);
+        Pump();
+        var sourceAtResize = vm.ContinuousImageItemSource;
+        foreach (var width in new[] { 400d, 312d })
+        {
+            // Each settled width change is a new gesture. Horizontal rows regroup,
+            // so its new first visible file can differ from the prior gesture's anchor.
+            var geometryAtResize = actualPanel.GeometryIndex!;
+            var origin = actualPanel.TranslatePoint(default, gallery)!.Value;
+            var viewportY = -origin.Y;
+            var range = geometryAtResize.QueryViewport(viewportY, gallery.Viewport.Height);
+            var anchor = Enumerable.Range(range.StartIndex, range.Count).First(i =>
+                geometryAtResize.TryGetItemRect(i, out var rect) && rect.Bottom > viewportY && rect.Y < viewportY + gallery.Viewport.Height);
+            geometryAtResize.TryGetItemRect(anchor, out var beforeRect);
+            var relativeY = origin.Y + beforeRect.Y;
+            vm.DetailsPane.PreferredWidth = width;
+            WaitUntil(() => Math.Abs(actualPanel.GeometryIndex!.Options.ContainerWidth - gallery.Viewport.Width) < 1);
+            Pump();
+            actualPanel.GeometryIndex!.TryGetItemRect(anchor, out var afterRect);
+            var afterOrigin = actualPanel.TranslatePoint(default, gallery)!.Value;
+            if (!ReferenceEquals(sourceAtResize, vm.ContinuousImageItemSource) ||
+                Math.Abs(afterOrigin.Y + afterRect.Y - relativeY) > 1.5)
+                throw new InvalidOperationException($"Detail resize to {width} moved the {vm.WaterfallMode} scroll anchor {anchor}: {relativeY} -> {afterOrigin.Y + afterRect.Y}.");
+        }
+        var dragGeometry = actualPanel.GeometryIndex!;
+        var dragOrigin = actualPanel.TranslatePoint(default, gallery)!.Value;
+        var dragRange = dragGeometry.QueryViewport(-dragOrigin.Y, gallery.Viewport.Height);
+        var dragIndex = Enumerable.Range(dragRange.StartIndex, dragRange.Count).First(i =>
+            dragGeometry.TryGetItemRect(i, out var rect) && rect.Bottom > -dragOrigin.Y && rect.Y < gallery.Viewport.Height - dragOrigin.Y);
+        dragGeometry.TryGetItemRect(dragIndex, out var dragBefore);
+        var dragRelativeY = dragOrigin.Y + dragBefore.Y;
+        foreach (var width in new[] { 400d, 370d, 312d })
+        {
+            typeof(MainWindow).GetField("_detailDragWidth", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(main, (double?)width);
+            typeof(MainWindow).GetMethod("ApplyWorkspaceGeometry", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(main, [main.ClientSize.Width, main.ClientSize.Height]);
+            WaitUntil(() => Math.Abs(actualPanel.GeometryIndex!.Options.ContainerWidth - gallery.Viewport.Width) < 1);
+            Pump();
+            actualPanel.GeometryIndex!.TryGetItemRect(dragIndex, out var dragAfter);
+            var afterOrigin = actualPanel.TranslatePoint(default, gallery)!.Value;
+            if (Math.Abs(afterOrigin.Y + dragAfter.Y - dragRelativeY) > 1.5)
+                throw new InvalidOperationException($"A paused {vm.WaterfallMode} splitter drag replaced its original anchor.");
+        }
+        typeof(MainWindow).GetMethod("CommitDetailResize", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(main, null);
+        actualPanel.ScrollToIndex(0);
+        Pump();
+        Console.WriteLine($"PASS detail resize anchor and source retention: {vm.WaterfallMode}");
+    }
+
+    void VerifyWorkspaceDetailsGeometry()
+    {
+        var previousWidth = main.Width;
+        var root = main.FindControl<Grid>("RootGrid")!;
+        var pane = main.FindControl<DetailPreviewPane>("DetailsPaneView")!;
+        var splitter = main.FindControl<Border>("DetailSplitter")!;
+        var search = main.FindControl<Border>("WorkspaceSearchBar")!;
+        main.Width = 1280;
+        Pump();
+        var wideMiddle = root.ColumnDefinitions[1].ActualWidth;
+        if (Math.Abs(pane.Bounds.Width - 312) > 1 || Grid.GetColumnSpan(search) != 3)
+            throw new InvalidOperationException("The detail pane or full-width search row differs from the prototype.");
+        main.Width = 1120;
+        Pump();
+        if (Math.Abs(pane.Bounds.Width - 312) > 1 || root.ColumnDefinitions[1].ActualWidth >= wideMiddle)
+            throw new InvalidOperationException("Shrinking the outer window should first shrink the gallery.");
+        main.Width = 740;
+        Pump();
+        if (pane.Bounds.Width >= 312 || root.ColumnDefinitions[1].ActualWidth < 269 || vm.DetailsPane.PreferredWidth != 312)
+            throw new InvalidOperationException("Narrow windows must clamp actual pane width without losing its preferred width.");
+        main.Width = 700;
+        Pump();
+        if (Grid.GetColumn(pane) != 1 || splitter.IsVisible || pane.Bounds.Width > root.ColumnDefinitions[1].ActualWidth)
+            throw new InvalidOperationException("Small windows must show the details as a bounded overlay.");
+        main.Width = 1280;
+        Pump();
+        vm.ReplaceSelectedFiles([paths[0], paths[1]]);
+        Pump();
+        pane.FindControl<Button>("DetailOpen")!.RaiseEvent(new KeyEventArgs
+        {
+            RoutedEvent = InputElement.KeyDownEvent, Key = Key.A, KeyModifiers = KeyModifiers.Control
+        });
+        Pump();
+        if (vm.SelectedFilePaths.Count != 2)
+            throw new InvalidOperationException("A keyboard action inside the pane changed gallery selection.");
+        vm.ReplaceSelectedFiles([]);
+        vm.DetailsPane.IsOpen = false;
+        Pump();
+        if (pane.IsVisible || root.ColumnDefinitions[3].ActualWidth != 0)
+            throw new InvalidOperationException("Collapsing the pane did not return the space to the gallery.");
+        vm.DetailsPane.IsOpen = true;
+        main.Width = previousWidth;
+        Pump();
+        Console.WriteLine("PASS main window details: full search row, fixed pane, gallery-first shrink, narrow overlay, collapse and keyboard isolation");
     }
 
     // Search navigation stores its target as a path. Continuous mode must be
@@ -401,6 +536,8 @@ try
         throw new InvalidOperationException("Paged display did not bound controls and bytes to its viewport and prefetch window.");
 
     var pagedScroll = main.FindControl<ScrollViewer>("ThumbnailScrollViewer")!;
+    if (Environment.GetEnvironmentVariable("IM_SCROLL_FRAME_DIAGNOSTICS") == "1")
+        pagedScroll.ScrollChanged += (_, e) => Console.WriteLine($"WHEEL STATE offset={pagedScroll.Offset.Y:R} delta={e.OffsetDelta} extent={e.ExtentDelta} viewport={e.ViewportDelta}");
     pagedScroll.Offset = default;
     Pump();
     var wheelPointer = new Avalonia.Input.Pointer(1, PointerType.Mouse, true);
@@ -448,8 +585,19 @@ try
     var middleIndex = vm.Images.Count / 2;
     if (!pagedPanel.ScrollToIndex(middleIndex))
         throw new InvalidOperationException("Could not navigate to the paged prefetch fixture.");
-    WaitUntil(() => pagedPanel.CurrentScrollDirection == ContinuousScrollDirection.Down &&
-        pagedPanel.PagedPrefetchItems.FirstOrDefault()?.ThumbnailData is { Length: > 0 });
+    try
+    {
+        WaitUntil(() => pagedPanel.CurrentScrollDirection == ContinuousScrollDirection.Down &&
+            pagedPanel.PagedPrefetchItems.FirstOrDefault()?.ThumbnailData is { Length: > 0 });
+    }
+    catch (TimeoutException exception)
+    {
+        var first = pagedPanel.PagedPrefetchItems.FirstOrDefault();
+        throw new InvalidOperationException($"Paged prefetch not ready: direction={pagedPanel.CurrentScrollDirection}, " +
+            $"count={pagedPanel.PagedPrefetchItems.Count}, offset={pagedScroll.Offset.Y}, " +
+            $"loaded={first?.IsLoaded}, pending={(first != null && page.IsViewportThumbnailPending(first))}, " +
+            $"pressure={ImageManager.Common.Helpers.MemoryPressureMonitor.Current}.", exception);
+    }
     var forwardItem = pagedPanel.PagedPrefetchItems[0];
     if (pagedPanel.PagedPrefetchItems.Count > 48 ||
         pagedPanel.PagedPrefetchItems.Any(item => pagedItems.ContainerFromItem(item) is not null) ||
@@ -523,6 +671,15 @@ try
     SetFiles(paths);
     WaitForTask(vm.ResetDisplayFilterAsync());
     WaitForImages(actualPanel);
+    vm.ReplaceSelectedFiles([paths[0]]);
+    WaitUntil(() => vm.DetailsPane.CurrentPath == paths[0] && !vm.DetailsPane.IsLoading &&
+        vm.DetailsPane.ThumbnailItem?.ThumbnailData is { Length: > 0 });
+    if (vm.DetailsPane.ErrorText != null || vm.DetailsPane.DimensionsText != "100 × 100")
+        throw new InvalidOperationException("The integrated detail pane did not display the selected fixture metadata.");
+    var detailImage = main.FindControl<DetailPreviewPane>("DetailsPaneView")!
+        .GetVisualDescendants().OfType<AsyncThumbnailImage>().Single();
+    WaitUntil(() => detailImage.HasThumbnail);
+    Console.WriteLine("PASS integrated current selection, file metadata and preview bitmap");
     var capturePath = Path.Combine(Path.GetTempPath(), "ImageManager-continuous-regression.png");
     using (var capture = new Avalonia.Media.Imaging.RenderTargetBitmap(new PixelSize((int)main.Bounds.Width, (int)main.Bounds.Height)))
     {
@@ -543,7 +700,15 @@ finally
     try { Directory.Delete(fixtureDirectory, recursive: true); } catch (IOException) { }
 }
 
-void Pump() { main.UpdateLayout(); Dispatcher.UIThread.RunJobs(); }
+void Pump()
+{
+    main.UpdateLayout();
+    // RunJobs alone drains managed work but does not reliably deliver Win32
+    // timers/render frames. Exercise the same native dispatcher as the app.
+    using var pulse = new CancellationTokenSource(TimeSpan.FromMilliseconds(10));
+    Dispatcher.UIThread.MainLoop(pulse.Token);
+    Dispatcher.UIThread.RunJobs();
+}
 void WaitUntil(Func<bool> condition)
 {
     var timer = System.Diagnostics.Stopwatch.StartNew();
@@ -560,7 +725,8 @@ void WaitForImages(VirtualizingWaterfallPanel actualPanel)
 {
     WaitUntil(() => actualPanel.CurrentVisibleRange.Count > 0 &&
         vm.ContinuousImageItemSource!.GetCachedItems(actualPanel.CurrentVisibleRange) is { Count: > 0 } visible &&
-        visible.All(i => i.IsLoaded));
+        visible.All(i => i.IsLoaded) &&
+        actualPanel.GetVisualDescendants().OfType<Image>().Any(i => i.Source != null && i.Bounds.Width > 0 && i.Bounds.Height > 0));
     Pump();
     if (!actualPanel.GetVisualDescendants().OfType<Image>().Any(i => i.Source != null && i.Bounds.Width > 0 && i.Bounds.Height > 0))
         throw new InvalidOperationException("No decoded thumbnail has visible layout bounds.");
@@ -834,6 +1000,9 @@ void ComparePagedLayouts()
         Math.Abs(a.Y - b.Y) <= 1 && Math.Abs(a.Width - b.Width) <= 1 && Math.Abs(a.Height - b.Height) <= 1;
 }
 
+}
+}
+
 public class TestMainWindow : MainWindow
 {
     protected override void OnLoaded(RoutedEventArgs e) { }
@@ -850,10 +1019,21 @@ public class MetadataProxy : DispatchProxy
         "GetSortMetadataByFolderAsync" => Task.FromResult<IReadOnlyList<ImageSortMetadata>>(Array.Empty<ImageSortMetadata>()),
         "GetSortMetadataByPathsAsync" => Task.FromResult<IReadOnlyList<ImageSortMetadata>>(Array.Empty<ImageSortMetadata>()),
         "GetDimensionsByPathsAsync" => Task.FromResult(((List<string>)args![0]!).ToDictionary(p => p, _ => (100, 100))),
+        "GetByPathAsync" => GetFileMetadata((string)args![0]!),
         "GetTagMapByPathsAsync" => Task.FromResult(new Dictionary<string, List<string>>()),
         "GetCoOccurringTagsAsync" => GetCoTags((string?)args![2]),
         _ => throw new NotSupportedException(method.Name)
     };
+
+    private static Task<ImageMeta?> GetFileMetadata(string path)
+    {
+        var file = new FileInfo(path);
+        return Task.FromResult(file.Exists ? new ImageMeta
+        {
+            FilePath = path, Width = 100, Height = 100, FileSize = file.Length,
+            LastWriteTicks = file.LastWriteTimeUtc.Ticks, Tags = [new TagCount { Name = "测试图片", Count = 1 }]
+        } : null);
+    }
 
     private Task<List<TagCount>> GetCoTags(string? filter)
     {

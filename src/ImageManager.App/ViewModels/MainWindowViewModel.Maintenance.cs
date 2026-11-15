@@ -137,11 +137,13 @@ public partial class MainWindowViewModel
         _folderWatcher.Created += OnFolderFileCreated;
         _folderWatcher.Deleted += OnFolderFileDeleted;
         _folderWatcher.Renamed += OnFolderFileRenamed;
+        _folderWatcher.Changed += OnFolderFileChanged;
         _folderWatcher.EnableRaisingEvents = true;
     }
 
     private void StopWatchingCurrentFolder()
     {
+        StopPreviewChangeNotifications();
         _folderWatchDebounceCts?.Cancel();
         _folderWatchDebounceCts?.Dispose();
         _folderWatchDebounceCts = null;
@@ -151,6 +153,7 @@ public partial class MainWindowViewModel
             _folderWatcher.Created -= OnFolderFileCreated;
             _folderWatcher.Deleted -= OnFolderFileDeleted;
             _folderWatcher.Renamed -= OnFolderFileRenamed;
+            _folderWatcher.Changed -= OnFolderFileChanged;
             _folderWatcher.Dispose();
             _folderWatcher = null;
         }
@@ -170,11 +173,13 @@ public partial class MainWindowViewModel
 
     private void OnFolderFileCreated(object sender, FileSystemEventArgs e)
     {
+        QueuePreviewInvalidation(e.FullPath);
         QueueFolderRefreshForWatcherEvent(e, force: Directory.Exists(e.FullPath));
     }
 
     private void OnFolderFileDeleted(object sender, FileSystemEventArgs e)
     {
+        QueuePreviewInvalidation(e.FullPath);
         if (FileTypeConstants.IsMediaFile(e.FullPath))
             _thumbCache.InvalidateThumbnail(e.FullPath);
         QueueFolderRefreshForWatcherEvent(e, force: Directory.Exists(e.FullPath) || !FileTypeConstants.IsMediaFile(e.FullPath));
@@ -182,6 +187,8 @@ public partial class MainWindowViewModel
 
     private void OnFolderFileRenamed(object sender, RenamedEventArgs e)
     {
+        QueuePreviewInvalidation(e.OldFullPath);
+        QueuePreviewInvalidation(e.FullPath);
         if (!FileTypeConstants.IsMediaFile(e.Name ?? string.Empty) && !FileTypeConstants.IsMediaFile(e.OldName ?? string.Empty))
             return;
 

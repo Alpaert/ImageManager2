@@ -25,12 +25,7 @@ public partial class HoverPreviewPopup : UserControl
     public HoverPreviewPopup()
     {
         InitializeComponent();
-        PointerEntered += (_, _) => PointerEnteredPreview?.Invoke(this, EventArgs.Empty);
-        PointerExited += (_, _) => PointerExitedPreview?.Invoke(this, EventArgs.Empty);
     }
-
-    public event EventHandler? PointerEnteredPreview;
-    public event EventHandler? PointerExitedPreview;
 
     /// <summary>
     /// Maximum image area used by the popup. The controller can update these
@@ -71,7 +66,16 @@ public partial class HoverPreviewPopup : UserControl
 
         var screen = owner.Screens.ScreenFromPoint(anchor) ?? owner.Screens.Primary;
         var workArea = screen?.WorkingArea ?? new PixelRect(0, 0, 1920, 1080);
-        var screenScaling = screen?.Scaling ?? 1d;
+        var screenScaling = owner.RenderScaling;
+        // This preview lives in the owner's overlay. Keep its full image and
+        // chrome inside the client area instead of placing it off-window.
+        var clientStart = owner.PointToScreen(default);
+        var clientEnd = owner.PointToScreen(new Point(owner.ClientSize.Width, owner.ClientSize.Height));
+        var left = Math.Max(workArea.X, clientStart.X);
+        var top = Math.Max(workArea.Y, clientStart.Y);
+        var right = Math.Min(workArea.Right, clientEnd.X);
+        var bottom = Math.Min(workArea.Bottom, clientEnd.Y);
+        workArea = new PixelRect(left, top, Math.Max(1, right - left), Math.Max(1, bottom - top));
         var layout = CalculateLayout(
             anchor, sourceRect, workArea, screenScaling, decodedWidth, decodedHeight,
             Math.Max(MinimumPreviewWidth, MaxPreviewWidth),

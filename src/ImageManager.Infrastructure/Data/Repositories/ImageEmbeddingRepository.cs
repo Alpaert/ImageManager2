@@ -140,15 +140,18 @@ public sealed class ImageEmbeddingRepository : IImageEmbeddingRepository
         foreach (var chunk in distinctPaths.Chunk(500))
         {
             ct.ThrowIfCancellationRequested();
+            // Drive the lookup from the candidate paths. A model-first join
+            // scans that model's whole index again for every 500 paths.
             var command = new CommandDefinition(@"
                 SELECT ie.ImageMetaId, im.FilePath, ie.FileHash, ie.EmbeddingDim, ie.EmbeddingBlob,
                        ie.SourceFileSize, ie.SourceLastWriteTicks
-                FROM ImageEmbedding ie
-                INNER JOIN ImageMeta im ON im.Id = ie.ImageMetaId
+                FROM ImageMeta im
+                CROSS JOIN ImageEmbedding ie ON ie.ImageMetaId = im.Id
                 WHERE ie.ModelKey = @ModelKey
                   AND ie.ModelVersion = @ModelVersion
                   AND ie.SourceFileSize = im.FileSize
                   AND ie.SourceLastWriteTicks = im.LastWriteTicks
+                  AND (@ModelKey <> 'sscd' OR ie.FileHash IS im.FileHash COLLATE NOCASE)
                   AND im.FilePath COLLATE NOCASE IN @FilePaths",
                 new { ModelKey = modelKey, ModelVersion = modelVersion, FilePaths = chunk },
                 cancellationToken: ct);
@@ -192,6 +195,65 @@ public sealed class ImageEmbeddingRepository : IImageEmbeddingRepository
         var rows = await conn.QueryAsync<SearchIndexCandidate>(sql, parameters);
         return rows.ToList();
     }
+
+    public Task<List<ImageEmbeddingRecord>> GetReusablePixaiEmbeddingsByPathsAsync(
+        IReadOnlyCollection<string> paths, CancellationToken ct = default) =>
+        ReadPixaiSearchEmbeddingsAsync(paths, checkFileState: true, ct);
+
+    internal Task<List<ImageEmbeddingRecord>> GetPixaiSearchEmbeddingsByPathsAsync(
+        IReadOnlyCollection<string> paths, CancellationToken ct) =>
+        ReadPixaiSearchEmbeddingsAsync(paths, checkFileState: false, ct);
+
+    private async Task<List<ImageEmbeddingRecord>> ReadPixaiSearchEmbeddingsAsync(
+        IReadOnlyCollection<string> paths, bool checkFileState, CancellationToken ct)
+    {
+        var result = new List<ImageEmbeddingRecord>();
+        using var conn = _dbFactory.CreateConnection();
+        foreach (var chunk in paths.Distinct(StringComparer.OrdinalIgnoreCase).Chunk(500))
+        {
+            ct.ThrowIfCancellationRequested();
+            // Keep the same path-first lookup for legacy PixAI vectors.
+            var rows = await conn.QueryAsync<PixaiSearchRow>(new CommandDefinition("""
+                SELECT im.Id AS ImageMetaId, im.FilePath, im.FileHash, im.FileSize, im.LastWriteTicks,
+                       ie.EmbeddingBlob
+                FROM ImageMeta im
+                CROSS JOIN ImageEmbedding ie ON ie.ImageMetaId = im.Id
+                WHERE ie.ModelKey = 'pixai' AND ie.ModelVersion = 'v0.9'
+                  AND ie.EmbeddingDim = 1024 AND length(ie.EmbeddingBlob) = 4096
+                  AND im.FilePath COLLATE NOCASE IN @Paths
+                  AND (ie.FileHash IS NULL OR ie.FileHash = im.FileHash COLLATE NOCASE)
+                  AND ((ie.SourceFileSize IS NULL AND ie.SourceLastWriteTicks IS NULL)
+                       OR (ie.SourceFileSize = im.FileSize AND ie.SourceLastWriteTicks = im.LastWriteTicks))
+                """, new { Paths = chunk }, cancellationToken: ct));
+            foreach (var row in rows)
+            {
+                ct.ThrowIfCancellationRequested();
+                // Older PixAI rows may lack a fingerprint. Their current file must
+                // match ImageMeta, but that cannot certify the historical encoding.
+                if (checkFileState && !MatchesSearchFileState(row.FilePath, row.FileSize, row.LastWriteTicks))
+                    continue;
+
+                result.Add(new ImageEmbeddingRecord(row.ImageMetaId, row.FilePath, row.FileHash,
+                    FromBytes(row.EmbeddingBlob, 1024), row.FileSize, row.LastWriteTicks));
+            }
+        }
+        return result;
+    }
+
+    internal static bool MatchesSearchFileState(string path, long length, long ticks)
+    {
+        try
+        {
+            var file = new FileInfo(path);
+            return file.Exists && file.Length == length && file.LastWriteTimeUtc.Ticks == ticks;
+        }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
+    }
+
+    private sealed record PixaiSearchRow(
+        long ImageMetaId, string FilePath, string? FileHash, long FileSize,
+        long LastWriteTicks, byte[] EmbeddingBlob);
 
     public async Task<int> GetValidSearchEmbeddingCountAsync(
         string modelKey,

@@ -60,7 +60,7 @@ public abstract class OnnxTagServiceBase : IDisposable
     protected readonly SemaphoreSlim _inferenceLock = new(1, 1);
     private string _modelDir = string.Empty;
     private DenseTensor<float>? _cachedTensor;
-    private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(1);
+    protected virtual TimeSpan ModelIdleTimeout => TimeSpan.FromMinutes(1);
     private static readonly TimeSpan IdleCheckInterval = TimeSpan.FromSeconds(15);
     private CancellationTokenSource? _idleTimerCts;
     private long _lastUsedTimestamp = Stopwatch.GetTimestamp();
@@ -117,27 +117,33 @@ public abstract class OnnxTagServiceBase : IDisposable
 
             AppLogger.Info($"创建 InferenceSession (CUDA): {onnxPath}");
             ct.ThrowIfCancellationRequested();
-            _session = await Task.Run(() => OnnxSessionFactory.Create(onnxPath, ModelSubDir), ct);
-            _inputName = _session.InputNames[0];
-            var inMeta = _session.InputMetadata[_inputName];
-            var shape = $"[{string.Join(",", inMeta.Dimensions)}]";
+            // Finish reading the tag metadata before publishing a usable session.
+            // A canceled cold search must not leave an initialized model with no tags.
+            var (tagNames, tagCategories) = await Task.Run(() => ParseTagsCsv(tagsPath), ct);
+            var session = await Task.Run(() => OnnxSessionFactory.Create(onnxPath, ModelSubDir), ct);
+            string shape;
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                _inputName = session.InputNames[0];
+                shape = $"[{string.Join(",", session.InputMetadata[_inputName].Dimensions)}]";
 
-            // Resolve output: prefer PreferredOutputName, then search for "output"/"prediction"/"logits"
-            var allOuts = _session.OutputNames;
-            if (PreferredOutputName != null && allOuts.Contains(PreferredOutputName))
-                _outputName = PreferredOutputName;
-            else if (allOuts.Contains("output"))
-                _outputName = "output";
-            else if (allOuts.Contains("prediction"))
-                _outputName = "prediction";
-            else if (allOuts.Contains("logits"))
-                _outputName = "logits";
-            else
-                _outputName = allOuts[0];
-            AppLogger.Info($"模型 {ModelSubDir} 输出选择: '{_outputName}' (可用: [{string.Join(", ", allOuts)}])");
+                var allOuts = session.OutputNames;
+                _outputName = new[] { PreferredOutputName, "output", "prediction", "logits" }
+                    .FirstOrDefault(name => name != null && allOuts.Contains(name)) ?? allOuts[0];
+                AppLogger.Info($"模型 {ModelSubDir} 输出选择: '{_outputName}' (可用: [{string.Join(", ", allOuts)}])");
 
-            (_tagNames, _tagCategories) = await Task.Run(() => ParseTagsCsv(tagsPath), ct);
-            _totalTagCount = _tagNames.Length;
+                _tagNames = tagNames;
+                _tagCategories = tagCategories;
+                _totalTagCount = tagNames.Length;
+                Volatile.Write(ref _lastUsedTimestamp, Stopwatch.GetTimestamp());
+                _session = session;
+            }
+            catch
+            {
+                session.Dispose();
+                throw;
+            }
 
             int enabledCount = EnabledCategories == null
                 ? _totalTagCount
@@ -259,7 +265,7 @@ public abstract class OnnxTagServiceBase : IDisposable
                     break;
 
                 long lastUsed = Volatile.Read(ref _lastUsedTimestamp);
-                if (Stopwatch.GetElapsedTime(lastUsed) >= IdleTimeout)
+                if (Stopwatch.GetElapsedTime(lastUsed) >= ModelIdleTimeout)
                 {
                     DisposeSession();
                     if (_session == null)
@@ -291,12 +297,12 @@ public abstract class OnnxTagServiceBase : IDisposable
             lock (_idleLock)
             {
                 if (_disposed || _session == null) return;
-                if (!force && Stopwatch.GetElapsedTime(Volatile.Read(ref _lastUsedTimestamp)) < IdleTimeout)
+                if (!force && Stopwatch.GetElapsedTime(Volatile.Read(ref _lastUsedTimestamp)) < ModelIdleTimeout)
                 {
                     return;
                 }
 
-                AppLogger.Info($"[{ModelSubDir}] 1 分钟未使用，释放 GPU 显存");
+                AppLogger.Info($"[{ModelSubDir}] 释放 GPU 显存 force={force} idleLimitSeconds={ModelIdleTimeout.TotalSeconds:0}");
                 _session.Dispose();
                 _session = null;
                 // 显式清空 Tensor 缓存，释放托管内存

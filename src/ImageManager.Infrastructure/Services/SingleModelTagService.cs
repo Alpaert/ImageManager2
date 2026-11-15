@@ -1,5 +1,7 @@
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Imaging;
+using SkiaSharp;
 
 namespace ImageManager.Infrastructure.Services;
 
@@ -68,7 +70,15 @@ public class SingleModelTagService : IEnsembleTagService, IDisposable
 
     public async Task<EnsembleResult> PredictWithSourcesAsync(string imagePath, CancellationToken ct = default)
     {
-        var (preds, embedding) = await PredictPixaiAsync(imagePath, ct);
+        using var bitmap = InferenceImageLoader.DecodeForInference(imagePath);
+        return await PredictWithSourcesAsync(bitmap, ct);
+    }
+
+    internal async Task<EnsembleResult> PredictWithSourcesAsync(SKBitmap? bitmap, CancellationToken ct)
+    {
+        var (preds, embedding) = bitmap is null
+            ? (new List<TagPrediction>(), (float[]?)null)
+            : await _pixai.PredictWithEmbeddingAsync(bitmap, ct);
         preds = preds
             .Where(p => p.Confidence >= _minConfidence)
             .ToList();
@@ -87,11 +97,6 @@ public class SingleModelTagService : IEnsembleTagService, IDisposable
             Embedding = embedding
         };
     }
-
-    private async Task<(List<TagPrediction> Tags, float[]? Embedding)> PredictPixaiAsync(
-        string imagePath,
-        CancellationToken ct)
-        => await _pixai.PredictWithEmbeddingAsync(imagePath, ct);
 
     public IReadOnlyList<ModelStatus> GetModelStatuses()
     {

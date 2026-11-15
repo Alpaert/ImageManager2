@@ -13,6 +13,8 @@ public sealed class VectorIndexService : IVectorIndexService
     private readonly IImageMetaRepository _metaRepository;
     private readonly ChineseClipService _chineseClip;
     private readonly ISimilarImageService _similarImageService;
+    private readonly SscdEmbeddingService? _sscd;
+    private readonly SscdIndexWriter? _sscdWriter;
     private readonly object _stateLock = new();
     private CancellationTokenSource? _runCancellation;
     private volatile bool _paused;
@@ -22,12 +24,16 @@ public sealed class VectorIndexService : IVectorIndexService
         IImageEmbeddingRepository repository,
         IImageMetaRepository metaRepository,
         ChineseClipService chineseClip,
-        ISimilarImageService similarImageService)
+        ISimilarImageService similarImageService,
+        SscdEmbeddingService? sscd = null,
+        SscdIndexWriter? sscdWriter = null)
     {
         _repository = repository;
         _metaRepository = metaRepository;
         _chineseClip = chineseClip;
         _similarImageService = similarImageService;
+        _sscd = sscd;
+        _sscdWriter = sscdWriter;
     }
 
     public bool IsRunning => Volatile.Read(ref _running) != 0;
@@ -36,12 +42,17 @@ public sealed class VectorIndexService : IVectorIndexService
     {
         var candidates = await GetImageCandidatesAsync(scope);
         var candidateIds = candidates.Select(item => item.ImageMetaId).ToHashSet();
-        var statuses = new List<VectorIndexStatus>(3);
-        foreach (var kind in new[] { VectorIndexKind.Semantic, VectorIndexKind.Atmosphere, VectorIndexKind.Color })
+        var statuses = new List<VectorIndexStatus>(4);
+        foreach (var kind in new[] { VectorIndexKind.Semantic, VectorIndexKind.Atmosphere, VectorIndexKind.Color, VectorIndexKind.Sscd })
         {
             var (modelKey, modelVersion) = GetModel(kind);
-            var validIds = await _repository.GetValidSearchEmbeddingIdsAsync(modelKey, modelVersion);
-            var indexed = validIds.Count(candidateIds.Contains);
+            var validIds = kind == VectorIndexKind.Sscd && _sscdWriter is not null
+                ? await _sscdWriter.GetValidIdsAsync()
+                : await _repository.GetValidSearchEmbeddingIdsAsync(modelKey, modelVersion);
+            var indexed = kind == VectorIndexKind.Sscd
+                ? candidates.Count(item => validIds.Contains(item.ImageMetaId) &&
+                    RegionSearchService.MatchesFileState(item.FilePath, item.FileSize, item.LastWriteTicks))
+                : validIds.Count(candidateIds.Contains);
             statuses.Add(new VectorIndexStatus(kind, candidates.Count, indexed, candidates.Count - indexed));
         }
         return statuses;
@@ -73,6 +84,12 @@ public sealed class VectorIndexService : IVectorIndexService
         var (modelKey, modelVersion) = GetModel(kind);
         try
         {
+            if (kind == VectorIndexKind.Sscd)
+            {
+                await BuildSscdAsync(rebuild, scope, progress, token);
+                return;
+            }
+
             if (kind == VectorIndexKind.Semantic)
                 _chineseClip.ValidateImageModelFiles();
             var candidates = await GetImageCandidatesAsync(scope);
@@ -144,7 +161,8 @@ public sealed class VectorIndexService : IVectorIndexService
             {
                 try
                 {
-                    _similarImageService.InvalidateVectorSnapshots();
+                    if (kind != VectorIndexKind.Sscd)
+                        _similarImageService.InvalidateVectorSnapshots();
                 }
                 catch (Exception ex)
                 {
@@ -173,6 +191,92 @@ public sealed class VectorIndexService : IVectorIndexService
                 }
                 Interlocked.Exchange(ref _running, 0);
             }
+        }
+    }
+
+    private async Task BuildSscdAsync(
+        bool rebuild, VectorIndexScope scope, IProgress<VectorIndexProgress>? progress, CancellationToken ct)
+    {
+        if (_sscd is null || _sscdWriter is null || !_sscd.IsAvailable)
+            throw new InvalidOperationException("SSCD 模型不可用，请先安装模型。");
+
+        await AutoTagRuntimeState.WaitForIdleAsync(ct);
+        await _sscd.ValidateModelAsync(ct);
+
+        const VectorIndexKind kind = VectorIndexKind.Sscd;
+        const int batchSize = 8;
+        var candidates = await GetImageCandidatesAsync(scope);
+        var validIds = rebuild ? [] : await _sscdWriter.GetValidIdsAsync(ct);
+        var batch = new List<SscdIndexWrite>(batchSize);
+        var processed = 0;
+        var written = 0;
+        var skipped = 0;
+        var failed = 0;
+
+        Report(progress, kind, candidates.Count, processed, written, skipped, failed, null, null);
+        foreach (var candidate in candidates)
+        {
+            ct.ThrowIfCancellationRequested();
+            await WaitWhilePausedAsync(ct);
+            await AutoTagRuntimeState.WaitForIdleAsync(ct);
+            string? error = null;
+            try
+            {
+                if (!RegionSearchService.MatchesFileState(candidate.FilePath, candidate.FileSize, candidate.LastWriteTicks))
+                    throw new IOException("源图片状态已变化，请先更新图库元数据。");
+
+                if (validIds.Contains(candidate.ImageMetaId))
+                {
+                    skipped++;
+                }
+                else
+                {
+                    var state = await _sscdWriter.GetSourceAsync(candidate.ImageMetaId, ct);
+                    if (state is not { } current || current.FileSize != candidate.FileSize ||
+                        current.LastWriteTicks != candidate.LastWriteTicks ||
+                        !string.Equals(current.FilePath, candidate.FilePath, StringComparison.OrdinalIgnoreCase))
+                        throw new IOException("图库中的源图片状态已变化。");
+
+                    using var source = File.Open(candidate.FilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    if (source.Length != candidate.FileSize ||
+                        !RegionSearchService.MatchesFileState(candidate.FilePath, candidate.FileSize, candidate.LastWriteTicks))
+                        throw new IOException("源图片在编码前发生变化。");
+                    using var bitmap = InferenceImageLoader.DecodeForInference(candidate.FilePath)
+                        ?? throw new InvalidDataException("无法解码图片。");
+                    var vector = await _sscd.EncodeAsync(bitmap, ct);
+                    if (!RegionSearchService.IsUsableVector(vector, SscdEmbeddingService.Dimension))
+                        throw new InvalidDataException("无法提取有效的 SSCD 向量。");
+                    if (!RegionSearchService.MatchesFileState(candidate.FilePath, candidate.FileSize, candidate.LastWriteTicks))
+                        throw new IOException("源图片在编码期间发生变化。");
+
+                    batch.Add(new SscdIndexWrite(
+                        candidate.ImageMetaId, candidate.FilePath, candidate.FileSize, candidate.LastWriteTicks,
+                        vector, current.FileHash));
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                failed++;
+                error = ex.Message;
+                AppLogger.Warn($"SSCD index failed file={candidate.FilePath}: {error}");
+            }
+
+            processed++;
+            if (batch.Count >= batchSize)
+                await FlushSscdAsync();
+            Report(progress, kind, candidates.Count, processed, written, skipped, failed, candidate.FilePath, error);
+        }
+        await FlushSscdAsync();
+        Report(progress, kind, candidates.Count, processed, written, skipped, failed, null, null);
+
+        async Task FlushSscdAsync()
+        {
+            if (batch.Count == 0)
+                return;
+            var committed = await _sscdWriter.WriteAsync(batch, rebuild, ct);
+            written += committed;
+            failed += batch.Count - committed;
+            batch.Clear();
         }
     }
 
@@ -404,6 +508,7 @@ public sealed class VectorIndexService : IVectorIndexService
 
     public static (string ModelKey, string ModelVersion) GetModel(VectorIndexKind kind) => kind switch
     {
+        VectorIndexKind.Sscd => (SscdEmbeddingService.ModelKey, SscdEmbeddingService.ModelVersion),
         VectorIndexKind.Semantic => (ChineseClipService.ModelKey, ChineseClipService.ModelVersion),
         VectorIndexKind.Atmosphere => (ImageSignatureService.AtmosphereModelKey, ImageSignatureService.ModelVersion),
         VectorIndexKind.Color => (ImageSignatureService.ColorModelKey, ImageSignatureService.ModelVersion),

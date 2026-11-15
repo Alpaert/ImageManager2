@@ -10,6 +10,7 @@ public partial class VectorIndexViewModel : ViewModelBase
     private readonly IVectorIndexService _indexService;
     private long _statusRefreshVersion;
 
+    [ObservableProperty] private string _sscdStatus = "正在读取...";
     [ObservableProperty] private string _semanticStatus = "正在读取...";
     [ObservableProperty] private string _atmosphereStatus = "正在读取...";
     [ObservableProperty] private string _colorStatus = "正在读取...";
@@ -43,7 +44,7 @@ public partial class VectorIndexViewModel : ViewModelBase
     {
         var scope = CurrentScope;
         var version = Interlocked.Increment(ref _statusRefreshVersion);
-        SemanticStatus = AtmosphereStatus = ColorStatus = "正在读取...";
+        SscdStatus = SemanticStatus = AtmosphereStatus = ColorStatus = "正在读取...";
         try
         {
             // SQLite reads and candidate File.Exists checks may complete synchronously.
@@ -56,6 +57,9 @@ public partial class VectorIndexViewModel : ViewModelBase
             var atmosphere = statuses.First(status => status.Kind == VectorIndexKind.Atmosphere);
             var color = statuses.First(status => status.Kind == VectorIndexKind.Color);
             SemanticStatus = FormatStatus(semantic);
+            SscdStatus = statuses.FirstOrDefault(status => status.Kind == VectorIndexKind.Sscd) is { } sscd
+                ? FormatStatus(sscd)
+                : "不可用";
             AtmosphereStatus = FormatStatus(atmosphere);
             ColorStatus = FormatStatus(color);
         }
@@ -63,10 +67,11 @@ public partial class VectorIndexViewModel : ViewModelBase
         {
             if (version != Volatile.Read(ref _statusRefreshVersion) || scope != CurrentScope)
                 return;
-            SemanticStatus = AtmosphereStatus = ColorStatus = $"读取失败: {ex.Message}";
+            SscdStatus = SemanticStatus = AtmosphereStatus = ColorStatus = $"读取失败: {ex.Message}";
         }
     }
 
+    [RelayCommand] private Task BuildSscdAsync() => RunAsync(VectorIndexKind.Sscd, false);
     [RelayCommand] private Task BuildSemanticAsync() => RunAsync(VectorIndexKind.Semantic, false);
     [RelayCommand] private Task RebuildSemanticAsync() => RunAsync(VectorIndexKind.Semantic, true);
     [RelayCommand] private Task BuildAtmosphereAsync() => RunAsync(VectorIndexKind.Atmosphere, false);
@@ -192,6 +197,7 @@ public partial class VectorIndexViewModel : ViewModelBase
     private static string KindName(VectorIndexKind kind) => kind switch
     {
         VectorIndexKind.Semantic => "Chinese-CLIP",
+        VectorIndexKind.Sscd => "SSCD 找原图",
         VectorIndexKind.Atmosphere => "氛围",
         VectorIndexKind.Color => "颜色",
         _ => kind.ToString()

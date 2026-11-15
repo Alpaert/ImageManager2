@@ -10,7 +10,6 @@ using ImageManager.Common.Constants;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
-using Microsoft.Extensions.DependencyInjection;
 
 namespace ImageManager.App.ViewModels;
 
@@ -21,6 +20,9 @@ public partial class MainWindowViewModel
     [RelayCommand]
     private async Task SearchByTag()
     {
+        if (IsRegionSearchActive) await ExitRegionSearchSessionAsync();
+        Interlocked.Increment(ref _searchRequestVersion);
+        Volatile.Read(ref _searchCts)?.Cancel();
         var raw = TagSearchText.Trim();
         if (string.IsNullOrEmpty(raw))
         {
@@ -302,6 +304,7 @@ public partial class MainWindowViewModel
     public async Task RemoveFilesFromViewAsync(HashSet<string> deletedPaths)
     {
         if (deletedPaths.Count == 0) return;
+        RemoveFilesFromRegionSnapshot(deletedPaths);
 
         var hasFilterSnapshot = HasDisplayFilter || _publishedDisplayFilterVersion >= 0;
         var filterNeedsRebuild = IsDisplayFilterBusy ||
@@ -326,6 +329,7 @@ public partial class MainWindowViewModel
         _filteredNavigationFiles = _filteredNavigationFiles.Where(path => !deletedPaths.Contains(path)).ToList();
         PublishAllFiles(_allFiles.Where(path => !deletedPaths.Contains(path)).ToList());
         _selectedFilePaths.RemoveWhere(deletedPaths.Contains);
+        QueueDetailsSelectionRefresh();
 
         if (_tagSearch.SearchResultFiles.RemoveAll(deletedPaths.Contains) > 0)
             _tagSearch.NotifySearchResultFilesChanged();
@@ -632,29 +636,33 @@ public partial class MainWindowViewModel
     // ==================== Similar Image Search ====================
 
     [RelayCommand]
-    private async Task SearchSimilarAsync(string filePath)
+    private Task SearchSimilarAsync(string filePath) => SearchWholeImageAsync(filePath,
+        SimilaritySearchModeValues[Math.Clamp(SelectedSimilarityMode, 0, SimilaritySearchModeValues.Length - 1)]);
+
+    public async Task SearchWholeImageAsync(string filePath, SimilaritySearchMode mode, Func<bool>? isCurrentIntent = null)
     {
-        var mode = SimilaritySearchModeValues[
-            Math.Clamp(SelectedSimilarityMode, 0, SimilaritySearchModeValues.Length - 1)];
         var (requestVersion, requestCts) = BeginSearchRequest();
-        StatusText = "正在搜索相似图片...";
-
-        if (!IsShowingSearchResult)
-            _pageManager.SavePreSearchState(CurrentPage);
-
+        bool IsCurrent() => !requestCts.IsCancellationRequested &&
+            IsCurrentSearchRequest(requestVersion, requestCts) && (isCurrentIntent?.Invoke() ?? true);
         try
         {
+            if (IsRegionSearchActive) await ExitRegionSearchSessionAsync();
+            if (!IsCurrent()) return;
+            StatusText = "正在搜索相似图片...";
+            if (!IsShowingSearchResult)
+                _pageManager.SavePreSearchState(CurrentPage);
             var candidates = (await GetSearchScopeFilesAsync()).ToList();
             requestCts.Token.ThrowIfCancellationRequested();
+            if (!IsCurrent()) return;
             AppLogger.Info($"SimilarSearch scope={SearchScope} candidates={candidates.Count} mode={mode} file={filePath}");
             var resultLimit = Math.Clamp(AppSettings.SimilaritySearchResultLimit, 1, 500);
-            var results = await _similarService.SearchByImageAsync(
-                filePath, candidates, mode, resultLimit, requestCts.Token);
+            var results = await Task.Run(() => _similarService.SearchByImageAsync(
+                filePath, candidates, mode, resultLimit, requestCts.Token), requestCts.Token);
             await ApplySimilarityResultsAsync(
                 results,
                 mode,
-                () => IsCurrentSearchRequest(requestVersion, requestCts));
-            if (mode == SimilaritySearchMode.Perceptual)
+                IsCurrent);
+            if (IsCurrent() && mode == SimilaritySearchMode.Perceptual)
             {
                 var searchPaths = candidates.ToArray();
                 RunBackgroundSafe("similar-search-hash-repair", CurrentFolderWorkToken,
@@ -668,18 +676,99 @@ public partial class MainWindowViewModel
         }
         catch (OperationCanceledException)
         {
-            if (IsCurrentSearchRequest(requestVersion, requestCts))
+            if (IsCurrentSearchRequest(requestVersion, requestCts) && (isCurrentIntent?.Invoke() ?? true))
                 StatusText = "搜索已取消";
         }
         catch (Exception ex)
         {
-            if (IsCurrentSearchRequest(requestVersion, requestCts))
+            if (IsCurrent())
                 StatusText = $"相似搜索失败: {ex.Message}";
         }
         finally
         {
             CompleteSearchRequest(requestCts);
         }
+    }
+
+    public async Task SearchRegionAsync(string path, ImageRegion? region, RegionSearchMode mode)
+    {
+        var (version, cts) = BeginSearchRequest();
+        var token = cts.Token;
+        var watch = Stopwatch.StartNew();
+        Task<RegionSearchResponse>? worker = null;
+        StatusText = mode == RegionSearchMode.SimilarContent
+            ? "正在找相似内容…首次搜索需要加载 PixAI，可随时停止"
+            : "正在找原图…";
+        if (!IsShowingSearchResult)
+            _pageManager.SavePreSearchState(CurrentPage);
+
+        try
+        {
+            var candidates = (await GetSearchScopeFilesAsync())
+                .Where(FileTypeConstants.IsImageFile).ToArray();
+            token.ThrowIfCancellationRequested();
+            var service = _regionSearchService ?? throw new InvalidOperationException("局部搜图服务未配置。");
+            var limit = Math.Clamp(AppSettings.SimilaritySearchResultLimit, 1, 500);
+            AppLogger.Info($"RegionSearch.Start request={version} mode={mode} candidates={candidates.Length}");
+            // SQLite's async API can execute synchronously, and the candidate
+            // validity checks read file metadata. Keep both off the dispatcher.
+            worker = Task.Run(() => service.SearchAsync(
+                path, region, candidates, mode, limit, token), token);
+            var result = await worker.WaitAsync(TimeSpan.FromMinutes(5), token);
+            token.ThrowIfCancellationRequested();
+            AppLogger.Info($"RegionSearch.ResultsReady request={version} results={result.Results.Count} ms={watch.ElapsedMilliseconds}");
+            StatusText = "搜索完成，正在显示结果…";
+            var publishWatch = Stopwatch.StartNew();
+            await ApplySimilarityResultsAsync(result.Results, SimilaritySearchMode.Semantic,
+                () => !token.IsCancellationRequested && IsCurrentSearchRequest(version, cts));
+            token.ThrowIfCancellationRequested();
+
+            StatusText = $"找到 {result.Results.Count} 张图片，向量覆盖 {result.IndexedImages}/{result.CandidateImages} 张";
+            if (result.IndexedImages == 0 && mode == RegionSearchMode.FindOriginal)
+                StatusText += "。可在「相似搜索向量索引」中补算 SSCD";
+            AppLogger.Info($"RegionSearch.Done request={version} mode={mode} indexed={result.IndexedImages} results={result.Results.Count} publishMs={publishWatch.ElapsedMilliseconds} ms={watch.ElapsedMilliseconds}");
+        }
+        catch (TimeoutException) when (worker is { IsCompleted: false })
+        {
+            cts.Cancel();
+            AppLogger.Warn($"RegionSearch.Timeout request={version} mode={mode} ms={watch.ElapsedMilliseconds}");
+            if (IsCurrentSearchRequest(version, cts))
+                StatusText = "框选搜图等待超时，已停止等待。可缩小搜索范围后重试。";
+        }
+        catch (OperationCanceledException)
+        {
+            AppLogger.Info($"RegionSearch.Canceled request={version} mode={mode} ms={watch.ElapsedMilliseconds}");
+            if (IsCurrentSearchRequest(version, cts))
+                StatusText = "搜索已取消";
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"RegionSearch.Failed mode={mode} ms={watch.ElapsedMilliseconds}: {ex}");
+            if (IsCurrentSearchRequest(version, cts))
+                StatusText = $"框选搜图失败：{ex.Message}";
+        }
+        finally
+        {
+            // Cancellation ends the UI wait even if a native call is still
+            // running. Keep the token source alive until that call unwinds.
+            Interlocked.CompareExchange(ref _searchCts, null, cts);
+            if (worker is { IsCompleted: false })
+                _ = ObserveDetachedRegionSearchAsync(worker, cts, version);
+            else
+            {
+                _ = worker?.Exception;
+                cts.Dispose();
+            }
+        }
+    }
+
+    private static async Task ObserveDetachedRegionSearchAsync(
+        Task<RegionSearchResponse> worker, CancellationTokenSource cancellation, int version)
+    {
+        try { await worker.ConfigureAwait(false); }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) { AppLogger.Warn($"RegionSearch.DetachedFailed request={version}: {ex.Message}"); }
+        finally { cancellation.Dispose(); }
     }
 
     public void SelectSimilarityMode(SimilaritySearchMode mode)
@@ -692,6 +781,7 @@ public partial class MainWindowViewModel
     [RelayCommand]
     private async Task SearchNaturalLanguageAsync()
     {
+        if (IsRegionSearchActive) await ExitRegionSearchSessionAsync();
         var query = NaturalLanguageQuery.Trim();
         if (query.Length == 0)
         {
@@ -744,7 +834,6 @@ public partial class MainWindowViewModel
         var requestCts = new CancellationTokenSource();
         var previous = Interlocked.Exchange(ref _searchCts, requestCts);
         previous?.Cancel();
-        previous?.Dispose();
         return (requestVersion, requestCts);
     }
 
@@ -756,8 +845,8 @@ public partial class MainWindowViewModel
 
     private void CompleteSearchRequest(CancellationTokenSource requestCts)
     {
-        if (ReferenceEquals(Interlocked.CompareExchange(ref _searchCts, null, requestCts), requestCts))
-            requestCts.Dispose();
+        Interlocked.CompareExchange(ref _searchCts, null, requestCts);
+        requestCts.Dispose();
     }
 
     private async Task ApplySimilarityResultsAsync(
@@ -767,6 +856,12 @@ public partial class MainWindowViewModel
     {
         if (!isCurrentSearch())
             return;
+
+        if (IsRegionSearchActive)
+        {
+            await PublishRegionResultsAsync(results, isCurrentSearch);
+            return;
+        }
 
         var useRankedResults = searchMode != SimilaritySearchMode.Perceptual ||
                                AppSettings.PerceptualSearchResultMode == PerceptualSearchResultMode.Ranked;
@@ -791,7 +886,7 @@ public partial class MainWindowViewModel
             if (useRankedResults)
             {
                 IsShowingSearchResult = true;
-                await RebuildDisplayFilterAsync();
+                await RebuildSearchDisplayAsync(isCurrentSearch);
                 if (!isCurrentSearch())
                     return;
                 ScrollSearchResultsToTopRequested?.Invoke();
@@ -799,7 +894,7 @@ public partial class MainWindowViewModel
             else if (IsShowingSearchResult)
             {
                 IsShowingSearchResult = false;
-                await RebuildDisplayFilterAsync();
+                await RebuildSearchDisplayAsync(isCurrentSearch);
                 if (!isCurrentSearch())
                     return;
             }
@@ -825,7 +920,7 @@ public partial class MainWindowViewModel
     {
         IsShowingSearchResult = true;
         Interlocked.Increment(ref _resultNavigationVersion);
-        await RebuildDisplayFilterAsync();
+        await RebuildSearchDisplayAsync(isCurrentSearch);
         if (!isCurrentSearch())
             return;
 
@@ -844,7 +939,7 @@ public partial class MainWindowViewModel
         if (IsShowingSearchResult)
         {
             IsShowingSearchResult = false;
-            await RebuildDisplayFilterAsync(renderPage: false);
+            await RebuildSearchDisplayAsync(isCurrentSearch, renderPage: false);
             if (!isCurrentSearch())
                 return;
         }
@@ -852,7 +947,7 @@ public partial class MainWindowViewModel
         {
             // Publish the filtered snapshot without rendering the old page.
             // NavigateToResultAsync will render the target page exactly once.
-            await RebuildDisplayFilterAsync(renderPage: false);
+            await RebuildSearchDisplayAsync(isCurrentSearch, renderPage: false);
             if (!isCurrentSearch()) return;
         }
 

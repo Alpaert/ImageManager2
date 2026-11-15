@@ -840,6 +840,11 @@ public sealed class VirtualizingWaterfallPanel : VirtualizingPanel
     {
         if (_lastPublishedViewportY is { } previousY)
         {
+            // ScrollToIndex uses fractional geometry while the arranged viewport
+            // can round it by less than one DIP. Do not reverse prefetch direction
+            // for that jitter; retain the baseline so slow real movement accumulates.
+            if (Math.Abs(viewportY - previousY) < 1)
+                return;
             if (viewportY > previousY)
                 CurrentScrollDirection = ContinuousScrollDirection.Down;
             else if (viewportY < previousY)

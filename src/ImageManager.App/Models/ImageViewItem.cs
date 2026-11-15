@@ -10,6 +10,8 @@ public partial class ImageViewItem : ObservableObject
 
     // Thumbnail as raw bytes; converted to Avalonia Bitmap via converter or code
     [ObservableProperty] private byte[]? _thumbnailData;
+    // Published before bytes, so consumers can reject a stale source after invalidation.
+    public string? ThumbnailVersion { get; set; }
 
     [ObservableProperty] private int _width = 1;
     [ObservableProperty] private int _height = 1;

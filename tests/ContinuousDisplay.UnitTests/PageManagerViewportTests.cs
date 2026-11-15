@@ -128,26 +128,34 @@ public sealed class PageManagerViewportTests
         private readonly string _directory = Path.Combine(Path.GetTempPath(), "ImageManager-ViewportTests", Guid.NewGuid().ToString("N"));
         public QueuedDispatcher Dispatcher { get; } = new();
         public PageManager Page { get; }
+        private readonly ThumbnailCacheService _cache;
 
         public Fixture()
         {
-            Page = new PageManager(new ThumbnailCacheService(null!, _directory), null!, dispatcher: Dispatcher)
+            _cache = new ThumbnailCacheService(new ImageManager.Infrastructure.Services.MediaProcessorFactory(null!), _directory);
+            Page = new PageManager(_cache, null!, dispatcher: Dispatcher)
                 { UseViewportLoading = true };
         }
 
         public ImageViewItem Item(string name)
         {
             var path = Path.Combine(_directory, name);
-            // The cache path does not require any user file or image decoding service.
-            var cache = new DiskThumbnailCache(_directory, 200);
-            cache.Save(path, [0xff, 0xd8, 0xff, 0xc0, 0, 11, 8, 0, 10, 0, 20, 1, 1, 0, 0, 0xff, 0xd9]);
-            cache.SaveMeta(path, 20, 10);
+            // Versioned publication requires a real source identity, even for a synthetic warm cache.
+            Directory.CreateDirectory(_directory);
+            using var bitmap = new SkiaSharp.SKBitmap(20, 10);
+            bitmap.Erase(SkiaSharp.SKColors.CornflowerBlue);
+            using var image = SkiaSharp.SKImage.FromBitmap(bitmap);
+            using var encoded = image.Encode(SkiaSharp.SKEncodedImageFormat.Jpeg, 85);
+            File.WriteAllBytes(path, encoded.ToArray());
+            _cache.GetOrCreateThumbnailAsync(path, 200).GetAwaiter().GetResult();
+            _cache.ClearMemoryEntry(path);
             return new ImageViewItem { FilePath = path, FileName = name };
         }
 
         public void Dispose()
         {
             Page.Dispose();
+            _cache.Dispose();
             Dispatcher.Drain();
             // Temporary test cache can still have canceled workers unwinding.
             try { Directory.Delete(_directory, true); } catch (IOException) { }

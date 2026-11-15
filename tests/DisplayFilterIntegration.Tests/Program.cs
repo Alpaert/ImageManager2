@@ -12,6 +12,13 @@ using ImageManager.Infrastructure.Caching;
 using ImageManager.Infrastructure.Audio;
 using SkiaSharp;
 
+// Run in its own process: shutting down the static FFmpeg manager is intentionally terminal.
+if (args.Contains("--media-process-smoke", StringComparer.OrdinalIgnoreCase))
+{
+    await MediaPreviewProcessChecks.RunAsync();
+    return;
+}
+
 var messenger = new WeakReferenceMessenger();
 var repository = DispatchProxy.Create<IImageMetaRepository, MetadataProxy>();
 var fake = (MetadataProxy)(object)repository;
@@ -24,33 +31,51 @@ var vm = new MainWindowViewModel(null!, null!, repository, null!, null!, null!, 
 var cacheFixtureDirectory = Path.Combine(Path.GetTempPath(), "ImageManager-CachedDimensions-" + Guid.NewGuid().ToString("N"));
 try
 {
-    const string cachedVideo = @"Z:\cache-fixture\video.mp4";
-    var dimensionCache = new ThumbnailCacheService(null!, cacheFixtureDirectory, 200);
+    Directory.CreateDirectory(cacheFixtureDirectory);
+    var cachedVideo = Path.Combine(cacheFixtureDirectory, "video.mp4");
+    await File.WriteAllTextAsync(cachedVideo, "synthetic source identity");
+    var frameExtractions = 0;
+    using var originalFrames = new VideoOriginalFrameCacheService(cacheFixtureDirectory, (_, _) =>
+    {
+        Interlocked.Increment(ref frameExtractions);
+        return Task.FromResult<byte[]?>(CreateTestJpeg(1920, 1080));
+    });
+    using var dimensionCache = new ThumbnailCacheService(new MediaProcessorFactory(originalFrames), cacheFixtureDirectory, 200);
     var currentWidthCache = new DiskThumbnailCache(cacheFixtureDirectory, 200);
     var otherWidthCache = new DiskThumbnailCache(cacheFixtureDirectory, 320);
-    var originalFrames = new VideoOriginalFrameCacheService(cacheFixtureDirectory);
-    var originalFramePath = originalFrames.GetOriginalFramePath(cachedVideo);
-    Directory.CreateDirectory(Path.GetDirectoryName(originalFramePath)!);
-    await File.WriteAllBytesAsync(originalFramePath, CreateJpegHeader(1920, 1080));
+    var seededFrame = await originalFrames.EnsureAsync(cachedVideo);
+    Require(seededFrame.Success && frameExtractions == 1,
+        "fixture must commit an actual source-versioned original frame through the cache service");
 
     otherWidthCache.SaveMeta(cachedVideo, 3840, 2160);
     currentWidthCache.SaveMeta(cachedVideo, 1, 1);
     Require(dimensionCache.TryResolveCachedDimensions(cachedVideo, 200) == (1920, 1080),
-        "video original frame dimensions must win over invalid current and other-width metadata");
+        "verified original frame dimensions must win over unversioned wrong metadata");
 
     currentWidthCache.SaveMeta(cachedVideo, 1280, 720);
-    Require(dimensionCache.TryResolveCachedDimensions(cachedVideo, 200) == (1280, 720),
-        "requested width metadata must win over the video original frame");
+    Require(dimensionCache.TryResolveCachedDimensions(cachedVideo, 200) == (1920, 1080),
+        "plausible but unversioned target metadata must not overwrite verified source dimensions");
 
     File.Delete(Path.ChangeExtension(currentWidthCache.GetCacheFilePath(cachedVideo), ".json"));
-    currentWidthCache.Save(cachedVideo, CreateJpegHeader(640, 360));
-    Require(dimensionCache.TryResolveCachedDimensions(cachedVideo, 200) == (640, 360),
-        "a target thumbnail without JSON metadata must be reused before the video original frame");
+    currentWidthCache.Save(cachedVideo, CreateTestJpeg(640, 360));
+    Require(dimensionCache.TryResolveCachedDimensions(cachedVideo, 200) == (1920, 1080),
+        "unversioned derived pixels must not be mistaken for intrinsic source dimensions");
 
+    var firstThumbnail = await dimensionCache.GetOrCreateThumbnailWithDiagnosticsAsync(cachedVideo, 200);
+    var secondThumbnail = await dimensionCache.GetOrCreateThumbnailWithDiagnosticsAsync(cachedVideo, 200);
+    Require(firstThumbnail.Data is { Length: > 0 } && secondThumbnail.Data is { Length: > 0 } && frameExtractions == 1,
+        "thumbnail creation and subsequent cache hit must reuse the versioned frame without extracting again");
     var batchDimensions = await dimensionCache.GetCachedDimensionsAsync([cachedVideo]);
-    Require(batchDimensions.TryGetValue(cachedVideo, out var batchSize) && batchSize == (640, 360),
-        "batched cache resolution must inspect thumbnails without JSON metadata");
-    Console.WriteLine("PASS cached video dimensions reuse target metadata and original frames without source access");
+    Require(batchDimensions.TryGetValue(cachedVideo, out var batchSize) && batchSize == (1920, 1080) && frameExtractions == 1,
+        "batched dimension resolution must read verified cache without starting another extraction");
+
+    File.Delete(cachedVideo);
+    Require(dimensionCache.TryResolveCachedDimensions(cachedVideo, 200) == (0, 0) &&
+            dimensionCache.TryGetCachedThumbnail(cachedVideo, 200).Data == null &&
+            !(await dimensionCache.GetCachedDimensionsAsync([cachedVideo])).ContainsKey(cachedVideo),
+        "missing source identity must make both old and versioned cache entries unusable");
+    Require(frameExtractions == 1, "missing-source cache checks must never start extraction");
+    Console.WriteLine("PASS cached video dimensions trust versioned source evidence and avoid new extraction");
 }
 finally
 {
@@ -166,11 +191,14 @@ try
     musicFactory.MutateSourceOnce = racePath;
     var readsBeforeRace = musicFactory.CoverReads;
     var raceThumbnail = await musicThumbnailCache.GetOrCreateThumbnailWithDiagnosticsAsync(racePath, 200);
-    Require(raceThumbnail.Data is { Length: > 0 } && musicFactory.CoverReads == readsBeforeRace + 2,
-        "a source changed during tag extraction must discard stale artwork and retry once");
+    Require(raceThumbnail.Data == null && musicFactory.CoverReads == readsBeforeRace + 1,
+        "a source changed during tag extraction must reject the stale result rather than publish it");
     var cachedRaceThumbnail = await musicThumbnailCache.GetOrCreateThumbnailWithDiagnosticsAsync(racePath, 80);
     Require(cachedRaceThumbnail.Data is { Length: > 0 } && musicFactory.CoverReads == readsBeforeRace + 2,
-        "the retried artwork must be reusable after its source fingerprint is stable");
+        "a subsequent request must extract the new stable version instead of reusing stale artwork");
+    var reusedRaceThumbnail = await musicThumbnailCache.GetOrCreateThumbnailWithDiagnosticsAsync(racePath, 200);
+    Require(reusedRaceThumbnail.Data is { Length: > 0 } && musicFactory.CoverReads == readsBeforeRace + 2,
+        "the stable new artwork must then be reusable across widths without a further tag read");
 
     var unwritableCacheRoot = Path.Combine(musicCacheFixtureDirectory, "cache-root-file");
     File.WriteAllText(unwritableCacheRoot, "not a directory");
@@ -208,10 +236,14 @@ try
 
     var prewarmFactory = new TestMusicProcessorFactory(CreateTestJpeg());
     var prewarmCache = new ThumbnailCacheService(prewarmFactory, prewarmFixtureDirectory, 120);
-    var prewarmFrames = new VideoOriginalFrameCacheService(prewarmFixtureDirectory);
-    var originalFramePath = prewarmFrames.GetOriginalFramePath(videoPath);
-    Directory.CreateDirectory(Path.GetDirectoryName(originalFramePath)!);
-    await File.WriteAllBytesAsync(originalFramePath, CreateTestJpeg());
+    var prewarmFrameExtractions = 0;
+    using var prewarmFrames = new VideoOriginalFrameCacheService(prewarmFixtureDirectory, (_, _) =>
+    {
+        Interlocked.Increment(ref prewarmFrameExtractions);
+        return Task.FromResult<byte[]?>(CreateTestJpeg());
+    });
+    Require((await prewarmFrames.EnsureAsync(videoPath)).Success && prewarmFrameExtractions == 1,
+        "prewarm fixture must first commit a versioned original frame");
     var prewarm = new MediaThumbnailPrewarmService(prewarmCache, prewarmFrames);
 
     var prewarmResult = await prewarm.PrewarmAsync(
@@ -223,6 +255,11 @@ try
         "prewarm must derive a video thumbnail from an existing original frame");
     Require(prewarmFactory.VideoProcessorAttempts == 0,
         "prewarm must not route any video through a media processor");
+    Require(prewarmFrameExtractions == 1,
+        "prewarm must not invoke even the injected extractor for cached or missing-frame videos");
+    await prewarm.PrewarmAsync([videoPath, skippedVideoPath], 120);
+    Require(prewarmFrameExtractions == 1 && prewarmFactory.VideoProcessorAttempts == 0,
+        "repeated prewarm must remain cache-only for videos");
     Console.WriteLine("PASS thumbnail prewarm reuses cached video frames and skips FFmpeg paths");
 }
 finally
@@ -794,19 +831,9 @@ Console.WriteLine($"PASS 100k continuous geometry known-dimension reuse elapsed_
 Console.WriteLine("All 11 display-filter integration groups passed.");
 
 static void Require(bool value, string message) { if (!value) throw new InvalidOperationException(message); }
-static byte[] CreateJpegHeader(int width, int height) =>
-[
-    0xFF, 0xD8,
-    0xFF, 0xC0,
-    0x00, 0x08,
-    0x08,
-    (byte)(height >> 8), (byte)height,
-    (byte)(width >> 8), (byte)width,
-    0x00
-];
-static byte[] CreateTestJpeg()
+static byte[] CreateTestJpeg(int width = 8, int height = 6)
 {
-    using var surface = SKSurface.Create(new SKImageInfo(8, 6));
+    using var surface = SKSurface.Create(new SKImageInfo(width, height));
     surface.Canvas.Clear(SKColors.CornflowerBlue);
     using var image = surface.Snapshot();
     using var encoded = image.Encode(SKEncodedImageFormat.Jpeg, 85);

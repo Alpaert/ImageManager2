@@ -41,11 +41,17 @@ public sealed class ImmediateDispatcher : ImageManager.Core.Services.IDispatcher
 public sealed class FakeSettingsRepository : ISettingsRepository
 {
     public AppSettings Settings { get; set; } = new();
+    public int SaveCallCount { get; private set; }
+    public Func<AppSettings, Task>? OnSave { get; set; }
 
     public Task<AppSettings> LoadAsync() => Task.FromResult(Settings);
 
     public Task SaveAsync(AppSettings settings)
     {
+        SaveCallCount++;
+        if (OnSave is not null)
+            return OnSave(settings);
+
         Settings = settings;
         return Task.CompletedTask;
     }
@@ -360,6 +366,7 @@ public sealed class FakeSimilarImageService : ISimilarImageService
 
 public sealed class FakeTagRepository : ITagRepository
 {
+    public Dictionary<string, List<string>>? MediaTags { get; set; }
     public Dictionary<string, long> TagIds { get; } = new(StringComparer.OrdinalIgnoreCase);
     public List<TagCount> TagCounts { get; set; } = new();
     public List<string> Favorites { get; } = new();
@@ -406,13 +413,24 @@ public sealed class FakeTagRepository : ITagRepository
     public Task<RenameResult> RenameTagAsync(string oldName, string newName)
     {
         RenameCalls.Add((oldName, newName));
+        if (NextRenameResult == RenameResult.Success) ReplaceMediaTag(oldName, newName);
         return Task.FromResult(NextRenameResult);
     }
 
     public Task MergeTagsAsync(string oldName, string newName)
     {
         MergeCalls.Add((oldName, newName));
+        ReplaceMediaTag(oldName, newName);
         return Task.CompletedTask;
+    }
+
+    private void ReplaceMediaTag(string oldName, string newName)
+    {
+        if (MediaTags == null) return;
+        foreach (var path in MediaTags.Keys.ToArray())
+            MediaTags[path] = MediaTags[path]
+                .Select(tag => string.Equals(tag, oldName, StringComparison.OrdinalIgnoreCase) ? newName : tag)
+                .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
     }
 
     public Task DeleteTagAsync(string tagName)
@@ -694,6 +712,16 @@ public sealed class FakeMediaMoveService : IMediaMoveService
 /// Encapsulates a test instance of MainWindowViewModel along with its mock / fake dependencies,
 /// providing deterministic control and automatic temporary directory cleanup.
 /// </summary>
+public sealed class FakeRegionSearchService : IRegionSearchService
+{
+    public IRegionSearchService? Handler { get; set; }
+    public IDisposable? BeginSession() => Handler?.BeginSession();
+    public Task<RegionSearchResponse> SearchAsync(string path, ImageRegion? region,
+        IReadOnlyCollection<string> candidates, RegionSearchMode mode, int limit, CancellationToken ct = default) =>
+        (Handler ?? throw new InvalidOperationException("Set a region search test handler."))
+            .SearchAsync(path, region, candidates, mode, limit, ct);
+}
+
 public sealed class MainWindowTestContext : IDisposable
 {
     private readonly List<string> _managedTempDirectories = new();
@@ -714,6 +742,7 @@ public sealed class MainWindowTestContext : IDisposable
     public PageManager PageManager { get; }
     public TagSearchEngine TagSearchEngine { get; }
     public FakeSimilarImageService SimilarService { get; }
+    public FakeRegionSearchService RegionService { get; } = new();
     public ImmediateDispatcher Dispatcher { get; }
     public WeakReferenceMessenger Messenger { get; }
     public string TempCacheDirectory { get; }
@@ -729,7 +758,8 @@ public sealed class MainWindowTestContext : IDisposable
         FakeSimilarImageService? similarService = null,
         FakeTagRepository? tagRepo = null,
         FakeCharacterTagSuppressionRepository? suppressionRepo = null,
-        FakeMediaMoveService? mediaMoveService = null)
+        FakeMediaMoveService? mediaMoveService = null,
+        bool detailsPaneOpen = false)
     {
         TempCacheDirectory = Path.Combine(Path.GetTempPath(), "IM2-TestCache-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(TempCacheDirectory);
@@ -749,6 +779,7 @@ public sealed class MainWindowTestContext : IDisposable
         var repoInstance = DispatchProxy.Create<IImageMetaRepository, TestMetaProxy>();
         MetaRepo = repoInstance;
         MetaProxy = (TestMetaProxy)(object)repoInstance;
+        TagRepo.MediaTags = MetaProxy.TagMap;
 
         Messenger = new WeakReferenceMessenger();
         CacheService = new ThumbnailCacheService(new MediaProcessorFactory(null!), TempCacheDirectory);
@@ -786,7 +817,12 @@ public sealed class MainWindowTestContext : IDisposable
             Messenger,
             Dispatcher,
             characterMatchingService: null,
-            mediaMoveService: MediaMoveService);
+            mediaMoveService: MediaMoveService,
+            regionSearchService: RegionService);
+        // Unrelated VM tests do not launch optional detail I/O. Detail tests opt in explicitly.
+        SettingsRepo.Settings.DetailsPaneOpen = detailsPaneOpen;
+        ViewModel.AppSettings.DetailsPaneOpen = detailsPaneOpen;
+        ViewModel.DetailsPane.IsOpen = detailsPaneOpen;
     }
 
 

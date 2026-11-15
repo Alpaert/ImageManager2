@@ -2,6 +2,14 @@ namespace ImageManager.Infrastructure.Audio;
 
 internal static class MusicArtworkResolver
 {
+    internal static ImageManager.Core.Models.ArtworkOrigin ClassifySidecar(string audioPath, string artworkPath)
+    {
+        var stem = Path.GetFileNameWithoutExtension(artworkPath);
+        var named = stem.Equals(Path.GetFileNameWithoutExtension(audioPath), StringComparison.OrdinalIgnoreCase)
+            || FileNames.Contains(stem, StringComparer.OrdinalIgnoreCase)
+            || string.Equals(Path.GetFileName(Path.GetDirectoryName(artworkPath)), "Scans", StringComparison.OrdinalIgnoreCase);
+        return named ? ImageManager.Core.Models.ArtworkOrigin.Sidecar : ImageManager.Core.Models.ArtworkOrigin.FolderImage;
+    }
     private static readonly string[] FileNames =
     [
         "Cover", "Folder", "Front", "AlbumArt", "Album", "Artwork"

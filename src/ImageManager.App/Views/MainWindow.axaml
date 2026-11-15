@@ -38,6 +38,7 @@
 						<MenuItem Header="清空选中图片的标签" Click="MenuClearSelectedTags_Click" IsVisible="{Binding ShowStandardContextMenuItems}"/>
 						<MenuItem Header="复制图片到剪贴板" Click="MenuCopyImage_Click" IsVisible="{Binding ShowStandardContextMenuItems}"/>
 						<MenuItem Header="查找相似图片" IsVisible="{Binding ShowStandardContextMenuItems}">
+							<MenuItem Header="框选搜图…" Click="MenuRegionSearch_Click"/>
 							<MenuItem Header="感知相似" Tag="0" Click="MenuFindSimilar_Click"/>
 							<MenuItem Header="语义相似" Tag="1" Click="MenuFindSimilar_Click"/>
 							<MenuItem Header="氛围相似" Tag="2" Click="MenuFindSimilar_Click"/>
@@ -245,7 +246,7 @@
 			<Setter Property="Foreground" Value="{Binding $parent[Button].Foreground}" />
 		</Style>
 	</Window.Styles>
-    <Grid x:Name="RootGrid" Focusable="True" ColumnDefinitions="210,*" RowDefinitions="Auto,Auto,*,Auto">
+    <Grid x:Name="RootGrid" Focusable="True" ColumnDefinitions="210,*,0,0" RowDefinitions="Auto,Auto,*,Auto">
 
         <!-- Left Sidebar -->
         <Border x:Name="WorkspaceSidebar" Grid.Column="0" Grid.RowSpan="4"
@@ -397,11 +398,13 @@
             </DockPanel>
         </Border>
 
-        <Border x:Name="WorkspaceSearchBar" Grid.Row="0" Grid.Column="1" Padding="27,11,27,12" MinHeight="58"
+        <Border x:Name="WorkspaceSearchBar" Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="3"
+                Padding="27,11,27,12" MinHeight="58"
                 BorderBrush="{DynamicResource WorkspaceLineBrush}" BorderThickness="0,0,0,1"
                 Background="{DynamicResource WorkspaceCanvasBrush}">
-            <Grid>
-                <Grid IsVisible="{Binding IsSearchToolbarLayoutA}" ColumnDefinitions="Auto,*"
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="9">
+                <Grid>
+                <Grid ColumnDefinitions="Auto,*"
                       RowDefinitions="Auto,Auto" ColumnSpacing="16" RowSpacing="5" VerticalAlignment="Center">
                     <StackPanel x:Name="WorkspaceSearchModesA" Orientation="Horizontal" Spacing="2">
                         <Button Content="标签搜索" Width="64" Height="34" Classes="workspace-tab workspace-tab-active"
@@ -421,22 +424,28 @@
                                 </Flyout>
                             </Button.Flyout>
                         </Button>
-                        <Button Content="以图搜图" Width="64" Height="34" Classes="workspace-tab"
+                        <Button x:Name="ImageSearchButtonA" Content="以图搜图" Width="64" Height="34" Classes="workspace-tab"
                                 ToolTip.Tip="选择相似模式，或直接拖入图片"
                                 DragDrop.AllowDrop="True" DragDrop.DragOver="DragSearchZone_DragOver"
                                 DragDrop.Drop="DragSearchZone_Drop">
                             <Button.Flyout>
                                 <Flyout Placement="Bottom" FlyoutPresenterClasses="toolbar-flyout">
                                     <StackPanel Width="290" Spacing="8">
-                                        <ComboBox Classes="toolbar-compact" ItemsSource="{Binding SimilaritySearchModes}"
+                                        <ComboBox x:Name="ImageSimilarityModeSelector" Classes="toolbar-compact" ItemsSource="{Binding SimilaritySearchModes}"
+                                                  IsEnabled="{Binding CanSelectWholeImageSearchMode}"
                                                   SelectedIndex="{Binding SelectedSimilarityMode}"/>
                                         <Border x:Name="DragSearchZoneA" Classes="toolbar-drop-zone" Cursor="Hand"
                                                 DragDrop.AllowDrop="True" DragDrop.DragOver="DragSearchZone_DragOver"
                                                 DragDrop.Drop="DragSearchZone_Drop">
-                                            <TextBlock Text="拖拽图片按所选模式搜索" TextAlignment="Center" FontSize="12"/>
+                                            <TextBlock Text="{Binding ImageDropSearchHint}" TextAlignment="Center" FontSize="12"/>
                                         </Border>
-                                        <CheckBox Classes="toolbar-compact" Content="局部匹配（暂未实现）"
-                                                  Foreground="{DynamicResource AccentBrush}"/>
+                                        <StackPanel Orientation="Horizontal" Spacing="8">
+                                            <Button Content="框选搜图…" Classes="workspace-quiet" Click="ExternalRegionSearch_Click"/>
+                                            <CheckBox x:Name="ImageDropRegionCheckBox" Content="拖入时框选" FontSize="12"
+                                                      IsChecked="{Binding UseRegionSearchOnImageDrop, Mode=TwoWay}"
+                                                      Click="ImageDropRegionOption_Click"
+                                                      ToolTip.Tip="勾选后拖入图片进入框选；取消勾选按上方所选模式搜索"/>
+                                        </StackPanel>
                                         <Button Content="停止搜索" Classes="workspace-quiet" HorizontalAlignment="Left"
                                                 Click="BtnStopSearch_Click"/>
                                     </StackPanel>
@@ -457,7 +466,7 @@
                                 </TextBox>
                             </Border>
                             <Popup x:Name="TagSearchSuggestionsPopupA"
-                                   IsOpen="{Binding IsTagSearchPopupOpenA}"
+                                   IsOpen="{Binding IsTagSearchPopupOpen}"
                                    Placement="Bottom"
                                    TakesFocusFromNativeControl="False">
                                 <Border Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource CtrlBorderBrush}"
@@ -495,110 +504,61 @@
                     </Grid>
                 </Grid>
 
-                <Grid IsVisible="{Binding IsSearchToolbarLayoutC}" ColumnDefinitions="Auto,*"
-                      RowDefinitions="Auto,Auto" ColumnSpacing="16" RowSpacing="5" VerticalAlignment="Center">
-                    <StackPanel x:Name="WorkspaceSearchModesC" Orientation="Horizontal" Spacing="2">
-                        <Button Content="标签搜索" Width="64" Height="34" Classes="workspace-tab workspace-tab-active"
-                                Click="WorkspaceTagTab_Click"/>
-                        <Button Content="自然语言搜图" Width="88" Height="34" Classes="workspace-tab">
-                            <Button.Flyout>
-                                <Flyout Placement="Bottom" FlyoutPresenterClasses="toolbar-flyout">
-                                    <StackPanel Width="290" Spacing="8">
-                                        <TextBox Classes="toolbar-compact" PlaceholderText="中文自然语言搜图"
-                                                 Text="{Binding NaturalLanguageQuery}"/>
-                                        <StackPanel Orientation="Horizontal" Spacing="6">
-                                            <Button Content="语义搜图" Classes="workspace-primary"
-                                                    Command="{Binding SearchNaturalLanguageCommand}"/>
-                                            <Button Content="停止搜索" Classes="workspace-quiet" Click="BtnStopSearch_Click"/>
-                                        </StackPanel>
-                                    </StackPanel>
-                                </Flyout>
-                            </Button.Flyout>
-                        </Button>
-                        <Button Content="以图搜图" Width="64" Height="34" Classes="workspace-tab"
-                                ToolTip.Tip="选择相似模式，或直接拖入图片"
-                                DragDrop.AllowDrop="True" DragDrop.DragOver="DragSearchZone_DragOver"
-                                DragDrop.Drop="DragSearchZone_Drop">
-                            <Button.Flyout>
-                                <Flyout Placement="Bottom" FlyoutPresenterClasses="toolbar-flyout">
-                                    <StackPanel Width="290" Spacing="8">
-                                        <ComboBox Classes="toolbar-compact" ItemsSource="{Binding SimilaritySearchModes}"
-                                                  SelectedIndex="{Binding SelectedSimilarityMode}"/>
-                                        <Border x:Name="DragSearchZoneC" Classes="toolbar-drop-zone" Cursor="Hand"
-                                                DragDrop.AllowDrop="True" DragDrop.DragOver="DragSearchZone_DragOver"
-                                                DragDrop.Drop="DragSearchZone_Drop">
-                                            <TextBlock Text="拖拽图片按所选模式搜索" TextAlignment="Center" FontSize="12"/>
-                                        </Border>
-                                        <CheckBox Classes="toolbar-compact" Content="局部匹配（暂未实现）"
-                                                  Foreground="{DynamicResource AccentBrush}"/>
-                                        <Button Content="停止搜索" Classes="workspace-quiet" HorizontalAlignment="Left"
-                                                Click="BtnStopSearch_Click"/>
-                                    </StackPanel>
-                                </Flyout>
-                            </Button.Flyout>
-                        </Button>
-                    </StackPanel>
-                    <Grid x:Name="WorkspaceSearchBodyC" Grid.Column="1" ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="8">
-                        <StackPanel>
-                            <Border BorderBrush="{Binding SearchBoxBorderColor}" BorderThickness="1" CornerRadius="5">
-                                <TextBox x:Name="TxtTagSearchC" Classes="toolbar-compact workspace-query" Text="{Binding TagSearchText, UpdateSourceTrigger=PropertyChanged}"
-                                         PlaceholderText="输入 Tag，例如：自然 a 森林" AutomationProperties.Name="标签搜索" Height="32"
-                                         BorderThickness="0"
-                                         KeyDown="TxtTagSearch_KeyDown" GotFocus="TxtTagSearch_GotFocus">
-                                    <TextBox.InnerLeftContent>
-                                        <TextBlock Text="&#xE721;" FontFamily="Segoe MDL2 Assets" Classes="workspace-meta" Margin="10,0,2,0"/>
-                                    </TextBox.InnerLeftContent>
-                                </TextBox>
-                            </Border>
-                            <Popup x:Name="TagSearchSuggestionsPopupC"
-                                   IsOpen="{Binding IsTagSearchPopupOpenC}"
-                                   Placement="Bottom"
-                                   TakesFocusFromNativeControl="False">
-                                <Border Background="{DynamicResource SurfaceBrush}" BorderBrush="{DynamicResource CtrlBorderBrush}"
-                                        BorderThickness="1" CornerRadius="8" Padding="6" MaxWidth="300">
-                                    <StackPanel>
-                                        <TextBox Classes="toolbar-compact" PlaceholderText="输入以联想共现 Tag..." Text="{Binding CoTagFilterText, UpdateSourceTrigger=PropertyChanged}"
-                                                 IsVisible="{Binding IsSuggestionCoTagMode}" Margin="0,0,0,4"/>
-                                        <ScrollViewer MaxHeight="400">
-                                            <ItemsControl ItemsSource="{Binding TagSearchSuggestions}">
-                                                <ItemsControl.ItemsPanel>
-                                                    <ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate>
-                                                </ItemsControl.ItemsPanel>
-                                                <ItemsControl.ItemTemplate>
-                                                    <DataTemplate x:DataType="models:TagCount">
-                                                        <Button Classes="toolbar-compact" Margin="2" Padding="0" Click="TagSuggestion_Click" Tag="{Binding}">
-                                                            <Border Padding="6,3" CornerRadius="3"><TextBlock Text="{Binding Name}"/></Border>
-                                                        </Button>
-                                                    </DataTemplate>
-                                                </ItemsControl.ItemTemplate>
-                                            </ItemsControl>
-                                        </ScrollViewer>
-                                    </StackPanel>
-                                </Border>
-                            </Popup>
-                        </StackPanel>
-                        <Button Grid.Column="1" Content="搜索" Width="48" Height="34" Padding="0"
-                                Classes="workspace-primary" Command="{Binding SearchByTagCommand}" ToolTip.Tip="按 Tag 搜索"/>
-                        <ComboBox Grid.Column="2" Classes="toolbar-compact" Width="118" Height="34" Padding="6,4"
-                                  SelectedIndex="{Binding SearchScope}" AutomationProperties.Name="搜索范围">
-                            <ComboBoxItem>当前文件夹</ComboBoxItem>
-                            <ComboBoxItem>当前及子文件夹</ComboBoxItem>
-                        </ComboBox>
-                        <Button Grid.Column="3" Content="标签联想" Width="60" Height="34" Padding="0"
-                                Classes="workspace-quiet" Click="WorkspaceSuggestions_Click"/>
-                    </Grid>
                 </Grid>
+                <Button x:Name="PreviewToggle" Grid.Column="1" Classes="workspace-quiet"
+                        Classes.workspace-preview-active="{Binding DetailsPane.IsOpen}" Height="34" VerticalAlignment="Bottom"
+                        Click="PreviewToggle_Click" AutomationProperties.Name="预览栏">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <Path Width="16" Height="16" Stretch="Uniform" VerticalAlignment="Center"
+                              Stroke="{Binding #PreviewToggle.Foreground}" StrokeThickness="1.4"
+                              Data="M2,2 H18 V18 H2 Z M12,2 V18"/>
+                        <TextBlock x:Name="PreviewToggleLabel" Text="预览" VerticalAlignment="Center"/>
+                    </StackPanel>
+                </Button>
             </Grid>
         </Border>
 
         <!-- Keep the path and display controls above the scrolling gallery. -->
+        <Border Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="3" Padding="24,10"
+                IsVisible="{Binding IsRegionSearchActive}" Background="{DynamicResource WorkspaceCanvasBrush}">
+            <DockPanel>
+                <Button x:Name="RegionPreviewToggle" DockPanel.Dock="Right" Content="预览" Classes="workspace-quiet"
+                        Classes.workspace-preview-active="{Binding DetailsPane.IsOpen}" Click="PreviewToggle_Click"/>
+                <StackPanel Orientation="Horizontal" Spacing="12" VerticalAlignment="Center">
+                    <TextBlock Text="以图搜图" FontWeight="SemiBold" FontSize="18"/>
+                    <TextBlock Text="框选图片，发现相似内容" Classes="workspace-meta"/>
+                </StackPanel>
+            </DockPanel>
+        </Border>
+        <Border x:Name="RegionQueryStrip" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="3"
+                IsVisible="{Binding IsRegionSearchActive}" Margin="24,0,24,10" Padding="14,10"
+                Background="{DynamicResource WorkspaceSurfaceBrush}" BorderBrush="{DynamicResource WorkspaceLineBrush}"
+                BorderThickness="1" CornerRadius="8">
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="12">
+                <StackPanel Spacing="3">
+                    <TextBlock Text="{Binding RegionSearchInputName}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                    <TextBlock Text="{Binding RegionSearchConditionText}" Classes="workspace-meta" TextTrimming="CharacterEllipsis"/>
+                    <TextBlock Text="{Binding RegionSearchStatus}" Classes="workspace-meta" TextTrimming="CharacterEllipsis"
+                               ToolTip.Tip="{Binding RegionSearchStatus}"/>
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <CheckBox Content="包含子文件夹" IsChecked="{Binding RegionSearchRecursive}"/>
+                    <Button Content="停止" Classes="workspace-quiet" IsVisible="{Binding IsRegionSearchBusy}" Click="RegionStop_Click"/>
+                    <Button Content="返回图库" Classes="workspace-quiet" Click="RegionExit_Click"/>
+                </StackPanel>
+            </Grid>
+        </Border>
         <Border x:Name="WorkspaceHeader" Grid.Row="1" Grid.Column="1" Padding="27,12,27,8">
             <StackPanel>
-                <DockPanel LastChildFill="True" MinHeight="34">
-                    <WrapPanel DockPanel.Dock="Right" ItemSpacing="4" LineSpacing="4" Margin="8,0,0,0"
+                <controls:ResponsiveBreadcrumbBar x:Name="FolderBreadcrumbBar"
+                                                   ItemsSource="{Binding FolderBreadcrumbs}"
+                                                   IsVisible="{Binding HasBreadcrumbs}"
+                                                   Margin="0,0,0,5"
+                                                   NavigateRequested="FolderBreadcrumb_NavigateRequested"/>
+                <Grid x:Name="WorkspaceHeadingRow" ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" MinHeight="34">
+                    <WrapPanel x:Name="WorkspaceViewActions" Grid.Column="1" ItemSpacing="4" LineSpacing="4" Margin="8,0,0,0"
                                VerticalAlignment="Center">
-                        <controls:DisplayFilterBar x:Name="DisplayFiltersBarA" IsVisible="{Binding IsSearchToolbarLayoutA}"/>
-                        <controls:DisplayFilterBar x:Name="DisplayFiltersBarC" IsVisible="{Binding IsSearchToolbarLayoutC}"/>
+                        <controls:DisplayFilterBar x:Name="DisplayFiltersBarA"/>
                         <Menu Background="Transparent">
                             <MenuItem Header="排序与视图 ▾" ToolTip.Tip="{Binding SortMenuHeader}" FontSize="12" Padding="4,4" Width="74" Height="32">
                                 <MenuItem Header="组织方式" IsEnabled="False"/>
@@ -667,31 +627,6 @@
                                   Width="69" Height="32" Padding="4,0,0,0" VerticalAlignment="Center" FontSize="12"/>
                     </WrapPanel>
                     <DockPanel LastChildFill="True">
-                        <Border x:Name="FolderBreadcrumbBar" IsVisible="{Binding HasWorkspaceAncestors}" DockPanel.Dock="Left" MaxWidth="260" Margin="0,0,7,0" VerticalAlignment="Center">
-                            <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
-                                <StackPanel Orientation="Horizontal" Spacing="2" VerticalAlignment="Center">
-                                    <ItemsControl ItemsSource="{ReflectionBinding WorkspaceAncestorBreadcrumbs}">
-                                        <ItemsControl.ItemsPanel>
-                                            <ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate>
-                                        </ItemsControl.ItemsPanel>
-                                        <ItemsControl.ItemTemplate>
-                                            <DataTemplate>
-                                                <StackPanel Orientation="Horizontal" Spacing="2">
-
-                                                    <Button Classes="workspace-quiet" MinHeight="23" Padding="5,2" Click="FolderBreadcrumb_Click"
-                                                            ToolTip.Tip="{ReflectionBinding Path}">
-                                                        <TextBlock Text="{ReflectionBinding DisplayName}" MaxWidth="180"
-                                                                   TextTrimming="CharacterEllipsis"/>
-                                                    </Button>
-                                                    <TextBlock Text="&#xE76C;" FontFamily="Segoe MDL2 Assets" FontSize="11"
-                                                               Foreground="{DynamicResource WorkspaceMutedBrush}" VerticalAlignment="Center"/>
-                                                </StackPanel>
-                                            </DataTemplate>
-                                        </ItemsControl.ItemTemplate>
-                                    </ItemsControl>
-                                </StackPanel>
-                            </ScrollViewer>
-                        </Border>
                         <Button DockPanel.Dock="Left" Classes="workspace-title-link" MaxWidth="240"
                                 IsVisible="{Binding HasWorkspaceFolderTitle}" Click="WorkspaceFolderTitle_Click"
                                 ToolTip.Tip="{Binding CurrentFolder}">
@@ -701,7 +636,7 @@
                                    IsVisible="{Binding !HasWorkspaceFolderTitle}" ToolTip.Tip="{Binding WorkspaceTitle}"/>
                         <TextBlock Text="{Binding WorkspaceCountText}" Classes="workspace-meta" Margin="8,0,0,0" TextTrimming="CharacterEllipsis"/>
                     </DockPanel>
-                </DockPanel>
+                </Grid>
                 <WrapPanel ItemSpacing="6" LineSpacing="4">
                     <Button Content="{Binding TypeFilterText}" Classes="toolbar-chip" IsVisible="{Binding HasTypeFilter}"
                             Command="{Binding RemoveTypeFilterCommand}" ToolTip.Tip="移除此类型筛选"/>
@@ -723,9 +658,33 @@
             </StackPanel>
         </Border>
 
-        <Grid x:Name="WorkspaceGallery" Grid.Row="2" Grid.Column="1" Margin="27,3,27,0">
+        <Grid x:Name="WorkspaceGallery" Grid.Row="2" Grid.Column="1" Margin="27,3,27,0"
+              ColumnDefinitions="0,*" RowDefinitions="Auto,*">
+        <controls:RegionSearchPane x:Name="RegionSearchEditor" Grid.Column="0" Grid.RowSpan="2"
+                                   IsVisible="{Binding IsRegionSearchActive}" Margin="0,0,12,8"/>
+        <DockPanel Grid.Column="1" Margin="8,0,8,8" IsVisible="{Binding IsRegionSearchActive}">
+            <Button x:Name="RegionLimitButton" DockPanel.Dock="Right" Content="{Binding RegionSearchResultLimitLabel}" Classes="workspace-quiet">
+                <Button.Flyout>
+                    <Flyout Opened="RegionLimitFlyout_Opened">
+                        <StackPanel Spacing="10" Width="230">
+                            <TextBlock Text="最大搜索结果数" FontWeight="SemiBold"/>
+                            <TextBlock Text="与搜索设置共用，范围 1–500。" TextWrapping="Wrap"/>
+                            <NumericUpDown x:Name="RegionResultLimitInput" Minimum="1" Maximum="500" Increment="1" FormatString="0"/>
+                            <Button Content="应用" HorizontalAlignment="Right" Click="RegionLimitApply_Click"/>
+                        </StackPanel>
+                    </Flyout>
+                </Button.Flyout>
+            </Button>
+            <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                <TextBlock Text="搜索结果" FontWeight="SemiBold"/>
+                <TextBlock Text="{Binding RegionSearchResultCount, StringFormat='{}{0} 张'}" Classes="workspace-meta"/>
+            </StackPanel>
+        </DockPanel>
+        <TextBlock x:Name="RegionEmptyState" Grid.Column="1" Grid.Row="1" IsVisible="False"
+                   Text="选择或拖入图片后，搜索结果会显示在这里" TextWrapping="Wrap"
+                   HorizontalAlignment="Center" VerticalAlignment="Center" Margin="24" Classes="workspace-meta"/>
             <!-- A single content surface: folders and media scroll together. -->
-        <ScrollViewer x:Name="ThumbnailScrollViewer">
+        <ScrollViewer x:Name="ThumbnailScrollViewer" Grid.Column="1" Grid.Row="1">
             <Grid x:Name="ImagePanelHost" RowDefinitions="Auto,Auto,*"
                   Background="Transparent"
                   PointerPressed="ImagePanelHost_PointerPressed"
@@ -799,7 +758,7 @@
                 <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" Spacing="8"
                             Margin="12,0,0,0" VerticalAlignment="Center">
                     <TextBlock Text="缩略图" Classes="workspace-meta"/>
-                    <Slider Classes="workspace-zoom" Minimum="1" Maximum="10" Value="{Binding ZoomTick}"
+                    <Slider x:Name="WorkspaceZoomSlider" Classes="workspace-zoom" Minimum="1" Maximum="10" Value="{Binding ZoomTick}"
                             Width="80" VerticalAlignment="Center" AutomationProperties.Name="缩略图缩放">
                         <Slider.Resources>
                             <GridLength x:Key="SliderPreContentMargin">8</GridLength>
@@ -829,7 +788,7 @@
                         <Button Content="›" Classes="workspace-quiet" ToolTip.Tip="下一项搜索结果"
                                 AutomationProperties.Name="下一项搜索结果" Command="{Binding NextResultCommand}"/>
                     </StackPanel>
-                    <TextBlock Text="{Binding LoadedInfoText}" Classes="workspace-meta">
+                    <TextBlock x:Name="WorkspaceLoadedInfo" Text="{Binding LoadedInfoText}" Classes="workspace-meta">
                         <TextBlock.IsVisible>
                             <MultiBinding Converter="{x:Static BoolConverters.And}">
                                 <Binding Path="IsPagedDisplay"/>
@@ -850,14 +809,30 @@
             </DockPanel>
         </Border>
 
+        <Border x:Name="DetailSplitter" Grid.Row="1" Grid.RowSpan="3" Grid.Column="2"
+                IsVisible="False" Background="Transparent" Cursor="SizeWestEast" Focusable="True"
+                Classes="workspace-preview-splitter" ZIndex="2"
+                PointerPressed="DetailSplitter_PointerPressed" PointerMoved="DetailSplitter_PointerMoved"
+                PointerReleased="DetailSplitter_PointerReleased" PointerCaptureLost="DetailSplitter_PointerCaptureLost"
+                KeyDown="DetailSplitter_KeyDown">
+            <Grid IsHitTestVisible="False">
+                <Border Width="1" Background="{DynamicResource WorkspaceLineBrush}" HorizontalAlignment="Center"/>
+                <Border Classes="workspace-preview-grip" Width="3" Height="35" CornerRadius="2"
+                        HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Grid>
+        </Border>
+        <controls:DetailPreviewPane x:Name="DetailsPaneView" Grid.Row="1" Grid.RowSpan="3" Grid.Column="3"
+                                    DataContext="{Binding DetailsPane}" IsVisible="False" ZIndex="1"/>
+
         <Popup x:Name="HoverPreviewHost"
+               ShouldUseOverlayLayer="True"
                Placement="AnchorAndGravity"
                PlacementAnchor="TopLeft"
                PlacementGravity="BottomRight"
                IsLightDismissEnabled="False"
                TakesFocusFromNativeControl="False"
                Topmost="True">
-            <controls:HoverPreviewPopup x:Name="HoverPreviewContent"/>
+            <controls:HoverPreviewPopup x:Name="HoverPreviewContent" IsHitTestVisible="False"/>
         </Popup>
 
     </Grid>

@@ -110,10 +110,10 @@ public sealed class ChineseClipAndVideoServiceTests : IDisposable
 
         var missingVideo = Path.Combine(_testRoot, "nonexistent.mp4");
 
-        // Missing file dimensions return (1920, 1080)
+        // Missing dimensions remain unknown; never persist a fabricated landscape size.
         var dims = processor.GetDimensions(missingVideo);
-        Assert.Equal(1920, dims.Width);
-        Assert.Equal(1080, dims.Height);
+        Assert.Equal(0, dims.Width);
+        Assert.Equal(0, dims.Height);
 
         // Missing file thumbnail returns null
         var thumb = await processor.ExtractThumbnailAsync(missingVideo, 200, CancellationToken.None);
@@ -121,7 +121,7 @@ public sealed class ChineseClipAndVideoServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task VideoMediaProcessor_CachedOriginalFrame_GeneratesThumbnailAndDimensions()
+    public void VideoMediaProcessor_UnversionedOriginalFrame_IsNotTrusted()
     {
         var frameCache = new VideoOriginalFrameCacheService(_cacheDir);
         var processor = new VideoMediaProcessor(frameCache);
@@ -142,18 +142,11 @@ public sealed class ChineseClipAndVideoServiceTests : IDisposable
             File.WriteAllBytes(cachedFramePath, data.ToArray());
         }
 
-        // GetDimensions should now return cached frame's dimensions (640, 360)
+        // A JPEG alone has no source identity and cannot authorize reuse after same-path replacement.
         var dims = processor.GetDimensions(fakeVideo);
-        Assert.Equal(640, dims.Width);
-        Assert.Equal(360, dims.Height);
-
-        // ExtractThumbnailAsync should successfully return media result from cached frame
-        var result = await processor.ExtractThumbnailAsync(fakeVideo, decodeWidth: 160, CancellationToken.None);
-        Assert.NotNull(result);
-        Assert.Equal(640, result.Width);
-        Assert.Equal(360, result.Height);
-        Assert.NotNull(result.Data);
-        Assert.True(result.Data.Length > 0);
+        Assert.Equal(0, dims.Width);
+        Assert.Equal(0, dims.Height);
+        Assert.False(frameCache.Exists(fakeVideo));
     }
 
     [Fact]

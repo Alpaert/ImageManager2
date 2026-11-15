@@ -582,6 +582,10 @@ public class DiskThumbnailCache
             {
                 try { total += new FileInfo(file).Length; } catch { }
             }
+            var versioned = Path.Combine(_cacheRoot, "media_v2");
+            if (Directory.Exists(versioned))
+                foreach (var file in Directory.EnumerateFiles(versioned, "*.json", SearchOption.AllDirectories))
+                    try { total += new FileInfo(file).Length; } catch { }
             return total;
         }
         catch

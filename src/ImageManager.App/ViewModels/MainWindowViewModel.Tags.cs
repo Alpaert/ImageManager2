@@ -35,6 +35,7 @@ public partial class MainWindowViewModel
             InvalidateTagCountsCache();
             await RefreshTagCountsAsync(forceRefresh: true);
             SyncArtistName(oldName, newName);
+            await RefreshTagsAfterExternalWriteAsync(Array.Empty<string>(), refreshCounts: false);
             return RenameResult.Success;
         });
     }
@@ -65,6 +66,7 @@ public partial class MainWindowViewModel
             InvalidateTagCountsCache();
             await RefreshTagCountsAsync(forceRefresh: true);
             SyncArtistName(oldName, newName);
+            await RefreshTagsAfterExternalWriteAsync(Array.Empty<string>(), refreshCounts: false);
         });
     }
 
@@ -132,6 +134,15 @@ public partial class MainWindowViewModel
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
 
+        if (paths.Count == 0)
+            await _dispatcher.InvokeAsync(() =>
+            {
+                paths.AddRange(Images.Concat(ContinuousImageItemSource?.GetAllCachedItems() ?? [])
+                    .Select(item => item.FilePath)
+                    .Concat(!DetailsPane.IsFolder && DetailsPane.CurrentPath != null ? [DetailsPane.CurrentPath] : [])
+                    .Where(path => !string.IsNullOrWhiteSpace(path)).Distinct(StringComparer.OrdinalIgnoreCase));
+            });
+
         if (paths.Count > 0)
         {
             var tagMap = await _metaRepo.GetTagMapByPathsAsync(paths);
@@ -148,16 +159,17 @@ public partial class MainWindowViewModel
 
             await _dispatcher.InvokeAsync(() =>
             {
-                foreach (var item in Images)
+                foreach (var item in GetMaterializedThumbnailItems(paths))
                 {
-                    if (!tagMap.TryGetValue(item.FilePath, out var tags))
-                        continue;
-
-                    item.Tags = new List<string>(tags);
+                    item.Tags = tagMap.TryGetValue(item.FilePath, out var tags)
+                        ? new List<string>(tags)
+                        : new List<string>();
                     item.NotifyAll();
                 }
             });
         }
+
+        RefreshDetailsForFiles(paths.Count == 0 ? null : paths);
 
         if (refreshCounts)
         {
@@ -205,6 +217,7 @@ public partial class MainWindowViewModel
     public async Task DeleteTagFromAllImagesAsync(string tagName)
     {
         await _tagRepo.DeleteTagAsync(tagName);
+        RefreshDetailsForFiles();
 
         // Clear from in-memory caches
         lock (_tagCacheLock)
@@ -233,6 +246,7 @@ public partial class MainWindowViewModel
     public async Task RefreshImageTagsAsync(string filePath)
     {
         var meta = await Task.Run(() => _metaRepo.GetByPathAsync(filePath));
+        RefreshDetailsForFiles(new[] { filePath });
         if (meta == null) return;
 
         var tags = meta.Tags.Select(t => t.Name).ToList();
@@ -274,6 +288,19 @@ public partial class MainWindowViewModel
         {
             _tagCacheByPath[filePath] = normalizedTags;
         }
+        await _dispatcher.InvokeAsync(() =>
+        {
+            // A detail action edits a temporary item. Keep every existing gallery
+            // projection current so reopening the old editor cannot restore stale tags.
+            foreach (var item in Images.Concat(ContinuousImageItemSource?.GetAllCachedItems()
+                         ?? Array.Empty<ImageViewItem>()).Where(item =>
+                         string.Equals(item.FilePath, filePath, StringComparison.OrdinalIgnoreCase)))
+            {
+                item.Tags = normalizedTags.ToList();
+                item.NotifyAll();
+            }
+        });
+        RefreshDetailsForFiles(new[] { filePath });
     }
 
     public async Task AddTagToImageAsync(string filePath, string tag)
@@ -329,6 +356,7 @@ public partial class MainWindowViewModel
             await _metaRepo.AddTagToImagesAsync(pathToId.Values.ToList(), tag);
         }
 
+        RefreshDetailsForFiles(filePaths);
         InvalidateTagCountsCache();
         await RefreshTagCountsAsync(forceRefresh: true);
     }
@@ -355,6 +383,7 @@ public partial class MainWindowViewModel
             }
         }
 
+        RefreshDetailsForFiles(filePaths);
         InvalidateTagCountsCache();
         await RefreshTagCountsAsync(forceRefresh: true);
     }
@@ -375,6 +404,7 @@ public partial class MainWindowViewModel
                 await _metaRepo.SetAutoTagStatusByPathAsync(path, 0);
         }
 
+        RefreshDetailsForFiles(filePaths);
         InvalidateTagCountsCache();
         await RefreshTagCountsAsync(forceRefresh: true);
     }

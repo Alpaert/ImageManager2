@@ -1,6 +1,8 @@
 using ImageManager.Common.Constants;
 using ImageManager.Core.Services;
 using ImageManager.Infrastructure.Imaging;
+using ImageManager.Infrastructure.Caching;
+using ImageManager.Core.Models;
 
 namespace ImageManager.Infrastructure.Audio;
 
@@ -9,23 +11,24 @@ public sealed class MusicMediaProcessor : IMediaProcessor
 {
     public bool CanHandle(string extension) => FileTypeConstants.MusicExtensions.Contains(extension);
 
-    public Task<MediaResult?> ExtractThumbnailAsync(string filePath, int decodeWidth, CancellationToken ct)
+    public async Task<MediaResult?> ExtractThumbnailAsync(string filePath, int decodeWidth, CancellationToken ct)
+        => (await ExtractArtworkAsync(filePath, ct).ConfigureAwait(false)).Result;
+
+    internal Task<(MediaResult? Result, ArtworkOrigin Origin)> ExtractArtworkAsync(string filePath, CancellationToken ct)
     {
-        return Task.Run(() =>
+        return Task.Run<(MediaResult? Result, ArtworkOrigin Origin)>(() =>
         {
             ct.ThrowIfCancellationRequested();
-            byte[]? embeddedArtwork = null;
+            var hadEmbeddedCandidate = false;
+            byte[]? jpeg = null;
             var tagsReadable = false;
             try
             {
                 using var media = TagLib.File.Create(filePath);
                 tagsReadable = true;
                 var pictures = media.Tag.Pictures ?? Array.Empty<TagLib.IPicture>();
-                var picture = pictures.FirstOrDefault(item => item.Type == TagLib.PictureType.FrontCover)
-                    ?? pictures.FirstOrDefault();
-                embeddedArtwork = picture?.Data?.Data is { Length: > 0 } artwork
-                    ? artwork
-                    : null;
+                hadEmbeddedCandidate = pictures.Any(picture => picture.Data?.Data is { Length: > 0 });
+                jpeg = DecodeEmbeddedArtwork(pictures);
             }
             catch (OperationCanceledException)
             {
@@ -36,9 +39,7 @@ public sealed class MusicMediaProcessor : IMediaProcessor
                 // A readable sidecar can still provide artwork when tags are damaged.
             }
 
-            var jpeg = embeddedArtwork is { Length: > 0 }
-                ? ThumbnailGenerator.NormalizeJpeg(embeddedArtwork, 2048)
-                : null;
+            var origin = ArtworkOrigin.Embedded;
             if (jpeg == null)
             {
                 var sidecarPath = MusicArtworkResolver.FindSidecarArtwork(filePath);
@@ -46,32 +47,49 @@ public sealed class MusicMediaProcessor : IMediaProcessor
                 {
                     // Corrupt/unreadable tags and corrupt embedded artwork remain
                     // retryable; a valid tag set with no candidates is final.
-                    return tagsReadable && embeddedArtwork == null
-                        ? new MediaResult { IsFinalWithoutThumbnail = true }
-                        : null;
+                    return tagsReadable && !hadEmbeddedCandidate
+                        ? (new MediaResult { IsFinalWithoutThumbnail = true }, ArtworkOrigin.None)
+                        : (null, ArtworkOrigin.None);
                 }
 
                 try
                 {
-                    jpeg = ThumbnailGenerator.NormalizeJpeg(File.ReadAllBytes(sidecarPath), 2048);
+                    var sidecar = new FileInfo(sidecarPath);
+                    if (sidecar.Length > 32 * 1024 * 1024) return (null, ArtworkOrigin.None);
+                    var bytes = File.ReadAllBytes(sidecarPath);
+                    if (!ThumbnailCacheService.ValidEncodedImage(new("", bytes, 1, 1))) return (null, ArtworkOrigin.None);
+                    jpeg = ThumbnailGenerator.NormalizeJpeg(bytes, 2048);
+                    origin = MusicArtworkResolver.ClassifySidecar(filePath, sidecarPath);
                 }
                 catch
                 {
-                    return null;
+                    return (null, ArtworkOrigin.None);
                 }
             }
 
             if (jpeg == null)
-                return null;
+                return (null, ArtworkOrigin.None);
 
             var (width, height) = ThumbnailGenerator.GetDimensions(jpeg);
             if (width <= 0 || height <= 0)
-                return null;
+                return (null, ArtworkOrigin.None);
 
             ct.ThrowIfCancellationRequested();
-            return new MediaResult { Data = jpeg, Width = width, Height = height };
+            return (new MediaResult { Data = jpeg, Width = width, Height = height }, origin);
         }, ct);
     }
 
     public (int Width, int Height) GetDimensions(string filePath) => (0, 0);
+
+    internal static byte[]? DecodeEmbeddedArtwork(IEnumerable<TagLib.IPicture> pictures)
+    {
+        foreach (var picture in pictures.OrderBy(p => p.Type == TagLib.PictureType.FrontCover ? 0 : 1))
+        {
+            var bytes = picture.Data?.Data;
+            if (bytes is not { Length: > 0 } || !ThumbnailCacheService.ValidEncodedImage(new("", bytes, 1, 1))) continue;
+            var jpeg = ThumbnailGenerator.NormalizeJpeg(bytes, 2048);
+            if (jpeg != null) return jpeg;
+        }
+        return null;
+    }
 }

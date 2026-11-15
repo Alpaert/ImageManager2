@@ -294,7 +294,8 @@ public class AutoTagOrchestrator : IAutoTagOrchestrator, IDisposable
     public async Task<List<TagTranslationDto>> RunSingleImageAsync(string filePath, CancellationToken ct = default)
     {
         var activeTagService = _factory.Create(_currentMode);
-        var result = await activeTagService.PredictWithSourcesAsync(filePath, ct);
+        var source = await _metaRepo.GetByPathAsync(filePath);
+        var result = await _pipeline.PredictSingleWithSscdAsync(activeTagService, source?.Id ?? 0, filePath, ct);
         if (result.Rating is >= SystemRating.General and <= SystemRating.Explicit)
             await _metaRepo.SetSystemRatingByPathAsync(filePath, (int)result.Rating);
 

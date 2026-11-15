@@ -41,6 +41,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private readonly ITagRepository _tagRepo;
     private readonly ICharacterTagSuppressionRepository _characterTagSuppressionRepo;
     private readonly ISimilarImageService _similarService;
+    private readonly IRegionSearchService? _regionSearchService;
     private readonly IDuplicateService _duplicateService;
     private readonly IThumbnailCacheService _thumbCache;
 
@@ -55,7 +56,6 @@ public partial class MainWindowViewModel : ViewModelBase
 
     // Observable mirror properties for UI bindings (AppSettings is POCO, no INPC)
     [ObservableProperty] private string _waterfallMode = "None";
-    [ObservableProperty] private string _searchToolbarLayout = "A";
     [ObservableProperty] private bool _showFileName = true;
     [ObservableProperty] private bool _showTags = true;
     [ObservableProperty] private bool _showOrientation = true;
@@ -80,7 +80,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
     public void SyncUISettingsFromAppData()
     {
-        AppSettings.SearchToolbarLayout = NormalizeSearchToolbarLayout(AppSettings.SearchToolbarLayout);
+        UseRegionSearchOnImageDrop = AppSettings.UseRegionSearchOnImageDrop;
         AppSettings.ImageDisplayMode = NormalizeImageDisplayMode(AppSettings.ImageDisplayMode);
         CurrentSortScope = Enum.TryParse<ImageSortScope>(AppSettings.ImageSortScope, true, out var sortScope) &&
                            Enum.IsDefined(typeof(ImageSortScope), sortScope)
@@ -92,7 +92,6 @@ public partial class MainWindowViewModel : ViewModelBase
             : ImageSortOrder.FileNameAsc;
         AppSettings.ImageSortScope = CurrentSortScope.ToString();
         AppSettings.ImageSortOrder = CurrentSortOrder.ToString();
-        SearchToolbarLayout = AppSettings.SearchToolbarLayout;
         WaterfallMode = AppSettings.WaterfallMode;
         // Restore zoom for the current mode
         ZoomTick = AppSettings.WaterfallMode switch
@@ -110,50 +109,15 @@ public partial class MainWindowViewModel : ViewModelBase
         KeepPadding = AppSettings.ThumbnailNoTextKeepPadding;
         CornerRadiusDip = AppSettings.ThumbnailCornerRadius;
         DisplayMode = Enum.Parse<ImageDisplayMode>(AppSettings.ImageDisplayMode);
+        SyncDetailsPaneSettings();
         OnPropertyChanged(nameof(IsPagedDisplay));
     }
-
-    public bool IsSearchToolbarLayoutA => string.Equals(SearchToolbarLayout, "A", StringComparison.OrdinalIgnoreCase);
-    public bool IsSearchToolbarLayoutC => string.Equals(SearchToolbarLayout, "C", StringComparison.OrdinalIgnoreCase);
-    public bool IsTagSearchPopupOpenA => IsSearchToolbarLayoutA && IsTagSearchPopupOpen;
-    public bool IsTagSearchPopupOpenC => IsSearchToolbarLayoutC && IsTagSearchPopupOpen;
-
-    public void SetSearchToolbarLayout(string? layout)
-    {
-        var normalized = NormalizeSearchToolbarLayout(layout);
-        if (string.Equals(SearchToolbarLayout, normalized, StringComparison.OrdinalIgnoreCase))
-        {
-            AppSettings.SearchToolbarLayout = normalized;
-            return;
-        }
-
-        DismissTagSearchSuggestions();
-        SearchToolbarLayout = normalized;
-        AppSettings.SearchToolbarLayout = normalized;
-    }
-
-    private static string NormalizeSearchToolbarLayout(string? layout) =>
-        string.Equals(layout, "C", StringComparison.OrdinalIgnoreCase) ? "C" : "A";
 
     private string NormalizeImageDisplayMode(string? mode) =>
         IsContinuousDisplayAvailable &&
         string.Equals(mode, nameof(ImageDisplayMode.Continuous), StringComparison.OrdinalIgnoreCase)
             ? nameof(ImageDisplayMode.Continuous)
             : nameof(ImageDisplayMode.Paged);
-
-    partial void OnSearchToolbarLayoutChanged(string value)
-    {
-        OnPropertyChanged(nameof(IsSearchToolbarLayoutA));
-        OnPropertyChanged(nameof(IsSearchToolbarLayoutC));
-        OnPropertyChanged(nameof(IsTagSearchPopupOpenA));
-        OnPropertyChanged(nameof(IsTagSearchPopupOpenC));
-    }
-
-    partial void OnIsTagSearchPopupOpenChanged(bool value)
-    {
-        OnPropertyChanged(nameof(IsTagSearchPopupOpenA));
-        OnPropertyChanged(nameof(IsTagSearchPopupOpenC));
-    }
 
     /// <summary>Save current zoom to AppSettings for the given mode</summary>
     private void SaveZoomForMode(string? mode)
@@ -411,10 +375,13 @@ public partial class MainWindowViewModel : ViewModelBase
 
     public void ReplaceSelectedFiles(IEnumerable<string> filePaths)
     {
+        // Callers may pass SelectedFilePaths itself or a lazy projection of it.
+        var paths = filePaths.Where(path => !string.IsNullOrWhiteSpace(path)).ToArray();
         _selectedFilePaths.Clear();
-        foreach (var filePath in filePaths.Where(path => !string.IsNullOrWhiteSpace(path)))
+        foreach (var filePath in paths)
             _selectedFilePaths.Add(filePath);
         ApplySelectionToRealizedItems();
+        QueueDetailsSelectionRefresh();
     }
 
     public void SetFileSelected(string filePath, bool selected)
@@ -426,6 +393,8 @@ public partial class MainWindowViewModel : ViewModelBase
         else
             _selectedFilePaths.Remove(filePath);
         ApplySelectionToRealizedItems();
+        if (selected) _preferredDetailFilePath = filePath;
+        QueueDetailsSelectionRefresh();
     }
 
     public IReadOnlyList<ImageViewItem> GetSelectedRealizedItems() =>
@@ -496,7 +465,9 @@ public partial class MainWindowViewModel : ViewModelBase
         IVectorIndexService? vectorIndexService = null,
         IChineseClipService? chineseClipService = null,
         IVideoService? videoService = null,
-        IHashService? hashService = null)
+        IHashService? hashService = null,
+        IFolderDetailsService? folderDetailsService = null,
+        IRegionSearchService? regionSearchService = null)
     {
         _settingsRepo = settingsRepo;
         _folderRepo = folderRepo;
@@ -504,6 +475,7 @@ public partial class MainWindowViewModel : ViewModelBase
         _tagRepo = tagRepo;
         _characterTagSuppressionRepo = characterTagSuppressionRepo;
         _similarService = similarService;
+        _regionSearchService = regionSearchService;
         _duplicateService = duplicateService;
         _thumbCache = thumbCache;
         _pageManager = pageManager;
@@ -513,6 +485,9 @@ public partial class MainWindowViewModel : ViewModelBase
         _characterStore = characterStore;
         _messenger = messenger;
         _dispatcher = dispatcher;
+        _folderDetailsService = folderDetailsService;
+        DetailsPane = new DetailPaneViewModel(new DetailPaneDataLoader(_metaRepo, _thumbCache, folderDetailsService), dispatcher,
+            source => !_pageManager.UseViewportLoading || _pageManager.IsViewportThumbnailPending(source));
         _characterMatchingService = characterMatchingService;
         _mediaMoveService = mediaMoveService;
         _mediaThumbnailPrewarmService = mediaThumbnailPrewarmService;
@@ -531,6 +506,7 @@ public partial class MainWindowViewModel : ViewModelBase
             Images = new ObservableCollection<ImageViewItem>(args.Items);
             RestorePendingSelection(Images);
             ApplySelectionToRealizedItems();
+            QueueDetailsSelectionRefresh();
             _isNavigating = true;
             CurrentPage = args.PageIndex;
             _isNavigating = false;
@@ -546,6 +522,7 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             _dispatcher.Post(() =>
             {
+                if (IsRegionSearchActive) return;
                 InvalidateTagSuggestionRequest();
                 _searchResultSuggestionVersion = _tagSuggestionVersion;
                 SetCoTagFilterTextWithoutRefresh(string.Empty);
@@ -679,6 +656,9 @@ public partial class MainWindowViewModel : ViewModelBase
 
     public void ShutdownBackgroundWork()
     {
+        SuspendRegionSearch();
+        ReleaseRegionModelLease();
+        ShutdownDetailsPane();
         _automaticMaintenance.Dispose();
         CancelActiveBackgroundTasks();
         CancelDisplayFilter();

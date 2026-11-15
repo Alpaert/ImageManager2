@@ -1,0 +1,211 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:ImageManager.App.ViewModels"
+             xmlns:controls="using:ImageManager.App.Controls"
+             x:Class="ImageManager.App.Controls.DetailPreviewPane"
+             x:DataType="vm:DetailPaneViewModel" AutomationProperties.Name="文件预览">
+    <UserControl.Styles>
+        <Style Selector="TextBlock.detail-muted">
+            <Setter Property="Foreground" Value="{DynamicResource WorkspaceMutedBrush}"/>
+            <Setter Property="FontSize" Value="11"/>
+        </Style>
+        <Style Selector="TextBlock.detail-value">
+            <Setter Property="Foreground" Value="{DynamicResource WorkspaceTextBrush}"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="TextAlignment" Value="Right"/>
+            <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+        </Style>
+        <Style Selector="TextBlock.detail-heading">
+            <Setter Property="Foreground" Value="{DynamicResource WorkspaceTextBrush}"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="FontWeight" Value="Medium"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        <Style Selector="Border.detail-section">
+            <Setter Property="BorderBrush" Value="{DynamicResource WorkspaceLineBrush}"/>
+            <Setter Property="BorderThickness" Value="0,1,0,0"/>
+            <Setter Property="Margin" Value="0,17,0,0"/>
+            <Setter Property="Padding" Value="0,17,0,0"/>
+        </Style>
+        <Style Selector="Border.detail-tag">
+            <Setter Property="Background" Value="{DynamicResource WorkspaceSurfaceBrush}"/>
+            <Setter Property="CornerRadius" Value="4"/>
+            <Setter Property="Height" Value="24"/>
+            <Setter Property="Padding" Value="8,2"/>
+        </Style>
+        <Style Selector="Border.detail-tag > TextBlock">
+            <Setter Property="Foreground" Value="{DynamicResource WorkspaceMutedBrush}"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+        </Style>
+        <Style Selector="Button.detail-action">
+            <Setter Property="MinHeight" Value="32"/>
+            <Setter Property="Padding" Value="5"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="Foreground" Value="{DynamicResource WorkspaceMutedBrush}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource WorkspaceLineBrush}"/>
+        </Style>
+        <Style Selector="Button#DetailArt /template/ ContentPresenter#PART_ContentPresenter">
+            <Setter Property="Background" Value="{DynamicResource WorkspaceSidebarBrush}"/>
+        </Style>
+        <Style Selector="Border.detail-art-hint">
+            <Setter Property="IsVisible" Value="False"/>
+        </Style>
+        <Style Selector="Button#DetailArt:pointerover Border.detail-art-hint, Button#DetailArt:focus-visible Border.detail-art-hint">
+            <Setter Property="IsVisible" Value="True"/>
+        </Style>
+    </UserControl.Styles>
+    <Border x:Name="PaneSurface" Background="{DynamicResource WorkspaceCanvasBrush}"
+            BorderBrush="{DynamicResource WorkspaceLineBrush}" ClipToBounds="True">
+        <Grid RowDefinitions="49,*">
+            <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8" Margin="15,0,18,0">
+                <TextBlock Text="预览" Classes="detail-muted" FontSize="12" VerticalAlignment="Center" FontWeight="Medium"/>
+                <TextBlock Grid.Column="1" Text="{Binding SelectionHint}" IsVisible="{Binding HasItem}"
+                           Classes="detail-muted" FontSize="10" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                <Button Grid.Column="2" Classes="workspace-quiet" MinHeight="26" Width="26" Height="26" Padding="0"
+                        VerticalAlignment="Center" Tag="Collapse" Click="Action_Click"
+                        ToolTip.Tip="收起预览栏" AutomationProperties.Name="收起预览栏">
+                    <Path Width="16" Height="16" Stretch="Uniform" StrokeThickness="1.4"
+                          Stroke="{DynamicResource WorkspaceMutedBrush}"
+                          Data="M2,2 H18 V18 H2 Z M13,2 V18 M5,7 L8,10 L5,13"/>
+                </Button>
+            </Grid>
+            <StackPanel Grid.Row="1" IsVisible="{Binding !HasItem}" HorizontalAlignment="Center"
+                        VerticalAlignment="Center" Margin="20,0,20,72" Spacing="5">
+                <Path Width="34" Height="34" Stretch="Uniform" Opacity="0.5" Margin="0,0,0,7" StrokeThickness="1.4"
+                      Stroke="{DynamicResource WorkspaceMutedBrush}"
+                      Data="M2,3 H20 V17 H2 Z M2,14 L7,9 L12,14 L15,11 L20,16 M14,7 H15"/>
+                <TextBlock Text="点选媒体文件，即可预览" Classes="detail-muted" TextAlignment="Center" TextWrapping="Wrap" FontSize="12"/>
+            </StackPanel>
+            <ScrollViewer x:Name="DetailScrollViewer" Grid.Row="1" IsVisible="{Binding HasItem}"
+                          HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+                <StackPanel Margin="15,0,18,22">
+                    <Button x:Name="DetailArt" Height="182" Padding="0" CornerRadius="6" ClipToBounds="True"
+                            HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch"
+                            Background="{DynamicResource WorkspaceSidebarBrush}" BorderThickness="0" Tag="Open" Click="Action_Click">
+                        <Grid ClipToBounds="True">
+                            <StackPanel IsVisible="{Binding #DetailThumbnail.HasThumbnail, Converter={x:Static BoolConverters.Not}}"
+                                        VerticalAlignment="Center" HorizontalAlignment="Center" Spacing="4">
+                                <Path Width="36" Height="36" Stretch="Uniform" Opacity="0.55" IsVisible="{Binding CanEditTags}"
+                                      StrokeThickness="1.4" Stroke="{DynamicResource WorkspaceMutedBrush}"
+                                      Data="M2,3 H20 V17 H2 Z M2,14 L7,9 L12,14 L15,11 L20,16 M14,7 H15"/>
+                                <TextBlock Text="♫" Classes="detail-muted" FontSize="38" IsVisible="{Binding IsMusic}"/>
+                                <Path Width="36" Height="36" Stretch="Uniform" Opacity="0.55" IsVisible="{Binding IsFolder}"
+                                      StrokeThickness="1.4" Stroke="{DynamicResource WorkspaceMutedBrush}"
+                                      Data="M2,5 H8 L10,7 H20 V17 H2 Z"/>
+                                <TextBlock x:Name="DetailPlaceholder" Text="暂无预览" Classes="detail-muted"
+                                           IsVisible="{Binding !IsPreviewLoading}" TextAlignment="Center"/>
+                            </StackPanel>
+                            <controls:AsyncThumbnailImage x:Name="DetailThumbnail" Stretch="Uniform" DataContext="{Binding ThumbnailItem}"
+                                                          ThumbnailData="{ReflectionBinding ThumbnailData}"/>
+                            <Border Classes="detail-art-hint" HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                                    Margin="8" Padding="7,4" CornerRadius="4" Background="#C918181B">
+                                <TextBlock x:Name="DetailArtHint" Foreground="White" FontSize="10"/>
+                            </Border>
+                        </Grid>
+                    </Button>
+                    <TextBlock Text="{Binding FileName}" ToolTip.Tip="{Binding CurrentPath}" TextWrapping="Wrap"
+                               Classes="detail-heading" FontSize="14" FontWeight="SemiBold" Margin="0,14,0,4"/>
+                    <TextBlock x:Name="DetailMetaLine" Classes="detail-muted" TextTrimming="CharacterEllipsis"/>
+                    <Grid x:Name="DetailImageSearchActions" ColumnDefinitions="*,*" ColumnSpacing="6" Margin="0,10,0,0" IsVisible="False">
+                        <Button Classes="workspace-quiet detail-action" Content="找相似内容" Tag="SimilarContent" Click="Action_Click" HorizontalAlignment="Stretch"/>
+                        <Button Grid.Column="1" Classes="workspace-quiet detail-action" Content="框选搜图" Tag="RegionSearch" Click="Action_Click" HorizontalAlignment="Stretch"/>
+                    </Grid>
+                    <TextBlock x:Name="ReadingDetails" Text="正在读取文件信息…" Classes="detail-muted"
+                               IsVisible="{Binding IsLoading}" Margin="0,5,0,0"/>
+                    <TextBlock x:Name="PreviewFeedback" Classes="detail-muted" TextWrapping="Wrap" IsVisible="False" Margin="0,5,0,0"/>
+                    <TextBlock Text="{Binding ArtworkSourceText}" Classes="detail-muted" TextWrapping="Wrap" Margin="0,5,0,0"
+                               IsVisible="{Binding ArtworkSourceText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+                    <Button x:Name="RetryPreviewButton" Classes="workspace-quiet" IsVisible="False" Content="重试预览"
+                            Tag="RetryPreview" Click="Action_Click" HorizontalAlignment="Left"/>
+                    <Button Classes="workspace-quiet" IsVisible="{Binding CanRetrySave}" Content="重试保存"
+                            Tag="RetrySave" Click="Action_Click" HorizontalAlignment="Left"/>
+                    <TextBlock Text="{Binding ErrorText}" Classes="detail-muted" TextWrapping="Wrap" Margin="0,5,0,0"
+                               IsVisible="{Binding ErrorText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+                    <Border Classes="detail-section" IsVisible="{Binding CanEditTags}">
+                        <StackPanel>
+                            <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="6" Margin="0,0,0,10">
+                                <TextBlock Text="标签" Classes="detail-heading"/>
+                                <TextBlock Grid.Column="1" Text="{Binding Tags.Count}" Classes="detail-muted" VerticalAlignment="Center"/>
+                                <Button Grid.Column="2" Content="编辑" Classes="workspace-quiet" MinHeight="23" FontSize="11"
+                                        Padding="7,2,0,2" AutomationProperties.Name="编辑当前文件的标签" Tag="EditTags" Click="Action_Click"/>
+                            </Grid>
+                            <TextBlock x:Name="NoTags" Text="还没有标签" Classes="detail-muted"/>
+                            <ScrollViewer x:Name="TagScroller" MaxHeight="150" HorizontalScrollBarVisibility="Disabled"
+                                          VerticalScrollBarVisibility="Disabled">
+                                <WrapPanel x:Name="TagChips" ItemSpacing="6" LineSpacing="6"/>
+                            </ScrollViewer>
+                            <Button x:Name="ToggleTags" IsVisible="False" Classes="workspace-quiet" MinHeight="24" FontSize="11"
+                                    Padding="0,5,0,0" Foreground="{DynamicResource WorkspaceAccentBrush}" Click="ToggleTags_Click"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Classes="detail-section" IsVisible="{Binding !IsFolder}">
+                        <StackPanel Spacing="10">
+                            <TextBlock Text="文件信息" Classes="detail-heading"/>
+                            <Grid ColumnDefinitions="62,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto" ColumnSpacing="12" RowSpacing="9">
+                                <TextBlock Text="类型" Classes="detail-muted"/>
+                                <TextBlock Grid.Column="1" Text="{Binding FormatText}" Classes="detail-value"/>
+                                <TextBlock Grid.Row="1" Text="尺寸" Classes="detail-muted" IsVisible="{Binding !IsMusic}"/>
+                                <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding DimensionsText}" Classes="detail-value" IsVisible="{Binding !IsMusic}"/>
+                                <TextBlock Grid.Row="2" Text="大小" Classes="detail-muted"/>
+                                <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding FileSizeText}" Classes="detail-value"/>
+                                <TextBlock Grid.Row="3" Text="所在文件夹" Classes="detail-muted"/>
+                                <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding FolderPath}" Classes="detail-value" ToolTip.Tip="{Binding FolderPath}"/>
+                                <TextBlock Grid.Row="4" Text="修改时间" Classes="detail-muted"/>
+                                <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding ModifiedText}" Classes="detail-value"/>
+                                <TextBlock Grid.Row="5" Text="路径" Classes="detail-muted"/>
+                                <TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding CurrentPath}" Classes="detail-value" ToolTip.Tip="{Binding CurrentPath}"/>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+                    <Border Classes="detail-section" IsVisible="{Binding IsFolder}">
+                        <StackPanel Spacing="10">
+                            <TextBlock Text="文件夹信息（含子文件夹）" Classes="detail-heading" TextWrapping="Wrap"/>
+                            <Grid ColumnDefinitions="62,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto" ColumnSpacing="12" RowSpacing="9">
+                                <TextBlock Text="总大小" Classes="detail-muted"/>
+                                <TextBlock Grid.Column="1" Text="{Binding FileSizeText}" Classes="detail-value"/>
+                                <TextBlock Grid.Row="1" Text="文件数" Classes="detail-muted"/>
+                                <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding FolderFileCount}" Classes="detail-value"/>
+                                <TextBlock Grid.Row="2" Text="媒体数" Classes="detail-muted"/>
+                                <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding FolderMediaCount}" Classes="detail-value"/>
+                                <TextBlock Grid.Row="3" Text="子文件夹数" Classes="detail-muted"/>
+                                <TextBlock Grid.Row="3" Grid.Column="1" Text="{Binding FolderDirectoryCount}" Classes="detail-value"/>
+                                <TextBlock Grid.Row="4" Text="统计时间" Classes="detail-muted"/>
+                                <TextBlock Grid.Row="4" Grid.Column="1" Text="{Binding ModifiedText}" Classes="detail-value"/>
+                                <TextBlock Grid.Row="5" Text="路径" Classes="detail-muted"/>
+                                <TextBlock Grid.Row="5" Grid.Column="1" Text="{Binding CurrentPath}" Classes="detail-value"
+                                           ToolTip.Tip="{Binding CurrentPath}"/>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+                    <Border Classes="detail-section">
+                        <StackPanel Spacing="9">
+                            <Button x:Name="ToggleSimilar" Classes="workspace-quiet" FontSize="11" MinHeight="33"
+                                    Background="{DynamicResource WorkspaceSurfaceBrush}" HorizontalAlignment="Stretch"
+                                    HorizontalContentAlignment="Stretch" Click="ToggleSimilar_Click">
+                                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="7">
+                                    <TextBlock Text="查找相似图片"/>
+                                    <TextBlock x:Name="SimilarChevron" Grid.Column="1" Text="⌄"/>
+                                </Grid>
+                            </Button>
+                            <Grid x:Name="SimilarOptions" IsVisible="False" ColumnDefinitions="*,*" RowDefinitions="Auto,Auto,Auto" ColumnSpacing="5" RowSpacing="5">
+                                <Button Classes="workspace-quiet detail-action" HorizontalAlignment="Stretch" Content="感知相似" Tag="Perceptual" Click="Action_Click"/>
+                                <Button Grid.Column="1" Classes="workspace-quiet detail-action" HorizontalAlignment="Stretch" Content="语义相似" Tag="Semantic" Click="Action_Click"/>
+                                <Button Grid.Row="1" Classes="workspace-quiet detail-action" HorizontalAlignment="Stretch" Content="氛围相似" Tag="Atmosphere" Click="Action_Click"/>
+                                <Button Grid.Row="1" Grid.Column="1" Classes="workspace-quiet detail-action" HorizontalAlignment="Stretch" Content="颜色相似" Tag="Color" Click="Action_Click"/>
+                                <Button Grid.Row="2" Grid.ColumnSpan="2" Classes="workspace-quiet detail-action" HorizontalAlignment="Stretch" Content="框选搜图…" Tag="RegionSearch" Click="Action_Click"/>
+                            </Grid>
+                            <Grid ColumnDefinitions="*,*,30" ColumnSpacing="7">
+                                <Button x:Name="DetailOpen" Classes="workspace-quiet detail-action" HorizontalAlignment="Stretch" Tag="Open" Click="Action_Click"/>
+                                <Button Grid.Column="1" Classes="workspace-quiet detail-action" HorizontalAlignment="Stretch" Content="复制路径" Tag="CopyPath" Click="Action_Click"/>
+                                <Button x:Name="MoreActions" Grid.Column="2" Content="···" Classes="workspace-quiet detail-action"
+                                        ToolTip.Tip="更多当前文件操作" AutomationProperties.Name="更多当前文件操作" Click="MoreActions_Click"/>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </ScrollViewer>
+        </Grid>
+    </Border>
+</UserControl>

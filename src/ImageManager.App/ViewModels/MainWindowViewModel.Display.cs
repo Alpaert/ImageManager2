@@ -508,7 +508,7 @@ public partial class MainWindowViewModel
         return Images
             .Concat(ContinuousImageItemSource?.GetAllCachedItems() ?? Array.Empty<ImageViewItem>())
             .Where(item => paths.Contains(item.FilePath))
-            .DistinctBy(item => item.FilePath, StringComparer.OrdinalIgnoreCase)
+            .Distinct()
             .ToArray();
     }
 

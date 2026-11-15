@@ -4,4 +4,6 @@
     <ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="../../src/ImageManager.App/ImageManager.App.csproj" /></ItemGroup>
+  <!-- App keeps its Windows ONNX package private; real inference checks need their own native runtime. -->
+  <ItemGroup><PackageReference Include="Microsoft.ML.OnnxRuntime.Gpu.Windows" Version="1.26.0" /></ItemGroup>
 </Project>

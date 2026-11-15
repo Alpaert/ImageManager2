@@ -92,6 +92,8 @@ public static class VideoThumbnailGenerator
         {
             var metadata = await VideoMetadataExtractor.ExtractMetadataAsync(filePath, ct);
             if (metadata == null) return null;
+            // Bound decoder input as well as output. Default thumbnail buffers 100 full frames.
+            if ((long)metadata.Value.Width * metadata.Value.Height > 40_000_000) return null;
 
             double startTimestamp = metadata.Value.Duration * 0.25;
             string tsStr = startTimestamp.ToString("F2", CultureInfo.InvariantCulture);
@@ -101,7 +103,7 @@ public static class VideoThumbnailGenerator
             try
             {
                 tempFile = Path.Combine(Path.GetTempPath(), $"thumb_{Guid.NewGuid():N}.jpg");
-                string args = $"-ss {tsStr} -i \"{filePath}\" -t 5 -vf \"thumbnail\" -frames:v 1 -update 1 -q:v 2 \"{tempFile}\"";
+                string args = $"-threads 2 -ss {tsStr} -i \"{filePath}\" -t 5 -vf \"thumbnail=1\" -frames:v 1 -update 1 -q:v 2 \"{tempFile}\"";
                 var (exitCode, _, _) = await FFmpegManager.RunAsync(args, 30, ct);
                 if (exitCode == 0 && File.Exists(tempFile))
                 {

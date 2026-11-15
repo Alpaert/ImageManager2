@@ -242,6 +242,17 @@ public class PageManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// True until this item's queued viewport work has actually finished, including
+    /// cancellation while a native decoder is still returning. IsLoading alone also
+    /// describes unloaded placeholders and cannot identify an active request.
+    /// </summary>
+    public bool IsViewportThumbnailPending(ImageViewItem item)
+    {
+        lock (_queuedRequests)
+            return _queuedRequests.Any(request => ReferenceEquals(request.Item, item));
+    }
+
     public void UpdatePagedViewport(
         IReadOnlyList<ImageViewItem> pageItems,
         IReadOnlyList<ImageViewItem> visibleItems,
@@ -498,14 +509,14 @@ public class PageManager : IDisposable
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
     }
 
-    public async Task RegenerateThumbnailsAsync(List<ImageViewItem> items)
+    public async Task<(int Generated, int NoArtwork, int Failed, int InvalidationNotSaved)> RegenerateThumbnailsAsync(List<ImageViewItem> items)
     {
         var targetPaths = new HashSet<string>(
             items.Where(item => !string.IsNullOrWhiteSpace(item.FilePath))
                 .Select(item => item.FilePath),
             StringComparer.OrdinalIgnoreCase);
         if (targetPaths.Count == 0)
-            return;
+            return (0, 0, 0, 0);
 
         var cachedItems = _cache.GetAllItems()
             .Where(item => targetPaths.Contains(item.FilePath))
@@ -520,11 +531,22 @@ public class PageManager : IDisposable
                 affectedItems.Add(item);
         }
 
-        foreach (var path in targetPaths)
-            _thumbCache.InvalidateThumbnail(path);
+        int invalidationNotSaved = 0;
+        await Task.Run(() =>
+        {
+            foreach (var path in targetPaths)
+            {
+                if (_thumbCache is ThumbnailCacheService cache)
+                {
+                    if (!cache.TryInvalidatePreview(path)) invalidationNotSaved++;
+                }
+                else _thumbCache.InvalidateThumbnail(path);
+            }
+        });
 
         foreach (var item in affectedItems)
         {
+            item.ThumbnailVersion = null;
             item.ThumbnailData = null;
             item.HasNoPreview = false;
             item.IsRefreshingThumbnail = false;
@@ -533,12 +555,17 @@ public class PageManager : IDisposable
             item.NotifyAll();
         }
 
+        int generated = 0, noArtwork = 0, failed = 0;
         foreach (var group in affectedItems.GroupBy(item => item.FilePath, StringComparer.OrdinalIgnoreCase))
         {
             var primary = group.First();
             await LoadSingleThumbnailAsync(primary, source: ThumbnailLoadSource.Viewport);
+            if (primary.ThumbnailData is { Length: > 0 }) generated++;
+            else if (primary.HasNoPreview && primary.IsLoaded) noArtwork++;
+            else failed++;
             foreach (var item in group.Skip(1))
             {
+                item.ThumbnailVersion = primary.ThumbnailVersion;
                 item.ThumbnailData = primary.ThumbnailData;
                 item.Width = primary.Width;
                 item.Height = primary.Height;
@@ -548,6 +575,7 @@ public class PageManager : IDisposable
             }
             PostLoadedItems(group);
         }
+        return (generated, noArtwork, failed, invalidationNotSaved);
     }
 
     public int EstimateVisibleItemCount(PageUiState state)
@@ -1109,14 +1137,17 @@ public class PageManager : IDisposable
                 var published = await PublishThumbnailAsync(() =>
                 {
                     if (!IsCurrent()) return false;
+                    if (_thumbCache is ThumbnailCacheService versioned && result.Version is { } version &&
+                        !versioned.IsKnownPreviewVersionCurrent(path, version)) return false;
                     if (result.Data != null)
                     {
                         SetDecodedDimensionsIfUnknown(item, result.Width, result.Height);
+                        item.ThumbnailVersion = result.Version;
                         item.ThumbnailData = result.Data;
                         item.HasNoPreview = false;
                         item.IsLoaded = true;
                     }
-                    else if (result.IsFinalWithoutThumbnail || FileTypeConstants.IsMusicFile(path))
+                    else if (result.IsFinalWithoutThumbnail)
                     {
                         item.ThumbnailData = null;
                         item.HasNoPreview = true;

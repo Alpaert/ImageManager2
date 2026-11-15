@@ -48,16 +48,6 @@
 
                 <Separator Margin="0,4"/>
 
-                <TextBlock Text="搜索栏布局" FontWeight="SemiBold" FontSize="14"/>
-                <ComboBox Width="260"
-                          ItemsSource="{Binding SearchToolbarLayoutOptions}"
-                          SelectedIndex="{Binding SearchToolbarLayoutIndex}"/>
-                <TextBlock Text="A 将常用检索固定显示，高级搜索按需展开；C 使用紧凑命令栏，将低频功能收进菜单。"
-                           Foreground="{DynamicResource SecondaryFgBrush}"
-                           FontSize="12" TextWrapping="Wrap"/>
-
-                <Separator Margin="0,4"/>
-
                 <TextBlock Text="图片显示方式" FontWeight="SemiBold" FontSize="14"/>
                 <StackPanel Spacing="4">
                     <RadioButton Content="分页显示"

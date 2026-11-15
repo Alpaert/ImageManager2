@@ -13,6 +13,8 @@ public class AppSettings
     public double PreviewHeight { get; set; }
     public double PreviewLeft { get; set; } = double.NaN;
     public double PreviewTop { get; set; } = double.NaN;
+    public bool DetailsPaneOpen { get; set; } = true;
+    public double DetailsPaneWidth { get; set; } = 312;
     public string WallpaperPath { get; set; } = string.Empty;
     public string WallpaperStretch { get; set; } = "UniformToFill";
     public string WallpaperAlignment { get; set; } = "Center";
@@ -25,8 +27,6 @@ public class AppSettings
     public bool ThumbnailNoTextKeepPadding { get; set; } = false;
     public double ThumbnailCornerRadius { get; set; }
     public string ThemeVariant { get; set; } = "Dark";
-    /// <summary>Top search toolbar layout: A (layered) or C (command bar).</summary>
-    public string SearchToolbarLayout { get; set; } = "A";
     /// <summary>Image result projection: Paged or Continuous.</summary>
     public string ImageDisplayMode { get; set; } = "Paged";
     /// <summary>File ordering scope: AllFiles or FolderGrouped.</summary>
@@ -51,6 +51,7 @@ public class AppSettings
     public Dictionary<string, string> ShortcutBindings { get; set; } = new();
     public PerceptualSearchResultMode PerceptualSearchResultMode { get; set; } = PerceptualSearchResultMode.Ranked;
     public int SimilaritySearchResultLimit { get; set; } = 50;
+    public bool UseRegionSearchOnImageDrop { get; set; }
 
     /// <summary>Hash algorithm version — bump to force re-computation of all perceptual hashes</summary>
     public string HashVersion { get; set; } = "1";

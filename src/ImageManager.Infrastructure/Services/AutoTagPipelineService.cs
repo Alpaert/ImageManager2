@@ -4,6 +4,7 @@ using System.Threading.Channels;
 using ImageManager.Common.Helpers;
 using ImageManager.Core.Models;
 using ImageManager.Core.Services;
+using ImageManager.Infrastructure.Imaging;
 
 
 namespace ImageManager.Infrastructure.Services;
@@ -24,6 +25,8 @@ public class AutoTagPipelineService : IDisposable
     private readonly IEnsembleTagService _tagService;
     private readonly IAutoTagStateRepository _stateRepo;
     private readonly IImageEmbeddingRepository _embeddingRepo;
+    private readonly SscdEmbeddingService? _sscd;
+    private readonly SscdIndexWriter? _sscdWriter;
     private readonly ICharacterTagSuppressionRepository _suppressionRepo;
     private double _confidenceThreshold = 0.35;
     private int _maxTagsPerImage = 20;
@@ -37,13 +40,16 @@ public class AutoTagPipelineService : IDisposable
         IEnsembleTagService tagService,
         IAutoTagStateRepository stateRepo,
         IImageEmbeddingRepository embeddingRepo,
-        ICharacterTagSuppressionRepository suppressionRepo)
+        ICharacterTagSuppressionRepository suppressionRepo,
+        SscdEmbeddingService? sscd = null, SscdIndexWriter? sscdWriter = null)
     {
         _metaRepo = metaRepo;
         _tagService = tagService;
         _stateRepo = stateRepo;
         _embeddingRepo = embeddingRepo;
         _suppressionRepo = suppressionRepo;
+        _sscd = sscd;
+        _sscdWriter = sscdWriter;
     }
 
     public void Configure(double confidenceThreshold, int maxTagsPerImage)
@@ -93,6 +99,18 @@ public class AutoTagPipelineService : IDisposable
     {
         using var autoTagRun = AutoTagRuntimeState.Enter();
         var activeTagService = tagService ?? _tagService;
+        var sscdEnabled = _sscd?.IsAvailable == true && _sscdWriter != null;
+        var validSscdIds = new HashSet<long>();
+        if (sscdEnabled)
+        {
+            try { validSscdIds = await _sscdWriter!.GetValidIdsAsync(ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                sscdEnabled = false;
+                AppLogger.Warn($"Unable to read SSCD coverage during tagging: {ex.Message}");
+            }
+        }
+
         bool hasState = folderId > 0;
         int runId = Interlocked.Increment(ref _pipelineRunCount);
         int total = metas.Count;
@@ -115,7 +133,7 @@ public class AutoTagPipelineService : IDisposable
             await _stateRepo.UpsertStateAsync(state);
         }
 
-        var channel = Channel.CreateBounded<(long ImageId, string FilePath, List<TagPrediction> Predictions, float[]? Embedding, SystemRating Rating)>(
+        var channel = Channel.CreateBounded<(long ImageId, string FilePath, List<TagPrediction> Predictions, float[]? Embedding, SystemRating Rating, SscdIndexWrite? Sscd)>(
             new BoundedChannelOptions(16) { SingleWriter = true, SingleReader = true,
                 FullMode = BoundedChannelFullMode.Wait });
 
@@ -171,10 +189,13 @@ public class AutoTagPipelineService : IDisposable
                         List<TagPrediction> predictions;
                         float[]? embedding = null;
                         var rating = SystemRating.Unknown;
+                        SscdIndexWrite? sscdWrite = null;
                         var inferSw = Stopwatch.StartNew();
                         if (activeTagService is IEnsembleTagService ensemble)
                         {
-                            var result = await ensemble.PredictWithSourcesAsync(meta.FilePath, ct);
+                            var (result, pendingSscd) = await PredictWithOptionalSscdAsync(
+                                ensemble, meta.Id, meta.FilePath, sscdEnabled && !validSscdIds.Contains(meta.Id), ct);
+                            sscdWrite = pendingSscd;
                             predictions = result.MergedTags;
                             embedding = result.Embedding;
                             rating = result.Rating;
@@ -190,7 +211,7 @@ public class AutoTagPipelineService : IDisposable
                             .Where(p => p.Confidence >= _confidenceThreshold)
                             .Take(_maxTagsPerImage)
                             .ToList();
-                        await channel.Writer.WriteAsync((meta.Id, meta.FilePath, filtered, embedding, rating), ct);
+                        await channel.Writer.WriteAsync((meta.Id, meta.FilePath, filtered, embedding, rating, sscdWrite), ct);
                     }
                     catch (OperationCanceledException) { break; }
                     catch (OutOfMemoryException ex)
@@ -216,9 +237,9 @@ public class AutoTagPipelineService : IDisposable
         {
             var completed = 0;
             const int BatchChunkSize = 32;
-            var chunkBuffer = new List<(long ImageId, string FilePath, List<TagPrediction> Predictions, float[]? Embedding, SystemRating Rating)>(BatchChunkSize);
+            var chunkBuffer = new List<(long ImageId, string FilePath, List<TagPrediction> Predictions, float[]? Embedding, SystemRating Rating, SscdIndexWrite? Sscd)>(BatchChunkSize);
 
-            async Task FlushChunkAsync(List<(long ImageId, string FilePath, List<TagPrediction> Predictions, float[]? Embedding, SystemRating Rating)> buffer)
+            async Task FlushChunkAsync(List<(long ImageId, string FilePath, List<TagPrediction> Predictions, float[]? Embedding, SystemRating Rating, SscdIndexWrite? Sscd)> buffer)
             {
                 if (buffer.Count == 0) return;
                 var flushSw = Stopwatch.StartNew();
@@ -312,6 +333,19 @@ public class AutoTagPipelineService : IDisposable
                     swStep.Stop();
                     totalEmbeddingTicks += swStep.ElapsedTicks;
                 }
+                if (_sscdWriter is not null)
+                {
+                    var sscdBatch = buffer.Where(item => item.Sscd is not null).Select(item => item.Sscd!).ToArray();
+                    if (sscdBatch.Length > 0)
+                    {
+                        try { await _sscdWriter.WriteAsync(sscdBatch, ct); }
+                        catch (Exception ex) when (ex is not OperationCanceledException)
+                        {
+                            AppLogger.Warn($"SSCD vectors can be backfilled later: {ex.Message}");
+                        }
+                    }
+                }
+
 
                 buffer.Clear();
                 flushSw.Stop();
@@ -419,6 +453,95 @@ public class AutoTagPipelineService : IDisposable
         return processedPaths;
     }
 
+    internal async Task<EnsembleResult> PredictSingleWithSscdAsync(
+        IEnsembleTagService ensemble, long id, string path, CancellationToken ct)
+    {
+        if (_sscd?.IsAvailable != true || _sscdWriter is null || id <= 0)
+            return await ensemble.PredictWithSourcesAsync(path, ct);
+
+        using var tagRun = AutoTagRuntimeState.Enter();
+        var includeSscd = true;
+        try
+        {
+            var cached = await _embeddingRepo.GetValidSearchEmbeddingsByPathsAsync(
+                SscdEmbeddingService.ModelKey, SscdEmbeddingService.ModelVersion, [path], ct);
+            includeSscd = !cached.Any(row => RegionSearchService.IsUsableVector(row.Embedding, SscdEmbeddingService.Dimension)
+                && RegionSearchService.MatchesFileState(path, row.SourceFileSize, row.SourceLastWriteTicks));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            includeSscd = false;
+            AppLogger.Warn($"Unable to read SSCD coverage during tagging: {ex.Message}");
+        }
+
+        var (result, pending) = await PredictWithOptionalSscdAsync(ensemble, id, path, includeSscd, ct);
+        if (pending is not null)
+        {
+            try { await _sscdWriter.WriteAsync([pending], ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                AppLogger.Warn($"SSCD vector can be backfilled later: {ex.Message}");
+            }
+        }
+        return result;
+    }
+
+    private async Task<(EnsembleResult Result, SscdIndexWrite? Write)> PredictWithOptionalSscdAsync(
+        IEnsembleTagService ensemble, long id, string path, bool includeSscd, CancellationToken ct)
+    {
+        if (!includeSscd || _sscd?.IsAvailable != true ||
+            (ensemble is not EnsembleTagService && ensemble is not SingleModelTagService))
+            return (await ensemble.PredictWithSourcesAsync(path, ct), null);
+
+        var source = await TryOpenSscdSourceAsync(id, path, ct);
+        using var sourceLock = source?.Stream;
+        using var bitmap = source is null ? null : InferenceImageLoader.DecodeForInference(path);
+        if (bitmap is null || source is null)
+            return (await ensemble.PredictWithSourcesAsync(path, ct), null);
+
+        var result = ensemble is EnsembleTagService dual
+            ? await dual.PredictWithSourcesAsync(bitmap, Path.GetFileName(path), ct)
+            : await ((SingleModelTagService)ensemble).PredictWithSourcesAsync(bitmap, ct);
+        if (!RegionSearchService.MatchesFileState(path, source.Size, source.Ticks))
+            return (result, null);
+
+        try
+        {
+            var vector = await _sscd.EncodeAsync(bitmap, ct);
+            return (result, new SscdIndexWrite(id, path, source.Size, source.Ticks, vector, source.Hash));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            AppLogger.Warn($"SSCD vector can be backfilled later: {ex.Message}");
+            return (result, null);
+        }
+    }
+
+    private sealed record SscdTagSource(FileStream Stream, long Size, long Ticks, string? Hash);
+
+    private async Task<SscdTagSource?> TryOpenSscdSourceAsync(long id, string path, CancellationToken ct)
+    {
+        FileStream? stream = null;
+        try
+        {
+            var state = await _sscdWriter!.GetSourceAsync(id, ct);
+            if (state is not { } row || !string.Equals(row.FilePath, path, StringComparison.OrdinalIgnoreCase))
+                return null;
+            stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (stream.Length != row.FileSize || File.GetLastWriteTimeUtc(path).Ticks != row.LastWriteTicks)
+                return null;
+            var source = new SscdTagSource(stream, row.FileSize, row.LastWriteTicks, row.FileHash);
+            stream = null;
+            return source;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            AppLogger.Warn($"SSCD source will be backfilled later: {ex.Message}");
+            return null;
+        }
+        finally { stream?.Dispose(); }
+    }
+
     private async Task FlushEmbeddingBufferAsync(List<(long ImageMetaId, string? FileHash, float[] Embedding)> buffer)
     {
         if (buffer.Count == 0) return;

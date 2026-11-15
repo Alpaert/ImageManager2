@@ -30,8 +30,22 @@ public enum VectorIndexKind
 {
     Semantic = 1,
     Atmosphere = 2,
-    Color = 3
+    Color = 3,
+    Sscd = 4
 }
+
+public enum RegionSearchMode
+{
+    FindOriginal,
+    SimilarContent
+}
+
+public sealed record ImageRegion(int X, int Y, int Width, int Height);
+
+public sealed record RegionSearchResponse(
+    IReadOnlyList<SimilaritySearchResult> Results,
+    int IndexedImages,
+    int CandidateImages);
 
 public sealed record VectorIndexScope(string? FolderPath, bool IncludeSubfolders = true)
 {
