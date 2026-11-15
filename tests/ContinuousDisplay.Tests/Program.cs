@@ -129,6 +129,8 @@ try
     main.Show();
     Pump();
     VerifyWorkspaceDetailsGeometry();
+    VerifyWorkspaceDetailsGeometry(maxWidth: 1000);
+    if (args.Contains("--workspace-geometry-only")) return;
     BreadcrumbNativeChecks.VerifyWorkspace(main, vm);
     var hoverPreview = main.FindControl<HoverPreviewPopup>("HoverPreviewContent")!;
     var hoverHost = main.FindControl<Avalonia.Controls.Primitives.Popup>("HoverPreviewHost")!;
@@ -330,50 +332,77 @@ try
         Console.WriteLine($"PASS detail resize anchor and source retention: {vm.WaterfallMode}");
     }
 
-    void VerifyWorkspaceDetailsGeometry()
+    void VerifyWorkspaceDetailsGeometry(double? maxWidth = null)
     {
         var previousWidth = main.Width;
+        var previousMaxWidth = main.MaxWidth;
         var root = main.FindControl<Grid>("RootGrid")!;
         var pane = main.FindControl<DetailPreviewPane>("DetailsPaneView")!;
         var splitter = main.FindControl<Border>("DetailSplitter")!;
         var search = main.FindControl<Border>("WorkspaceSearchBar")!;
-        main.Width = 1280;
-        Pump();
-        var wideMiddle = root.ColumnDefinitions[1].ActualWidth;
-        if (Math.Abs(pane.Bounds.Width - 312) > 1 || Grid.GetColumnSpan(search) != 3)
-            throw new InvalidOperationException("The detail pane or full-width search row differs from the prototype.");
-        main.Width = 1120;
-        Pump();
-        if (Math.Abs(pane.Bounds.Width - 312) > 1 || root.ColumnDefinitions[1].ActualWidth >= wideMiddle)
-            throw new InvalidOperationException("Shrinking the outer window should first shrink the gallery.");
-        main.Width = 740;
-        Pump();
-        if (pane.Bounds.Width >= 312 || root.ColumnDefinitions[1].ActualWidth < 269 || vm.DetailsPane.PreferredWidth != 312)
-            throw new InvalidOperationException("Narrow windows must clamp actual pane width without losing its preferred width.");
-        main.Width = 700;
-        Pump();
-        if (Grid.GetColumn(pane) != 1 || splitter.IsVisible || pane.Bounds.Width > root.ColumnDefinitions[1].ActualWidth)
-            throw new InvalidOperationException("Small windows must show the details as a bounded overlay.");
-        main.Width = 1280;
-        Pump();
-        vm.ReplaceSelectedFiles([paths[0], paths[1]]);
-        Pump();
-        pane.FindControl<Button>("DetailOpen")!.RaiseEvent(new KeyEventArgs
+        try
         {
-            RoutedEvent = InputElement.KeyDownEvent, Key = Key.A, KeyModifiers = KeyModifiers.Control
-        });
-        Pump();
-        if (vm.SelectedFilePaths.Count != 2)
-            throw new InvalidOperationException("A keyboard action inside the pane changed gallery selection.");
-        vm.ReplaceSelectedFiles([]);
-        vm.DetailsPane.IsOpen = false;
-        Pump();
-        if (pane.IsVisible || root.ColumnDefinitions[3].ActualWidth != 0)
-            throw new InvalidOperationException("Collapsing the pane did not return the space to the gallery.");
-        vm.DetailsPane.IsOpen = true;
-        main.Width = previousWidth;
-        Pump();
-        Console.WriteLine("PASS main window details: full search row, fixed pane, gallery-first shrink, narrow overlay, collapse and keyboard isolation");
+            if (maxWidth is { } limit) main.MaxWidth = Math.Min(previousMaxWidth, limit);
+            // Hosted Windows desktops can be narrower than both 1280 and 1120.
+            // Request two attainable client sizes so native clamping cannot make
+            // the "wide" and "narrow" windows identical. Keep space for the frame.
+            var screen = main.Screens.ScreenFromVisual(main) ?? main.Screens.Primary;
+            var availableWidth = screen is null ? main.ClientSize.Width : screen.WorkingArea.Width / main.RenderScaling - 64;
+            var wideWidth = Math.Floor(Math.Min(1280, Math.Min(availableWidth, main.MaxWidth)));
+            var narrowerWidth = Math.Max(780, wideWidth - 160);
+            if (wideWidth - narrowerWidth < 16)
+                throw new InvalidOperationException($"Desktop too narrow for fixed-pane resize check: available={availableWidth}, max={main.MaxWidth}.");
+            ResizeWorkspace(wideWidth);
+            var wideMiddle = root.ColumnDefinitions[1].ActualWidth;
+            if (Math.Abs(pane.Bounds.Width - 312) > 1 || Grid.GetColumnSpan(search) != 3)
+                throw new InvalidOperationException("The detail pane or full-width search row differs from the prototype.");
+            ResizeWorkspace(narrowerWidth);
+            if (Math.Abs(pane.Bounds.Width - 312) > 1 || root.ColumnDefinitions[1].ActualWidth >= wideMiddle)
+                throw new InvalidOperationException($"Shrinking the outer window should first shrink the gallery: client {wideWidth}->{main.ClientSize.Width}, gallery {wideMiddle}->{root.ColumnDefinitions[1].ActualWidth}, pane={pane.Bounds.Width}.");
+            ResizeWorkspace(740);
+            if (pane.Bounds.Width >= 312 || root.ColumnDefinitions[1].ActualWidth < 269 || vm.DetailsPane.PreferredWidth != 312)
+                throw new InvalidOperationException("Narrow windows must clamp actual pane width without losing its preferred width.");
+            ResizeWorkspace(700);
+            if (Grid.GetColumn(pane) != 1 || splitter.IsVisible || pane.Bounds.Width > root.ColumnDefinitions[1].ActualWidth)
+                throw new InvalidOperationException("Small windows must show the details as a bounded overlay.");
+            ResizeWorkspace(wideWidth);
+            vm.ReplaceSelectedFiles([paths[0], paths[1]]);
+            Pump();
+            pane.FindControl<Button>("DetailOpen")!.RaiseEvent(new KeyEventArgs
+            {
+                RoutedEvent = InputElement.KeyDownEvent, Key = Key.A, KeyModifiers = KeyModifiers.Control
+            });
+            Pump();
+            if (vm.SelectedFilePaths.Count != 2)
+                throw new InvalidOperationException("A keyboard action inside the pane changed gallery selection.");
+            vm.ReplaceSelectedFiles([]);
+            vm.DetailsPane.IsOpen = false;
+            Pump();
+            if (pane.IsVisible || root.ColumnDefinitions[3].ActualWidth != 0)
+                throw new InvalidOperationException("Collapsing the pane did not return the space to the gallery.");
+            vm.DetailsPane.IsOpen = true;
+            Console.WriteLine($"PASS main window details: full search row, fixed pane, gallery-first shrink ({wideWidth}->{narrowerWidth}), narrow overlay, collapse and keyboard isolation; maxWidth={main.MaxWidth}");
+        }
+        finally
+        {
+            main.MaxWidth = previousMaxWidth;
+            main.Width = previousWidth;
+            Pump();
+        }
+
+        void ResizeWorkspace(double width)
+        {
+            main.Width = width;
+            try
+            {
+                WaitUntil(() => Math.Abs(main.ClientSize.Width - width) < 1 &&
+                                Math.Abs(root.Bounds.Width - width) < 1);
+            }
+            catch (TimeoutException ex)
+            {
+                throw new TimeoutException($"Workspace resize did not settle: requested={width}, client={main.ClientSize.Width}, root={root.Bounds.Width}.", ex);
+            }
+        }
     }
 
     // Search navigation stores its target as a path. Continuous mode must be
