@@ -23,10 +23,14 @@ public class MainWindowStaticSerialCollectionDefinition { }
 /// </summary>
 public sealed class ImmediateDispatcher : ImageManager.Core.Services.IDispatcher
 {
+    public Func<Action, Task>? InvokeActionAsync { get; set; }
+
     public void Post(Action action) => action();
 
     public Task InvokeAsync(Action action)
     {
+        if (InvokeActionAsync is { } handler)
+            return handler(action);
         action();
         return Task.CompletedTask;
     }

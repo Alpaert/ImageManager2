@@ -429,7 +429,7 @@ public partial class MainWindowViewModel
             missing = paths.Where(p => !_tagCacheByPath.ContainsKey(p)).ToList();
         }
         if (missing.Count == 0) return;
-        Dictionary<string, List<string>> loadedTags = new(StringComparer.OrdinalIgnoreCase);
+        var loadedPaths = missing.ToHashSet(StringComparer.OrdinalIgnoreCase);
         await Task.Run(async () =>
         {
             var tagMap = await _metaRepo.GetTagMapByPathsAsync(missing);
@@ -437,22 +437,23 @@ public partial class MainWindowViewModel
             {
                 foreach (var path in missing)
                 {
-                    var tags = tagMap.TryGetValue(path, out var found)
-                        ? found : new List<string>();
-                    _tagCacheByPath[path] = tags;
-                    loadedTags[path] = tags;
+                    // A tag edit or another load may have filled this entry while
+                    // the query was running. Preloading must not replace that value.
+                    if (!_tagCacheByPath.ContainsKey(path))
+                        _tagCacheByPath[path] = tagMap.TryGetValue(path, out var found)
+                            ? new List<string>(found) : new List<string>();
                 }
             }
         });
-        if (loadedTags.Count == 0) return;
 
         await _dispatcher.InvokeAsync(() =>
         {
             foreach (var item in Images)
             {
-                if (loadedTags.TryGetValue(item.FilePath, out var tags))
+                if (loadedPaths.Contains(item.FilePath))
                 {
-                    item.Tags = new List<string>(tags);
+                    // The dispatcher callback can also run after a newer tag edit.
+                    item.Tags = GetTagsForFile(item.FilePath);
                     item.NotifyAll();
                 }
             }
@@ -478,18 +479,10 @@ public partial class MainWindowViewModel
     /// <summary>确保文件列表的 Tag 已加载，返回 FilePath → Tags 字典</summary>
     public async Task<Dictionary<string, List<string>>> EnsureTagsLoadedAsync(List<string> filePaths)
     {
-        var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-        var missingPaths = new List<string>();
-
+        List<string> missingPaths;
         lock (_tagCacheLock)
         {
-            foreach (var path in filePaths)
-            {
-                if (_tagCacheByPath.TryGetValue(path, out var tags))
-                    result[path] = tags;
-                else
-                    missingPaths.Add(path);
-            }
+            missingPaths = filePaths.Where(path => !_tagCacheByPath.ContainsKey(path)).ToList();
         }
 
         if (missingPaths.Count > 0)
@@ -499,16 +492,13 @@ public partial class MainWindowViewModel
                 var tagMap = await _metaRepo.GetTagMapByPathsAsync(missingPaths);
                 lock (_tagCacheLock)
                 {
-                    foreach (var kv in tagMap)
-                    {
-                        _tagCacheByPath[kv.Key] = kv.Value;
-                        result[kv.Key] = kv.Value;
-                    }
-                    // 对于数据库中也没有的文件，标记为空列表
                     foreach (var path in missingPaths)
                     {
-                        if (!result.ContainsKey(path))
-                            result[path] = new List<string>();
+                        // Preserve edits made since the cache-miss check, including
+                        // an explicitly empty entry after clearing all tags.
+                        if (!_tagCacheByPath.ContainsKey(path))
+                            _tagCacheByPath[path] = tagMap.TryGetValue(path, out var found)
+                                ? new List<string>(found) : new List<string>();
                     }
                 }
             }
@@ -518,6 +508,15 @@ public partial class MainWindowViewModel
             }
         }
 
+        // Even an initial cache hit may have been edited while missing paths loaded.
+        // Return one current snapshot, without exposing the mutable cache lists.
+        var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        lock (_tagCacheLock)
+        {
+            foreach (var path in filePaths)
+                if (_tagCacheByPath.TryGetValue(path, out var tags))
+                    result[path] = new List<string>(tags);
+        }
         return result;
     }
 
